@@ -44,10 +44,10 @@ pub fn evaluate(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
                 t,
                 Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
             ) {
-                Ok(Value::Null)
+                Ok(missing_index_value(target))
             } else {
                 let i = evaluate(index, ctx)?;
-                Ok(index_into(&t, &i))
+                Ok(index_into(&t, &i).unwrap_or_else(|| missing_index_value(target)))
             }
         }
         Expr::Wildcard { target } => {
@@ -120,40 +120,57 @@ fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, ctx: &Context) -> Result<Value
 
 /// `target[index]` / `target.property` — design memo §1.4, "nothing here
 /// ever throws".
-fn index_into(target: &Value, index: &Value) -> Value {
+fn index_into(target: &Value, index: &Value) -> Option<Value> {
     match target {
         // "Target is not a collection (null or primitive): result is Null."
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => Value::Null,
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
         Value::Object(obj) => {
             // "if its result is a primitive it is converted with ToString
             // ... Missing key or non-primitive index -> Null."
             if matches!(index, Value::Array(_) | Value::Object(_)) {
-                return Value::Null;
+                return None;
             }
             let key = to_display_string(index);
-            obj.get(&key).cloned().unwrap_or(Value::Null)
+            obj.get(&key).cloned()
         }
-        Value::Array(arr) if arr.is_filtered() => index_into_filtered(arr, index),
+        Value::Array(arr) if arr.is_filtered() => Some(index_into_filtered(arr, index)),
         Value::Array(arr) => index_into_plain_array(arr, index),
+    }
+}
+
+/// GitHub's Contexts reference promises an empty string when a property is
+/// absent from a context. Ordinary expression-created arrays/objects retain
+/// the evaluator's `null` missing-index result.
+/// https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#about-contexts
+fn missing_index_value(target: &Expr) -> Value {
+    if is_context_path(target) {
+        Value::String(String::new())
+    } else {
+        Value::Null
+    }
+}
+
+fn is_context_path(expr: &Expr) -> bool {
+    match expr {
+        Expr::NamedValue(_) => true,
+        Expr::Index { target, .. } | Expr::Wildcard { target } => is_context_path(target),
+        _ => false,
     }
 }
 
 /// "Target is an array: index result -> ToNumber; if NaN or `< 0` -> Null;
 /// `floor()` it; if `> i32::MAX` -> Null; if `>= len` -> Null; else the
 /// element."
-fn index_into_plain_array(arr: &ArrayValue, index: &Value) -> Value {
+fn index_into_plain_array(arr: &ArrayValue, index: &Value) -> Option<Value> {
     let n = to_number(index);
     if n.is_nan() || n < 0.0 {
-        return Value::Null;
+        return None;
     }
     let floored = n.floor();
     if floored > f64::from(i32::MAX) {
-        return Value::Null;
+        return None;
     }
-    arr.items()
-        .get(floored as usize)
-        .cloned()
-        .unwrap_or(Value::Null)
+    arr.items().get(floored as usize).cloned()
 }
 
 /// Indexing a *filtered* array (design memo §1.4): "for each item that is

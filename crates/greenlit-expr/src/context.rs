@@ -3,18 +3,17 @@
 //! Source for the root name set and shape notes: design memo §5 ("Contexts:
 //! shapes, typing, missing-key behavior"), cross-referenced against the
 //! [Contexts reference](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).
-//! Per the Phase 1 task list this crate implements exactly the ten roots
-//! `github`, `env`, `vars`, `secrets`, `needs`, `matrix`, `steps`, `runner`,
-//! `job`, `inputs` — not `strategy` or the reusable-workflow `jobs` context,
-//! which the design memo also discusses but which are out of this phase's
-//! explicit scope.
+//! Greenlit implements the eleven roots available to ordinary v0 jobs:
+//! `github`, `env`, `vars`, `secrets`, `needs`, `matrix`, `strategy`,
+//! `steps`, `runner`, `job`, and `inputs`. The reusable-workflow-only `jobs`
+//! context remains outside v0 together with reusable workflows themselves.
 //!
 //! **Per-key context availability is not modeled here.** Real GitHub
-//! additionally restricts which of these ten roots are legal in a given
+//! additionally restricts which of these eleven roots are legal in a given
 //! workflow key (the "Context availability" table — e.g. `secrets` is not
-//! legal in `jobs.<id>.if`); this crate treats all ten roots as always
-//! resolvable and leaves any narrower per-key allow-list to
-//! `greenlit-workflow`/`greenlit-engine`, which can walk the public
+//! legal in `jobs.<id>.if`); this crate treats all eleven roots as always
+//! resolvable and leaves the narrower per-key allow-list to
+//! `greenlit-workflow`, which walks the public
 //! [`crate::ast::Expr`] tree themselves to find referenced root names.
 
 use std::path::Path;
@@ -25,8 +24,9 @@ use crate::value::Value;
 
 /// The fixed, case-insensitive set of context root names this crate
 /// recognizes. Order matches the design memo's context table.
-pub(crate) const ROOT_NAMES: [&str; 10] = [
-    "github", "env", "vars", "secrets", "needs", "matrix", "steps", "runner", "job", "inputs",
+pub(crate) const ROOT_NAMES: [&str; 11] = [
+    "github", "env", "vars", "secrets", "needs", "matrix", "strategy", "steps", "runner", "job",
+    "inputs",
 ];
 
 /// The rolling job/step status status-check functions evaluate against.
@@ -66,6 +66,7 @@ pub struct Context {
     secrets: Value,
     needs: Value,
     matrix: Value,
+    strategy: Value,
     steps: Value,
     runner: Value,
     job: Value,
@@ -87,6 +88,7 @@ impl Context {
             secrets: Value::object(vec![]),
             needs: Value::object(vec![]),
             matrix: Value::Null,
+            strategy: Value::Null,
             steps: Value::object(vec![]),
             runner: Value::object(vec![]),
             job: Value::object(vec![]),
@@ -129,6 +131,11 @@ impl Context {
     /// strategy).
     pub fn with_matrix(mut self, v: Value) -> Self {
         self.matrix = v;
+        self
+    }
+    /// Sets the `strategy` context root (`Null` outside a matrix job).
+    pub fn with_strategy(mut self, v: Value) -> Self {
+        self.strategy = v;
         self
     }
     /// Sets the `steps` context root (conventionally an `Object` of
@@ -177,7 +184,7 @@ impl Context {
 
     /// Resolves a context root name case-insensitively (design memo §1.1:
     /// "root named-value ... names resolve case-insensitively"). Returns
-    /// `None` for anything outside the fixed ten-name set — the caller
+    /// `None` for anything outside the fixed eleven-name set — the caller
     /// (`parser`) is expected to have already rejected unrecognized root
     /// names at parse time, so this should never actually miss for an AST
     /// produced by [`crate::parse`], but stays total rather than panicking.
@@ -194,6 +201,8 @@ impl Context {
             Some(&self.needs)
         } else if name.eq_ignore_ascii_case("matrix") {
             Some(&self.matrix)
+        } else if name.eq_ignore_ascii_case("strategy") {
+            Some(&self.strategy)
         } else if name.eq_ignore_ascii_case("steps") {
             Some(&self.steps)
         } else if name.eq_ignore_ascii_case("runner") {
