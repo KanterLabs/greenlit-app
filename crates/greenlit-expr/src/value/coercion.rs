@@ -8,11 +8,12 @@ use super::Value;
 
 /// GitHub's truthiness rule (`EvaluationResult.IsFalsy`).
 ///
-/// Docs list falsy as `false, 0, -0, "", '', null`; the design memo notes
-/// the *source* additionally makes `NaN` falsy, which the docs omit — the
-/// source wins per this crate's fidelity policy (match documented behavior,
-/// then observed/source behavior). Every other value (including `"0"`,
-/// `"false"`, an empty array, an empty object) is truthy.
+/// GitHub's Expressions reference lists `false`, `0`, `-0`, `""`, `''`, and
+/// `null` as falsy. The runner's `EvaluationResult.IsFalsy` additionally
+/// treats `NaN` as falsy:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs>.
+/// Every other value (including `"0"`, `"false"`, an empty array, and an
+/// empty object) is truthy.
 pub fn is_falsy(v: &Value) -> bool {
     match v {
         Value::Null => true,
@@ -32,9 +33,13 @@ pub fn is_truthy(v: &Value) -> bool {
 // ToNumber
 // ---------------------------------------------------------------------
 
-/// GitHub's `ToNumber` coercion (`EvaluationResult.ConvertToNumber` +
-/// `ExpressionUtility.ParseNumber`, described as "follows JavaScript
-/// `Number()`" by the design memo).
+/// GitHub's `ToNumber` coercion. The public conversion table is documented
+/// under
+/// [expression operators](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#operators);
+/// the runner implements it in `EvaluationResult.ConvertToNumber` and
+/// `ExpressionUtility.ParseNumber`:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs>,
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/ExpressionUtility.cs>.
 pub fn to_number(v: &Value) -> f64 {
     match v {
         Value::Null => 0.0,
@@ -52,7 +57,8 @@ pub fn to_number(v: &Value) -> f64 {
     }
 }
 
-/// String→number per the memo: trim Unicode whitespace; empty → 0; else a
+/// String-to-number conversion follows the runner's
+/// `ExpressionUtility.ParseNumber`: trim Unicode whitespace; empty → 0; else a
 /// JSON-ish decimal parse (lenient forms `.5`/`1.`/`+3` allowed, no interior
 /// whitespace or thousands separators); else lowercase `0x`/`0o` (i32
 /// range); else the case-insensitive `"Infinity"`/`"-Infinity"` symbols;
@@ -142,11 +148,12 @@ pub fn to_display_string(v: &Value) -> String {
 /// and at least two exponent digits; trailing zeros stripped; `-0`
 /// preserved; `NaN`/`±Infinity` as their literal names.
 ///
-/// Source: design memo §2.3 ("G15 semantics to replicate exactly"). Exact
-/// behavior at extreme exponents is flagged there as needing a
-/// fuzz-compare against real GitHub output; the boundary cases named in the
-/// memo (`1E+20`, `1E-06`, `-0`) are pinned through the crate's end-to-end
-/// oracle table.
+/// `EvaluationResult.ConvertToString` formats numbers with the runner's
+/// `ExpressionConstants.NumberFormat`, which is `G15`:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs>,
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/ExpressionConstants.cs>.
+/// The boundary cases `1E+20`, `1E-06`, and `-0` are pinned through the
+/// crate's end-to-end oracle table.
 pub fn format_g15(n: f64) -> String {
     if n.is_nan() {
         return "NaN".to_string();

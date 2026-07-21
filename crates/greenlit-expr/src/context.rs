@@ -1,7 +1,6 @@
 //! The typed evaluation context: one [`Value`] per legal `${{ }}` root name.
 //!
-//! Source for the root name set and shape notes: design memo §5 ("Contexts:
-//! shapes, typing, missing-key behavior"), cross-referenced against the
+//! The root-name set, shapes, and availability rules follow GitHub's
 //! [Contexts reference](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).
 //! Greenlit implements the eleven roots available to ordinary v0 jobs:
 //! `github`, `env`, `vars`, `secrets`, `needs`, `matrix`, `strategy`,
@@ -23,7 +22,8 @@ use crate::functions::hash_files::HashFilesFs;
 use crate::value::Value;
 
 /// The fixed, case-insensitive set of context root names this crate
-/// recognizes. Order matches the design memo's context table.
+/// recognizes. The set comes from GitHub's Contexts reference; this stable
+/// order keeps parser diagnostics deterministic.
 pub(crate) const ROOT_NAMES: [&str; 11] = [
     "github", "env", "vars", "secrets", "needs", "matrix", "strategy", "steps", "runner", "job",
     "inputs",
@@ -31,10 +31,13 @@ pub(crate) const ROOT_NAMES: [&str; 11] = [
 
 /// The rolling job/step status status-check functions evaluate against.
 ///
-/// Source: design memo §4 ("Status functions and the implicit status
-/// check") — the runner keeps a rolling status (`JobContext.Status`,
+/// GitHub documents these functions under
+/// [status check functions](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions).
+/// The Actions runner keeps a rolling status (`JobContext.Status`,
 /// initially `Success`; becomes `Failure` when a step fails without
-/// `continue-on-error`; becomes `Cancelled` on cancellation). Computing
+/// `continue-on-error`; becomes `Cancelled` on cancellation) in
+/// [`StepsRunner.cs`](https://github.com/actions/runner/blob/main/src/Runner.Worker/StepsRunner.cs).
+/// Computing
 /// *which* status a job/step is currently at (across a `needs` DAG, or
 /// across prior steps) is `greenlit-engine`'s planning job; this crate only
 /// evaluates the four status functions against whatever status it is given.
@@ -182,8 +185,10 @@ impl Context {
         self.fs.as_ref()
     }
 
-    /// Resolves a context root name case-insensitively (design memo §1.1:
-    /// "root named-value ... names resolve case-insensitively"). Returns
+    /// Resolves a context root name case-insensitively, matching the
+    /// ordinal-ignore-case named-value registry in the Actions runner's
+    /// [`ExpressionParser.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/ExpressionParser.cs).
+    /// Returns
     /// `None` for anything outside the fixed eleven-name set — the caller
     /// (`parser`) is expected to have already rejected unrecognized root
     /// names at parse time, so this should never actually miss for an AST
