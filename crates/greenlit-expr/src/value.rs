@@ -158,13 +158,13 @@ impl ArrayValue {
 /// An object value: insertion-ordered key/value pairs, looked up
 /// case-insensitively.
 ///
-/// Source: the design memo's "Index / dereference evaluation" section —
-/// "the runner's `DictionaryContextData` uses `StringComparer.OrdinalIgnoreCase`;
-/// the dictionary preserves insertion order." A linear scan is used for
-/// lookup rather than a second case-folded index: context objects in
-/// practice (env maps, `github.event` sub-objects, matrix entries) are small,
-/// and a linear scan avoids maintaining two representations of the same
-/// key that could drift.
+/// The runner's `DictionaryContextData` uses
+/// `StringComparer.OrdinalIgnoreCase` while retaining a list for insertion
+/// order:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ContextData/DictionaryContextData.cs>.
+/// A linear scan is used here rather than a second case-folded index: context
+/// objects in practice (env maps, `github.event` sub-objects, matrix entries)
+/// are small, and one representation cannot drift from another.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectValue {
     entries: Rc<Vec<(String, Value)>>,
