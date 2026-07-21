@@ -40,6 +40,18 @@ jobs:
       - run: echo ${{ matrix.label }} ${{ strategy.job-index }} ${{ strategy.job-total }} ${{ strategy.fail-fast }} ${{ strategy.max-parallel }}
 "#;
 
+const DEFAULT_MAX_PARALLEL: &str = r#"on: push
+jobs:
+  default_parallel:
+    name: ${{ strategy.job-total }}-${{ strategy.max-parallel }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        channel: [stable, beta, nightly]
+    steps:
+      - run: echo ${{ strategy.max-parallel }}
+"#;
+
 fn sandbox_with_workflow(source: &str) -> Sandbox {
     let sandbox = Sandbox::new();
     sandbox.write("matrix.yml", source);
@@ -142,6 +154,19 @@ fn include_only_legs_resolve_strategy_controls_and_each_legs_context() {
 }
 
 #[test]
+fn omitted_max_parallel_defaults_to_job_total_in_each_strategy_context() {
+    let plan = plan_json(DEFAULT_MAX_PARALLEL);
+    let matrix = job(&plan, "default_parallel");
+
+    assert!(matrix["strategy"]["max_parallel"].is_null());
+    assert_eq!(matrix["legs"].as_array().unwrap().len(), 3);
+    for leg in matrix["legs"].as_array().unwrap() {
+        assert_eq!(leg["name"]["value"], "3-3");
+        assert_eq!(run_script(leg), "echo 3");
+    }
+}
+
+#[test]
 fn exactly_256_legs_are_accepted_and_fully_serialized() {
     let values = (0..256).collect::<Vec<_>>();
     let matrix_json = serde_json::json!({"index": values}).to_string();
@@ -211,6 +236,15 @@ fn malformed_matrix_shapes_controls_and_257_leg_paths_are_actionable() {
             )
         })
         .collect::<Vec<_>>();
+
+    rows.push((
+        "non-array inline expression axis",
+        "on: push\njobs:\n  matrix:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        channel: ${{ 'one' }}\n    steps:\n      - run: echo invalid\n"
+            .to_string(),
+        "matrix.yml:7:18",
+        "strategy.matrix expression field 'channel' must evaluate to an array, got string"
+            .to_string(),
+    ));
 
     let product_values = (0..257).collect::<Vec<_>>();
     rows.push((
