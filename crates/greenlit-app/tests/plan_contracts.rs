@@ -93,9 +93,87 @@ jobs:
       - run: echo pull-request
   dispatch_shape:
     runs-on: ubuntu-latest
-    if: github.event_name != 'workflow_dispatch' || (inputs.required_text == 'hello' && inputs.enabled == true && inputs.count == 2.5 && inputs.mode == 'fast' && github.event.inputs.enabled == 'true' && github.event.inputs.count == '2.5')
+    if: github.event_name != 'workflow_dispatch' || (inputs.required_text == 'hello' && inputs.enabled == true && inputs.count == 2.5 && inputs.mode == 'fast' && github.event.inputs.enabled == 'true' && github.event.inputs.count == '2.5' && github.server_url == 'https://github.com' && github.api_url == 'https://api.github.com' && github.graphql_url == 'https://api.github.com/graphql' && github.triggering_actor == 'litci tests' && github.workflow_sha == github.sha && github.workflow == 'contracts.yml' && github.workflow_ref == format('{0}/contracts.yml@refs/heads/main', github.repository))
     steps:
       - run: echo dispatch
+  render_fields:
+    name: Render ${{ github.event_name }}
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+      credentials:
+        username: fixture-user
+        password: fixture-password
+      env:
+        CONTAINER_EVENT: ${{ github.event_name }}
+      ports: ["8080:80"]
+      volumes: ["/tmp:/tmp"]
+      options: --cpus 1
+    services:
+      redis:
+        image: redis:7
+        env:
+          SERVICE_EVENT: ${{ github.event_name }}
+        ports: ["6379:6379"]
+        volumes: ["/var/lib/redis:/data"]
+        options: --health-cmd redis-cli ping
+    env:
+      JOB_EVENT: ${{ github.event_name }}
+    defaults:
+      run:
+        shell: sh
+        working-directory: job-work
+    outputs:
+      static-output: rendered
+      deferred-output: ${{ steps.rich.outputs.value }}
+    steps:
+      - id: rich
+        name: Rich ${{ github.event_name }}
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          STEP_EVENT: ${{ github.event_name }}
+        working-directory: step-work
+        continue-on-error: ${{ fromJSON('false') }}
+        timeout-minutes: ${{ fromJSON('30') }}
+        shell: bash
+        run: |
+          echo first
+          echo second
+      - id: action
+        name: Use action
+        uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+  render_matrix:
+    name: Matrix ${{ matrix.channel }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        channel: [stable]
+    container:
+      image: alpine:${{ matrix.channel }}
+    services:
+      redis:
+        image: redis:${{ matrix.channel }}
+    env:
+      MATRIX_CHANNEL: ${{ matrix.channel }}
+    defaults:
+      run:
+        shell: sh
+        working-directory: matrix-work
+    outputs:
+      selected: ${{ matrix.channel }}
+    steps:
+      - name: Matrix step ${{ matrix.channel }}
+        run: echo ${{ matrix.channel }}
+defaults:
+  run:
+    shell: bash
+    working-directory: workflow-work
+permissions:
+  contents: read
+  actions: write
 "#;
 
 fn sandbox_with_workflow(source: &str) -> Sandbox {
@@ -253,7 +331,7 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
     assert_eq!(
         job(&plan, "dispatch_shape")["condition"]["value"],
         true,
-        "typed inputs and github.event.inputs strings must both compare correctly"
+        "typed inputs and deterministic synthetic github fields must compare correctly"
     );
 
     assert_eq!(plan["env"]["LEVEL"]["value"], "workflow");
@@ -292,8 +370,8 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
     assert_eq!(rescued["condition"]["evaluation"], "deferred");
 
     let zero = job(&plan, "zero");
-    assert_eq!(zero["strategy"]["is_matrix"], true);
-    assert_eq!(zero["strategy"]["legs"], serde_json::json!([]));
+    assert_eq!(zero["strategy"]["matrix"]["evaluation"], "static");
+    assert_eq!(zero["strategy"]["matrix"]["legs"], serde_json::json!([]));
     assert_eq!(zero["legs"], serde_json::json!([]));
     assert!(zero["runner"].is_null());
 
@@ -355,11 +433,50 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
         "mode=fast",
     ]);
     assert!(human.status.success());
-    assert!(
-        support::stdout_text(&human).contains(
-            "runner: deferred <- needs.runner_source.outputs.label (defers on: needs.runner_source.outputs.label)"
-        )
-    );
+    let human_stdout = support::stdout_text(&human);
+    let expected_human_fields = [
+        "plan schema: 1",
+        "defaults.run:\n  shell: static(\"bash\") <- bash\n  working-directory: static(\"workflow-work\") <- workflow-work",
+        "permissions: {\"kind\":\"scoped\",\"scopes\":{\"contents\":\"read\",\"actions\":\"write\"}}",
+        "runner: deferred <- needs.runner_source.outputs.label (defers on: needs.runner_source.outputs.label)",
+        "Render workflow_dispatch [wave 0] needs: (none)",
+        "name: static(\"Render workflow_dispatch\") <- Render ${{ github.event_name }}",
+        "image: static(\"alpine:3.20\") <- alpine:3.20",
+        "username: static(\"fixture-user\") <- fixture-user",
+        "password: static([masked])",
+        "CONTAINER_EVENT: static(\"workflow_dispatch\") <- ${{ github.event_name }}",
+        "- static(\"8080:80\") <- 8080:80",
+        "- static(\"/tmp:/tmp\") <- /tmp:/tmp",
+        "options: static(\"--cpus 1\") <- --cpus 1",
+        "SERVICE_EVENT: static(\"workflow_dispatch\") <- ${{ github.event_name }}",
+        "JOB_EVENT: static(\"workflow_dispatch\") <- ${{ github.event_name }}",
+        "static-output: static(\"rendered\") <- rendered",
+        "deferred-output: deferred <- steps.rich.outputs.value (defers on: steps.rich.outputs.value)",
+        "name: static(\"Rich workflow_dispatch\") <- Rich ${{ github.event_name }}",
+        "if: static(true) <- github.event_name == 'workflow_dispatch'",
+        "kind: run",
+        "script: static(\"echo first\\necho second\\n\") <- echo first\necho second",
+        "shell: static(\"bash\") <- bash",
+        "STEP_EVENT: static(\"workflow_dispatch\") <- ${{ github.event_name }}",
+        "working-directory: static(\"step-work\") <- step-work",
+        "continue-on-error: static(false) <- ${{ fromJSON('false') }}",
+        "timeout-minutes: static(30) <- ${{ fromJSON('30') }}",
+        "kind: uses",
+        "reference: static(\"actions/checkout@0123456789abcdef0123456789abcdef01234567\")",
+        "ref: static(\"refs/heads/main\") <- ${{ github.ref }}",
+        "fetch-depth: static(\"1\") <- 1",
+        "leg 0 \"Matrix stable\"",
+        "image: static(\"alpine:stable\") <- alpine:${{ matrix.channel }}",
+        "image: static(\"redis:stable\") <- redis:${{ matrix.channel }}",
+        "MATRIX_CHANNEL: static(\"stable\") <- ${{ matrix.channel }}",
+        "selected: static(\"stable\") <- ${{ matrix.channel }}",
+    ];
+    for expected in expected_human_fields {
+        assert!(
+            human_stdout.contains(expected),
+            "missing human-plan field `{expected}`:\n{human_stdout}"
+        );
+    }
 }
 
 #[test]
