@@ -1,7 +1,7 @@
-//! The four-phase cartesian-product/exclude/include algorithm (design memo
-//! §1.2), plus the conversions that let both an inline `strategy.matrix:`
-//! mapping and a `${{ fromJSON(...) }}` expression's resulting object
-//! converge on the same [`run_algorithm`].
+//! Cartesian-product/exclude/include expansion, plus the conversions that
+//! let both an inline `strategy.matrix:` mapping and a
+//! `${{ fromJSON(...) }}` expression's resulting object converge on the
+//! same expansion algorithm.
 
 use indexmap::IndexMap;
 
@@ -12,7 +12,8 @@ use greenlit_workflow::model::value::{ScalarOrExpr, YamlValue};
 use crate::lints::Lint;
 use crate::partial_eval::{FoldCtx, TemplateFold, fold_template};
 
-use super::{LegOrigin, MatrixError, MatrixLeg, MatrixValue, ResolvedEntry, value_kind_name};
+use super::algorithm::run_algorithm;
+use super::{MatrixError, MatrixLeg, MatrixValue, ResolvedEntry, value_kind_name};
 
 pub(super) fn expand_matrix_source(
     source: &MatrixSource,
@@ -94,7 +95,7 @@ fn expand_expression_matrix(
     let value = match folded {
         TemplateFold::Static(v) => v,
         TemplateFold::Deferred { defers_on, .. } => {
-            return Err(MatrixError::DynamicMatrixNotSupported {
+            return Err(MatrixError::ValueNotStatic {
                 span: text.span.clone(),
                 defers_on: defers_on.into_iter().collect(),
             });
@@ -251,165 +252,4 @@ fn scalar_to_matrix_value(s: &greenlit_workflow::model::value::YamlScalar) -> Ma
         YamlScalar::Number(n) => MatrixValue::Number(*n),
         YamlScalar::String(s) => MatrixValue::String(s.clone()),
     }
-}
-
-/// The core four-phase algorithm (design memo §1.2), operating on
-/// already-resolved [`MatrixValue`]s so both the inline-`strategy.matrix:`
-/// path and the `${{ fromJSON(...) }}`-expression path converge here.
-fn run_algorithm(
-    axes: Vec<(String, Vec<MatrixValue>)>,
-    include: Vec<(usize, ResolvedEntry, Span)>,
-    exclude: Vec<(ResolvedEntry, Span)>,
-    cap: usize,
-    matrix_span: Span,
-) -> Result<(Vec<MatrixLeg>, Vec<Lint>), MatrixError> {
-    let original_keys: std::collections::HashSet<&str> =
-        axes.iter().map(|(k, _)| k.as_str()).collect();
-
-    // Phase 1: cartesian product, first axis outermost (varies slowest).
-    // GitHub caps a matrix at 256 generated jobs. Compute the cardinality
-    // with checked arithmetic and enforce the configured equivalent before
-    // allocating any cartesian-product storage.
-    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategymatrix
-    let product_cardinality = if axes.is_empty() || axes.iter().any(|(_, values)| values.is_empty())
-    {
-        0
-    } else {
-        axes.iter()
-            .try_fold(1_usize, |cardinality, (_, values)| {
-                cardinality.checked_mul(values.len())
-            })
-            .ok_or_else(|| MatrixError::CardinalityOverflow {
-                cap,
-                span: matrix_span.clone(),
-            })?
-    };
-    if product_cardinality > cap {
-        return Err(MatrixError::TooManyLegs {
-            count: product_cardinality,
-            cap,
-            span: matrix_span,
-        });
-    }
-
-    let mut product: Vec<IndexMap<String, MatrixValue>> = if product_cardinality == 0 {
-        Vec::new()
-    } else {
-        let mut combos: Vec<IndexMap<String, MatrixValue>> = vec![IndexMap::new()];
-        for (key, values) in &axes {
-            let next_cardinality = combos.len().checked_mul(values.len()).ok_or_else(|| {
-                MatrixError::CardinalityOverflow {
-                    cap,
-                    span: matrix_span.clone(),
-                }
-            })?;
-            let mut next = Vec::with_capacity(next_cardinality);
-            for combo in &combos {
-                for v in values {
-                    let mut c = combo.clone();
-                    c.insert(key.clone(), v.clone());
-                    next.push(c);
-                }
-            }
-            combos = next;
-        }
-        combos
-    };
-
-    // Phase 2: exclude, strictly before include.
-    let mut lints = Vec::new();
-    let mut surviving = vec![true; product.len()];
-    for (entry, span) in &exclude {
-        if entry.is_empty() {
-            return Err(MatrixError::EmptyExcludeEntry { span: span.clone() });
-        }
-        let mut removed_any = false;
-        for (i, combo) in product.iter().enumerate() {
-            if surviving[i] && matches_exclude(entry, combo) {
-                surviving[i] = false;
-                removed_any = true;
-            }
-        }
-        if !removed_any {
-            lints.push(Lint::dead_exclude(span.clone()));
-        }
-    }
-    product = product
-        .into_iter()
-        .enumerate()
-        .filter(|(i, _)| surviving[*i])
-        .map(|(_, c)| c)
-        .collect();
-
-    // Phase 3: include, sequential, fit-tested only against the surviving
-    // product combinations (never against combos created by earlier
-    // include entries).
-    let mut legs: Vec<MatrixLeg> = product
-        .into_iter()
-        .map(|values| MatrixLeg {
-            index: 0,
-            values,
-            origin: LegOrigin::Product,
-        })
-        .collect();
-    let mut standalone: Vec<MatrixLeg> = Vec::new();
-    for (entry_index, entry, _span) in &include {
-        let mut fit_any = false;
-        for leg in legs.iter_mut() {
-            let fits = entry.iter().all(|(k, v)| {
-                if original_keys.contains(k.as_str()) {
-                    leg.values.get(k) == Some(v)
-                } else {
-                    true
-                }
-            });
-            if fits {
-                fit_any = true;
-                for (k, v) in entry {
-                    leg.values.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        if !fit_any {
-            let count = legs
-                .len()
-                .checked_add(standalone.len())
-                .and_then(|current| current.checked_add(1))
-                .ok_or_else(|| MatrixError::CardinalityOverflow {
-                    cap,
-                    span: matrix_span.clone(),
-                })?;
-            if count > cap {
-                return Err(MatrixError::TooManyLegs {
-                    count,
-                    cap,
-                    span: matrix_span,
-                });
-            }
-            let mut values = IndexMap::new();
-            for (k, v) in entry {
-                values.insert(k.clone(), v.clone());
-            }
-            standalone.push(MatrixLeg {
-                index: 0,
-                values,
-                origin: LegOrigin::Include {
-                    entry_index: *entry_index,
-                },
-            });
-        }
-    }
-
-    // Phase 4: result — surviving product combinations, then
-    // include-created ones, both in their own order; assign final indices.
-    legs.extend(standalone);
-    for (i, leg) in legs.iter_mut().enumerate() {
-        leg.index = i;
-    }
-
-    Ok((legs, lints))
-}
-
-fn matches_exclude(entry: &ResolvedEntry, combo: &IndexMap<String, MatrixValue>) -> bool {
-    entry.iter().all(|(k, v)| combo.get(k) == Some(v))
 }
