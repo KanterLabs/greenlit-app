@@ -5,7 +5,6 @@
 
 use greenlit_expr::Value;
 use greenlit_workflow::model::job::Job;
-use greenlit_workflow::model::value::ScalarOrExpr;
 use greenlit_workflow::model::workflow::Workflow;
 
 use crate::event::SyntheticEvent;
@@ -13,19 +12,14 @@ use crate::graph::{JobGraph, JobId};
 use crate::lints::Lint;
 use crate::matrix::{MatrixLeg, plan_strategy};
 use crate::outputs::JobOutputsPlan;
-use crate::partial_eval::{
-    EnvChain, FoldCtx, LocatedEvalError, PartialEvalError, StaticRoots, build_env_chain,
-};
-use crate::pass_through::{plan_container, plan_env_layer};
-use crate::planned::{Planned, plan_scalar_string, plan_template_string};
-use crate::runner::{RunnerPlan, resolve_runs_on};
+use crate::partial_eval::{EnvChain, FoldCtx, StaticRoots, StrategyDeferred};
+use crate::planned::Planned;
 
 use super::conditions::{expr_calls_status, fold_job_condition};
 use super::contexts::{matrix_leg_value, strategy_context_value};
-use super::error::{eval_err, located_eval_err};
+use super::instance::plan_instance;
 use super::references::{ReferencingJob, lint_needs_output_references};
-use super::step::plan_step;
-use super::{JobPlan, LegPlan, PlanError, PlanOptions, RunDefaultsPlan, StepPlan};
+use super::{JobPlan, LegPlan, PlanError, PlanOptions, RunDefaultsPlan};
 
 pub(crate) fn plan_job(
     workflow: &Workflow,
@@ -53,7 +47,7 @@ pub(crate) fn plan_job(
         matrix: &roots_null,
         matrix_deferred: false,
         strategy: &roots_null,
-        strategy_deferred: false,
+        strategy_deferred: StrategyDeferred::default(),
         inputs: &event.inputs,
     };
 
@@ -102,17 +96,53 @@ pub(crate) fn plan_job(
 
     // The matrix context changes for every generated job. Accordingly,
     // every context-sensitive field below is planned independently for
-    // each leg: runner, display name, outputs, and the complete step list.
+    // each static leg. When expansion depends on `needs` output data, the
+    // same fields form one explicit deferred job template: `matrix.*` and
+    // `strategy.*` references remain residuals until Phase 2 materializes
+    // its concrete legs after the prerequisites finish.
     // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#matrix-context
     let (runner, name, container, services, env, defaults, outputs, steps, legs) =
-        if strategy.is_matrix {
-            let mut legs = Vec::with_capacity(strategy.legs.len());
-            for leg in &strategy.legs {
+        if strategy.is_matrix_deferred() {
+            let deferred_strategy = super::contexts::deferred_strategy_context_value(&strategy);
+            let deferred_roots = StaticRoots {
+                matrix_deferred: true,
+                strategy: &deferred_strategy,
+                strategy_deferred: deferred_strategy_fields(&strategy, true),
+                ..static_roots
+            };
+            let template_leg = MatrixLeg {
+                index: 0,
+                values: indexmap::IndexMap::new(),
+                origin: crate::matrix::LegOrigin::Product,
+            };
+            let instance = plan_instance(
+                workflow,
+                job,
+                &job_id,
+                deferred_roots,
+                &raw_outputs,
+                &template_leg,
+            )?;
+            (
+                Some(instance.runner),
+                instance.name,
+                instance.container,
+                instance.services,
+                instance.env,
+                instance.defaults,
+                instance.outputs,
+                instance.steps,
+                Vec::new(),
+            )
+        } else if strategy.is_matrix() {
+            let mut legs = Vec::with_capacity(strategy.legs().len());
+            for leg in strategy.legs() {
                 let leg_matrix = matrix_leg_value(leg);
                 let leg_strategy = strategy_context_value(&strategy, leg.index);
                 let leg_roots = StaticRoots {
                     matrix: &leg_matrix,
                     strategy: &leg_strategy,
+                    strategy_deferred: deferred_strategy_fields(&strategy, false),
                     ..static_roots
                 };
                 let instance = plan_instance(workflow, job, &job_id, leg_roots, &raw_outputs, leg)?;
@@ -175,6 +205,7 @@ pub(crate) fn plan_job(
         id: job_id,
         span: job.id.span.clone(),
         name,
+        name_is_default: job.name.is_none(),
         needs,
         wave: graph
             .idx_of(&JobId(job.id.value.clone()))
@@ -185,7 +216,11 @@ pub(crate) fn plan_job(
         services,
         env,
         defaults,
-        condition: if strategy.is_matrix { None } else { condition },
+        condition: if strategy.is_matrix() && !strategy.is_matrix_deferred() {
+            None
+        } else {
+            condition
+        },
         implicit_status_gate,
         skip: None,
         strategy,
@@ -207,165 +242,17 @@ pub(crate) fn plan_job(
     Ok(plan)
 }
 
-struct PlannedInstance {
-    name: Planned<String>,
-    runner: RunnerPlan,
-    container: Option<crate::pass_through::ContainerPlan>,
-    services: indexmap::IndexMap<String, crate::pass_through::ContainerPlan>,
-    env: indexmap::IndexMap<String, crate::pass_through::EnvValue>,
-    defaults: RunDefaultsPlan,
-    outputs: JobOutputsPlan,
-    steps: Vec<StepPlan>,
-}
-
-fn plan_instance(
-    workflow: &Workflow,
-    job: &Job,
-    job_id: &JobId,
-    roots: StaticRoots<'_>,
-    raw_outputs: &[(String, String, greenlit_workflow::Span)],
-    leg: &MatrixLeg,
-) -> Result<PlannedInstance, PlanError> {
-    let workflow_env_layers: [&[(
-        greenlit_workflow::Spanned<String>,
-        greenlit_workflow::Spanned<ScalarOrExpr>,
-    )]; 1] = [&workflow.env];
-    let workflow_env_chain = build_env_chain(&workflow_env_layers, roots)
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-    let job_layer_ctx = FoldCtx {
-        roots,
-        env: &workflow_env_chain,
-        secrets_forbidden: false,
-    };
-    let env = plan_env_layer(&job.env, &job_layer_ctx)
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-
-    let job_env_layers: [&[(
-        greenlit_workflow::Spanned<String>,
-        greenlit_workflow::Spanned<ScalarOrExpr>,
-    )]; 2] = [&workflow.env, &job.env];
-    let job_env_chain = build_env_chain(&job_env_layers, roots)
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-    let ctx = FoldCtx {
-        roots,
-        env: &job_env_chain,
-        secrets_forbidden: false,
-    };
-
-    let runner = resolve_job_runner(job, job_id, &ctx)?;
-    let default_name = format!("{}{}", job.id.value, leg.display_suffix());
-    let name_span = job
-        .name
-        .as_ref()
-        .map_or_else(|| job.id.span.clone(), |name| name.span.clone());
-    let name = resolve_job_name(job, &default_name, &ctx)
-        .map_err(|source| eval_err(job_id, None, name_span, source))?;
-    let container = job
-        .container
-        .as_ref()
-        .map(|container| plan_container(&container.value, &ctx))
-        .transpose()
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-    let mut services = indexmap::IndexMap::with_capacity(job.services.len());
-    for (service_id, service) in &job.services {
-        let service_plan = plan_container(&service.value, &ctx)
-            .map_err(|error| located_eval_err(job_id, None, error))?;
-        services.insert(service_id.value.clone(), service_plan);
+fn deferred_strategy_fields(
+    strategy: &crate::matrix::StrategyPlan,
+    matrix_pending: bool,
+) -> StrategyDeferred {
+    StrategyDeferred {
+        fail_fast: strategy.fail_fast.is_deferred(),
+        job_index: matrix_pending,
+        job_total: matrix_pending,
+        max_parallel: match strategy.max_parallel.as_ref() {
+            None => matrix_pending,
+            Some(value) => value.is_deferred(),
+        },
     }
-    let defaults = plan_defaults(workflow, job, &ctx)
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-    let outputs = crate::outputs::plan_outputs(raw_outputs, &ctx)
-        .map_err(|error| located_eval_err(job_id, None, error))?;
-
-    let mut steps = Vec::with_capacity(job.steps.len());
-    for step in &job.steps {
-        steps.push(plan_step(workflow, job, step, &roots, job_id)?);
-    }
-
-    Ok(PlannedInstance {
-        name,
-        runner,
-        container,
-        services,
-        env,
-        defaults,
-        outputs,
-        steps,
-    })
-}
-
-fn resolve_job_name(
-    job: &Job,
-    default_name: &str,
-    ctx: &FoldCtx<'_>,
-) -> Result<Planned<String>, PartialEvalError> {
-    let Some(name) = &job.name else {
-        return Ok(Planned::static_value(
-            job.id.span.clone(),
-            job.id.value.clone(),
-            default_name.to_string(),
-        ));
-    };
-    plan_template_string(&name.value, &name.span, ctx)
-}
-
-fn plan_defaults(
-    workflow: &Workflow,
-    job: &Job,
-    ctx: &FoldCtx<'_>,
-) -> Result<RunDefaultsPlan, LocatedEvalError> {
-    let workflow_run = workflow
-        .defaults
-        .as_ref()
-        .and_then(|defaults| defaults.value.run.as_ref());
-    let job_run = job
-        .defaults
-        .as_ref()
-        .and_then(|defaults| defaults.value.run.as_ref());
-
-    let shell = job_run
-        .and_then(|run| run.value.shell.as_ref())
-        .or_else(|| workflow_run.and_then(|run| run.value.shell.as_ref()))
-        .map(|shell| {
-            plan_template_string(&shell.value, &shell.span, ctx).map_err(|source| {
-                LocatedEvalError {
-                    span: shell.span.clone(),
-                    source,
-                }
-            })
-        })
-        .transpose()?;
-    let working_directory = job_run
-        .and_then(|run| run.value.working_directory.as_ref())
-        .or_else(|| workflow_run.and_then(|run| run.value.working_directory.as_ref()))
-        .map(|directory| {
-            plan_scalar_string(directory, ctx).map_err(|source| LocatedEvalError {
-                span: directory.span.clone(),
-                source,
-            })
-        })
-        .transpose()?;
-
-    Ok(RunDefaultsPlan {
-        shell,
-        working_directory,
-    })
-}
-
-fn resolve_job_runner(
-    job: &Job,
-    job_id: &JobId,
-    ctx: &FoldCtx<'_>,
-) -> Result<RunnerPlan, PlanError> {
-    let runs_on = job
-        .runs_on
-        .as_ref()
-        .ok_or_else(|| PlanError::NotSupportedInV0 {
-            name: "reusable workflow call (jobs.<id>.uses)",
-            span: job.id.span.clone(),
-        })?;
-    resolve_runs_on(runs_on, ctx).map_err(|source| PlanError::Runner {
-        job: job_id.clone(),
-        source: Box::new(source),
-    })
 }
