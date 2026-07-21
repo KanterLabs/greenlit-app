@@ -36,17 +36,34 @@ fn expand_inline_matrix(
     for (name, values) in &matrix.axes {
         let mut converted = Vec::with_capacity(values.len());
         for v in values {
-            let splice_expression_array =
-                matches!(&v.value, YamlValue::Scalar(ScalarOrExpr::Expression(_)));
-            let value = convert_yaml_value(v, ctx)?;
-            if splice_expression_array {
-                if let MatrixValue::Sequence(items) = value {
-                    converted.extend(items);
-                } else {
-                    converted.push(value);
+            if let YamlValue::Scalar(ScalarOrExpr::Expression(raw)) = &v.value {
+                // GitHub defines each matrix variable as an array of values;
+                // context-backed axes use the same shape and are spliced into
+                // the axis only after resolving to an array.
+                // https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations#using-contexts-to-create-matrices
+                match fold_template(raw, ctx).map_err(|source| MatrixError::PartialEval {
+                    span: v.span.clone(),
+                    source,
+                })? {
+                    TemplateFold::Static(greenlit_expr::Value::Array(items)) => {
+                        converted.extend(items.items().iter().map(expr_value_to_matrix_value))
+                    }
+                    TemplateFold::Static(value) => {
+                        return Err(MatrixError::ExpressionFieldNotArray {
+                            field: name.value.clone(),
+                            actual: value_kind_name(&value),
+                            span: v.span.clone(),
+                        });
+                    }
+                    TemplateFold::Deferred { defers_on, .. } => {
+                        return Err(MatrixError::ValueNotStatic {
+                            span: v.span.clone(),
+                            defers_on: defers_on.into_iter().collect(),
+                        });
+                    }
                 }
             } else {
-                converted.push(value);
+                converted.push(convert_yaml_value(v, ctx)?);
             }
         }
         axes.push((name.value.clone(), converted));
