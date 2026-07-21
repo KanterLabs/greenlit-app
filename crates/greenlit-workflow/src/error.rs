@@ -75,6 +75,21 @@ pub enum ParseError {
         message: String,
     },
 
+    /// A `${{ ... }}` template was not closed, its inner expression did
+    /// not parse, or it referenced a context/special function unavailable
+    /// at the workflow key where it appeared. GitHub validates all three at
+    /// workflow-read time; keeping the modeled field's span here prevents a
+    /// malformed expression from disappearing during static extraction.
+    #[error("{span}: invalid expression in {context}: {message}")]
+    Expression {
+        /// The complete scalar containing the invalid expression.
+        span: Span,
+        /// The workflow key whose expression policy applies.
+        context: String,
+        /// The delimiter, grammar, context, or function error.
+        message: String,
+    },
+
     /// An explicit YAML tag other than the four honored core-schema scalar
     /// tags (`!!str`, `!!bool`, `!!int`, `!!float`, `!!null`) or the two
     /// honored (no-op) collection tags (`!!seq`, `!!map`). Design memo §6.1:
@@ -155,6 +170,7 @@ impl ParseError {
             ParseError::UnknownKey { span, .. }
             | ParseError::MissingKey { span, .. }
             | ParseError::Schema { span, .. }
+            | ParseError::Expression { span, .. }
             | ParseError::UnsupportedTag { span, .. }
             | ParseError::TagMismatch { span, .. }
             | ParseError::IntegerOverflow { span, .. }

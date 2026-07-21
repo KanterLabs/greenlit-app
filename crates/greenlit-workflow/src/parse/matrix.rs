@@ -1,7 +1,7 @@
 //! `strategy:` and `strategy.matrix:`.
 
 use crate::error::ParseError;
-use crate::expression::single_expression_body;
+use crate::expression::{parse_template, single_expression_body};
 use crate::model::job::{Matrix, MatrixEntry, MatrixSource, Strategy};
 use crate::model::value::ScalarOrExpr;
 use crate::parse::util::{
@@ -43,6 +43,15 @@ fn parse_matrix_source(node: &Spanned<RawNode>) -> Result<Spanned<MatrixSource>,
         }
         RawNode::Scalar(_) => match scalar_or_expr(node, "strategy.matrix")? {
             ScalarOrExpr::Expression(text) => {
+                parse_template(&text, &node.span, "strategy.matrix")?;
+                if single_expression_body(&text).is_none() {
+                    return Err(ParseError::Schema {
+                        span: node.span.clone(),
+                        message:
+                            "strategy.matrix must be a mapping or a single '${{ }}' expression"
+                                .to_owned(),
+                    });
+                }
                 let expr = Spanned::new(text, node.span.clone());
                 Ok(Spanned::new(
                     MatrixSource::Expression(expr),
@@ -84,12 +93,19 @@ fn parse_matrix(node: &Spanned<RawNode>) -> Result<Matrix, ParseError> {
                         .map(|item| Spanned::new(to_yaml_value(item), item.span.clone()))
                         .collect(),
                     RawNode::Scalar(_) => match scalar_or_expr(v, "strategy.matrix.<axis>")? {
-                        ScalarOrExpr::Expression(ref text)
-                            if single_expression_body(text).is_some() =>
-                        {
-                            vec![Spanned::new(to_yaml_value(v), v.span.clone())]
+                        ScalarOrExpr::Expression(ref text) => {
+                            parse_template(text, &v.span, "strategy.matrix.<axis>")?;
+                            if single_expression_body(text).is_some() {
+                                vec![Spanned::new(to_yaml_value(v), v.span.clone())]
+                            } else {
+                                return Err(ParseError::Schema {
+                                    span: v.span.clone(),
+                                    message: "strategy.matrix.<axis> must be a sequence or a single '${{ }}' expression"
+                                        .to_owned(),
+                                });
+                            }
                         }
-                        ScalarOrExpr::Expression(_) | ScalarOrExpr::Literal(_) => {
+                        ScalarOrExpr::Literal(_) => {
                             return Err(ParseError::Schema {
                                 span: v.span.clone(),
                                 message: "strategy.matrix.<axis> must be a sequence or a single '${{ }}' expression"

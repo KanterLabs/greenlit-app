@@ -26,7 +26,7 @@ fn bench_parse_and_extract(c: &mut Criterion) {
     let workflow = parse_workflow("ci.yml", MULTI_JOB_WORKFLOW).expect("fixture must parse");
     c.bench_function("extract_static(multi_job.yml)", |b| {
         b.iter(|| {
-            let extraction = extract_static(black_box(&workflow));
+            let extraction = extract_static(black_box(&workflow)).expect("fixture extracts");
             black_box(extraction);
         });
     });

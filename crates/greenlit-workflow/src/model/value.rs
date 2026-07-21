@@ -17,9 +17,10 @@ pub use crate::yaml::scalar::YamlScalar;
 /// memo §1.5) — is `greenlit-expr`/`greenlit-engine`'s job, not this
 /// crate's; `greenlit-workflow` only classifies and preserves.
 ///
-/// Classification is currently a simple substring check for `${{` (see
-/// `crate::extract` module docs for why, and what should replace it once
-/// `greenlit-expr` exposes a lexer this crate can call instead).
+/// Classification is intentionally a simple substring check for `${{`.
+/// The parser then performs quote-aware wrapper segmentation, parses every
+/// inner expression with `greenlit-expr`, and applies the workflow key's
+/// context/function policy before returning the model.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScalarOrExpr {
     /// No `${{` appears anywhere in the raw text; resolved to a typed

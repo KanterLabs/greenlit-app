@@ -97,13 +97,19 @@ fn workflow_dispatch_with_inputs() {
 
 #[test]
 fn schedule_with_cron_entries() {
-    let source =
-        format!("on:\n  schedule:\n    - cron: \"0 3 * * *\"\n    - cron: \"0 15 * * *\"\n{TAIL}");
+    let source = format!(
+        "on:\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/New_York\n    - cron: \"0 15 * * *\"\n{TAIL}"
+    );
     let workflow = parse_workflow("t.yml", &source).expect("parses");
     match &workflow.on[0].value {
         Trigger::Schedule(crons) => {
-            let texts: Vec<&str> = crons.iter().map(|c| c.value.as_str()).collect();
+            let texts: Vec<&str> = crons.iter().map(|c| c.cron.value.as_str()).collect();
             assert_eq!(texts, ["0 3 * * *", "0 15 * * *"]);
+            assert_eq!(
+                crons[0].timezone.as_ref().map(|zone| zone.value.as_str()),
+                Some("America/New_York")
+            );
+            assert!(crons[1].timezone.is_none());
         }
         other => panic!("expected Schedule, got {other:?}"),
     }

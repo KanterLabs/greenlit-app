@@ -96,7 +96,7 @@ pub fn parse_workflow(
     let jobs_node = require(entries, "jobs", &root.span, "workflow")?;
     let jobs = parse_jobs(jobs_node)?;
 
-    Ok(Workflow {
+    let workflow = Workflow {
         span: root.span.clone(),
         name,
         on,
@@ -105,7 +105,9 @@ pub fn parse_workflow(
         permissions,
         concurrency,
         jobs,
-    })
+    };
+    crate::validate::validate_workflow(&workflow)?;
+    Ok(workflow)
 }
 
 /// [`parse_workflow`], reading `path` from disk first and using it

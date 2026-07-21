@@ -19,7 +19,7 @@ pub enum Trigger {
     /// `workflow_dispatch`.
     WorkflowDispatch(WorkflowDispatch),
     /// `schedule`.
-    Schedule(Vec<Spanned<String>>),
+    Schedule(Vec<Schedule>),
     /// `repository_dispatch`.
     RepositoryDispatch {
         /// `types:` list; empty means "all types".
@@ -38,6 +38,17 @@ pub enum Trigger {
         /// The event's configuration mapping, if any.
         config: Option<Spanned<YamlValue>>,
     },
+}
+
+/// One `on.schedule[]` declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Schedule {
+    /// The complete schedule-entry mapping.
+    pub span: Span,
+    /// Required POSIX cron expression.
+    pub cron: Spanned<String>,
+    /// Optional IANA timezone. If absent, GitHub schedules in UTC.
+    pub timezone: Option<Spanned<String>>,
 }
 
 /// The branch/tag/path filters shared by `push`, `pull_request`, and
@@ -60,8 +71,7 @@ pub struct WebhookFilter {
     pub paths: Vec<Spanned<String>>,
     /// `paths-ignore:`.
     pub paths_ignore: Vec<Spanned<String>>,
-    /// `types:` — only meaningful for `pull_request`/`pull_request_target`,
-    /// but accepted generically.
+    /// `types:` — accepted only for `pull_request`/`pull_request_target`.
     pub types: Vec<Spanned<String>>,
 }
 

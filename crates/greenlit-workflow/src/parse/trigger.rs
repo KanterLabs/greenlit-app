@@ -1,13 +1,11 @@
 //! `on:` — normalizing all three trigger-list YAML forms.
 
 use crate::error::ParseError;
-use crate::model::trigger::{
-    Trigger, WebhookFilter, WorkflowDispatch, WorkflowDispatchInput, WorkflowDispatchInputType,
-};
+use crate::model::trigger::{Schedule, Trigger, WebhookFilter, WorkflowDispatch};
 use crate::model::value::{UnsupportedConstruct, YamlScalar};
 use crate::parse::util::{
-    Entries, as_mapping, as_sequence, find, find_pair, key_text, raw_string, reject_unknown_keys,
-    require, string_list, to_yaml_value,
+    Entries, as_mapping, as_sequence, expect_string, find, find_pair, key_text, raw_string,
+    reject_unknown_keys, require, string_list, to_yaml_value,
 };
 use crate::span::Spanned;
 use crate::yaml::raw::RawNode;
@@ -52,8 +50,8 @@ fn build_trigger(
     // name's span.
     let span = config.map_or_else(|| name.span.clone(), |node| node.span.clone());
     let trigger = match name.value.as_str() {
-        // push/pull_request/pull_request_target share the same
-        // branch/tag/path/type filter shape (design memo §5.2).
+        // These events share the normalized filter model, while the parser
+        // applies each event's distinct allowed-key schema below.
         "push" | "pull_request" | "pull_request_target" => Trigger::Webhook {
             name: name.value.clone(),
             filter: match config {
@@ -62,12 +60,17 @@ fn build_trigger(
             },
         },
         "workflow_dispatch" => Trigger::WorkflowDispatch(match config {
-            Some(c) => parse_workflow_dispatch(c)?,
+            Some(c) => super::dispatch::parse_workflow_dispatch(c)?,
             None => WorkflowDispatch::default(),
         }),
         "schedule" => Trigger::Schedule(match config {
             Some(c) => parse_schedule(c)?,
-            None => Vec::new(),
+            None => {
+                return Err(ParseError::Schema {
+                    span: name.span.clone(),
+                    message: "on.schedule must declare at least one cron mapping".to_owned(),
+                });
+            }
         }),
         "repository_dispatch" => Trigger::RepositoryDispatch {
             types: match config {
@@ -97,11 +100,21 @@ fn build_trigger(
     Ok(Spanned::new(trigger, span))
 }
 
-const WEBHOOK_FILTER_KEYS: &[&str] = &[
+const PUSH_FILTER_KEYS: &[&str] = &[
     "branches",
     "branches-ignore",
     "tags",
     "tags-ignore",
+    "paths",
+    "paths-ignore",
+];
+// GitHub gives tag filters only to `push`, and activity `types` only to the
+// pull-request events:
+// https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushbranchestagsbranches-ignoretags-ignore
+// https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpull_requestpull_request_targettypes
+const PULL_REQUEST_FILTER_KEYS: &[&str] = &[
+    "branches",
+    "branches-ignore",
     "paths",
     "paths-ignore",
     "types",
@@ -113,15 +126,35 @@ fn parse_webhook_filter(
 ) -> Result<WebhookFilter, ParseError> {
     let context = format!("on.{event_name}");
     let entries = as_mapping(node, &context)?;
-    reject_unknown_keys(entries, WEBHOOK_FILTER_KEYS, &context)?;
+    let known = if event_name == "push" {
+        PUSH_FILTER_KEYS
+    } else {
+        PULL_REQUEST_FILTER_KEYS
+    };
+    reject_unknown_keys(entries, known, &context)?;
     reject_conflicting_filters(entries, &context)?;
     let list = |key: &str| -> Result<Vec<Spanned<String>>, ParseError> {
         match find(entries, key) {
-            Some(v) => string_list(v, &context),
+            Some(v) => {
+                let patterns = string_list(v, &format!("{context}.{key}"))?;
+                if patterns.is_empty() {
+                    return Err(ParseError::Schema {
+                        span: v.span.clone(),
+                        message: format!("{context}.{key} must contain at least one pattern"),
+                    });
+                }
+                if let Some(empty) = patterns.iter().find(|pattern| pattern.value.is_empty()) {
+                    return Err(ParseError::Schema {
+                        span: empty.span.clone(),
+                        message: format!("{context}.{key} patterns must not be empty"),
+                    });
+                }
+                Ok(patterns)
+            }
             None => Ok(Vec::new()),
         }
     };
-    Ok(WebhookFilter {
+    let filter = WebhookFilter {
         span: node.span.clone(),
         branches: list("branches")?,
         branches_ignore: list("branches-ignore")?,
@@ -130,7 +163,11 @@ fn parse_webhook_filter(
         paths: list("paths")?,
         paths_ignore: list("paths-ignore")?,
         types: list("types")?,
-    })
+    };
+    validate_negative_patterns(&filter.branches, "branches", &context)?;
+    validate_negative_patterns(&filter.tags, "tags", &context)?;
+    validate_negative_patterns(&filter.paths, "paths", &context)?;
+    Ok(filter)
 }
 
 fn empty_webhook_filter(span: crate::span::Span) -> WebhookFilter {
@@ -171,89 +208,75 @@ fn reject_conflicting_filters(entries: &Entries, context: &str) -> Result<(), Pa
     Ok(())
 }
 
-fn parse_workflow_dispatch(node: &Spanned<RawNode>) -> Result<WorkflowDispatch, ParseError> {
-    let entries = as_mapping(node, "on.workflow_dispatch")?;
-    reject_unknown_keys(entries, &["inputs"], "on.workflow_dispatch")?;
-    let inputs = match find(entries, "inputs") {
-        Some(v) => {
-            let input_entries = as_mapping(v, "on.workflow_dispatch.inputs")?;
-            input_entries
-                .iter()
-                .map(|(k, v)| parse_dispatch_input(k, v))
-                .collect::<Result<_, _>>()?
-        }
-        None => Vec::new(),
-    };
-    Ok(WorkflowDispatch { inputs })
+fn validate_negative_patterns(
+    patterns: &[Spanned<String>],
+    key: &str,
+    context: &str,
+) -> Result<(), ParseError> {
+    // A positive filter may mix `!` exclusions with inclusions, but GitHub
+    // requires at least one positive pattern so the set has something to
+    // subtract from:
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushbranchestagsbranches-ignoretags-ignore
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore
+    let first_negative = patterns
+        .iter()
+        .find(|pattern| pattern.value.starts_with('!'));
+    let has_positive = patterns
+        .iter()
+        .any(|pattern| !pattern.value.starts_with('!'));
+    if let Some(negative) = first_negative
+        && !has_positive
+    {
+        return Err(ParseError::Schema {
+            span: negative.span.clone(),
+            message: format!(
+                "{context}.{key} uses a negative pattern but has no positive pattern; use '{key}-ignore' for exclusions only"
+            ),
+        });
+    }
+    Ok(())
 }
 
-const DISPATCH_INPUT_KEYS: &[&str] = &["description", "required", "default", "type", "options"];
-
-fn parse_dispatch_input(
-    key: &Spanned<RawNode>,
-    value: &Spanned<RawNode>,
-) -> Result<WorkflowDispatchInput, ParseError> {
-    let name = Spanned::new(key_text(key)?.to_owned(), key.span.clone());
-    let entries = as_mapping(value, "on.workflow_dispatch.inputs.<name>")?;
-    reject_unknown_keys(
-        entries,
-        DISPATCH_INPUT_KEYS,
-        "on.workflow_dispatch.inputs.<name>",
-    )?;
-    let description = find(entries, "description")
-        .map(|v| raw_string(v, "on.workflow_dispatch.inputs.<name>.description"))
-        .transpose()?;
-    let required = find(entries, "required")
-        .map(|v| crate::parse::util::expect_bool(v, "on.workflow_dispatch.inputs.<name>.required"))
-        .transpose()?;
-    let default = find(entries, "default").map(|v| Spanned::new(to_yaml_value(v), v.span.clone()));
-    let input_type = find(entries, "type").map(parse_input_type).transpose()?;
-    let options = match find(entries, "options") {
-        Some(v) => string_list(v, "on.workflow_dispatch.inputs.<name>.options")?,
-        None => Vec::new(),
-    };
-    Ok(WorkflowDispatchInput {
-        span: value.span.clone(),
-        name,
-        description,
-        required,
-        default,
-        input_type,
-        options,
-    })
-}
-
-fn parse_input_type(
-    node: &Spanned<RawNode>,
-) -> Result<Spanned<WorkflowDispatchInputType>, ParseError> {
-    let text = raw_string(node, "on.workflow_dispatch.inputs.<name>.type")?;
-    let kind = match text.value.as_str() {
-        "string" => WorkflowDispatchInputType::String,
-        "boolean" => WorkflowDispatchInputType::Boolean,
-        "number" => WorkflowDispatchInputType::Number,
-        "choice" => WorkflowDispatchInputType::Choice,
-        "environment" => WorkflowDispatchInputType::Environment,
-        other => {
-            return Err(ParseError::Schema {
-                span: text.span,
-                message: format!(
-                    "input type '{other}' is not one of string|boolean|number|choice|environment"
-                ),
-            });
-        }
-    };
-    Ok(Spanned::new(kind, text.span))
-}
-
-fn parse_schedule(node: &Spanned<RawNode>) -> Result<Vec<Spanned<String>>, ParseError> {
+fn parse_schedule(node: &Spanned<RawNode>) -> Result<Vec<Schedule>, ParseError> {
+    // A schedule is a nonempty sequence of mappings containing `cron` and,
+    // on current GitHub.com, an optional IANA `timezone` string:
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onschedule
     let items = as_sequence(node, "on.schedule")?;
+    if items.is_empty() {
+        return Err(ParseError::Schema {
+            span: node.span.clone(),
+            message: "on.schedule must declare at least one cron mapping".to_owned(),
+        });
+    }
     items
         .iter()
         .map(|item| {
             let entries = as_mapping(item, "on.schedule[]")?;
-            reject_unknown_keys(entries, &["cron"], "on.schedule[]")?;
+            reject_unknown_keys(entries, &["cron", "timezone"], "on.schedule[]")?;
             let cron = require(entries, "cron", &item.span, "on.schedule[]")?;
-            raw_string(cron, "on.schedule[].cron")
+            let cron = expect_string(cron, "on.schedule[].cron")?;
+            if cron.value.trim().is_empty() {
+                return Err(ParseError::Schema {
+                    span: cron.span,
+                    message: "on.schedule[].cron must not be empty".to_owned(),
+                });
+            }
+            let timezone = find(entries, "timezone")
+                .map(|value| expect_string(value, "on.schedule[].timezone"))
+                .transpose()?;
+            if let Some(timezone) = &timezone
+                && timezone.value.trim().is_empty()
+            {
+                return Err(ParseError::Schema {
+                    span: timezone.span.clone(),
+                    message: "on.schedule[].timezone must not be empty".to_owned(),
+                });
+            }
+            Ok(Schedule {
+                span: item.span.clone(),
+                cron,
+                timezone,
+            })
         })
         .collect()
 }

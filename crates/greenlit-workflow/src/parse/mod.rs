@@ -9,6 +9,7 @@
 //! submodule builds on.
 
 mod container;
+mod dispatch;
 mod job;
 mod matrix;
 mod step;

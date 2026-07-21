@@ -58,6 +58,7 @@ pub mod extract;
 pub mod model;
 mod parse;
 mod span;
+mod validate;
 mod yaml;
 
 pub use error::ParseError;
