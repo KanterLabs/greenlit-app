@@ -1,30 +1,40 @@
-//! The default human-readable plan rendering: an indented tree of jobs,
-//! matrix legs, outputs, and steps, written to stdout
-//! (`PHASE-1-engine-core.md`: "human-readable tree output by default,
-//! stable JSON with --json").
+//! The default human-readable execution-plan tree.
 //!
-//! A matrix job's outputs/steps/display-name live on each
-//! [`greenlit_engine::LegPlan`] instead of the job itself (the job-level
-//! fields are empty for a matrix job -- see [`greenlit_engine::JobPlan`]'s
-//! doc comments), so this renderer branches on
-//! [`greenlit_engine::StrategyPlan::is_matrix`] to decide whether to walk
-//! the job-level or the per-leg fields.
+//! Unlike the compact job heading, every context-sensitive field below is
+//! rendered with its explicit static/deferred state. This keeps the default
+//! `litci plan` output useful for fidelity debugging without changing the
+//! stable `--json` schema.
 
 use std::io::Write;
 
 use greenlit_engine::{
-    Condition, DeferReason, EnvValue, Evaluation, ExecutionPlan, JobOutputsPlan, JobPlan, Planned,
-    PlannedCond, PlannedOutput, PlannedValue, RunnerPlan, StaticSkip, StatusFn, StepKind, StepPlan,
-    StepStatusField,
+    ExecutionPlan, JobPlan, LegPlan, MatrixPlan, StepKind, StepPlan, StrategyControl,
+};
+
+mod fields;
+mod format;
+
+use fields::{
+    render_container, render_defaults, render_env, render_outputs, render_permissions,
+    render_services,
+};
+use format::{
+    display_planned_string, format_condition, format_defer_reasons, format_planned_bool,
+    format_planned_number, format_planned_string, format_runner, skip_suffix,
 };
 
 /// Renders the whole plan as an indented tree.
 pub(crate) fn render(plan: &ExecutionPlan, out: &mut impl Write) -> std::io::Result<()> {
+    writeln!(out, "plan schema: {}", plan.schema_version)?;
     writeln!(out, "event: {}", plan.event_name)?;
-    if plan.env.iter().next().is_some() {
-        writeln!(out, "env: {}", format_env_map(&plan.env))?;
-    }
-    let order: Vec<&str> = plan.topo_order.iter().map(|id| id.0.as_str()).collect();
+    render_env("env", &plan.env, out, "")?;
+    render_defaults(&plan.defaults, out, "")?;
+    render_permissions(plan.permissions.as_ref(), out)?;
+    let order = plan
+        .topo_order
+        .iter()
+        .map(|id| id.0.as_str())
+        .collect::<Vec<_>>();
     writeln!(out, "topo order: {}", order.join(" -> "))?;
     writeln!(out)?;
     writeln!(out, "jobs:")?;
@@ -40,275 +50,224 @@ fn render_job(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
     } else {
         job.needs
             .iter()
-            .map(|n| n.0.as_str())
+            .map(|need| need.0.as_str())
             .collect::<Vec<_>>()
             .join(", ")
     };
     writeln!(
         out,
         "  {} [wave {}] needs: {}{}",
-        planned_text(&job.name),
+        display_planned_string(&job.name),
         job.wave,
         needs,
         skip_suffix(job.skip.as_ref())
     )?;
-    if planned_text(&job.name) != job.id.0 {
-        writeln!(out, "    id: {}", job.id)?;
-    }
+    writeln!(out, "    id: {}", job.id)?;
+    writeln!(out, "    name: {}", format_planned_string(&job.name))?;
 
-    if job.strategy.is_matrix {
+    if job.strategy.is_matrix() {
         render_strategy(job, out)?;
+        if job.strategy.is_matrix_deferred() {
+            if let Some(runner) = &job.runner {
+                writeln!(out, "    runner template: {}", format_runner(runner))?;
+            }
+            render_instance_fields(
+                job.container.as_ref(),
+                &job.services,
+                &job.env,
+                &job.defaults,
+                out,
+                "    ",
+            )?;
+            render_condition(job, out, "    ")?;
+            render_outputs(&job.outputs, out, "    ")?;
+            render_steps(&job.steps, out, "    ", "step template")?;
+        }
     } else {
         if let Some(runner) = &job.runner {
             writeln!(out, "    runner: {}", format_runner(runner))?;
         }
-        render_condition_line(
-            job.condition.as_ref(),
-            job.implicit_status_gate,
+        render_instance_fields(
+            job.container.as_ref(),
+            &job.services,
+            &job.env,
+            &job.defaults,
             out,
             "    ",
         )?;
+        render_condition(job, out, "    ")?;
         render_outputs(&job.outputs, out, "    ")?;
-        writeln!(out, "    steps:")?;
-        for step in &job.steps {
-            render_step(step, out, "      ")?;
-        }
+        render_steps(&job.steps, out, "    ", "steps")?;
     }
     Ok(())
 }
 
-fn skip_suffix(skip: Option<&StaticSkip>) -> String {
-    match skip {
-        None => String::new(),
-        Some(StaticSkip::ConditionFalse) => " [skipped: condition is statically false]".to_string(),
-        Some(StaticSkip::NeedSkipped { need }) => {
-            format!(" [skipped: dependency '{need}' is skipped]")
-        }
-    }
+fn render_condition(job: &JobPlan, out: &mut impl Write, indent: &str) -> std::io::Result<()> {
+    let condition = format_condition(job.condition.as_ref(), job.implicit_status_gate);
+    writeln!(out, "{indent}if: {condition}")
 }
 
-fn render_condition_line(
-    condition: Option<&Condition>,
-    implicit_status_gate: bool,
-    out: &mut impl Write,
-    indent: &str,
-) -> std::io::Result<()> {
-    match condition {
-        None => writeln!(
-            out,
-            "{indent}if: (none){}",
-            if implicit_status_gate {
-                " -- implicit success() gate"
-            } else {
-                ""
-            }
-        ),
-        Some(c) => writeln!(out, "{indent}if: {}", format_condition(c)),
-    }
-}
-
-fn format_condition(c: &Condition) -> String {
-    match &c.eval {
-        PlannedCond::Static(b) => format!("static({b}) <- {}", c.source),
-        PlannedCond::Deferred(d) => format!(
-            "deferred <- {} (defers on: {})",
-            d.residual_text,
-            format_defer_reasons(&d.defers_on)
-        ),
-    }
-}
-
-fn format_defer_reasons(reasons: &[DeferReason]) -> String {
-    reasons
-        .iter()
-        .map(format_defer_reason)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_defer_reason(r: &DeferReason) -> String {
-    match r {
-        DeferReason::NeedsOutput {
-            job,
-            output: Some(o),
-        } => format!("needs.{job}.outputs.{o}"),
-        DeferReason::NeedsOutput { job, output: None } => format!("needs.{job}.outputs"),
-        DeferReason::NeedsResult { job } => format!("needs.{job}.result"),
-        DeferReason::StepOutput {
-            step,
-            output: Some(o),
-        } => format!("steps.{step}.outputs.{o}"),
-        DeferReason::StepOutput { step, output: None } => format!("steps.{step}.outputs"),
-        DeferReason::StepStatus { step, field } => format!(
-            "steps.{step}.{}",
-            match field {
-                StepStatusField::Outcome => "outcome",
-                StepStatusField::Conclusion => "conclusion",
-            }
-        ),
-        DeferReason::StatusFn(f) => format!(
-            "{}()",
-            match f {
-                StatusFn::Success => "success",
-                StatusFn::Failure => "failure",
-                StatusFn::Cancelled => "cancelled",
-                StatusFn::Always => "always",
-            }
-        ),
-        DeferReason::HashFiles => "hashFiles(...)".to_string(),
-        DeferReason::DynamicEnv { name } => format!("env.{name}"),
-        DeferReason::RunnerContext => "runner.*".to_string(),
-        DeferReason::JobContext => "job.*".to_string(),
-        DeferReason::MatrixContext => "matrix.*".to_string(),
-        DeferReason::StrategyContext => "strategy.*".to_string(),
-        DeferReason::SecretsContext => "secrets.*".to_string(),
-        DeferReason::NeedsContextWhole => "needs".to_string(),
-        DeferReason::StepsContextWhole => "steps".to_string(),
-    }
-}
-
-/// Renders `strategy:` plus each leg's independently planned
-/// name/runner/if/outputs/steps -- a matrix job carries none of those at
-/// the job level (see [`greenlit_engine::JobPlan`]'s doc comments).
 fn render_strategy(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "    strategy: matrix fail-fast={} max-parallel={} legs={}",
-        job.strategy.fail_fast,
-        job.strategy
-            .max_parallel
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "(none)".to_string()),
-        job.strategy.legs.len()
-    )?;
-    for (leg, leg_plan) in job.strategy.legs.iter().zip(&job.legs) {
+    let fail_fast = format_strategy_bool(&job.strategy.fail_fast);
+    let max_parallel = job
+        .strategy
+        .max_parallel
+        .as_ref()
+        .map_or_else(|| "(job total)".to_string(), format_strategy_number);
+    if let Some(MatrixPlan::Deferred { expressions, .. }) = &job.strategy.matrix {
         writeln!(
             out,
-            "      leg {} \"{}\": runner={}{}",
-            leg.index,
-            planned_text(&leg_plan.name),
-            format_runner(&leg_plan.runner),
-            skip_suffix(leg_plan.skip.as_ref())
+            "    strategy: matrix deferred fail-fast={fail_fast} max-parallel={max_parallel}"
         )?;
-        render_condition_line(
-            leg_plan.condition.as_ref(),
-            job.implicit_status_gate,
-            out,
-            "        ",
-        )?;
-        render_outputs(&leg_plan.outputs, out, "        ")?;
-        writeln!(out, "        steps:")?;
-        for step in &leg_plan.steps {
-            render_step(step, out, "          ")?;
+        for expression in expressions {
+            writeln!(
+                out,
+                "      {}: deferred <- {} (defers on: {})",
+                expression.path,
+                expression.residual,
+                format_defer_reasons(&expression.defers_on)
+            )?;
         }
+        return Ok(());
+    }
+
+    writeln!(
+        out,
+        "    strategy: matrix fail-fast={fail_fast} max-parallel={max_parallel} legs={}",
+        job.strategy.legs().len()
+    )?;
+    for (leg, leg_plan) in job.strategy.legs().iter().zip(&job.legs) {
+        render_leg(leg.index, leg_plan, job.implicit_status_gate, out)?;
     }
     Ok(())
 }
 
-fn render_outputs(
-    outputs: &JobOutputsPlan,
+fn format_strategy_bool(value: &StrategyControl<bool>) -> String {
+    match value {
+        StrategyControl::Static(value) => format!("static({value})"),
+        StrategyControl::Deferred(value) => format_planned_bool(value),
+    }
+}
+
+fn format_strategy_number(value: &StrategyControl<std::num::NonZeroU32>) -> String {
+    match value {
+        StrategyControl::Static(value) => format!("static({value})"),
+        StrategyControl::Deferred(value) => format::format_planned(value, ToString::to_string),
+    }
+}
+
+fn render_leg(
+    index: usize,
+    leg: &LegPlan,
+    implicit_status_gate: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "      leg {index} \"{}\"{}",
+        display_planned_string(&leg.name),
+        skip_suffix(leg.skip.as_ref())
+    )?;
+    writeln!(out, "        name: {}", format_planned_string(&leg.name))?;
+    writeln!(out, "        runner: {}", format_runner(&leg.runner))?;
+    render_instance_fields(
+        leg.container.as_ref(),
+        &leg.services,
+        &leg.env,
+        &leg.defaults,
+        out,
+        "        ",
+    )?;
+    writeln!(
+        out,
+        "        if: {}",
+        format_condition(leg.condition.as_ref(), implicit_status_gate)
+    )?;
+    render_outputs(&leg.outputs, out, "        ")?;
+    render_steps(&leg.steps, out, "        ", "steps")
+}
+
+fn render_instance_fields<'a>(
+    container: Option<&'a greenlit_engine::ContainerPlan>,
+    services: impl IntoIterator<Item = (&'a String, &'a greenlit_engine::ContainerPlan)>,
+    env: impl IntoIterator<Item = (&'a String, &'a greenlit_engine::EnvValue)>,
+    defaults: &'a greenlit_engine::RunDefaultsPlan,
     out: &mut impl Write,
     indent: &str,
 ) -> std::io::Result<()> {
-    if outputs.entries.is_empty() {
-        return writeln!(out, "{indent}outputs: (none)");
-    }
-    writeln!(out, "{indent}outputs:")?;
-    for (name, output) in &outputs.entries {
-        writeln!(out, "{indent}  {name}: {}", format_output(output))?;
-    }
-    Ok(())
+    render_container("container", container, out, indent)?;
+    render_services(services, out, indent)?;
+    render_env("env", env, out, indent)?;
+    render_defaults(defaults, out, indent)
 }
 
-fn format_output(o: &PlannedOutput) -> String {
-    match &o.value {
-        PlannedValue::Static(s) => format!("static(\"{s}\") <- {}", o.source),
-        PlannedValue::Deferred(d) => format!(
-            "deferred <- {} (defers on: {})",
-            d.residual_text,
-            format_defer_reasons(&d.defers_on)
-        ),
+fn render_steps(
+    steps: &[StepPlan],
+    out: &mut impl Write,
+    indent: &str,
+    label: &str,
+) -> std::io::Result<()> {
+    if steps.is_empty() {
+        return writeln!(out, "{indent}{label}: (none)");
     }
+    writeln!(out, "{indent}{label}:")?;
+    for step in steps {
+        render_step(step, out, &format!("{indent}  "))?;
+    }
+    Ok(())
 }
 
 fn render_step(step: &StepPlan, out: &mut impl Write, indent: &str) -> std::io::Result<()> {
-    let label = step
-        .id
-        .as_deref()
-        .map(|id| format!("[{id}] "))
-        .unwrap_or_default();
-    let name = step.name.as_ref().map(planned_text).unwrap_or("");
+    let id = step.id.as_deref().unwrap_or("(none)");
+    writeln!(out, "{indent}step [id: {id}]")?;
+    match &step.name {
+        Some(name) => writeln!(out, "{indent}  name: {}", format_planned_string(name))?,
+        None => writeln!(out, "{indent}  name: (none)")?,
+    }
+    writeln!(
+        out,
+        "{indent}  if: {}",
+        format_condition(step.condition.as_ref(), step.implicit_status_gate)
+    )?;
     match &step.kind {
         StepKind::Run { script, shell } => {
-            let title = if name.is_empty() {
-                first_line(planned_text(script))
-            } else {
-                name.to_string()
-            };
-            let shell_note = shell
-                .as_ref()
-                .map(|shell| format!(" (shell: {})", planned_text(shell)))
-                .unwrap_or_default();
-            writeln!(out, "{indent}{label}run{shell_note} -- {title}")?;
-        }
-        StepKind::Uses { reference, with } => {
-            let name_note = if name.is_empty() {
-                String::new()
-            } else {
-                format!(" -- {name}")
-            };
-            writeln!(out, "{indent}{label}uses {reference}{name_note}")?;
-            if with.iter().next().is_some() {
-                writeln!(out, "{indent}  with: {}", format_env_map(with))?;
+            writeln!(out, "{indent}  kind: run")?;
+            writeln!(out, "{indent}  script: {}", format_planned_string(script))?;
+            match shell {
+                Some(shell) => writeln!(out, "{indent}  shell: {}", format_planned_string(shell))?,
+                None => writeln!(out, "{indent}  shell: (default)")?,
             }
         }
+        StepKind::Uses { reference, with } => {
+            writeln!(out, "{indent}  kind: uses")?;
+            writeln!(out, "{indent}  reference: static({reference:?})")?;
+            render_env("with", with, out, &format!("{indent}  "))?;
+        }
     }
-    let condition_indent = format!("{indent}  ");
-    render_condition_line(
-        step.condition.as_ref(),
-        step.implicit_status_gate,
-        out,
-        &condition_indent,
-    )?;
-    if step.env.iter().next().is_some() {
-        writeln!(out, "{indent}  env: {}", format_env_map(&step.env))?;
+    render_env("env", &step.env, out, &format!("{indent}  "))?;
+    match &step.working_directory {
+        Some(value) => writeln!(
+            out,
+            "{indent}  working-directory: {}",
+            format_planned_string(value)
+        )?,
+        None => writeln!(out, "{indent}  working-directory: (default)")?,
+    }
+    match &step.continue_on_error {
+        Some(value) => writeln!(
+            out,
+            "{indent}  continue-on-error: {}",
+            format_planned_bool(value)
+        )?,
+        None => writeln!(out, "{indent}  continue-on-error: (default false)")?,
+    }
+    match &step.timeout_minutes {
+        Some(value) => writeln!(
+            out,
+            "{indent}  timeout-minutes: {}",
+            format_planned_number(value)
+        )?,
+        None => writeln!(out, "{indent}  timeout-minutes: (default)")?,
     }
     Ok(())
-}
-
-fn first_line(script: &str) -> String {
-    script.lines().next().unwrap_or("").to_string()
-}
-
-fn format_env_map<'a>(entries: impl IntoIterator<Item = (&'a String, &'a EnvValue)>) -> String {
-    entries
-        .into_iter()
-        .map(|(k, v)| format!("{k}={}", format_env_value(v)))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_env_value(v: &EnvValue) -> String {
-    match &v.evaluation {
-        Evaluation::Static(value) => value.clone(),
-        Evaluation::Deferred(deferred) => format!("{} [deferred]", deferred.residual_text),
-    }
-}
-
-fn format_runner(runner: &RunnerPlan) -> String {
-    match &runner.evaluation {
-        Evaluation::Static(image) => image.image_identifier().to_string(),
-        Evaluation::Deferred(deferred) => format!(
-            "deferred <- {} (defers on: {})",
-            deferred.residual_text,
-            format_defer_reasons(&deferred.defers_on)
-        ),
-    }
-}
-
-fn planned_text(value: &Planned<String>) -> &str {
-    match &value.evaluation {
-        Evaluation::Static(value) => value,
-        Evaluation::Deferred(deferred) => &deferred.residual_text,
-    }
 }
