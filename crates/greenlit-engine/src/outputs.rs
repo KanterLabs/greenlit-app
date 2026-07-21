@@ -1,12 +1,13 @@
 //! [`JobOutputsPlan`]/[`PlannedValue`]: `jobs.<id>.outputs` modeled without
 //! inventing values.
 //!
-//! Source: design memo §4 ("Modeling `jobs.<id>.outputs` without inventing
-//! values"). Output *names* are fully static (declared in the workflow
+//! `PHASE-1-engine-core.md` requires outputs to remain runtime-deferred
+//! without invented values. Output *names* are fully static (declared in the workflow
 //! file); output *values* are templates whose interpolations this module
 //! partially evaluates with exactly the same machinery as `if:` conditions
-//! (`crate::partial_eval`) — "reuse the §3 machinery wholesale... carries NO
-//! value, never invent one."
+//! (`crate::partial_eval`). GitHub's `needs` context exposes those values
+//! only after the producing job completes:
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context>.
 
 use indexmap::IndexMap;
 use serde::Serialize;

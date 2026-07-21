@@ -1,8 +1,8 @@
 //! `hashFiles(pattern…)`: glob matching plus GitHub's documented two-level
 //! SHA-256 algorithm.
 //!
-//! Source: design memo §3.8, itself derived from
-//! `src/Runner.Worker/Expressions/HashFilesFunction.cs`,
+//! Sources: the Actions runner's
+//! [`HashFilesFunction.cs`](https://github.com/actions/runner/blob/main/src/Runner.Worker/Expressions/HashFilesFunction.cs),
 //! `src/Misc/expressionFunc/hashFiles/src/hashFiles.ts`, and
 //! `@actions/toolkit` `packages/glob/src/internal-*.ts`. Filesystem access is
 //! behind the [`HashFilesFs`] trait specifically so tests can supply an
@@ -67,8 +67,10 @@ pub enum HashFilesError {
 }
 
 /// Evaluates `hashFiles(args…)` against `fs`. `args` are the already
-/// `ToString`-converted function arguments (see the design memo §3.8:
-/// "1-255 string arguments (each evaluated then ToString)" — there is no
+/// `ToString`-converted function arguments. The public function contract is
+/// documented at
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#hashfiles>;
+/// there is no
 /// documented laziness for `hashFiles`, unlike `format`/`join`).
 pub(crate) fn hash_files(args: &[String], fs: &dyn HashFilesFs) -> Result<Value, HashFilesError> {
     let mut follow_symlinks = false;

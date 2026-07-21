@@ -1,9 +1,10 @@
 //! [`DeferReason`]: why a condition or output value could not be decided at
-//! plan time. Shared between `crate::condition` and `crate::outputs` (the
-//! design memo's "same shape reused wholesale" instruction, §4.2).
+//! plan time. Shared between `crate::condition` and `crate::outputs` so every
+//! deferred Phase 1 plan value has one stable representation.
 //!
-//! Source: design memo §3.1 ("The classification rule") for the exact list
-//! of what counts as deferred — `needs.<id>.outputs.*`/`needs.<id>.result`,
+//! The classification implements `PHASE-1-engine-core.md`'s planner contract:
+//! statically known values are evaluated, while runtime-only values such as
+//! `needs.<id>.outputs.*`/`needs.<id>.result`,
 //! `steps.<id>.outputs.*`/`.outcome`/`.conclusion`, the four status-check
 //! functions, `hashFiles(...)`, `runner.*`, `job.*`, and `secrets.*` (at
 //! step level; job-level `secrets.*` is a hard `PartialEvalError`
@@ -24,7 +25,7 @@ pub enum StepStatusField {
 }
 
 /// Which status-check function was called — `success()`/`failure()`/
-/// `cancelled()`/`always()` are all runtime-only (design memo §3.1): even
+/// `cancelled()`/`always()` are all runtime-only. Even
 /// though `always()` is a constant `true` in this crate's evaluator, its
 /// entire *purpose* is suppressing the implicit status gate, which is a
 /// scheduling decision, not a plan-time value.
@@ -43,7 +44,7 @@ pub enum StatusFn {
 /// Why a condition or output value's residual expression could not be
 /// resolved to a concrete value at plan time. Sorted, deduplicated in
 /// [`crate::condition::DeferredExpr::defers_on`]/[`crate::outputs::PlannedValue::Deferred`]
-/// — see the design memo's determinism contract (§5).
+/// to keep stable plan JSON deterministic.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeferReason {
     /// `needs.<job>.outputs.<output>`, or `needs.<job>.outputs` as a whole
@@ -79,15 +80,15 @@ pub enum DeferReason {
     /// exist at plan time.
     HashFiles,
     /// An `env.<name>` reference where `<name>` is not statically resolvable
-    /// from the declared `env:` chain (design memo §3.1's recommendation
-    /// (b): "defer ... a runtime `GITHUB_ENV` write could set it").
+    /// from the declared `env:` chain. Runtime workflow commands may still
+    /// set it through `GITHUB_ENV`, so planning must defer it.
     DynamicEnv {
         /// The referenced env var name, or `"*"` for a dynamically indexed
         /// `env[...]` access whose selected name is not a string literal.
         name: String,
     },
     /// Any reference into the `runner` context — modeled wholesale as
-    /// runtime-only per the design memo, even for sub-fields that are in
+    /// runtime-only, even for sub-fields that are in
     /// principle knowable earlier (e.g. `runner.os` — see
     /// `crate::partial_eval` module docs for why this crate does not special-case
     /// that).
@@ -99,9 +100,8 @@ pub enum DeferReason {
     SecretsContext,
     /// A bare `needs`/`steps` context reference with no further indexing
     /// (e.g. `if: needs`) — degenerate in practice, but must still defer
-    /// rather than silently resolve to an empty object. Not itself named in
-    /// the design memo's enum (which only lists indexed forms); added here
-    /// as the total, defensive catch-all for the un-indexed case.
+    /// rather than silently resolve to an empty object. This is the total,
+    /// defensive catch-all for the un-indexed case.
     NeedsContextWhole,
     /// See [`DeferReason::NeedsContextWhole`]; the `steps` equivalent.
     StepsContextWhole,

@@ -5,9 +5,11 @@
 //! or `yaml-rust2` would give you by default, and which additionally accepts
 //! `yes`/`no`/`on`/`off`/`y`/`n` as booleans under YAML 1.1 — the reason the
 //! `on:` workflow key doesn't get misparsed). It instead runs each *plain*
-//! scalar through its own strict matcher (design memo §6.1, transcribing
-//! `actions/runner`'s `YamlObjectReader.cs` `MatchNull` / `MatchBoolean` /
-//! `MatchInteger` / `MatchFloat`) before falling back to string. Quoted and
+//! scalar through the strict `MatchNull` / `MatchBoolean` / `MatchInteger` /
+//! `MatchFloat` chain in the runner's `YamlObjectReader.cs` before falling
+//! back to string:
+//! <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
+//! Quoted and
 //! block scalars (single/double-quoted, `|`, `>`) are never subject to this
 //! matching — YAML's own quoting already pins them to string, and GitHub
 //! honors that.
@@ -17,13 +19,12 @@
 
 /// The four scalar kinds GitHub's core-schema-subset YAML typing produces,
 /// plus the residual string case. This mirrors `greenlit-expr`'s expression
-/// `Value` kinds deliberately (design memo §2.1: "All numbers become f64")
+/// value kinds deliberately: numeric values use one `f64` representation,
 /// so a value read from YAML and a value produced by expression evaluation
 /// are shaped the same way once both crates meet in `greenlit-engine`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum YamlScalar {
-    /// Matched GitHub's Null grammar (design memo §6.1: `""`, `null`,
-    /// `Null`, `NULL`, `~`).
+    /// Matched GitHub's Null grammar: `""`, `null`, `Null`, `NULL`, or `~`.
     Null,
     /// Matched GitHub's Boolean grammar (`true`/`True`/`TRUE`/`false`/
     /// `False`/`FALSE` only — critically, *not* `yes`/`no`/`on`/`off`).
@@ -36,7 +37,7 @@ pub enum YamlScalar {
     String(String),
 }
 
-/// GitHub's Null grammar (design memo §6.1): empty, `null`, `Null`, `NULL`,
+/// GitHub runner Null grammar: empty, `null`, `Null`, `NULL`,
 /// or `~`, and nothing else (not YAML 1.1's `~`-adjacent spellings like
 /// `Null`/`NULL` case variants beyond these exact four, nor bare `N`/`n`).
 ///
@@ -47,7 +48,7 @@ pub(crate) fn as_null(raw: &str) -> bool {
     matches!(raw, "" | "null" | "Null" | "NULL" | "~")
 }
 
-/// GitHub's Boolean grammar (design memo §6.1): exactly these six
+/// GitHub runner Boolean grammar: exactly these six
 /// spellings — `yes`/`no`/`on`/`off`/`y`/`n` are deliberately *not* matched
 /// here (this is the documented reason `on:` works as a workflow key).
 ///
@@ -60,7 +61,7 @@ pub(crate) fn as_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// GitHub's Integer grammar (design memo §6.1): `[0-9]+`, `[+-][0-9]+`,
+/// GitHub runner Integer grammar: `[0-9]+`, `[+-][0-9]+`,
 /// `0x[0-9a-fA-F]+`, or `0o[0-7]+`. The sign belongs only to the decimal
 /// branch; `-0x1` and `+0o7` therefore remain strings. Hex/octal literals
 /// are parsed within `i32` range, while decimal literals must fit a finite
@@ -105,7 +106,7 @@ fn parse_radix_within_i32(digits: &str, radix: u32) -> Result<f64, NumberParseEr
         .map_err(|_| NumberParseError::RadixIntegerOverflow)
 }
 
-/// GitHub's Floating Point grammar (design memo §6.1):
+/// GitHub runner Floating Point grammar:
 /// `[+-]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][+-]?[0-9]+)?`, plus the special
 /// spellings `.inf`/`.Inf`/`.INF` (optionally signed) and
 /// `.nan`/`.NaN`/`.NAN`.
@@ -192,8 +193,8 @@ fn matches_float_grammar(s: &str) -> bool {
 }
 
 /// Resolve a *plain-style* scalar's raw text against GitHub's Null →
-/// Boolean → Integer → Floating Point → String matcher chain, in that
-/// order (design memo §6.1 lists them in this order, and it matters:
+/// Boolean → Integer → Floating Point → String matcher chain, in the order
+/// implemented by `YamlObjectReader.cs`. The order matters:
 /// `"123"` must resolve as an Integer, not fall through to Float, even
 /// though the Float grammar's fractional part is optional and would also
 /// accept it).
@@ -222,8 +223,8 @@ pub(crate) fn resolve_plain(raw: &str) -> Result<YamlScalar, NumberParseError> {
 // directly would necessarily be a colocated test of an internal helper —
 // exactly what `TESTING.md`'s banned list rules out ("No tests for private
 // functions or internal helpers. Internals are covered through the
-// behaviors they serve."). The oracle table for this exact rule
-// (design memo §6.1's Null/Boolean/Integer/Float matcher) instead lives in
+// behaviors they serve."). The oracle table for this exact
+// Null/Boolean/Integer/Float matcher instead lives in
 // `tests/scalar_typing.rs`, driven through the crate's real public API
 // (`parse_workflow`), so a refactor that preserves behavior here can't
 // break a test that never should have known this function's name.

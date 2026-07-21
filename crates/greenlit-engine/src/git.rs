@@ -16,8 +16,8 @@ use std::process::Command;
 
 /// Everything the synthetic event builder needs from the local git
 /// checkout: enough to populate `github.repository`, `github.ref`,
-/// `github.sha`, and `github.actor` (design memo's `github` context roots)
-/// without a real GitHub event payload.
+/// `github.sha`, and `github.actor` without a real GitHub event payload, as
+/// required by `PHASE-1-engine-core.md`'s synthetic-event task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitContext {
     /// `owner/repo` parsed from the `origin` remote URL, or (when there is

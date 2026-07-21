@@ -272,7 +272,9 @@ fn scan_yaml_value(v: &Spanned<YamlValue>, out: &mut StaticExtraction) -> Result
 }
 
 /// `if:` text is always an expression, with or without the `${{ }}`
-/// wrapper (design memo §1.5) — unlike other fields, an unwrapped `if:`
+/// wrapper, as documented for workflow conditionals at
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idif>.
+/// Unlike other fields, an unwrapped `if:`
 /// value must be scanned as one whole expression body rather than only
 /// searching for `${{ }}` occurrences within it.
 fn scan_if_condition(cond: &Spanned<String>, out: &mut StaticExtraction) -> Result<(), ParseError> {

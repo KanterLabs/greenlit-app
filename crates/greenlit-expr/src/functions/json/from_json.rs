@@ -11,7 +11,10 @@ pub struct FromJsonError {
     message: String,
 }
 
-/// `fromJSON(value)`. Source: design memo §3.6 — parsed with
+/// `fromJSON(value)`. The runner parses through Newtonsoft's `JsonTextReader`
+/// and `JToken.ReadFrom`:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/FromJson.cs>.
+/// This gives
 /// Newtonsoft-compatible *leniency*: single-quoted strings, unquoted object
 /// keys, `//`/`/* */` comments, trailing commas, and bare `NaN`/`Infinity`
 /// literals are all accepted (unlike strict `serde_json`). Trailing content
@@ -57,7 +60,7 @@ impl JsonParser {
     }
 
     /// Skips whitespace, `//` line comments, and `/* */` block comments —
-    /// Newtonsoft's lenient-reader extensions the design memo calls out.
+    /// Newtonsoft `JsonTextReader`'s lenient extensions.
     fn skip_insignificant(&mut self) {
         loop {
             match self.peek() {

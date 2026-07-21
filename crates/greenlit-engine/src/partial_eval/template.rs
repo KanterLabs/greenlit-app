@@ -87,9 +87,8 @@ pub(crate) fn fold_template(
         )));
     }
 
-    // Exactly one whole-template placeholder: preserve its native type
-    // (design memo, `ScalarOrExpr` doc comment's "preserves the
-    // expression's own type" rule).
+    // Exactly one whole-template placeholder preserves its native type,
+    // matching GitHub's documented expression literal types.
     if placeholder_count == 1
         && parts.len() == 1
         && let TemplatePart::Placeholder(src) = parts[0]
@@ -102,7 +101,7 @@ pub(crate) fn fold_template(
                 // folded) expression, without the `${{ }}` wrapper —
                 // `source` (kept separately by the caller, e.g.
                 // `PlannedOutput::source`) is what still carries the
-                // wrapper (design memo §4.4's worked JSON example).
+                // wrapper.
                 let residual_text = super::pretty_print(&expr);
                 TemplateFold::Deferred {
                     residual: expr,
@@ -138,9 +137,7 @@ pub(crate) fn fold_template(
     }
 
     // At least one placeholder is deferred: `residual_text` substitutes
-    // only the resolved placeholders (matching the design memo's own
-    // worked example, "`v1.4-${{ steps.meta.outputs.sha }}` where only the
-    // literal prefix is known"); `residual` reconstructs the whole template
+    // only the resolved placeholders; `residual` reconstructs the whole template
     // as a `format()` call (GitHub's own positional-template function) —
     // see `value_to_literal_expr`'s doc comment for why this reconstruction
     // only needs to be *valid*, not literally what the user wrote.

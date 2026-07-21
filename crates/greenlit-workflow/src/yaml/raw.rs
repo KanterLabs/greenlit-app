@@ -1,22 +1,20 @@
 //! The span-preserving raw YAML tree, and the event-driven builder that
 //! produces it.
 //!
-//! This is the one module in the crate that touches `saphyr_parser` types
-//! (design memo §6.3 risk mitigation: "confine all saphyr types to one
-//! small internal module"). It drives the parser's low-level event stream
+//! This is the one module in the crate that touches `saphyr_parser` types,
+//! confining the pre-1.0 dependency surface to one small internal module.
+//! It drives the parser's low-level event stream
 //! directly — rather than going through the higher-level `saphyr` crate's
 //! `YamlLoader`/`MarkedYaml` — for one concrete reason: GitHub's workflow
 //! YAML dialect rejects duplicate mapping keys outright and treats `<<` as
 //! an ordinary (unsupported) key rather than performing a YAML-1.1 merge
-//! (design memo §6.1), and `YamlLoader`'s internal map-building
+//! as GitHub's `TemplateReader` does, and `YamlLoader`'s internal map-building
 //! (`hashlink::LinkedHashMap::insert`, which silently overwrites a
 //! duplicate key) is not something a caller can hook or override — its
 //! `doc_stack`/`key_stack` fields are private. Building the tree from raw
-//! events instead gives full control over both checks. This is the same
-//! "build the spanned tree from events" fallback the design memo describes
-//! for `yaml-rust2`, applied to `saphyr-parser` (the actively-maintained
-//! low-level half of the same project) for a correctness reason rather
-//! than an availability one.
+//! events instead gives full control over both checks. Greenlit applies
+//! that event-stream approach to `saphyr-parser`, the actively maintained
+//! low-level half of the same project.
 //!
 //! Duplicate detection operates on each scalar key's decoded string value,
 //! independent of whether YAML wrote it plain or quoted. This matches the
@@ -268,9 +266,9 @@ impl<'input> SpannedEventReceiver<'input> for Builder {
                 // Matches the behavior of `saphyr`'s own `YamlLoader`: the
                 // alias use-site's span replaces the node's own (top-level)
                 // span, but nested children keep the spans from the
-                // anchor's original definition. See design memo §6.3 point
-                // 3 (flagged there as an observed-behavior item for which
-                // location GitHub's own errors would use).
+                // anchor's original definition. This follows `saphyr`'s
+                // own `YamlLoader` alias cloning behavior; the public span
+                // contract is exercised through `parse_workflow`.
                 node.span = node_span;
                 self.finish_node(node, 0);
             }

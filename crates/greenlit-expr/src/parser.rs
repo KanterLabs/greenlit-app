@@ -3,13 +3,13 @@
 //!
 //! Precedence is encoded directly as a chain of grammar tiers (`or` → `and`
 //! → `eq` → `rel` → `unary` → `postfix` → `primary`), each binding tighter
-//! than the last — exactly the ordering GitHub's precedence-integer table
-//! gives (design memo §1.2: relational binds tighter than equality, which
-//! binds tighter than `&&`, which binds tighter than `||`; `!` and
-//! index/dereference/call bind tightest of all). This directly implements
-//! the memo's informal EBNF (§1.3): a bare literal can never start a
+//! than the last — exactly the ordering in the Actions runner's
+//! [`ExpressionConstants.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/ExpressionConstants.cs):
+//! relational binds tighter than equality, which binds tighter than `&&`,
+//! which binds tighter than `||`; `!` and index/dereference/call bind
+//! tightest of all. A bare literal can never start a
 //! `postfix` chain (only a named-value, function call, or parenthesized
-//! group can), which is exactly the memo's "deref/index never follows a
+//! group can), matching the runner's "deref/index never follows a
 //! bare literal, only via grouping" rule — `'abc'.length` fails to parse
 //! here for the same structural reason it fails on GitHub, without needing
 //! a separate token-adjacency validator.
@@ -18,8 +18,9 @@
 //! `eval`), because both are checks against a fixed, data-independent
 //! registry — see [`crate::error::ParseError::UnrecognizedFunction`] and
 //! [`crate::error::ParseError::UnrecognizedNamedValue`] for why that makes
-//! them parse-time errors in this crate, matching GitHub's own
-//! validation-before-evaluation architecture (design memo §1.5).
+//! them parse-time errors in this crate, matching the runner's
+//! validation-before-evaluation architecture in
+//! <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/ExpressionParser.cs>.
 
 use crate::ast::{BinOp, Expr};
 use crate::context::ROOT_NAMES;
@@ -159,8 +160,7 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let (expr, postfixable) = self.parse_primary()?;
-        // "deref/index never follows a bare literal, only via grouping"
-        // (design memo §1.1 adjacency table: `.`/`[` are only legal after
+        // The runner's adjacency table allows `.`/`[` only after
         // `)` `]` `*` PropertyName or NamedValue — never directly after a
         // literal). `'abc'.length`/`'abc'[0]`/`5[0]` must not parse; a
         // parenthesized literal `('abc').length` is fine because the

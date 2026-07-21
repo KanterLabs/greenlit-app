@@ -1,4 +1,5 @@
-//! `toJSON(value)` / `fromJSON(value)` — design memo §3.5 and §3.6.
+//! `toJSON(value)` / `fromJSON(value)` as documented at
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#tojson>.
 
 use crate::value::{Value, format_g15};
 
@@ -11,7 +12,9 @@ pub(crate) use from_json::from_json;
 // toJSON
 // ---------------------------------------------------------------------
 
-/// `toJSON(value)`. Never errors. Source: design memo §3.5 — numbers render
+/// `toJSON(value)`. Never errors. The runner's implementation is
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/ToJson.cs>.
+/// Numbers render
 /// bare/unquoted using the same `G15` formatter as `ToString` (so
 /// `toJSON(fromJSON('1e400'))` deliberately emits the bare, invalid-JSON
 /// token `Infinity`, reproducing GitHub's behavior rather than "fixing" it),

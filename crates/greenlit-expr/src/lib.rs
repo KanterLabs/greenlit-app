@@ -58,8 +58,9 @@ pub use value::{ArrayValue, ObjectValue, Value, ValueKind};
 /// Parses the text inside a `${{ … }}` wrapper into an [`Expr`] tree.
 ///
 /// The `${{ }}` delimiters themselves must already be stripped by the
-/// caller — this function parses exactly the expression grammar (design
-/// memo §1.3), nothing about YAML template interpolation. Function names
+/// caller — this function parses exactly the grammar in GitHub's
+/// [Expressions reference](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions),
+/// nothing about YAML template interpolation. Function names
 /// and context-root names are validated here against this crate's fixed
 /// registries (see [`error::ParseError::UnrecognizedFunction`] and
 /// [`error::ParseError::UnrecognizedNamedValue`]); everything else about an

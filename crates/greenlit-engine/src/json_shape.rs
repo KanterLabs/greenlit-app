@@ -1,10 +1,11 @@
-//! The one stable JSON value-object shape shared by conditions and output
-//! values (design memo §3.4/§4.4: "the condition object is a tagged union
-//! on `evaluation`; the same shape is reused for step conditions and
-//! output values").
+//! The stable JSON value-object shape shared by conditions, outputs, and
+//! other planned fields, implementing `PHASE-1-engine-core.md`'s stable
+//! `litci plan --json` contract.
 //!
 //! `evaluation` is a closed two-value enum (`"static" | "deferred"`);
-//! `source` is always the verbatim authored text; `value` appears only for
+//! `source` preserves expression/template text verbatim, while typed YAML
+//! literals use their canonical value spelling because the workflow model
+//! intentionally does not retain scalar lexemes. `value` appears only for
 //! `"static"`; `residual`/`defers_on` appear only for `"deferred"`.
 //! `defers_on[].kind` is deliberately open (new variants are additive) —
 //! this is exactly what [`DeferReason`]'s manual [`serde::Serialize`] impl
@@ -30,9 +31,7 @@ where
     serializer.serialize_str(&span.to_string())
 }
 
-/// The shared tagged-union shape. `T` is `bool` for conditions and `String`
-/// for output values — both are the only static-value types the design
-/// memo's two call sites ever produce.
+/// The shared tagged-union shape for every serializable planned value.
 #[derive(Debug, Serialize)]
 pub(crate) struct EvaluatedJson<'a, T: Serialize> {
     /// Verbatim authored text.

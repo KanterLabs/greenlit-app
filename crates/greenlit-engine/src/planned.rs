@@ -21,7 +21,9 @@ use crate::partial_eval::{
 pub struct Planned<T> {
     /// Location of the authored value.
     pub span: Span,
-    /// Authored text, preserved for diagnostics and runtime evaluation.
+    /// Verbatim expression/template text, or a typed YAML literal's
+    /// canonical spelling (the workflow model does not retain literal
+    /// lexemes).
     pub source: String,
     /// Static value or runtime residual.
     pub evaluation: Evaluation<T>,

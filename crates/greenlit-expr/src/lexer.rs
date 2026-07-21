@@ -1,9 +1,10 @@
 //! Tokenizer for the expression grammar.
 //!
-//! Source for every rule below: the design memo's "Lexical structure"
-//! section, itself derived from `actions/runner`
-//! `Sdk/DTExpressions2/Expressions2/Tokens/LexicalAnalyzer.cs` and
-//! `Sdk/ExpressionUtility.cs`. This module does not attempt to reproduce
+//! The token and adjacency rules follow the Actions runner's
+//! [`LexicalAnalyzer.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Tokens/LexicalAnalyzer.cs)
+//! and
+//! [`ExpressionUtility.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/ExpressionUtility.cs).
+//! This module does not attempt to reproduce
 //! GitHub's exact per-token adjacency-table error taxonomy; instead it
 //! reproduces the *disambiguation* rules that change what a token stream
 //! actually means (dot-vs-number-start, in particular) and leaves "this
@@ -45,8 +46,8 @@ pub(crate) enum Tok {
     Str(String),
     /// Any bare identifier that isn't one of the case-sensitive keyword
     /// spellings above. The parser decides Function-vs-NamedValue by
-    /// lookahead (does the *next* token open a call?), not the lexer — see
-    /// the design memo's note that this is purely a lookahead decision.
+    /// lookahead (does the *next* token open a call?), matching the runner's
+    /// lexical analyzer.
     Ident(String),
 }
 
@@ -56,7 +57,7 @@ pub(crate) enum Tok {
 /// "operator position" (a binary operator, `.` dereference, `[` index, `)`,
 /// `]`, or `,` is expected next).
 ///
-/// Per the memo: "a leading `.` starts a number only when it appears in
+/// In the runner's adjacency rules, a leading `.` starts a number only in
 /// value position: expression start, or after `,` `(` `[` or a logical
 /// operator; otherwise `.` is dereference." This function generalizes that
 /// same value-position test to also gate whether `+`/`-` start a number
@@ -157,7 +158,7 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenSpan>, ParseError> {
         if starts_number {
             // Greedily consume until a token-boundary character; `.` never
             // terminates a number (so `1.2.3` is consumed as one candidate
-            // and fails validation below), per the memo.
+            // and fails validation below), matching `LexicalAnalyzer`.
             let mut j = i + 1;
             while j < chars.len() && !is_number_boundary(chars[j]) {
                 j += 1;
@@ -294,8 +295,8 @@ fn is_number_boundary(ch: char) -> bool {
     ) || ch.is_whitespace()
 }
 
-/// Parses a number-token candidate string under GitHub's exact rules (the
-/// design memo's ToNumber/lexer section): JSON-ish decimal (including
+/// Parses a number-token candidate string under GitHub's exact runner rules:
+/// JSON-ish decimal (including
 /// lenient `.5`, `1.`, `+3`), `0x`/`0o` literals (`i32` range only), and the
 /// exact-ordinal `Infinity`/`-Infinity` forms. The radix prefixes are
 /// lowercase-only because `ExpressionUtility.ParseNumber` checks `str[1]`
