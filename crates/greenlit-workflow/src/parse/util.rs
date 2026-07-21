@@ -174,6 +174,34 @@ pub(crate) fn expect_bool(
     }
 }
 
+/// Require `node` to be a YAML string rather than another scalar kind.
+pub(crate) fn expect_string(
+    node: &Spanned<RawNode>,
+    context: &str,
+) -> Result<Spanned<String>, ParseError> {
+    let scalar = as_scalar(node, context)?;
+    if matches!(scalar.value, YamlScalar::String(_)) {
+        Ok(Spanned::new(scalar.raw.clone(), node.span.clone()))
+    } else {
+        Err(ParseError::Schema {
+            span: node.span.clone(),
+            message: format!("{context} must be a string"),
+        })
+    }
+}
+
+/// Require `node` to be a sequence containing only YAML strings.
+pub(crate) fn expect_string_sequence(
+    node: &Spanned<RawNode>,
+    context: &str,
+) -> Result<Vec<Spanned<String>>, ParseError> {
+    let items = as_sequence(node, context)?;
+    items
+        .iter()
+        .map(|item| expect_string(item, context))
+        .collect()
+}
+
 /// A scalar node's raw text, verbatim (ignoring GitHub's scalar typing —
 /// for identifier-like positions: job/step ids, env var names, event
 /// names, `uses:`/`run:` text).
