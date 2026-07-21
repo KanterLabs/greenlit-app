@@ -1,6 +1,6 @@
 //! The four-phase cartesian-product/exclude/include algorithm (design memo
 //! §1.2), plus the conversions that let both an inline `strategy.matrix:`
-//! mapping and a `${{ fromJSON(...) }}` expression's resulting object/array
+//! mapping and a `${{ fromJSON(...) }}` expression's resulting object
 //! converge on the same [`run_algorithm`].
 
 use indexmap::IndexMap;
@@ -12,7 +12,7 @@ use greenlit_workflow::model::value::{ScalarOrExpr, YamlValue};
 use crate::lints::Lint;
 use crate::partial_eval::{FoldCtx, TemplateFold, fold_template};
 
-use super::{LegOrigin, MatrixError, MatrixLeg, MatrixValue, ResolvedEntry};
+use super::{LegOrigin, MatrixError, MatrixLeg, MatrixValue, ResolvedEntry, value_kind_name};
 
 pub(super) fn expand_matrix_source(
     source: &MatrixSource,
@@ -36,7 +36,18 @@ fn expand_inline_matrix(
     for (name, values) in &matrix.axes {
         let mut converted = Vec::with_capacity(values.len());
         for v in values {
-            converted.push(convert_yaml_value(v, ctx)?);
+            let splice_expression_array =
+                matches!(&v.value, YamlValue::Scalar(ScalarOrExpr::Expression(_)));
+            let value = convert_yaml_value(v, ctx)?;
+            if splice_expression_array {
+                if let MatrixValue::Sequence(items) = value {
+                    converted.extend(items);
+                } else {
+                    converted.push(value);
+                }
+            } else {
+                converted.push(value);
+            }
         }
         axes.push((name.value.clone(), converted));
     }
@@ -51,28 +62,7 @@ fn expand_inline_matrix(
         exclude.push((convert_matrix_entry(entry, ctx)?, entry.span.clone()));
     }
 
-    run_algorithm(
-        axes,
-        include,
-        exclude,
-        cap,
-        matrix_span(matrix, source_span),
-    )
-}
-
-/// The whole-document span doesn't carry a dedicated `strategy.matrix`
-/// span on [`Matrix`] itself; the cap error still needs *some* location, so
-/// this falls back to the first axis/include/exclude entry's span found, or
-/// (if the matrix is entirely empty) the enclosing `strategy.matrix:`
-/// node's own span.
-fn matrix_span(matrix: &Matrix, fallback: &Span) -> Span {
-    matrix
-        .axes
-        .first()
-        .map(|(k, _)| k.span.clone())
-        .or_else(|| matrix.include.first().map(|e| e.span.clone()))
-        .or_else(|| matrix.exclude.first().map(|e| e.span.clone()))
-        .unwrap_or_else(|| fallback.clone())
+    run_algorithm(axes, include, exclude, cap, source_span.clone())
 }
 
 fn expand_expression_matrix(
@@ -95,28 +85,26 @@ fn expand_expression_matrix(
     };
 
     match value {
-        greenlit_expr::Value::Array(items) => {
-            let include: Vec<(usize, ResolvedEntry, Span)> = items
-                .items()
-                .iter()
-                .enumerate()
-                .map(|(i, item)| (i, object_value_to_entry(item), text.span.clone()))
-                .collect();
-            run_algorithm(Vec::new(), include, Vec::new(), cap, text.span.clone())
-        }
         greenlit_expr::Value::Object(obj) => {
             let mut axes = Vec::new();
             let mut include = Vec::new();
             let mut exclude = Vec::new();
             for (k, v) in obj.iter() {
                 if k.eq_ignore_ascii_case("include") {
-                    include = value_to_matrix_entries(v, &text.span);
+                    include = value_to_matrix_entries(v, "include", &text.span)?;
                 } else if k.eq_ignore_ascii_case("exclude") {
-                    exclude = value_to_matrix_entries(v, &text.span)
+                    exclude = value_to_matrix_entries(v, "exclude", &text.span)?
                         .into_iter()
                         .map(|(_, entry, span)| (entry, span))
                         .collect();
-                } else if let greenlit_expr::Value::Array(items) = v {
+                } else {
+                    let greenlit_expr::Value::Array(items) = v else {
+                        return Err(MatrixError::ExpressionFieldNotArray {
+                            field: k.to_string(),
+                            actual: value_kind_name(v),
+                            span: text.span.clone(),
+                        });
+                    };
                     axes.push((
                         k.to_string(),
                         items
@@ -135,33 +123,42 @@ fn expand_expression_matrix(
     }
 }
 
-fn object_value_to_entry(v: &greenlit_expr::Value) -> ResolvedEntry {
-    match v {
-        greenlit_expr::Value::Object(obj) => obj
-            .iter()
-            .map(|(k, v)| (k.to_string(), expr_value_to_matrix_value(v)))
-            .collect(),
-        other => vec![("value".to_string(), expr_value_to_matrix_value(other))],
-    }
-}
-
 /// `fromJSON(...)`-sourced `include`/`exclude` entries carry no per-entry
 /// span (they come from evaluated data, not parsed YAML nodes); every
 /// entry is attributed to the enclosing `strategy.matrix: ${{ ... }}`
 /// field's own span instead.
 fn value_to_matrix_entries(
     v: &greenlit_expr::Value,
+    field: &'static str,
     fallback: &Span,
-) -> Vec<(usize, ResolvedEntry, Span)> {
-    match v {
-        greenlit_expr::Value::Array(items) => items
-            .items()
-            .iter()
-            .enumerate()
-            .map(|(i, item)| (i, object_value_to_entry(item), fallback.clone()))
-            .collect(),
-        _ => Vec::new(),
-    }
+) -> Result<Vec<(usize, ResolvedEntry, Span)>, MatrixError> {
+    let greenlit_expr::Value::Array(items) = v else {
+        return Err(MatrixError::ExpressionFieldNotArray {
+            field: field.to_string(),
+            actual: value_kind_name(v),
+            span: fallback.clone(),
+        });
+    };
+    items
+        .items()
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let greenlit_expr::Value::Object(obj) = item else {
+                return Err(MatrixError::ExpressionEntryNotObject {
+                    field,
+                    index,
+                    actual: value_kind_name(item),
+                    span: fallback.clone(),
+                });
+            };
+            let entry = obj
+                .iter()
+                .map(|(key, value)| (key.to_string(), expr_value_to_matrix_value(value)))
+                .collect();
+            Ok((index, entry, fallback.clone()))
+        })
+        .collect()
 }
 
 fn expr_value_to_matrix_value(v: &greenlit_expr::Value) -> MatrixValue {
@@ -253,12 +250,43 @@ fn run_algorithm(
         axes.iter().map(|(k, _)| k.as_str()).collect();
 
     // Phase 1: cartesian product, first axis outermost (varies slowest).
-    let mut product: Vec<IndexMap<String, MatrixValue>> = if axes.is_empty() {
+    // GitHub caps a matrix at 256 generated jobs. Compute the cardinality
+    // with checked arithmetic and enforce the configured equivalent before
+    // allocating any cartesian-product storage.
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategymatrix
+    let product_cardinality = if axes.is_empty() || axes.iter().any(|(_, values)| values.is_empty())
+    {
+        0
+    } else {
+        axes.iter()
+            .try_fold(1_usize, |cardinality, (_, values)| {
+                cardinality.checked_mul(values.len())
+            })
+            .ok_or_else(|| MatrixError::CardinalityOverflow {
+                cap,
+                span: matrix_span.clone(),
+            })?
+    };
+    if product_cardinality > cap {
+        return Err(MatrixError::TooManyLegs {
+            count: product_cardinality,
+            cap,
+            span: matrix_span,
+        });
+    }
+
+    let mut product: Vec<IndexMap<String, MatrixValue>> = if product_cardinality == 0 {
         Vec::new()
     } else {
         let mut combos: Vec<IndexMap<String, MatrixValue>> = vec![IndexMap::new()];
         for (key, values) in &axes {
-            let mut next = Vec::with_capacity(combos.len() * values.len());
+            let next_cardinality = combos.len().checked_mul(values.len()).ok_or_else(|| {
+                MatrixError::CardinalityOverflow {
+                    cap,
+                    span: matrix_span.clone(),
+                }
+            })?;
+            let mut next = Vec::with_capacity(next_cardinality);
             for combo in &combos {
                 for v in values {
                     let mut c = combo.clone();
@@ -326,6 +354,21 @@ fn run_algorithm(
             }
         }
         if !fit_any {
+            let count = legs
+                .len()
+                .checked_add(standalone.len())
+                .and_then(|current| current.checked_add(1))
+                .ok_or_else(|| MatrixError::CardinalityOverflow {
+                    cap,
+                    span: matrix_span.clone(),
+                })?;
+            if count > cap {
+                return Err(MatrixError::TooManyLegs {
+                    count,
+                    cap,
+                    span: matrix_span,
+                });
+            }
             let mut values = IndexMap::new();
             for (k, v) in entry {
                 values.insert(k.clone(), v.clone());
@@ -345,14 +388,6 @@ fn run_algorithm(
     legs.extend(standalone);
     for (i, leg) in legs.iter_mut().enumerate() {
         leg.index = i;
-    }
-
-    if legs.len() > cap {
-        return Err(MatrixError::TooManyLegs {
-            count: legs.len(),
-            cap,
-            span: matrix_span,
-        });
     }
 
     Ok((legs, lints))

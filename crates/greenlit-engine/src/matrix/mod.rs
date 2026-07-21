@@ -17,6 +17,7 @@ mod expand;
 
 use std::num::NonZeroU32;
 
+use greenlit_expr::Value;
 use indexmap::IndexMap;
 
 use greenlit_workflow::Span;
@@ -149,6 +150,17 @@ pub enum MatrixError {
         /// The `strategy.matrix` span.
         span: Span,
     },
+    /// Computing the cartesian-product cardinality overflowed `usize`.
+    /// This is rejected before allocating the product.
+    #[error(
+        "{span}: matrix cardinality is too large to represent and exceeds the limit of {cap} jobs"
+    )]
+    CardinalityOverflow {
+        /// The configured cap.
+        cap: usize,
+        /// The `strategy.matrix` span.
+        span: Span,
+    },
     /// A matrix axis/`include`/`exclude` value contained an expression that
     /// referenced runtime-only data — a matrix must be fully known before
     /// any job starts, so this is a hard v0 error, not a deferral.
@@ -161,12 +173,66 @@ pub enum MatrixError {
         /// Why it could not be resolved now.
         defers_on: Vec<DeferReason>,
     },
-    /// `strategy.matrix: ${{ ... }}` evaluated to a value that isn't a
-    /// documented matrix shape (an object of arrays, an object with
-    /// `include`/`exclude`, or a bare array of standalone legs).
-    #[error("{span}: strategy.matrix expression must evaluate to an object or array")]
+    /// `strategy.matrix: ${{ ... }}` evaluated to a non-object value.
+    #[error("{span}: strategy.matrix expression must evaluate to an object")]
     ExpressionNotMatrixShaped {
         /// The expression's span.
+        span: Span,
+    },
+    /// An axis or `include`/`exclude` field in an expression-produced
+    /// matrix was not an array.
+    #[error(
+        "{span}: strategy.matrix expression field '{field}' must evaluate to an array, got {actual}"
+    )]
+    ExpressionFieldNotArray {
+        /// The expression object's field name.
+        field: String,
+        /// The actual expression value kind.
+        actual: &'static str,
+        /// The enclosing expression's span. Evaluated object members have
+        /// no finer-grained source spans.
+        span: Span,
+    },
+    /// An `include`/`exclude` array item in an expression-produced matrix
+    /// was not an object.
+    #[error("{span}: strategy.matrix.{field}[{index}] must evaluate to an object, got {actual}")]
+    ExpressionEntryNotObject {
+        /// Either `include` or `exclude`.
+        field: &'static str,
+        /// Zero-based entry index.
+        index: usize,
+        /// The actual expression value kind.
+        actual: &'static str,
+        /// The enclosing expression's span. Evaluated array items have no
+        /// finer-grained source spans.
+        span: Span,
+    },
+    /// `strategy.fail-fast` resolved to a non-boolean value.
+    #[error("{span}: strategy.fail-fast must evaluate to a boolean, got {actual}")]
+    InvalidFailFastType {
+        /// The actual expression value kind.
+        actual: &'static str,
+        /// The field's span.
+        span: Span,
+    },
+    /// `strategy.max-parallel` resolved to a non-number value.
+    #[error("{span}: strategy.max-parallel must evaluate to a number, got {actual}")]
+    InvalidMaxParallelType {
+        /// The actual expression value kind.
+        actual: &'static str,
+        /// The field's span.
+        span: Span,
+    },
+    /// `strategy.max-parallel` resolved to a number that cannot represent
+    /// the positive integral concurrency carried by [`StrategyPlan`].
+    #[error(
+        "{span}: strategy.max-parallel must be a positive integer no greater than {}, got {value}",
+        u32::MAX
+    )]
+    InvalidMaxParallelValue {
+        /// The invalid numeric value.
+        value: f64,
+        /// The field's span.
         span: Span,
     },
     /// `strategy.matrix: ${{ ... }}` depends on runtime-only data (e.g.
@@ -248,7 +314,11 @@ fn fold_bool_default(
         source,
     })?;
     match folded {
-        Folded::Value(value) => Ok(greenlit_expr::value::is_truthy(&value)),
+        Folded::Value(Value::Bool(value)) => Ok(value),
+        Folded::Value(value) => Err(MatrixError::InvalidFailFastType {
+            actual: value_kind_name(&value),
+            span: v.span.clone(),
+        }),
         Folded::Residual { defers_on, .. } => Err(MatrixError::ValueNotStatic {
             span: v.span.clone(),
             defers_on: defers_on.into_iter().collect(),
@@ -266,10 +336,22 @@ fn fold_max_parallel(
         source,
     })?;
     match folded {
-        Folded::Value(value) => {
-            let n = greenlit_expr::value::to_number(&value);
-            Ok(NonZeroU32::new(n.max(0.0) as u32))
+        Folded::Value(Value::Number(value))
+            if value.is_finite()
+                && value >= 1.0
+                && value <= f64::from(u32::MAX)
+                && value.fract() == 0.0 =>
+        {
+            Ok(NonZeroU32::new(value as u32))
         }
+        Folded::Value(Value::Number(value)) => Err(MatrixError::InvalidMaxParallelValue {
+            value,
+            span: v.span.clone(),
+        }),
+        Folded::Value(value) => Err(MatrixError::InvalidMaxParallelType {
+            actual: value_kind_name(&value),
+            span: v.span.clone(),
+        }),
         Folded::Residual { defers_on, .. } => Err(MatrixError::ValueNotStatic {
             span: v.span.clone(),
             defers_on: defers_on.into_iter().collect(),
@@ -277,8 +359,19 @@ fn fold_max_parallel(
     }
 }
 
+pub(super) fn value_kind_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
 /// A matrix axis/`include`/`exclude` entry, already folded to
 /// [`MatrixValue`] — the shape [`expand`]'s algorithm operates on,
 /// independent of whether it came from an inline `strategy.matrix:`
-/// mapping or a `${{ fromJSON(...) }}` expression's resulting object/array.
+/// mapping or a `${{ fromJSON(...) }}` expression's resulting object.
 pub(crate) type ResolvedEntry = Vec<(String, MatrixValue)>;
