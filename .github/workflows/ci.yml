@@ -45,12 +45,7 @@ jobs:
         uses: taiki-e/install-action@cargo-deny
 
       - name: Dependency policy (licenses, advisories, bans, sources)
-        # -W unmaintained: see ARCHITECTURE.md known-issues log — this
-        # cargo-deny release treats `unmaintained`/`unsound` as always-deny
-        # Scope selectors rather than a configurable lint level, so the
-        # "unmaintained warns, doesn't block" policy from deny.toml's intent
-        # is applied here via the CLI lint-level override instead.
-        run: cargo deny check -W unmaintained
+        run: cargo deny check
 
       # 4. tools/check-stubs
       - name: Stub registry consistency

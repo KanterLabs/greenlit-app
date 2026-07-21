@@ -1,13 +1,11 @@
 # cargo-deny configuration for the greenlit-app workspace.
 #
-# Policy summary (see ARCHITECTURE.md "Known issues log" for the rationale
-# behind the multiple-versions choice):
+# Policy summary (see ARCHITECTURE.md "Known issues log" for the sole
+# duplicate-version exception):
 #   - licenses: allowlist of common permissive OSS licenses only.
-#   - advisories: RustSec security advisories are denied; unmaintained
-#     crates warn (visible, not blocking).
-#   - bans: duplicate transitive dependency versions warn rather than deny —
-#     a deliberate, documented pragmatic choice, not a loosened security or
-#     license gate.
+#   - advisories: RustSec security advisories are denied.
+#   - bans: duplicate dependency versions are denied except for one exact,
+#     documented syn 2.x transition entry.
 
 [graph]
 all-features = false
@@ -20,11 +18,8 @@ feature-depth = 1
 db-path = "$CARGO_HOME/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = []
-# `unmaintained`/`unsound` are Scope values in this cargo-deny release (which
-# crates they apply to), not lint levels — see ARCHITECTURE.md known-issues
-# log. The `-W unmaintained` flag on the `cargo deny check` invocation (both
-# here and in CI) is what actually downgrades unmaintained advisories to
-# warnings while vulnerability advisories stay hard-denied.
+# In cargo-deny 0.20 these are scope selectors, so all matching advisories
+# retain the command's default deny level.
 unmaintained = "all"
 unsound = "workspace"
 yanked = "deny"
@@ -48,14 +43,16 @@ ignore = false
 registries = []
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow-workspace = true
 deny = []
-skip = []
+skip = [
+    { crate = "syn@2.0.119", reason = "Proc-macro dependencies are split across the syn 2-to-3 transition; see ARCHITECTURE.md" },
+]
 skip-tree = []
 
 [sources]
