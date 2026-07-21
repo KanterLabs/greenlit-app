@@ -40,6 +40,7 @@ pub mod matrix;
 pub mod outputs;
 pub mod pass_through;
 pub mod plan;
+pub mod planned;
 pub mod runner;
 
 mod convert;
@@ -50,14 +51,18 @@ pub use condition::{Condition, DeferredExpr, PlannedCond};
 pub use defer::{DeferReason, StatusFn, StepStatusField};
 pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
 pub use git::GitError;
-pub use graph::{DependencyCycle, GraphError, JobGraph, JobId, JobIdx, build_graph};
+pub use graph::{DependencyCycle, GraphError, JobId};
 pub use lints::{Lint, LintKind};
 pub use matrix::{
     DEFAULT_MAX_MATRIX_LEGS, LegOrigin, MatrixError, MatrixLeg, MatrixValue, StrategyPlan,
 };
 pub use outputs::{JobOutputsPlan, PlannedOutput, PlannedValue};
-pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue, LiteralValue};
+pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue};
 pub use plan::{
-    ExecutionPlan, JobPlan, LegPlan, PlanError, PlanOptions, StaticSkip, StepKind, StepPlan, plan,
+    ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanError, PlanOptions,
+    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, plan,
 };
-pub use runner::{RunnerError, RunnerImage, SUPPORTED_RUNNER_LABELS, resolve_runner_label};
+pub use planned::{Evaluation, Planned};
+pub use runner::{
+    RunnerError, RunnerImage, RunnerPlan, SUPPORTED_RUNNER_LABELS, resolve_runner_label,
+};

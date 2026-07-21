@@ -13,8 +13,8 @@
 use std::io::Write;
 
 use greenlit_engine::{
-    Condition, DeferReason, EnvValue, ExecutionPlan, JobOutputsPlan, JobPlan, LiteralValue,
-    PlannedCond, PlannedOutput, PlannedValue, StaticSkip, StatusFn, StepKind, StepPlan,
+    Condition, DeferReason, EnvValue, Evaluation, ExecutionPlan, JobOutputsPlan, JobPlan, Planned,
+    PlannedCond, PlannedOutput, PlannedValue, RunnerPlan, StaticSkip, StatusFn, StepKind, StepPlan,
     StepStatusField,
 };
 
@@ -47,12 +47,12 @@ fn render_job(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
     writeln!(
         out,
         "  {} [wave {}] needs: {}{}",
-        job.name,
+        planned_text(&job.name),
         job.wave,
         needs,
         skip_suffix(job.skip.as_ref())
     )?;
-    if job.name != job.id.0 {
+    if planned_text(&job.name) != job.id.0 {
         writeln!(out, "    id: {}", job.id)?;
     }
 
@@ -60,7 +60,7 @@ fn render_job(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
         render_strategy(job, out)?;
     } else {
         if let Some(runner) = &job.runner {
-            writeln!(out, "    runner: {}", runner.image_identifier())?;
+            writeln!(out, "    runner: {}", format_runner(runner))?;
         }
         render_condition_line(
             job.condition.as_ref(),
@@ -159,6 +159,8 @@ fn format_defer_reason(r: &DeferReason) -> String {
         DeferReason::DynamicEnv { name } => format!("env.{name}"),
         DeferReason::RunnerContext => "runner.*".to_string(),
         DeferReason::JobContext => "job.*".to_string(),
+        DeferReason::MatrixContext => "matrix.*".to_string(),
+        DeferReason::StrategyContext => "strategy.*".to_string(),
         DeferReason::SecretsContext => "secrets.*".to_string(),
         DeferReason::NeedsContextWhole => "needs".to_string(),
         DeferReason::StepsContextWhole => "steps".to_string(),
@@ -184,8 +186,8 @@ fn render_strategy(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
             out,
             "      leg {} \"{}\": runner={}{}",
             leg.index,
-            leg_plan.name,
-            leg_plan.runner.image_identifier(),
+            planned_text(&leg_plan.name),
+            format_runner(&leg_plan.runner),
             skip_suffix(leg_plan.skip.as_ref())
         )?;
         render_condition_line(
@@ -235,17 +237,17 @@ fn render_step(step: &StepPlan, out: &mut impl Write, indent: &str) -> std::io::
         .as_deref()
         .map(|id| format!("[{id}] "))
         .unwrap_or_default();
-    let name = step.name.as_deref().unwrap_or("");
+    let name = step.name.as_ref().map(planned_text).unwrap_or("");
     match &step.kind {
         StepKind::Run { script, shell } => {
             let title = if name.is_empty() {
-                first_line(script)
+                first_line(planned_text(script))
             } else {
                 name.to_string()
             };
             let shell_note = shell
-                .as_deref()
-                .map(|s| format!(" (shell: {s})"))
+                .as_ref()
+                .map(|shell| format!(" (shell: {})", planned_text(shell)))
                 .unwrap_or_default();
             writeln!(out, "{indent}{label}run{shell_note} -- {title}")?;
         }
@@ -287,17 +289,26 @@ fn format_env_map<'a>(entries: impl IntoIterator<Item = (&'a String, &'a EnvValu
 }
 
 fn format_env_value(v: &EnvValue) -> String {
-    match v {
-        EnvValue::Literal { value } => format_literal(value),
-        EnvValue::Expression { source } => source.clone(),
+    match &v.evaluation {
+        Evaluation::Static(value) => value.clone(),
+        Evaluation::Deferred(deferred) => format!("{} [deferred]", deferred.residual_text),
     }
 }
 
-fn format_literal(v: &LiteralValue) -> String {
-    match v {
-        LiteralValue::Null => "null".to_string(),
-        LiteralValue::Bool(b) => b.to_string(),
-        LiteralValue::Number(n) => greenlit_expr::value::format_g15(*n),
-        LiteralValue::String(s) => s.clone(),
+fn format_runner(runner: &RunnerPlan) -> String {
+    match &runner.evaluation {
+        Evaluation::Static(image) => image.image_identifier().to_string(),
+        Evaluation::Deferred(deferred) => format!(
+            "deferred <- {} (defers on: {})",
+            deferred.residual_text,
+            format_defer_reasons(&deferred.defers_on)
+        ),
+    }
+}
+
+fn planned_text(value: &Planned<String>) -> &str {
+    match &value.evaluation {
+        Evaluation::Static(value) => value,
+        Evaluation::Deferred(deferred) => &deferred.residual_text,
     }
 }
