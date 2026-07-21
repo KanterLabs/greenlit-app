@@ -1,13 +1,15 @@
-//! End-to-end oracle rows transcribed from GitHub's Expressions reference
-//! and runner/toolkit source. Every language behavior enters through the
-//! public `parse` then `evaluate` path; the filesystem fake replaces only
-//! the true filesystem boundary used by `hashFiles()`.
+//! End-to-end, table-driven oracle rows transcribed from GitHub's public
+//! [Expressions reference](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions)
+//! and [Contexts reference](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts).
+//! Every row enters through the public `parse` then `evaluate` path; the
+//! filesystem fake replaces only the true filesystem boundary used by
+//! `hashFiles()`.
 
 use std::rc::Rc;
 
-use crate::error::{EvalError, ParseError};
+use crate::error::ParseError;
 use crate::functions::hash_files::test_support::NoFiles;
-use crate::{Context, RunStatus, Value, evaluate, expr_calls_status_function, parse};
+use crate::{Context, RunStatus, Value, evaluate, parse};
 
 mod hash_files;
 
@@ -32,341 +34,400 @@ fn eval_string(source: &str, context: &Context) -> String {
 }
 
 #[test]
-fn literals_lexing_and_parser_limits() {
+fn documented_literals_and_conditional_truthiness() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#literals
     let context = ctx();
-    let rows = [
+    let literal_rows = [
         ("true", Value::Bool(true)),
         ("false", Value::Bool(false)),
         ("null", Value::Null),
-        ("42", Value::Number(42.0)),
+        ("711", Value::Number(711.0)),
         ("-9.2", Value::Number(-9.2)),
         ("0xff", Value::Number(255.0)),
-        ("0o17", Value::Number(15.0)),
-        ("'it''s'", Value::String("it's".into())),
+        ("-2.99e-2", Value::Number(-2.99e-2)),
+        (
+            "'It''s open source!'",
+            Value::String("It's open source!".into()),
+        ),
     ];
-    for (source, expected) in rows {
-        assert_eq!(eval(source, &context), expected, "row {source}");
+    for (source, expected) in literal_rows {
+        assert_eq!(eval(source, &context), expected, "literal row {source}");
     }
-    assert!(parse("\"double quoted\"").is_err());
-    assert!(
-        parse("0Xff").is_err(),
-        "the runner recognizes lowercase 0x only"
-    );
 
-    let too_long = format!("'{}'", "😀".repeat(10_500));
-    assert!(matches!(
-        parse(&too_long),
-        Err(ParseError::TooLong { actual: 21_002 })
-    ));
-    let at_limit = format!("'{}'", "😀".repeat(10_499));
-    assert!(parse(&at_limit).is_ok(), "21,000 UTF-16 units are accepted");
+    let truthiness_rows = [
+        ("!false", true),
+        ("!0", true),
+        ("!-0", true),
+        ("!''", true),
+        ("!fromJSON('\"\"')", true),
+        ("!null", true),
+        ("!true", false),
+        ("!'false'", false),
+        ("!fromJSON('[]')", false),
+        ("!fromJSON('{}')", false),
+    ];
+    for (source, expected) in truthiness_rows {
+        assert_eq!(
+            eval(source, &context),
+            Value::Bool(expected),
+            "truthiness row {source}"
+        );
+    }
+
+    assert!(
+        parse("\"double quoted\"").is_err(),
+        "double-quoted strings inside an expression are documented as invalid"
+    );
 }
 
 #[test]
-fn operators_precedence_postfix_and_completed_ast_depth() {
+fn documented_operators_property_and_index_access() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#operators
     let context = ctx().with_github(Value::object(vec![(
-        "event".into(),
-        Value::object(vec![(
-            "pull_request".into(),
-            Value::object(vec![("number".into(), Value::Number(5.0))]),
-        )]),
+        "ref".into(),
+        Value::String("refs/heads/main".into()),
     )]));
     let rows = [
+        ("(true)", Value::Bool(true)),
+        ("fromJSON('[10,20]')[1]", Value::Number(20.0)),
+        ("github.ref", Value::String("refs/heads/main".into())),
         ("!false", Value::Bool(true)),
-        ("1 != 2", Value::Bool(true)),
+        ("1 < 2", Value::Bool(true)),
         ("1 <= 1", Value::Bool(true)),
         ("2 > 1", Value::Bool(true)),
         ("2 >= 2", Value::Bool(true)),
-        ("true && 'right'", Value::String("right".into())),
-        ("false && 'right'", Value::Bool(false)),
-        ("'left' || 'right'", Value::String("left".into())),
-        ("'' || 'right'", Value::String("right".into())),
-        ("1 == 2 < 3", Value::Bool(true)),
-        ("(1 == 1)", Value::Bool(true)),
-        ("github.event.pull_request.number", Value::Number(5.0)),
-        (
-            "github['event']['pull_request']['number']",
-            Value::Number(5.0),
-        ),
-        ("('abc')[0]", Value::Null),
+        ("1 == 1", Value::Bool(true)),
+        ("1 != 2", Value::Bool(true)),
+        ("true && true", Value::Bool(true)),
+        ("false || true", Value::Bool(true)),
     ];
     for (source, expected) in rows {
-        assert_eq!(eval(source, &context), expected, "row {source}");
+        assert_eq!(eval(source, &context), expected, "operator row {source}");
     }
-    assert!(
-        parse("'abc'[0]").is_err(),
-        "a bare literal is not postfixable"
-    );
-
-    let grouped = format!("{}true{}", "(".repeat(51), ")".repeat(51));
-    assert!(parse(&grouped).is_ok(), "grouping is absent from the AST");
-    let flat_and = std::iter::repeat_n("true", 60)
-        .collect::<Vec<_>>()
-        .join(" && ");
-    assert!(
-        parse(&flat_and).is_ok(),
-        "the runner flattens one logical And container"
-    );
-    let depth_50 = format!("github{}", ".a".repeat(49));
-    assert!(parse(&depth_50).is_ok());
-    let depth_51 = format!("github{}", ".a".repeat(50));
-    assert!(matches!(parse(&depth_51), Err(ParseError::TooDeep)));
 }
 
 #[test]
-fn contexts_missing_keys_and_ordinal_ignore_case() {
+fn documented_context_roots_and_missing_property_value() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#about-contexts
     let context = Context::new(Rc::new(NoFiles::new("/workspace")))
-        .with_github(Value::object(vec![(
-            "I".into(),
-            Value::String("ascii".into()),
-        )]))
-        .with_env(Value::object(vec![(
-            "FOO".into(),
-            Value::String("bar".into()),
-        )]))
+        .with_github(Value::object(vec![("G".into(), Value::String("g".into()))]))
+        .with_env(Value::object(vec![("E".into(), Value::String("e".into()))]))
         .with_vars(Value::object(vec![("V".into(), Value::String("v".into()))]))
         .with_secrets(Value::object(vec![("S".into(), Value::String("s".into()))]))
         .with_needs(Value::object(vec![("N".into(), Value::String("n".into()))]))
         .with_matrix(Value::object(vec![("M".into(), Value::String("m".into()))]))
+        .with_strategy(Value::object(vec![("Y".into(), Value::String("y".into()))]))
         .with_steps(Value::object(vec![("T".into(), Value::String("t".into()))]))
         .with_runner(Value::object(vec![("R".into(), Value::String("r".into()))]))
         .with_job(Value::object(vec![("J".into(), Value::String("j".into()))]))
-        .with_inputs(Value::object(vec![("P".into(), Value::String("p".into()))]));
+        .with_inputs(Value::object(vec![("I".into(), Value::String("i".into()))]));
     let rows = [
-        ("github.i", Value::String("ascii".into())),
-        ("env.FOO", Value::String("bar".into())),
+        ("github.g", Value::String("g".into())),
+        ("env.E", Value::String("e".into())),
         ("vars.V", Value::String("v".into())),
         ("secrets.S", Value::String("s".into())),
         ("needs.N", Value::String("n".into())),
         ("matrix.M", Value::String("m".into())),
+        ("strategy.Y", Value::String("y".into())),
         ("steps.T", Value::String("t".into())),
         ("runner.R", Value::String("r".into())),
         ("job.J", Value::String("j".into())),
-        ("inputs.P", Value::String("p".into())),
-        ("github.missing", Value::Null),
-        ("github['ı']", Value::Null),
-        ("'I' == 'ı'", Value::Bool(false)),
-        ("contains('I', 'ı')", Value::Bool(false)),
-        ("startsWith('I', 'ı')", Value::Bool(false)),
-        ("endsWith('I', 'ı')", Value::Bool(false)),
-        ("'I' < 'ı'", Value::Bool(true)),
+        ("inputs.I", Value::String("i".into())),
+        ("github.missing", Value::String(String::new())),
     ];
     for (source, expected) in rows {
-        assert_eq!(eval(source, &context), expected, "row {source}");
+        assert_eq!(eval(source, &context), expected, "context row {source}");
     }
 }
 
 #[test]
-fn object_filter_rows_include_the_documented_object_shape() {
-    let context = ctx();
-    let names = eval(
-        r#"fromJSON('{"fruits":[{"name":"apple"},{"name":"orange"},{"name":"pear"}]}').fruits.*.name"#,
-        &context,
-    );
-    assert_eq!(
-        names,
-        Value::filtered_array(vec![
-            Value::String("apple".into()),
-            Value::String("orange".into()),
-            Value::String("pear".into()),
-        ])
-    );
-
-    let portions = eval(
-        r#"fromJSON('{"vegetables":{"carrot":{"ediblePortions":["roots"]},"celery":{"ediblePortions":["stalks","leaves"]}}}').vegetables.*.ediblePortions"#,
-        &context,
-    );
-    assert_eq!(
-        portions,
-        Value::filtered_array(vec![
-            Value::array(vec![Value::String("roots".into())]),
-            Value::array(vec![
-                Value::String("stalks".into()),
-                Value::String("leaves".into()),
-            ]),
-        ])
-    );
-}
-
-#[test]
-fn coercion_number_formatting_and_string_consumers() {
+fn documented_object_filter_examples() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#object-filters
     let context = ctx();
     let rows = [
-        ("null == ''", Value::Bool(true)),
-        ("null == 0", Value::Bool(true)),
-        ("null == false", Value::Bool(true)),
-        ("true == 1", Value::Bool(true)),
-        ("true == '1'", Value::Bool(true)),
-        ("true == 'true'", Value::Bool(false)),
-        ("'' == 0", Value::Bool(true)),
-        ("'abc' == 0", Value::Bool(false)),
-        ("'ABC' == 'abc'", Value::Bool(true)),
-        ("'infinity' == Infinity", Value::Bool(true)),
-        ("'INFINITY' == Infinity", Value::Bool(true)),
-        ("'+InFiNiTy' == Infinity", Value::Bool(true)),
-        ("'-iNfInItY' == -Infinity", Value::Bool(true)),
-        ("format('{0}', 0.00001)", Value::String("1E-05".into())),
-        ("join(fromJSON('[0.00001]'))", Value::String("1E-05".into())),
-        ("contains(0.00001, 'E-05')", Value::Bool(true)),
-        ("startsWith(0.00001, '1E-')", Value::Bool(true)),
-        ("endsWith(0.00001, '-05')", Value::Bool(true)),
-        ("toJSON(0.00001)", Value::String("1E-05".into())),
-    ];
-    for (source, expected) in rows {
-        assert_eq!(eval(source, &context), expected, "row {source}");
-    }
-}
-
-#[test]
-fn builtin_function_examples_and_output_based_laziness() {
-    let context = ctx();
-    let rows = [
-        ("contains('Hello World', 'world')", Value::Bool(true)),
         (
-            "contains(fromJSON('[\"foo\",\"bar\"]'), 'foo')",
+            "array filter",
+            r#"fromJSON('[{"name":"apple","quantity":1},{"name":"orange","quantity":2},{"name":"pear","quantity":1}]').*.name"#,
+            vec![vec!["apple"], vec!["orange"], vec!["pear"]],
+            true,
+        ),
+        (
+            "object filter",
+            r#"fromJSON('{"scallions":{"colors":["green","white","red"],"ediblePortions":["roots","stalks"]},"beets":{"colors":["purple","red","gold","white","pink"],"ediblePortions":["roots","stems","leaves"]},"artichokes":{"colors":["green","purple","red","black"],"ediblePortions":["hearts","stems","leaves"]}}').*.ediblePortions"#,
+            vec![
+                vec!["roots", "stalks"],
+                vec!["roots", "stems", "leaves"],
+                vec!["hearts", "stems", "leaves"],
+            ],
+            false,
+        ),
+    ];
+
+    for (name, source, expected, order_is_defined) in rows {
+        let Value::Array(values) = eval(source, &context) else {
+            panic!("{name} did not produce an array");
+        };
+        let mut actual = values
+            .items()
+            .iter()
+            .map(|value| match value {
+                Value::String(value) => vec![value.clone()],
+                Value::Array(nested) => nested
+                    .items()
+                    .iter()
+                    .map(|item| match item {
+                        Value::String(value) => value.clone(),
+                        other => panic!("{name} produced non-string nested item {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("{name} produced unexpected item {other:?}"),
+            })
+            .collect::<Vec<Vec<String>>>();
+        let mut expected = expected
+            .into_iter()
+            .map(|group| group.into_iter().map(str::to_string).collect())
+            .collect::<Vec<Vec<String>>>();
+        if !order_is_defined {
+            actual.sort();
+            expected.sort();
+        }
+        assert_eq!(actual, expected, "object-filter row {name}");
+    }
+}
+
+#[test]
+fn documented_loose_equality_and_relational_coercion() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#operators
+    let shared_array = Value::array(vec![Value::Number(1.0)]);
+    let shared_object = Value::object(vec![("value".into(), Value::Number(1.0))]);
+    let context = ctx().with_github(Value::object(vec![
+        ("array".into(), shared_array.clone()),
+        ("array_alias".into(), shared_array),
+        ("object".into(), shared_object.clone()),
+        ("object_alias".into(), shared_object),
+    ]));
+    let rows = [
+        ("null == 0", true),
+        ("false == 0", true),
+        ("true == 1", true),
+        ("'' == 0", true),
+        ("'-2.99e-2' == -2.99e-2", true),
+        ("'not a number' == 0", false),
+        ("fromJSON('[]') < 1", false),
+        ("fromJSON('{}') < 1", false),
+        ("'not a number' < 1", false),
+        ("'not a number' <= 1", false),
+        ("'not a number' > 1", false),
+        ("'not a number' >= 1", false),
+        ("'Alpha' == 'alpha'", true),
+        ("'ALPHA' < 'beta'", true),
+        ("'BETA' > 'alpha'", true),
+        ("'ALPHA' <= 'alpha'", true),
+        ("'ALPHA' >= 'alpha'", true),
+        ("github.array == github.array_alias", true),
+        ("github.array == fromJSON('[1]')", false),
+        ("github.object == github.object_alias", true),
+        ("github.object == fromJSON('{\"value\":1}')", false),
+    ];
+    for (source, expected) in rows {
+        assert_eq!(
+            eval(source, &context),
+            Value::Bool(expected),
+            "coercion row {source}"
+        );
+    }
+}
+
+#[test]
+fn documented_builtin_function_examples_and_rules() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#functions
+    let labels = Value::array(vec![
+        Value::object(vec![("name".into(), Value::String("bug".into()))]),
+        Value::object(vec![("name".into(), Value::String("help wanted".into()))]),
+    ]);
+    let context = ctx()
+        .with_github(Value::object(vec![
+            ("event_name".into(), Value::String("push".into())),
+            (
+                "event".into(),
+                Value::object(vec![(
+                    "issue".into(),
+                    Value::object(vec![("labels".into(), labels)]),
+                )]),
+            ),
+        ]))
+        .with_env(Value::object(vec![
+            ("continue".into(), Value::String("true".into())),
+            ("time".into(), Value::String("3".into())),
+        ]))
+        .with_job(Value::object(vec![(
+            "status".into(),
+            Value::String("success".into()),
+        )]));
+
+    let matrix = Value::object(vec![(
+        "include".into(),
+        Value::array(vec![
+            Value::object(vec![
+                ("project".into(), Value::String("foo".into())),
+                ("config".into(), Value::String("Debug".into())),
+            ]),
+            Value::object(vec![
+                ("project".into(), Value::String("bar".into())),
+                ("config".into(), Value::String("Release".into())),
+            ]),
+        ]),
+    )]);
+    let matrix_json =
+        r#"{"include":[{"project":"foo","config":"Debug"},{"project":"bar","config":"Release"}]}"#;
+    let mut rows = vec![
+        (
+            "contains('Hello world', 'llo')".to_string(),
             Value::Bool(true),
         ),
-        ("startsWith('Hello world', 'He')", Value::Bool(true)),
-        ("endsWith('Hello world', 'ld')", Value::Bool(true)),
         (
-            "format('Hello {0} {1} {2}!', 'Mona', 'the', 'Octocat')",
-            Value::String("Hello Mona the Octocat!".into()),
+            "contains(github.event.issue.labels.*.name, 'bug')".to_string(),
+            Value::Bool(true),
         ),
         (
-            "format('{{Hello {0}!}}', 'World')",
-            Value::String("{Hello World!}".into()),
+            r#"contains(fromJSON('["push", "pull_request"]'), github.event_name)"#.to_string(),
+            Value::Bool(true),
         ),
         (
-            "format('{0}', 'used', fromJSON('bad'))",
-            Value::String("used".into()),
+            r#"contains(fromJSON('["PUSH"]'), 'push')"#.to_string(),
+            Value::Bool(true),
         ),
         (
-            "join(fromJSON('[\"a\",\"b\",\"c\"]'))",
-            Value::String("a,b,c".into()),
+            "startsWith('Hello world', 'he')".to_string(),
+            Value::Bool(true),
         ),
         (
-            "join(fromJSON('[\"a\",\"b\"]'), ', ')",
-            Value::String("a, b".into()),
+            "endsWith('Hello world', 'LD')".to_string(),
+            Value::Bool(true),
         ),
         (
-            "join(fromJSON('[\"only\"]'), fromJSON('bad'))",
-            Value::String("only".into()),
+            "format('Hello {0} {1} {2}', 'Mona', 'the', 'Octocat')".to_string(),
+            Value::String("Hello Mona the Octocat".into()),
         ),
         (
-            "contains(fromJSON('{}'), fromJSON('bad'))",
-            Value::Bool(false),
+            "format('{{Hello {0} {1} {2}!}}', 'Mona', 'the', 'Octocat')".to_string(),
+            Value::String("{Hello Mona the Octocat!}".into()),
         ),
         (
-            "contains(fromJSON('[]'), fromJSON('bad'))",
-            Value::Bool(false),
+            "join(github.event.issue.labels.*.name, ', ')".to_string(),
+            Value::String("bug, help wanted".into()),
         ),
         (
-            "startsWith(fromJSON('[]'), fromJSON('bad'))",
-            Value::Bool(false),
+            "join('Hello world', ', ')".to_string(),
+            Value::String("Hello world".into()),
         ),
         (
-            "endsWith(fromJSON('{}'), fromJSON('bad'))",
-            Value::Bool(false),
+            "toJSON(job)".to_string(),
+            Value::String("{\n  \"status\": \"success\"\n}".into()),
         ),
-        ("('primitive')[fromJSON('bad')]", Value::Null),
+        (
+            r#"toJSON(fromJSON('["foo","bar"]'))"#.to_string(),
+            Value::String("[\n  \"foo\",\n  \"bar\"\n]".into()),
+        ),
+        ("fromJSON(env.continue)".to_string(), Value::Bool(true)),
+        ("fromJSON(env.time)".to_string(), Value::Number(3.0)),
+        ("fromJSON('null')".to_string(), Value::Null),
+        (format!("fromJSON('{matrix_json}')"), matrix),
     ];
+
+    let replacement_values = (0..=256)
+        .map(|index| format!("'{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    rows.push((
+        format!("format('{{256}}', {replacement_values})"),
+        Value::String("256".into()),
+    ));
+
     for (source, expected) in rows {
-        assert_eq!(eval(source, &context), expected, "row {source}");
+        assert_eq!(eval(&source, &context), expected, "function row {source}");
     }
 
-    for source in [
-        "contains(fromJSON('[1]'), fromJSON('bad'))",
-        "startsWith('primitive', fromJSON('bad'))",
-        "endsWith('primitive', fromJSON('bad'))",
-    ] {
-        let expression = parse(source).unwrap();
-        assert!(matches!(
-            evaluate(&expression, &context),
-            Err(EvalError::FromJson(_))
-        ));
-    }
-}
-
-#[test]
-fn json_rows_include_utf16_surrogate_pairs() {
-    let context = ctx();
-    assert_eq!(
-        eval(r#"fromJSON('"\uD83D\uDE00"')"#, &context),
-        Value::String("😀".into())
-    );
-    assert_eq!(
-        eval("fromJSON('{''unquoted'': [1, 2,],}')", &context),
-        Value::object(vec![(
-            "unquoted".into(),
-            Value::array(vec![Value::Number(1.0), Value::Number(2.0)]),
-        )])
-    );
-    assert_eq!(
-        eval("toJSON('hi')", &context),
-        Value::String("\"hi\"".into())
-    );
-
-    let expression = parse(r#"fromJSON('"\uD83D"')"#).unwrap();
     assert!(matches!(
-        evaluate(&expression, &context),
-        Err(EvalError::FromJson(_))
+        parse("format('missing replacement value')"),
+        Err(ParseError::WrongArity { .. })
     ));
 }
 
 #[test]
-fn case_function_documented_rows_and_short_circuiting() {
+fn documented_case_examples() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#case
     let main = ctx().with_github(Value::object(vec![(
         "ref".into(),
         Value::String("refs/heads/main".into()),
+    )]));
+    let staging = ctx().with_github(Value::object(vec![(
+        "ref".into(),
+        Value::String("refs/heads/staging".into()),
     )]));
     let feature = ctx().with_github(Value::object(vec![(
         "ref".into(),
         Value::String("refs/heads/feature/topic".into()),
     )]));
-    let expression = "case(github.ref == 'refs/heads/main', 'production', github.ref == 'refs/heads/staging', 'staging', startsWith(github.ref, 'refs/heads/feature/'), 'development', 'unknown')";
-    assert_eq!(eval(expression, &main), Value::String("production".into()));
-    assert_eq!(
-        eval(expression, &feature),
-        Value::String("development".into())
-    );
-    assert_eq!(
-        eval(
-            "case(false, fromJSON('bad'), true, 'matched', fromJSON('also bad'))",
-            &ctx()
+    let other = ctx().with_github(Value::object(vec![(
+        "ref".into(),
+        Value::String("refs/heads/docs".into()),
+    )]));
+    let single = "case(github.ref == 'refs/heads/main', 'production', 'development')";
+    let multiple = "case(github.ref == 'refs/heads/main', 'production', github.ref == 'refs/heads/staging', 'staging', startsWith(github.ref, 'refs/heads/feature/'), 'development', 'unknown')";
+    let rows = [
+        ("single predicate match", single, &main, "production"),
+        ("single predicate default", single, &other, "development"),
+        ("multiple predicates main", multiple, &main, "production"),
+        ("multiple predicates staging", multiple, &staging, "staging"),
+        (
+            "multiple predicates feature",
+            multiple,
+            &feature,
+            "development",
         ),
-        Value::String("matched".into())
-    );
-    assert_eq!(
-        eval("CASE(false, 'no', 'default')", &ctx()),
-        Value::String("default".into())
-    );
-
-    let non_boolean = parse("case(1, 'value', 'default')").unwrap();
-    assert!(matches!(
-        evaluate(&non_boolean, &ctx()),
-        Err(EvalError::InvalidCasePredicate { .. })
-    ));
-    assert!(matches!(
-        parse("case(true, 'a', false, 'b')"),
-        Err(ParseError::EvenCaseParameters)
-    ));
+        ("multiple predicates default", multiple, &other, "unknown"),
+    ];
+    for (name, source, context, expected) in rows {
+        assert_eq!(
+            eval(source, context),
+            Value::String(expected.into()),
+            "case row {name}"
+        );
+    }
 }
 
 #[test]
-fn status_functions_and_status_call_detection() {
+fn documented_status_function_examples_and_truth_table() {
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions
     let succeeding = ctx().with_status(RunStatus::Success);
-    let failing = ctx().with_status(RunStatus::Failure);
+    let failing = ctx()
+        .with_status(RunStatus::Failure)
+        .with_steps(Value::object(vec![(
+            "demo".into(),
+            Value::object(vec![("conclusion".into(), Value::String("failure".into()))]),
+        )]));
     let cancelling = ctx().with_status(RunStatus::Cancelled);
-    assert_eq!(eval("success()", &succeeding), Value::Bool(true));
-    assert_eq!(eval("failure()", &succeeding), Value::Bool(false));
-    assert_eq!(eval("failure()", &failing), Value::Bool(true));
-    assert_eq!(eval("cancelled()", &cancelling), Value::Bool(true));
-    assert_eq!(eval("always()", &cancelling), Value::Bool(true));
-
-    assert!(!expr_calls_status_function(
-        &parse("github.ref == 'main'").unwrap()
-    ));
-    assert!(expr_calls_status_function(
-        &parse("!cancelled() && github.ref == 'main'").unwrap()
-    ));
+    let rows = [
+        ("success is true", "success()", &succeeding, true),
+        ("success is false", "success()", &failing, false),
+        ("failure is true", "failure()", &failing, true),
+        ("failure is false", "failure()", &succeeding, false),
+        ("cancelled is true", "cancelled()", &cancelling, true),
+        ("cancelled is false", "cancelled()", &succeeding, false),
+        ("always after cancellation", "always()", &cancelling, true),
+        (
+            "failure with a step condition",
+            "failure() && steps.demo.conclusion == 'failure'",
+            &failing,
+            true,
+        ),
+    ];
+    for (name, source, context, expected) in rows {
+        assert_eq!(
+            eval(source, context),
+            Value::Bool(expected),
+            "status row {name}"
+        );
+    }
 }

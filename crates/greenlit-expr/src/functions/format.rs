@@ -1,5 +1,6 @@
-//! `format(fmt, arg0, …, argN)` — design memo §3.3 ("reproduce this scanner
-//! exactly").
+//! `format(fmt, arg0, …, argN)` — GitHub's public contract requires at
+//! least one replacement value and specifies no maximum number of values.
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#format>
 //!
 //! Value arguments are evaluated lazily (only indices actually referenced by
 //! a placeholder are evaluated at all) and cached (a repeated `{0}` in the
@@ -13,13 +14,12 @@ use crate::value::{Value, ValueKind, to_display_string};
 /// A `format()` failure.
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {
-    /// A `{` that isn't `{{` and isn't a valid `{N[:spec]}` placeholder, or
-    /// a bare `}` not part of `}}`, or a placeholder index outside `0..=255`.
+    /// A `{` that isn't `{{` and isn't a valid `{N[:spec]}` placeholder, a
+    /// bare `}` not part of `}}`, or an index too large for this platform.
     #[error("invalid format string")]
     InvalidFormatString,
-    /// A placeholder's index was a valid byte (`0..=255`) but referenced an
-    /// argument position beyond how many value arguments were actually
-    /// supplied.
+    /// A placeholder referenced an argument position beyond how many value
+    /// arguments were actually supplied.
     #[error(
         "the format string references more arguments than were supplied: index {index} (only {supplied} value argument(s) given)"
     )]
@@ -78,15 +78,9 @@ pub(crate) fn format(
                     return Err(FormatError::InvalidFormatString);
                 }
                 let digits: String = chars[digits_start..j].iter().collect();
-                // "parsed as a byte with NumberStyles.None ... {256} or 4+
-                // digit overflow fails index parse -> invalid format string".
-                let raw: u64 = digits
+                let index: usize = digits
                     .parse()
                     .map_err(|_| FormatError::InvalidFormatString)?;
-                if raw > 255 {
-                    return Err(FormatError::InvalidFormatString);
-                }
-                let index = raw as usize;
 
                 // Optional `{N:spec}` — `}}` inside the spec is a literal
                 // `}`; the section ends at the first unescaped `}`.

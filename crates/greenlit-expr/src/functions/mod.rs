@@ -6,11 +6,13 @@
 //! complete-function requirement; product behavior takes precedence under
 //! `AGENTS.md`.
 //!
-//! Arities are fixed constants (design memo §3, "Arities … from
-//! `ExpressionConstants.cs` registration"), independent of any evaluated
-//! data, which is why `lookup_arity` is consulted by the *parser* (a
-//! wrong-arity call is a [`crate::error::ParseError`], not an
-//! [`crate::error::EvalError`]).
+//! Arities are independent of evaluated data, which is why `lookup_arity`
+//! is consulted by the *parser* (a wrong-arity call is a
+//! [`crate::error::ParseError`], not an [`crate::error::EvalError`]). The
+//! public Expressions reference is authoritative for `format`: it requires
+//! a format string plus at least one replacement and specifies no maximum
+//! number of replacements.
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#format>
 
 pub(crate) mod affixes;
 pub(crate) mod contains;
@@ -38,7 +40,7 @@ pub(crate) fn lookup_arity(name: &str) -> Option<Arity> {
         "contains" => a(2, 2, "2"),
         "startswith" => a(2, 2, "2"),
         "endswith" => a(2, 2, "2"),
-        "format" => a(1, 255, "1-255"),
+        "format" => a(2, usize::MAX, "2 or more"),
         "join" => a(1, 2, "1-2"),
         "tojson" => a(1, 1, "1"),
         "fromjson" => a(1, 1, "1"),

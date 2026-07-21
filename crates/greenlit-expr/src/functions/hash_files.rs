@@ -651,28 +651,11 @@ pub(crate) mod test_support {
             }
         }
 
-        /// Sets the directory `~`-rooted patterns resolve against.
-        pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
-            self.home = Some(home.into());
-            self
-        }
-
         /// Adds a file at `path` (relative to nothing in particular — tests
         /// pass full paths already joined under the configured root/home) in
         /// insertion order.
         pub fn with_file(mut self, path: impl Into<PathBuf>, content: impl Into<Vec<u8>>) -> Self {
             self.files.push((path.into(), content.into()));
-            self
-        }
-
-        /// Adds a symlink at `path` pointing at `target` (a broken symlink
-        /// if `target` isn't also a file added via `with_file`).
-        pub fn with_symlink(
-            mut self,
-            path: impl Into<PathBuf>,
-            target: impl Into<PathBuf>,
-        ) -> Self {
-            self.symlinks.insert(path.into(), target.into());
             self
         }
 
