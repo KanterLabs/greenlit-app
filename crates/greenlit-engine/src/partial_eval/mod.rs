@@ -3,21 +3,19 @@
 //! [`greenlit_expr::Value`] or a residual [`greenlit_expr::Expr`] plus the
 //! [`DeferReason`]s it could not get past.
 //!
-//! Source: design memo §3.2 ("Partial evaluation, not mere classification")
-//! and §3.1 ("The classification rule"). Split into three focused
-//! submodules (each under the ~1000-line cap on its own, per `AGENTS.md`'s
-//! "decompose into real domain modules" rule):
+//! This implements `PHASE-1-engine-core.md`'s rule to evaluate statically
+//! known expressions and preserve runtime-deferred residuals. It is split
+//! into focused single-purpose submodules:
 //!
-//! - [`fold`] — the recursive folder ([`fold_expr`]) and its
-//!   [`DeferReason`]-classification pass. One evaluator, reused: whenever a
-//!   subtree turns out to reference *nothing* deferred, it hands the whole
-//!   subtree to [`greenlit_expr::evaluate`] rather than reimplementing
-//!   index/wildcard/coercion semantics a second time (the design memo's
-//!   "one evaluator ... do not fork it" instruction) — the classification
-//!   pass exists purely to answer *whether* that fast path is available;
-//!   the slow, structural path only kicks in for the node shapes that need
-//!   to preserve `&&`/`||` short-circuit semantics across a
-//!   partially-deferred tree.
+//! - [`fold`] — the recursive folder ([`fold_expr`]). One evaluator, reused:
+//!   whenever a subtree turns out to reference *nothing* deferred, it hands
+//!   the whole subtree to [`greenlit_expr::evaluate`] rather than
+//!   reimplementing index/wildcard/coercion semantics a second time; the
+//!   slow, structural path only kicks in for node shapes that must preserve
+//!   short-circuit semantics across a partially-deferred tree.
+//! - [`calls`] — preserves built-ins' lazy argument semantics while folding
+//!   calls whose other arguments require runtime data.
+//! - [`classify`] — finds runtime dependencies without evaluating the tree.
 //! - [`template`] — folds a raw template string (`env:` entries, job output
 //!   values: zero or more `${{ }}` placeholders possibly mixed with
 //!   literal text), reusing [`fold_expr`] per placeholder.
@@ -25,6 +23,8 @@
 //!   residual tree for display; targets trees this module itself produces,
 //!   not a fully general round-trip printer for arbitrary hand-built trees.
 
+mod calls;
+mod classify;
 mod fold;
 mod printer;
 mod template;
@@ -100,29 +100,83 @@ pub enum PartialEvalError {
     /// known.
     #[error("could not evaluate a fully-static expression: {0}")]
     Eval(#[from] greenlit_expr::EvalError),
+    /// A context-sensitive field folded successfully but produced a value
+    /// outside that field's documented type/domain.
+    #[error("static expression must evaluate to {expected}")]
+    InvalidStaticValue {
+        /// The expected value domain.
+        expected: &'static str,
+    },
 }
 
-/// The four contexts this crate can materialize a concrete [`Value`] for at
-/// plan time (design memo §3.1): `github`, `vars`, `matrix` (`Null` outside
-/// a matrix leg), and `inputs`.
+/// A partial-evaluation failure paired with the exact authored field.
+#[derive(Debug)]
+pub(crate) struct LocatedEvalError {
+    pub(crate) span: greenlit_workflow::Span,
+    pub(crate) source: PartialEvalError,
+}
+
+/// The five contexts this crate can materialize a concrete [`Value`] for at
+/// plan time: `github`, `vars`, `matrix`, `strategy` (both `Null` outside a
+/// matrix leg), and `inputs`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StaticRoots<'a> {
     /// The `github` context root.
     pub github: &'a Value,
     /// The `vars` context root.
     pub vars: &'a Value,
+    /// A completed direct-dependency context. `None` means the job's
+    /// prerequisites have not finished and every `needs.*` lookup defers.
+    pub needs: Option<&'a Value>,
     /// The `matrix` context root (`Null` outside a matrix leg).
     pub matrix: &'a Value,
+    /// Whether `matrix` is pending expansion rather than statically null.
+    pub matrix_deferred: bool,
+    /// The `strategy` context root (`Null` outside a matrix leg).
+    pub strategy: &'a Value,
+    /// Which fixed `strategy` properties still require runtime data.
+    pub strategy_deferred: StrategyDeferred,
     /// The `inputs` context root.
     pub inputs: &'a Value,
+}
+
+/// Per-property availability for GitHub's fixed-shape `strategy` context.
+/// Keeping these flags separate avoids turning a known `job-total` into a
+/// residual merely because `fail-fast` depends on a prerequisite output.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StrategyDeferred {
+    pub fail_fast: bool,
+    pub job_index: bool,
+    pub job_total: bool,
+    pub max_parallel: bool,
+}
+
+impl StrategyDeferred {
+    pub(crate) fn any(self) -> bool {
+        self.fail_fast || self.job_index || self.job_total || self.max_parallel
+    }
+
+    pub(crate) fn field(self, name: &str) -> bool {
+        if name.eq_ignore_ascii_case("fail-fast") {
+            self.fail_fast
+        } else if name.eq_ignore_ascii_case("job-index") {
+            self.job_index
+        } else if name.eq_ignore_ascii_case("job-total") {
+            self.job_total
+        } else if name.eq_ignore_ascii_case("max-parallel") {
+            self.max_parallel
+        } else {
+            false
+        }
+    }
 }
 
 /// The resolved `env:` chain for one job or step: workflow-then-job(-then-
 /// step) layers already folded, split into names whose value is fully
 /// known (`resolved`) and names whose own definition is itself deferred
 /// (`deferred`, with the reasons why). A name absent from both was never
-/// declared anywhere in the chain (design memo §3.1's `env.*` rule,
-/// recommendation (b): defer with [`DeferReason::DynamicEnv`]).
+/// declared anywhere in the chain and defers with
+/// [`DeferReason::DynamicEnv`] because runtime commands may still set it.
 #[derive(Debug, Clone)]
 pub(crate) struct EnvChain {
     resolved: Value,
@@ -167,7 +221,7 @@ impl EnvChain {
 pub(crate) fn build_env_chain(
     layers: &[&[(Spanned<String>, Spanned<ScalarOrExpr>)]],
     roots: StaticRoots<'_>,
-) -> Result<EnvChain, PartialEvalError> {
+) -> Result<EnvChain, LocatedEvalError> {
     let mut resolved_entries: Vec<(String, Value)> = Vec::new();
     let mut deferred: HashMap<String, BTreeSet<DeferReason>> = HashMap::new();
     for layer in layers {
@@ -184,7 +238,12 @@ pub(crate) fn build_env_chain(
         for (name, value) in *layer {
             folded_layer.push((
                 name.value.clone(),
-                fold_scalar_or_expr(&value.value, &layer_ctx)?,
+                fold_scalar_or_expr(&value.value, &layer_ctx).map_err(|source| {
+                    LocatedEvalError {
+                        span: value.span.clone(),
+                        source,
+                    }
+                })?,
             ));
         }
         for (name, folded) in folded_layer {
@@ -223,16 +282,21 @@ pub(crate) struct FoldCtx<'a> {
 
 impl FoldCtx<'_> {
     /// Builds the real evaluator's [`Context`] for the fast path: `github`,
-    /// `env` (the resolved chain), `vars`, `matrix`, and `inputs` are the
+    /// `env` (the resolved chain), `vars`, `matrix`, `strategy`, and `inputs` are the
     /// only roots any subtree reaching this path can have touched — see
     /// this module's doc comment.
     pub(crate) fn static_context(&self) -> Context {
-        Context::new(Rc::new(StaticFs))
+        let context = Context::new(Rc::new(StaticFs))
             .with_github(self.roots.github.clone())
             .with_env(self.env.resolved.clone())
             .with_vars(self.roots.vars.clone())
             .with_matrix(self.roots.matrix.clone())
-            .with_inputs(self.roots.inputs.clone())
+            .with_strategy(self.roots.strategy.clone())
+            .with_inputs(self.roots.inputs.clone());
+        match self.roots.needs {
+            Some(needs) => context.with_needs(needs.clone()),
+            None => context,
+        }
     }
 }
 
