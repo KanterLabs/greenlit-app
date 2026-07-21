@@ -1,0 +1,70 @@
+# cargo-deny configuration for the greenlit-app workspace.
+#
+# Policy summary (see ARCHITECTURE.md "Known issues log" for the rationale
+# behind the multiple-versions choice):
+#   - licenses: allowlist of common permissive OSS licenses only.
+#   - advisories: RustSec security advisories are denied; unmaintained
+#     crates warn (visible, not blocking).
+#   - bans: duplicate transitive dependency versions warn rather than deny —
+#     a deliberate, documented pragmatic choice, not a loosened security or
+#     license gate.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+# `unmaintained`/`unsound` are Scope values in this cargo-deny release (which
+# crates they apply to), not lint levels — see ARCHITECTURE.md known-issues
+# log. The `-W unmaintained` flag on the `cargo deny check` invocation (both
+# here and in CI) is what actually downgrades unmaintained advisories to
+# warnings while vulnerability advisories stay hard-denied.
+unmaintained = "all"
+unsound = "workspace"
+yanked = "deny"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = true
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

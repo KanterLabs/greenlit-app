@@ -1,0 +1,116 @@
+//! [`Condition`]/[`PlannedCond`]: the plan-time result of partially
+//! evaluating one `if:` expression (job- or step-level).
+//!
+//! Source: design memo §3.3 ("Rust representation") and §3.4 (the stable
+//! `--json` shape). The implicit `success()` gate this crate's callers
+//! (`crate::plan`) attach alongside a [`Condition`] is modeled structurally,
+//! not folded into the expression itself — see
+//! `greenlit_expr::expr_calls_status_function`'s own doc comment, which this
+//! crate's job/step planning consults directly.
+
+use serde::Serialize;
+
+use greenlit_expr::Expr;
+use greenlit_expr::value::is_truthy;
+
+use crate::defer::DeferReason;
+use crate::json_shape::EvaluatedJson;
+use crate::partial_eval::{FoldCtx, Folded, PartialEvalError, fold_expr, pretty_print};
+
+/// One `if:` condition, fully resolved as far as plan time allows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Condition {
+    /// Verbatim authored text, with the `${{ }}` wrapper stripped if the
+    /// whole field was exactly one such wrapper.
+    pub source: String,
+    /// The partial-evaluation result.
+    pub eval: PlannedCond,
+}
+
+/// Either fully decided now, or left as a residual expression for runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedCond {
+    /// Fully decided at plan time. `false` means the node this condition
+    /// belongs to is statically skipped.
+    Static(bool),
+    /// Could not be fully decided; see [`DeferredExpr`].
+    Deferred(DeferredExpr),
+}
+
+/// The residual left after constant-folding a condition or output value as
+/// far as possible (design memo §3.2/§3.3). Shared verbatim between
+/// [`Condition`] and `crate::outputs::PlannedValue` — "one evaluator, four
+/// call sites... do not fork it."
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredExpr {
+    /// The partially-folded AST — static subtrees already collapsed to
+    /// literals.
+    pub residual: Expr,
+    /// Pretty-printed (or, for a template value, textually substituted)
+    /// rendering of `residual`, shown to users.
+    pub residual_text: String,
+    /// Sorted, deduplicated: why this could not be decided now.
+    pub defers_on: Vec<DeferReason>,
+}
+
+impl Serialize for Condition {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match &self.eval {
+            PlannedCond::Static(b) => EvaluatedJson {
+                source: &self.source,
+                evaluation: "static",
+                value: Some(b),
+                residual: None,
+                defers_on: None,
+            }
+            .serialize(serializer),
+            PlannedCond::Deferred(d) => EvaluatedJson::<bool> {
+                source: &self.source,
+                evaluation: "deferred",
+                value: None,
+                residual: Some(&d.residual_text),
+                defers_on: Some(&d.defers_on),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+/// Strips a whole-field `${{ ... }}` wrapper from an `if:` value, if the
+/// entire (trimmed) field is exactly one such wrapper — GitHub allows `if:`
+/// to be written either as a bare expression (`if: github.event_name ==
+/// 'push'`) or fully wrapped (`if: ${{ github.event_name == 'push' }}`);
+/// unlike output values or `env:` entries, an `if:` field is never a
+/// multi-segment template mixing literal text with placeholders (design
+/// memo §1.5; `greenlit-workflow`'s `extract` module documents the same
+/// simplification for its own static scan).
+fn strip_if_wrapper(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    match trimmed
+        .strip_prefix("${{")
+        .and_then(|s| s.strip_suffix("}}"))
+    {
+        Some(inner) => inner.trim(),
+        None => trimmed,
+    }
+}
+
+/// Partially evaluates one `if:` field's raw text into a [`Condition`].
+pub(crate) fn plan_condition(raw: &str, ctx: &FoldCtx<'_>) -> Result<Condition, PartialEvalError> {
+    let source = strip_if_wrapper(raw).to_string();
+    let expr = greenlit_expr::parse(&source)?;
+    let eval = match fold_expr(&expr, ctx)? {
+        // "The final condition value is coerced to bool" (design memo
+        // §3.2) — a fully-static condition always lands as `Static(bool)`.
+        Folded::Value(v) => PlannedCond::Static(is_truthy(&v)),
+        Folded::Residual { expr, defers_on } => PlannedCond::Deferred(DeferredExpr {
+            residual_text: pretty_print(&expr),
+            residual: expr,
+            defers_on: defers_on.into_iter().collect(),
+        }),
+    };
+    Ok(Condition { source, eval })
+}

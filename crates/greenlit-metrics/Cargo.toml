@@ -1,0 +1,23 @@
+[package]
+name = "greenlit-metrics"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Timed spans, counters, local NDJSON run records, and stats rendering."
+
+[dependencies]
+# Span-timing layer: greenlit-metrics opens real `tracing` spans around each
+# pipeline stage so that whatever subscriber greenlit-app installs (verbose
+# logging, future structured export) sees them; this crate itself installs
+# no subscriber and depends on no subscriber implementation.
+tracing = "0.1.44"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"
+
+[dev-dependencies]
+# Used only by tests to build isolated temp-directory metrics stores instead
+# of touching the real `$HOME/.litci/metrics` on the machine running `cargo
+# test`.
+tempfile = "3.27.0"

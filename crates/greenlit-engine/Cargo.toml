@@ -1,0 +1,39 @@
+[package]
+name = "greenlit-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Planner: turns (workflow, event, contexts) into a resolved ExecutionPlan."
+
+[dependencies]
+# The typed workflow model this crate plans against. `version` is pinned
+# alongside `path` (both required together, per this workspace's
+# `deny.toml` `bans.wildcards = "deny"` policy — a path-only dependency
+# with no version requirement is flagged as a "wildcard dependency").
+greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
+# The `${{ }}` parser/evaluator/context model this crate's partial evaluator
+# builds on directly (see `crate::partial_eval`).
+greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
+# Typed errors for every fallible path, per `AGENTS.md` "Errors: thiserror in
+# library crates".
+thiserror = "2.0.19"
+# `ExecutionPlan` and its constituent types derive `Serialize` so
+# `greenlit-app` can produce the stable `litci plan --json` document directly
+# from this crate's types without re-deriving the schema; see the design
+# memo §3.4/§4.4 ("Stable `--json` schema").
+serde = { version = "1.0.229", features = ["derive"] }
+# Order-preserving maps: matrix axis/leg keys, env layers, and job outputs
+# all have declaration-order-significant iteration per the design memo
+# ("Use `IndexMap` ... everywhere order matters") and the determinism
+# contract ("identical input file => byte-identical --json (ordered
+# maps...)"). Built with the `serde` feature so it participates directly in
+# the derives above.
+indexmap = { version = "2.14.0", features = ["serde"] }
+
+[dev-dependencies]
+# Used only by this crate's own tests to inspect the shape of serialized
+# plan documents (individual field values, not a literal stable-surface
+# snapshot — that snapshot's one real home is `crates/greenlit-app/tests/`
+# per `TESTING.md`).
+serde_json = "1.0.151"

@@ -2,5 +2,20 @@
 **/*.rs.bk
 *.pdb
 
+# Python bytecode cache (tools/check-stubs is a plain script, no venv/build step)
+__pycache__/
+*.pyc
+
 # Local Greenlit state
 .litci/
+
+# Ignore markdown scratch/notes files except README and the project's
+# required governance docs (AGENTS.md/spec/TESTING.md/PHASE-*.md/ARCHITECTURE.md
+# are mandated to exist and stay tracked per AGENTS.md).
+*.md
+!README.md
+!AGENTS.md
+!greenlit-v0-spec.md
+!TESTING.md
+!ARCHITECTURE.md
+!PHASE-*.md

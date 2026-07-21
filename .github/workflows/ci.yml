@@ -1,0 +1,72 @@
+name: CI
+
+# TESTING.md "Internal CI" — every PR, in order, fail-fast:
+#   1. cargo fmt --check
+#   2. cargo clippy --all-targets -- -D warnings
+#   3. cargo deny check
+#   4. tools/check-stubs
+#   5. cargo test --workspace
+#   6. cargo doc --workspace --no-deps (warnings denied)
+#   7. criterion benches (record only until Phase 5; no budget gate yet)
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: fmt, clippy, deny, stubs, test, doc, bench
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins channel 1.96.0 plus the rustfmt/clippy
+      # components; `rustup show` is enough to make the runner's existing
+      # rustup notice the file and provision exactly that toolchain.
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # 1. cargo fmt --check
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # 2. cargo clippy --all-targets -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # 3. cargo deny check
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+
+      - name: Dependency policy (licenses, advisories, bans, sources)
+        # -W unmaintained: see ARCHITECTURE.md known-issues log — this
+        # cargo-deny release treats `unmaintained`/`unsound` as always-deny
+        # Scope selectors rather than a configurable lint level, so the
+        # "unmaintained warns, doesn't block" policy from deny.toml's intent
+        # is applied here via the CLI lint-level override instead.
+        run: cargo deny check -W unmaintained
+
+      # 4. tools/check-stubs
+      - name: Stub registry consistency
+        run: python3 tools/check-stubs
+
+      # 5. cargo test --workspace (oracle + integration + invariant)
+      - name: Test
+        run: cargo test --workspace
+
+      # 6. RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - name: Docs (warnings denied)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+
+      # 7. Criterion benches — record baselines only until Phase 5's budget
+      # gate exists (AGENTS.md Metrics, PHASE-1-engine-core.md).
+      - name: Criterion benchmarks (record only)
+        run: cargo bench --workspace
