@@ -110,7 +110,10 @@ fn documented_operators_property_and_index_access() {
 fn documented_context_roots_and_missing_property_value() {
     // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#about-contexts
     let context = Context::new(Rc::new(NoFiles::new("/workspace")))
-        .with_github(Value::object(vec![("G".into(), Value::String("g".into()))]))
+        .with_github(Value::object(vec![
+            ("G".into(), Value::String("g".into())),
+            ("ÁCCENT".into(), Value::String("unicode-key".into())),
+        ]))
         .with_env(Value::object(vec![("E".into(), Value::String("e".into()))]))
         .with_vars(Value::object(vec![("V".into(), Value::String("v".into()))]))
         .with_secrets(Value::object(vec![("S".into(), Value::String("s".into()))]))
@@ -123,6 +126,7 @@ fn documented_context_roots_and_missing_property_value() {
         .with_inputs(Value::object(vec![("I".into(), Value::String("i".into()))]));
     let rows = [
         ("github.g", Value::String("g".into())),
+        ("github['áccent']", Value::String("unicode-key".into())),
         ("env.E", Value::String("e".into())),
         ("vars.V", Value::String("v".into())),
         ("secrets.S", Value::String("s".into())),
@@ -220,6 +224,11 @@ fn documented_loose_equality_and_relational_coercion() {
         ("'not a number' > 1", false),
         ("'not a number' >= 1", false),
         ("'Alpha' == 'alpha'", true),
+        ("'á' == 'Á'", true),
+        ("'á' == 'à'", false),
+        ("'ı' == 'I'", false),
+        ("'ß' == 'SS'", false),
+        ("'à' < 'Á'", true),
         ("'ALPHA' < 'beta'", true),
         ("'BETA' > 'alpha'", true),
         ("'ALPHA' <= 'alpha'", true),
@@ -285,6 +294,7 @@ fn documented_builtin_function_examples_and_rules() {
             "contains('Hello world', 'llo')".to_string(),
             Value::Bool(true),
         ),
+        ("contains('café', 'FÉ')".to_string(), Value::Bool(true)),
         (
             "contains(github.event.issue.labels.*.name, 'bug')".to_string(),
             Value::Bool(true),
@@ -301,10 +311,12 @@ fn documented_builtin_function_examples_and_rules() {
             "startsWith('Hello world', 'he')".to_string(),
             Value::Bool(true),
         ),
+        ("startsWith('Árvore', 'ár')".to_string(), Value::Bool(true)),
         (
             "endsWith('Hello world', 'LD')".to_string(),
             Value::Bool(true),
         ),
+        ("endsWith('CAFÉ', 'fé')".to_string(), Value::Bool(true)),
         (
             "format('Hello {0} {1} {2}', 'Mona', 'the', 'Octocat')".to_string(),
             Value::String("Hello Mona the Octocat".into()),
