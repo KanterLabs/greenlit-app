@@ -1,7 +1,8 @@
 //! Oracle table: `strategy:` / `strategy.matrix:`, including `include`,
 //! `exclude`, `fail-fast`, `max-parallel`, and the whole-value
 //! `${{ fromJSON(...) }}` expression form (`PHASE-1-engine-core.md`
-//! greenlit-workflow section; design memo §5.2 "matrix" row).
+//! greenlit-workflow section; GitHub's
+//! [matrix documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations)).
 
 use greenlit_workflow::model::job::MatrixSource;
 use greenlit_workflow::model::value::{ScalarOrExpr, YamlScalar, YamlValue};
@@ -31,8 +32,7 @@ fn matrix_axes_include_exclude() {
     assert_eq!(matrix.axes[0].0.value, "os");
     assert_eq!(matrix.axes[1].0.value, "node");
     // Matrix axis values keep their YAML type: `node: [18, 20]` are
-    // numbers, not strings (design memo §5.2's docs-vs-reality note on
-    // `matrix.<prop>` typing).
+    // numbers, not strings, matching GitHub's typed matrix examples.
     assert_eq!(
         matrix.axes[1].1[0].value,
         YamlValue::Scalar(ScalarOrExpr::Literal(YamlScalar::Number(18.0)))

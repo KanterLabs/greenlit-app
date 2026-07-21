@@ -1,6 +1,6 @@
-//! Oracle table: YAML-document-level rules (design memo §6.1/§6.3) —
-//! duplicate mapping keys, merge keys (`<<`), anchors/aliases, one
-//! document per file, and the unknown-key policy.
+//! Oracle table: GitHub workflow YAML document rules — duplicate mapping
+//! keys, merge keys (`<<`), anchors/aliases, one document per file, and the
+//! unknown-key policy.
 
 use greenlit_workflow::{ParseError, parse_workflow};
 
@@ -34,7 +34,9 @@ fn duplicate_mapping_keys_are_rejected() {
 #[test]
 fn merge_keys_are_not_supported_and_surface_as_unknown_key() {
     // GitHub treats `<<` as an ordinary (and therefore unrecognized) key
-    // rather than performing a YAML-1.1 merge (design memo §6.1).
+    // rather than performing a YAML-1.1 merge; its template reader consumes
+    // decoded mapping keys without applying merge semantics:
+    // https://github.com/actions/runner/blob/main/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateReader.cs
     let source = format!(
         "{HEADER}jobs:\n  build:\n    runs-on: ubuntu-latest\n    <<: {{}}\n    steps:\n      - run: echo hi\n"
     );

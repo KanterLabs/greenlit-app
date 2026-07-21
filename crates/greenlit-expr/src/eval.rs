@@ -1,8 +1,9 @@
 //! The evaluator: walks an [`Expr`] tree against a [`Context`], producing a
 //! [`Value`].
 //!
-//! Every rule implemented here cites the specific design-memo section (in
-//! turn cited to GitHub's docs or `actions/runner` source) it reproduces.
+//! GitHub's public expression contract is documented at
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions>;
+//! implementation-only behavior is cited directly to `actions/runner`.
 //! `evaluate` is defensive against a *hand-built* [`Expr`] (not only one
 //! produced by [`crate::parse`]) — see the [`crate::error::EvalError`]
 //! module doc comment for why re-checking function/named-value validity
@@ -30,8 +31,8 @@ pub fn evaluate(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
             .ok_or_else(|| EvalError::UnrecognizedNamedValue(name.clone())),
         Expr::Not(inner) => {
             let v = evaluate(inner, ctx)?;
-            // "`!` returns a genuine Boolean: `!x` => IsFalsy(x)" (design
-            // memo §1.2).
+            // `!` returns a genuine Boolean by applying the runner's
+            // falsy conversion.
             Ok(Value::Bool(is_falsy(&v)))
         }
         Expr::Binary { op, lhs, rhs } => eval_binary(*op, lhs, rhs, ctx),
@@ -60,8 +61,8 @@ pub fn evaluate(expr: &Expr, ctx: &Context) -> Result<Value, EvalError> {
 
 /// `&&`/`||` short-circuit and return an operand's *value* (not coerced to
 /// boolean); relational/equality operators always produce a genuine
-/// `Boolean`. Design memo §1.2 ("Semantics of the logical operators") and
-/// §2.5/§2.6.
+/// `Boolean`. See GitHub's expression operators documentation:
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#operators>.
 fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, ctx: &Context) -> Result<Value, EvalError> {
     match op {
         BinOp::And => {
@@ -118,8 +119,8 @@ fn eval_binary(op: BinOp, lhs: &Expr, rhs: &Expr, ctx: &Context) -> Result<Value
     }
 }
 
-/// `target[index]` / `target.property` — design memo §1.4, "nothing here
-/// ever throws".
+/// `target[index]` / `target.property`, following the runner's
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Operators/Index.cs>.
 fn index_into(target: &Value, index: &Value) -> Option<Value> {
     match target {
         // "Target is not a collection (null or primitive): result is Null."
@@ -173,7 +174,7 @@ fn index_into_plain_array(arr: &ArrayValue, index: &Value) -> Option<Value> {
     arr.items().get(floored as usize).cloned()
 }
 
-/// Indexing a *filtered* array (design memo §1.4): "for each item that is
+/// Indexing a *filtered* array follows `Index.cs`: for each item that is
 /// an object and has the key (case-insensitive), append its value; items
 /// lacking the key are silently skipped; non-object items skipped" for a
 /// string-shaped index, and "for each item that is an array with that
@@ -218,7 +219,8 @@ fn index_into_filtered(arr: &ArrayValue, index: &Value) -> Value {
     Value::filtered_array(out)
 }
 
-/// `target.*` / `target[*]` — design memo §1.4.
+/// `target.*` / `target[*]`, the object-filter syntax documented at
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#object-filters>.
 fn wildcard_filter(target: &Value) -> Value {
     match target {
         // "Filtered arrays ... `.*`: flatten one level — for each item
@@ -334,8 +336,8 @@ fn eval_call(name: &str, args: &[Expr], ctx: &Context) -> Result<Value, EvalErro
             Ok(functions::hash_files::hash_files(&strs, ctx.fs())?)
         }
         "case" => eval_case(args, ctx),
-        // Status functions (design memo §4): evaluated against the
-        // injected `RunStatus`, never erroring.
+        // Status functions are evaluated against the injected `RunStatus`,
+        // matching GitHub's documented status-check functions.
         "success" => Ok(Value::Bool(
             ctx.status() == crate::context::RunStatus::Success,
         )),

@@ -29,7 +29,7 @@ pub(super) fn compile_patterns(
     for raw_line in joined.lines() {
         let line = raw_line.trim();
         // Pattern list: blank lines and `#`-prefixed comment lines are
-        // skipped (design memo §3.8).
+        // skipped, matching `@actions/glob` pattern parsing.
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -68,8 +68,8 @@ pub(super) fn compile_patterns(
 /// Splits a recognized leading `.`/`./`/`~`/`~/` rooting prefix off `pattern`,
 /// or leaves it untouched (workspace-relative) otherwise.
 ///
-/// Source: design memo §3.8 ("Rooting"). The leading-`/` case is a
-/// deliberate, documented departure from the *implementation's* literal
+/// The leading-`/` case is a deliberate, documented departure from the
+/// toolkit implementation's literal
 /// behavior (filesystem-absolute) in favor of the *docs'* description
 /// ("root level" of the repo) — see the inline comment on that arm.
 fn strip_root_prefix(pattern: &str) -> (RootKind, String) {
@@ -97,8 +97,9 @@ fn strip_root_prefix(pattern: &str) -> (RootKind, String) {
 }
 
 /// Rejects `.`/`..` path segments anywhere in `stripped` (the pattern with
-/// its recognized rooting prefix already removed) — design memo §3.8: `.`
-/// mid-pattern and `..` anywhere are errors.
+/// its recognized rooting prefix already removed), matching the runner's
+/// `hashFiles` validation in
+/// <https://github.com/actions/runner/blob/main/src/Runner.Worker/Expressions/HashFilesFunction.cs>.
 fn validate_no_dot_segments(stripped: &str, original: &str) -> Result<(), HashFilesError> {
     for segment in stripped.split('/') {
         if segment == "." || segment == ".." {

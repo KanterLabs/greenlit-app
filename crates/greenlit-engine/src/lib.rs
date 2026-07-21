@@ -9,9 +9,8 @@
 //! statically-evaluable `if` conditions ([`condition`]) and job outputs
 //! ([`outputs`]) partially evaluated without inventing values, and
 //! supported-runner validation ([`runner`]). See `PHASE-1-engine-core.md`
-//! for the full task list this crate implements, and the design memo
-//! embedded in that phase's handover for the exact algorithms each module
-//! transcribes.
+//! for the full task list this crate implements; individual modules cite
+//! GitHub documentation or runner source for parity-sensitive behavior.
 //!
 //! # Entry points for other crates
 //!
@@ -23,7 +22,7 @@
 //! - [`ExecutionPlan`] derives [`serde::Serialize`] (as do all of its
 //!   constituent types), so `litci plan --json` is just
 //!   `serde_json::to_writer(stdout, &plan)` — see each type's doc comment
-//!   for the exact stable JSON shape (design memo §3.4/§4.4).
+//!   for the exact stable JSON shape required by `PHASE-1-engine-core.md`.
 //!
 //! # A note on `unsafe`
 //!

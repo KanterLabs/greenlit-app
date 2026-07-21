@@ -1,10 +1,9 @@
 //! [`Lint`]: a plan-time warning that never blocks planning — as opposed to
 //! a [`crate::plan::PlanError`], which does.
 //!
-//! Every case here is named explicitly by the design memo as a "lint
-//! warning" rather than a hard error, because GitHub itself accepts the
-//! workflow and behaves in a specific (if sometimes surprising) documented
-//! way: a dead `exclude` entry (§1.2), a `needs.<job>.outputs.<name>`
+//! Every case here is a warning rather than a hard error because GitHub
+//! accepts the workflow and behaves in a specific (if sometimes surprising)
+//! documented way: a dead `exclude` entry, a `needs.<job>.outputs.<name>`
 //! reference to an output job `<job>` never declares (§4.3 — "GitHub
 //! silently yields the empty string here, so hard-failing would reject
 //! workflows GitHub accepts"), a matrix job's outputs being read by a
@@ -39,9 +38,8 @@ pub enum LintKind {
     /// A matrix job's declared outputs are read by a dependent — the last
     /// leg to write wins, a well-known GHA limitation.
     MatrixOutputsCollision,
-    /// The same job id appeared more than once in one `needs:` list
-    /// (design memo §2.1: "duplicate entries in one `needs` list (lint
-    /// warning, deduplicate)").
+    /// The same job id appeared more than once in one `needs:` list. The
+    /// planner deduplicates the edge and emits this non-blocking diagnostic.
     DuplicateNeeds,
 }
 

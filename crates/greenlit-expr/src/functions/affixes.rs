@@ -1,4 +1,5 @@
-//! `startsWith(s, prefix)` / `endsWith(s, suffix)` — design memo §3.2.
+//! `startsWith(s, prefix)` / `endsWith(s, suffix)` as documented at
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#startswith>.
 
 use crate::value::{
     Value, ordinal_ignore_case_ends_with, ordinal_ignore_case_starts_with, to_display_string,

@@ -92,7 +92,8 @@ pub struct Strategy {
 
 /// `strategy.matrix:` — either an inline matrix definition, or a single
 /// whole-value expression (the documented `strategy.matrix: ${{ fromJSON(...) }}`
-/// pattern — design memo §5.2 "matrix" row).
+/// pattern in GitHub's matrix documentation:
+/// <https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations#using-an-output-to-define-two-matrices>).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatrixSource {
     /// A literal `strategy.matrix:` mapping.

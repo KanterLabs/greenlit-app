@@ -1,8 +1,10 @@
 //! The six-kind runtime value model and GitHub's exact coercion rules.
 //!
-//! Source for the kind set and every coercion below: the design memo's
-//! "Type model and coercions" section (`Sdk/EvaluationResult.cs`,
-//! `Sdk/ExpressionUtility.cs`), cross-referenced against the docs'
+//! The kind set and coercions follow the Actions runner's
+//! [`EvaluationResult.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/EvaluationResult.cs)
+//! and
+//! [`ExpressionUtility.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/ExpressionUtility.cs),
+//! cross-referenced against GitHub's
 //! [Expressions reference](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions).
 
 use std::rc::Rc;
@@ -17,9 +19,8 @@ pub use comparison::{
     ordinal_ignore_case_eq, ordinal_ignore_case_starts_with,
 };
 
-/// A GitHub Actions expression value. There are exactly six kinds
-/// (`ValueKind` in the design memo, all numeric host types canonicalize to
-/// [`Value::Number`] as `f64`).
+/// A GitHub Actions expression value. There are exactly six runner value
+/// kinds; all numeric host types canonicalize to [`Value::Number`] as `f64`.
 ///
 /// `Array`/`Object` hold an `Rc` so that `==`/`!=` can implement GitHub's
 /// documented "same instance" reference-identity rule for collections (see
@@ -105,8 +106,9 @@ impl Value {
     }
 }
 
-/// An array value. See the design memo's "Index / dereference evaluation"
-/// section for why filtered arrays are a distinct internal flavor: indexing
+/// An array value. The runner's
+/// [`Index.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Operators/Index.cs)
+/// makes filtered arrays a distinct internal flavor: indexing
 /// a *filtered* array by string key maps the lookup over each element
 /// (silently skipping elements that don't have it), whereas indexing an
 /// *ordinary* array by string key converts the key with `ToNumber` (almost

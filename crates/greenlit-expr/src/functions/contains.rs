@@ -1,9 +1,11 @@
-//! `contains(search, item)` — design memo §3.1.
+//! `contains(search, item)` as documented at
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#contains>.
 
 use crate::value::{Value, abstract_equal, ordinal_ignore_case_contains, to_display_string};
 
-/// Never errors, per the design memo: "If `search` is an Object -> `false`
-/// (keys/values are never searched)."
+/// Never errors. Object search returns `false` (keys and values are not
+/// searched), matching the runner's
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/Contains.cs>.
 pub(crate) fn contains(search: &Value, item: &Value) -> Value {
     match search {
         // "If `search` is an Array (including filtered arrays): returns

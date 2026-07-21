@@ -1,8 +1,8 @@
 //! [`Condition`]/[`PlannedCond`]: the plan-time result of partially
 //! evaluating one `if:` expression (job- or step-level).
 //!
-//! Source: design memo §3.3 ("Rust representation") and §3.4 (the stable
-//! `--json` shape). The implicit `success()` gate this crate's callers
+//! This implements `PHASE-1-engine-core.md`'s static/deferred condition
+//! planning and stable `--json` contract. The implicit `success()` gate this crate's callers
 //! (`crate::plan`) attach alongside a [`Condition`] is modeled structurally,
 //! not folded into the expression itself — see
 //! `greenlit_expr::expr_calls_status_function`'s own doc comment, which this
@@ -38,9 +38,9 @@ pub enum PlannedCond {
 }
 
 /// The residual left after constant-folding a condition or output value as
-/// far as possible (design memo §3.2/§3.3). Shared verbatim between
-/// [`Condition`] and `crate::outputs::PlannedValue` — "one evaluator, four
-/// call sites... do not fork it."
+/// far as possible. Shared verbatim between [`Condition`] and
+/// `crate::outputs::PlannedValue` so all planned expressions use one
+/// evaluator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeferredExpr {
     /// The partially-folded AST — static subtrees already collapsed to
@@ -84,9 +84,9 @@ impl Serialize for Condition {
 /// to be written either as a bare expression (`if: github.event_name ==
 /// 'push'`) or fully wrapped (`if: ${{ github.event_name == 'push' }}`);
 /// unlike output values or `env:` entries, an `if:` field is never a
-/// multi-segment template mixing literal text with placeholders (design
-/// memo §1.5; `greenlit-workflow`'s `extract` module documents the same
-/// simplification for its own static scan).
+/// multi-segment template mixing literal text with placeholders. GitHub
+/// documents the optional wrapper at
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idif>.
 fn strip_if_wrapper(raw: &str) -> &str {
     let trimmed = raw.trim();
     match trimmed
@@ -103,8 +103,8 @@ pub(crate) fn plan_condition(raw: &str, ctx: &FoldCtx<'_>) -> Result<Condition, 
     let source = strip_if_wrapper(raw).to_string();
     let expr = greenlit_expr::parse(&source)?;
     let eval = match fold_expr(&expr, ctx)? {
-        // "The final condition value is coerced to bool" (design memo
-        // §3.2) — a fully-static condition always lands as `Static(bool)`.
+        // GitHub conditionals use expression truthiness, so a fully-static
+        // condition always lands as `Static(bool)`.
         Folded::Value(v) => PlannedCond::Static(is_truthy(&v)),
         Folded::Residual { expr, defers_on } => PlannedCond::Deferred(DeferredExpr {
             residual_text: pretty_print(&expr),

@@ -1,4 +1,5 @@
-//! `join(array, sep?)` — design memo §3.4.
+//! `join(array, sep?)` as documented at
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#join>.
 //!
 //! The "separator is only evaluated if the array has ≥2 elements" laziness
 //! rule is enforced by the caller (`eval::evaluate`'s `Call` dispatch, which

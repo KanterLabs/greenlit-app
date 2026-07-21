@@ -13,9 +13,11 @@ pub use crate::yaml::scalar::YamlScalar;
 ///
 /// Evaluating the `Expression` case — including the template-layer rule
 /// that a scalar consisting of *exactly one* `${{ … }}` placeholder
-/// preserves the expression's own type instead of stringifying it (design
-/// memo §1.5) — is `greenlit-expr`/`greenlit-engine`'s job, not this
+/// preserves the expression's own type instead of stringifying it — is
+/// `greenlit-expr`/`greenlit-engine`'s job, not this
 /// crate's; `greenlit-workflow` only classifies and preserves.
+/// GitHub documents expression literals and their native types at
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#literals>.
 ///
 /// Classification is intentionally a simple substring check for `${{`.
 /// The parser then performs quote-aware wrapper segmentation, parses every

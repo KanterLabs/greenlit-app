@@ -77,9 +77,10 @@ pub enum ParseError {
         expected: &'static str,
     },
     /// A token appeared where the grammar did not allow it — this is also
-    /// how the "deref/index never follows a bare literal" and "`*` only
-    /// after `[` or `.`" adjacency rules surface (see the design memo's
-    /// lexical-structure section): the recursive-descent grammar shape
+    /// how the runner's "deref/index never follows a bare literal" and
+    /// "`*` only after `[` or `.`" adjacency rules surface (see
+    /// [`LexicalAnalyzer.cs`](https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Tokens/LexicalAnalyzer.cs)):
+    /// the recursive-descent grammar shape
     /// itself rejects these positions, so no separate adjacency-table
     /// validator is needed.
     #[error("unexpected token {found:?}, expected {expected}")]

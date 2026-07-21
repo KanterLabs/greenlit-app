@@ -1,10 +1,11 @@
-//! Oracle table: GitHub's YAML scalar-typing rules (design memo §6.1,
-//! transcribing `actions/runner`'s `YamlObjectReader.cs`
-//! `MatchNull`/`MatchBoolean`/`MatchInteger`/`MatchFloat`), driven through
+//! Oracle table: GitHub's YAML scalar-typing rules, transcribing the Actions
+//! runner's `YamlObjectReader.cs`
+//! `MatchNull`/`MatchBoolean`/`MatchInteger`/`MatchFloat`, driven through
 //! the crate's real public API (`parse_workflow`) rather than the
 //! `pub(crate)`-only matcher function directly — see
 //! `src/yaml/scalar.rs`'s note on why. One row per documented spelling plus
-//! the documented negative cases.
+//! the documented negative cases. Source:
+//! <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
 
 use greenlit_workflow::model::value::{ScalarOrExpr, YamlScalar};
 use greenlit_workflow::{ParseError, parse_workflow};

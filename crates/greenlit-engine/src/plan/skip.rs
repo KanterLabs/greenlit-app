@@ -1,4 +1,4 @@
-//! Static-skip propagation (design memo §3.3): once every [`super::JobPlan`]
+//! Static-skip propagation: once every [`super::JobPlan`]
 //! exists, decide each job's (and matrix leg's) [`super::StaticSkip`],
 //! processed over the `needs` graph's topological order so a dependency's
 //! "fully skipped" status is always known before its dependents are

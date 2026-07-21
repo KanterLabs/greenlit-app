@@ -7,9 +7,45 @@ use greenlit_workflow::model::job::RunsOn;
 use greenlit_workflow::model::step::StepAction;
 use greenlit_workflow::model::value::ScalarOrExpr;
 use greenlit_workflow::model::workflow::{PermissionLevel, PermissionLevelAll, Permissions};
-use greenlit_workflow::{ParseError, parse_workflow};
+use greenlit_workflow::{ParseError, extract_static, parse_workflow};
 
 const HEADER: &str = "on: push\n";
+
+#[test]
+fn static_extraction_reports_the_complete_preflight_inventory() {
+    let source = format!(
+        "{HEADER}jobs:\n  build:\n    runs-on: ubuntu-latest\n    env:\n      TOKEN: ${{{{ secrets.API_TOKEN }}}}\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          region: ${{{{ vars.REGION }}}}\n      - run: echo ${{{{ secrets['DB_PASSWORD'] }}}} ${{{{ vars['DEPLOY_ENV'] }}}} ${{{{ vars[matrix.key] }}}}\n  package:\n    runs-on: [self-hosted, linux]\n    steps:\n      - uses: actions/setup-node@v4\n"
+    );
+    let workflow = parse_workflow("inventory.yml", &source).expect("parses");
+    let extraction = extract_static(&workflow).expect("valid expressions extract");
+
+    let secret_names: Vec<&str> = extraction.secrets.keys().map(String::as_str).collect();
+    assert_eq!(secret_names, ["API_TOKEN", "DB_PASSWORD"]);
+    let variable_names: Vec<&str> = extraction.vars.keys().map(String::as_str).collect();
+    assert_eq!(variable_names, ["DEPLOY_ENV", "REGION"]);
+    assert!(extraction.has_dynamic_vars_lookup);
+    assert_eq!(extraction.dynamic_vars.len(), 1);
+
+    let uses: Vec<&str> = extraction
+        .uses
+        .iter()
+        .map(|reference| reference.value.as_str())
+        .collect();
+    assert_eq!(uses, ["actions/checkout@v4", "actions/setup-node@v4"]);
+    let runner_labels: Vec<&str> = extraction
+        .runs_on
+        .iter()
+        .map(|label| label.value.as_str())
+        .collect();
+    assert_eq!(runner_labels, ["ubuntu-latest", "self-hosted", "linux"]);
+
+    let literal_only = format!(
+        "{HEADER}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{{{ vars.REGION }}}}\n"
+    );
+    let workflow = parse_workflow("literal-only.yml", &literal_only).expect("parses");
+    let extraction = extract_static(&workflow).expect("valid expressions extract");
+    assert!(!extraction.has_dynamic_vars_lookup);
+}
 
 #[test]
 fn runs_on_single_label() {

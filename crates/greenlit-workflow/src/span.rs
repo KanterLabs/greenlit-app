@@ -1,25 +1,26 @@
 //! Source-location types preserved on every node of the typed workflow
 //! model, so later phases (the CLI, `greenlit-engine`) can render errors as
-//! `file:line:col — message — fix` (see `AGENTS.md` "greenlit-app (CLI
-//! skeleton)").
+//! `file:line:col — message — fix` (see `PHASE-1-engine-core.md`,
+//! "greenlit-app (CLI skeleton)").
 
 use std::fmt;
 use std::sync::Arc;
 
 /// A 1-based line/column position within a workflow source file.
 ///
-/// Both fields are 1-based to match GitHub's own error message convention
-/// (design memo §6.1: `The value 'x' on line 5 and column 3 is invalid for
-/// the type 'integer'`, from `YamlObjectReader.cs`). The underlying YAML
+/// Both fields are 1-based to match the source-location diagnostics emitted
+/// by GitHub's workflow YAML reader:
+/// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
+/// The underlying YAML
 /// parser (`saphyr-parser`) reports a 1-based line but a **0-based** column
 /// internally — its own doc comment claims "1-indexed" for both, but the
 /// scanner initializes `col` to `0` and the crate's own `ScanError` display
 /// impl adds one before printing (see
 /// `saphyr-parser-0.0.11/src/scanner.rs` `Marker`/`ScanError`) — so every
 /// [`Location`] built from a `saphyr_parser::Marker` in this crate adds one
-/// to the raw column. This normalization lives in exactly one place
-/// (`crate::yaml::raw::location_from_marker`) per the design memo's
-/// mitigation guidance for saphyr's pre-1.0 API.
+/// to the raw column. This normalization lives in exactly one place,
+/// `crate::yaml::raw::location_from_marker`, to isolate the dependency's
+/// pre-1.0 coordinate convention.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Location {
     /// 1-based line number.

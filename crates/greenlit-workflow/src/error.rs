@@ -92,8 +92,9 @@ pub enum ParseError {
 
     /// An explicit YAML tag other than the four honored core-schema scalar
     /// tags (`!!str`, `!!bool`, `!!int`, `!!float`, `!!null`) or the two
-    /// honored (no-op) collection tags (`!!seq`, `!!map`). Design memo §6.1:
-    /// "unknown tags error".
+    /// honored (no-op) collection tags (`!!seq`, `!!map`). This follows the
+    /// runner's workflow YAML reader:
+    /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
     #[error("{span}: unsupported YAML tag '{tag}'")]
     UnsupportedTag {
         /// Where the tag appears.
@@ -114,9 +115,9 @@ pub enum ParseError {
         tag_name: &'static str,
     },
 
-    /// A hex/octal integer literal's magnitude does not fit in `i32`
-    /// (design memo §6.1: "i32 for hex/octal … overflow = error, not
-    /// string").
+    /// A hex/octal integer literal's magnitude does not fit in the runner's
+    /// signed 32-bit representation. See `MatchInteger` in
+    /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
     #[error("{span}: integer literal '{raw}' is out of i32 range")]
     IntegerOverflow {
         /// Where the literal appears.
@@ -125,10 +126,10 @@ pub enum ParseError {
         raw: String,
     },
 
-    /// The same mapping key appeared twice. GitHub's template reader
-    /// rejects duplicate mapping keys outright (design memo §6.1); see
-    /// `yaml::raw`'s module docs for the exact duplicate-detection rule
-    /// this crate implements.
+    /// The same mapping key appeared twice. GitHub's template reader rejects
+    /// duplicate mapping keys outright; see `TemplateReader`'s key set in
+    /// <https://github.com/actions/runner/blob/main/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateReader.cs>
+    /// and `yaml::raw`'s module docs for the exact rule implemented here.
     #[error("{span}: duplicate mapping key '{key}' (first seen at {first_span})")]
     DuplicateKey {
         /// The second (rejected) occurrence.
