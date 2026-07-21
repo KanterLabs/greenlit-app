@@ -70,6 +70,22 @@ jobs:
           - axis: missing
     steps:
       - run: echo never
+  supported_label_list:
+    runs-on: [ubuntu-latest]
+    steps:
+      - run: echo supported
+  runner_source:
+    runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.select.outputs.label }}
+    steps:
+      - id: select
+        run: echo "label=ubuntu-22.04" >> "$GITHUB_OUTPUT"
+  deferred_runner:
+    needs: runner_source
+    runs-on: ${{ needs.runner_source.outputs.label }}
+    steps:
+      - run: echo deferred runner
   pr_shape:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' || (github.event.pull_request.number == 1 && github.base_ref == 'main' && github.head_ref == 'main')
@@ -281,6 +297,28 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
     assert_eq!(zero["legs"], serde_json::json!([]));
     assert!(zero["runner"].is_null());
 
+    let static_runner = &job(&plan, "supported_label_list")["runner"];
+    assert_eq!(static_runner["source"], "ubuntu-latest");
+    assert_eq!(static_runner["evaluation"], "static");
+    assert_eq!(static_runner["value"], "ubuntu-24.04");
+    assert_eq!(static_runner["span"], "contracts.yml:65:15");
+
+    let deferred_runner = &job(&plan, "deferred_runner")["runner"];
+    assert_eq!(
+        deferred_runner,
+        &serde_json::json!({
+            "span": "contracts.yml:77:14",
+            "source": "${{ needs.runner_source.outputs.label }}",
+            "evaluation": "deferred",
+            "residual": "needs.runner_source.outputs.label",
+            "defers_on": [{
+                "kind": "needs-output",
+                "job": "runner_source",
+                "output": "label"
+            }]
+        })
+    );
+
     let lint_kinds = plan["lints"]
         .as_array()
         .expect("lint array")
@@ -300,6 +338,28 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
         "{stderr}"
     );
     assert!(stderr.contains("stage timings (plan):"), "{stderr}");
+
+    let human = sandbox.run(&[
+        "plan",
+        "-W",
+        "contracts.yml",
+        "-e",
+        "workflow_dispatch",
+        "--input",
+        "required_text=hello",
+        "--input",
+        "enabled=true",
+        "--input",
+        "count=2.5",
+        "--input",
+        "mode=fast",
+    ]);
+    assert!(human.status.success());
+    assert!(
+        support::stdout_text(&human).contains(
+            "runner: deferred <- needs.runner_source.outputs.label (defers on: needs.runner_source.outputs.label)"
+        )
+    );
 }
 
 #[test]

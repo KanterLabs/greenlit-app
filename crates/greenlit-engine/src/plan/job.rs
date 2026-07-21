@@ -3,27 +3,29 @@
 //! `outputs:`, and every step independently for each concrete instance,
 //! and validates `needs.*` references.
 
-use greenlit_expr::value::to_display_string;
-use greenlit_expr::{Expr, Value};
+use greenlit_expr::Value;
 use greenlit_workflow::model::job::Job;
 use greenlit_workflow::model::value::ScalarOrExpr;
 use greenlit_workflow::model::workflow::Workflow;
 
-use crate::condition::{Condition, plan_condition};
-use crate::defer::DeferReason;
 use crate::event::SyntheticEvent;
 use crate::graph::{JobGraph, JobId};
 use crate::lints::Lint;
-use crate::matrix::{MatrixLeg, MatrixValue, plan_strategy};
+use crate::matrix::{MatrixLeg, plan_strategy};
 use crate::outputs::JobOutputsPlan;
 use crate::partial_eval::{
-    EnvChain, FoldCtx, PartialEvalError, StaticRoots, TemplateFold, build_env_chain, fold_template,
+    EnvChain, FoldCtx, LocatedEvalError, PartialEvalError, StaticRoots, build_env_chain,
 };
-use crate::pass_through::{container_plan_from, env_layer_to_map};
-use crate::runner::{RunnerImage, resolve_runs_on};
+use crate::pass_through::{plan_container, plan_env_layer};
+use crate::planned::{Planned, plan_scalar_string, plan_template_string};
+use crate::runner::{RunnerPlan, resolve_runs_on};
 
+use super::conditions::{expr_calls_status, fold_job_condition};
+use super::contexts::{matrix_leg_value, strategy_context_value};
+use super::error::{eval_err, located_eval_err};
+use super::references::{ReferencingJob, lint_needs_output_references};
 use super::step::plan_step;
-use super::{JobPlan, LegPlan, PlanError, PlanOptions, StepPlan};
+use super::{JobPlan, LegPlan, PlanError, PlanOptions, RunDefaultsPlan, StepPlan};
 
 pub(crate) fn plan_job(
     workflow: &Workflow,
@@ -47,7 +49,11 @@ pub(crate) fn plan_job(
     let static_roots = StaticRoots {
         github: &event.github,
         vars: &options.vars,
+        needs: None,
         matrix: &roots_null,
+        matrix_deferred: false,
+        strategy: &roots_null,
+        strategy_deferred: false,
         inputs: &event.inputs,
     };
 
@@ -88,81 +94,84 @@ pub(crate) fn plan_job(
     })?;
     lints.append(&mut strategy_lints);
 
-    let raw_outputs: Vec<(String, String)> = job
+    let raw_outputs: Vec<(String, String, greenlit_workflow::Span)> = job
         .outputs
         .iter()
-        .map(|(k, v)| (k.value.clone(), v.value.clone()))
+        .map(|(k, v)| (k.value.clone(), v.value.clone(), v.span.clone()))
         .collect();
 
     // The matrix context changes for every generated job. Accordingly,
     // every context-sensitive field below is planned independently for
     // each leg: runner, display name, outputs, and the complete step list.
     // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#matrix-context
-    let (runner, name, outputs, steps, legs) = if strategy.is_matrix {
-        let mut legs = Vec::with_capacity(strategy.legs.len());
-        for leg in &strategy.legs {
-            let leg_matrix = matrix_leg_value(leg);
-            let leg_roots = StaticRoots {
-                matrix: &leg_matrix,
-                ..static_roots
+    let (runner, name, container, services, env, defaults, outputs, steps, legs) =
+        if strategy.is_matrix {
+            let mut legs = Vec::with_capacity(strategy.legs.len());
+            for leg in &strategy.legs {
+                let leg_matrix = matrix_leg_value(leg);
+                let leg_strategy = strategy_context_value(&strategy, leg.index);
+                let leg_roots = StaticRoots {
+                    matrix: &leg_matrix,
+                    strategy: &leg_strategy,
+                    ..static_roots
+                };
+                let instance = plan_instance(workflow, job, &job_id, leg_roots, &raw_outputs, leg)?;
+                legs.push(LegPlan {
+                    name: instance.name,
+                    runner: instance.runner,
+                    container: instance.container,
+                    services: instance.services,
+                    env: instance.env,
+                    defaults: instance.defaults,
+                    condition: condition.clone(),
+                    skip: None,
+                    outputs: instance.outputs,
+                    steps: instance.steps,
+                });
+            }
+            (
+                None,
+                Planned::static_value(
+                    job.id.span.clone(),
+                    job.id.value.clone(),
+                    job.id.value.clone(),
+                ),
+                None,
+                indexmap::IndexMap::new(),
+                indexmap::IndexMap::new(),
+                RunDefaultsPlan::default(),
+                JobOutputsPlan::default(),
+                Vec::new(),
+                legs,
+            )
+        } else {
+            let implicit_leg = MatrixLeg {
+                index: 0,
+                values: indexmap::IndexMap::new(),
+                origin: crate::matrix::LegOrigin::Product,
             };
-            let instance = plan_instance(workflow, job, &job_id, leg_roots, &raw_outputs, leg)?;
-            legs.push(LegPlan {
-                name: instance.name,
-                runner: instance.runner,
-                condition: condition.clone(),
-                skip: None,
-                outputs: instance.outputs,
-                steps: instance.steps,
-            });
-        }
-        (
-            None,
-            job.id.value.clone(),
-            JobOutputsPlan::default(),
-            Vec::new(),
-            legs,
-        )
-    } else {
-        let implicit_leg = MatrixLeg {
-            index: 0,
-            values: indexmap::IndexMap::new(),
-            origin: crate::matrix::LegOrigin::Product,
+            let instance = plan_instance(
+                workflow,
+                job,
+                &job_id,
+                static_roots,
+                &raw_outputs,
+                &implicit_leg,
+            )?;
+            (
+                Some(instance.runner),
+                instance.name,
+                instance.container,
+                instance.services,
+                instance.env,
+                instance.defaults,
+                instance.outputs,
+                instance.steps,
+                Vec::new(),
+            )
         };
-        let instance = plan_instance(
-            workflow,
-            job,
-            &job_id,
-            static_roots,
-            &raw_outputs,
-            &implicit_leg,
-        )?;
-        (
-            Some(instance.runner),
-            instance.name,
-            instance.outputs,
-            instance.steps,
-            Vec::new(),
-        )
-    };
 
-    validate_needs_references(
-        &ReferencingJob {
-            id: &job_id,
-            span: &job.id.span,
-            needs: &needs,
-        },
-        &JobPlanParts {
-            condition: &condition,
-            legs: &legs,
-            steps: &steps,
-            outputs: &outputs,
-        },
-        workflow,
-        lints,
-    )?;
-
-    Ok(JobPlan {
+    let plan = JobPlan {
         id: job_id,
         span: job.id.span.clone(),
         name,
@@ -172,11 +181,10 @@ pub(crate) fn plan_job(
             .map(|idx| graph.wave(idx))
             .unwrap_or(0),
         runner,
-        container: job
-            .container
-            .as_ref()
-            .map(|c| container_plan_from(&c.value)),
-        env: env_layer_to_map(&job.env),
+        container,
+        services,
+        env,
+        defaults,
         condition: if strategy.is_matrix { None } else { condition },
         implicit_status_gate,
         skip: None,
@@ -184,12 +192,28 @@ pub(crate) fn plan_job(
         legs,
         outputs,
         steps,
-    })
+    };
+
+    lint_needs_output_references(
+        &ReferencingJob {
+            span: &job.id.span,
+            needs: &plan.needs,
+        },
+        &plan,
+        workflow,
+        lints,
+    );
+
+    Ok(plan)
 }
 
 struct PlannedInstance {
-    name: String,
-    runner: RunnerImage,
+    name: Planned<String>,
+    runner: RunnerPlan,
+    container: Option<crate::pass_through::ContainerPlan>,
+    services: indexmap::IndexMap<String, crate::pass_through::ContainerPlan>,
+    env: indexmap::IndexMap<String, crate::pass_through::EnvValue>,
+    defaults: RunDefaultsPlan,
     outputs: JobOutputsPlan,
     steps: Vec<StepPlan>,
 }
@@ -199,15 +223,29 @@ fn plan_instance(
     job: &Job,
     job_id: &JobId,
     roots: StaticRoots<'_>,
-    raw_outputs: &[(String, String)],
+    raw_outputs: &[(String, String, greenlit_workflow::Span)],
     leg: &MatrixLeg,
 ) -> Result<PlannedInstance, PlanError> {
+    let workflow_env_layers: [&[(
+        greenlit_workflow::Spanned<String>,
+        greenlit_workflow::Spanned<ScalarOrExpr>,
+    )]; 1] = [&workflow.env];
+    let workflow_env_chain = build_env_chain(&workflow_env_layers, roots)
+        .map_err(|error| located_eval_err(job_id, None, error))?;
+    let job_layer_ctx = FoldCtx {
+        roots,
+        env: &workflow_env_chain,
+        secrets_forbidden: false,
+    };
+    let env = plan_env_layer(&job.env, &job_layer_ctx)
+        .map_err(|error| located_eval_err(job_id, None, error))?;
+
     let job_env_layers: [&[(
         greenlit_workflow::Spanned<String>,
         greenlit_workflow::Spanned<ScalarOrExpr>,
     )]; 2] = [&workflow.env, &job.env];
-    let job_env_chain =
-        build_env_chain(&job_env_layers, roots).map_err(|source| eval_err(job_id, None, source))?;
+    let job_env_chain = build_env_chain(&job_env_layers, roots)
+        .map_err(|error| located_eval_err(job_id, None, error))?;
     let ctx = FoldCtx {
         roots,
         env: &job_env_chain,
@@ -216,10 +254,28 @@ fn plan_instance(
 
     let runner = resolve_job_runner(job, job_id, &ctx)?;
     let default_name = format!("{}{}", job.id.value, leg.display_suffix());
+    let name_span = job
+        .name
+        .as_ref()
+        .map_or_else(|| job.id.span.clone(), |name| name.span.clone());
     let name = resolve_job_name(job, &default_name, &ctx)
-        .map_err(|source| eval_err(job_id, None, source))?;
+        .map_err(|source| eval_err(job_id, None, name_span, source))?;
+    let container = job
+        .container
+        .as_ref()
+        .map(|container| plan_container(&container.value, &ctx))
+        .transpose()
+        .map_err(|error| located_eval_err(job_id, None, error))?;
+    let mut services = indexmap::IndexMap::with_capacity(job.services.len());
+    for (service_id, service) in &job.services {
+        let service_plan = plan_container(&service.value, &ctx)
+            .map_err(|error| located_eval_err(job_id, None, error))?;
+        services.insert(service_id.value.clone(), service_plan);
+    }
+    let defaults = plan_defaults(workflow, job, &ctx)
+        .map_err(|error| located_eval_err(job_id, None, error))?;
     let outputs = crate::outputs::plan_outputs(raw_outputs, &ctx)
-        .map_err(|source| eval_err(job_id, None, source))?;
+        .map_err(|error| located_eval_err(job_id, None, error))?;
 
     let mut steps = Vec::with_capacity(job.steps.len());
     for step in &job.steps {
@@ -229,6 +285,10 @@ fn plan_instance(
     Ok(PlannedInstance {
         name,
         runner,
+        container,
+        services,
+        env,
+        defaults,
         outputs,
         steps,
     })
@@ -238,93 +298,65 @@ fn resolve_job_name(
     job: &Job,
     default_name: &str,
     ctx: &FoldCtx<'_>,
-) -> Result<String, PartialEvalError> {
+) -> Result<Planned<String>, PartialEvalError> {
     let Some(name) = &job.name else {
-        return Ok(default_name.to_string());
+        return Ok(Planned::static_value(
+            job.id.span.clone(),
+            job.id.value.clone(),
+            default_name.to_string(),
+        ));
     };
-    match fold_template(&name.value, ctx)? {
-        TemplateFold::Static(value) => Ok(to_display_string(&value)),
-        TemplateFold::Deferred { residual_text, .. } => Ok(residual_text),
-    }
+    plan_template_string(&name.value, &name.span, ctx)
 }
 
-fn fold_job_condition(
+fn plan_defaults(
+    workflow: &Workflow,
     job: &Job,
     ctx: &FoldCtx<'_>,
-    job_id: &JobId,
-) -> Result<Option<Condition>, PlanError> {
-    let Some(raw) = &job.if_condition else {
-        return Ok(None);
-    };
-    validate_job_condition_availability(&raw.value, &raw.span, job_id)?;
-    plan_condition(&raw.value, ctx)
-        .map(Some)
-        .map_err(|source| eval_err(job_id, None, source))
-}
+) -> Result<RunDefaultsPlan, LocatedEvalError> {
+    let workflow_run = workflow
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.value.run.as_ref());
+    let job_run = job
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.value.run.as_ref());
 
-/// GitHub's Context availability table is authoritative for this workflow
-/// key: `jobs.<job_id>.if` may use only `github`, `needs`, `vars`, and
-/// `inputs`; among restricted functions it may use only the four status
-/// functions. Treating a disallowed root as an empty object would silently
-/// turn an invalid GitHub workflow into a plausible local plan.
-/// https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
-fn validate_job_condition_availability(
-    raw: &str,
-    span: &greenlit_workflow::Span,
-    job_id: &JobId,
-) -> Result<(), PlanError> {
-    let Ok(expr) = greenlit_expr::parse(strip_wrapper(raw)) else {
-        // The normal condition parser below reports the richer parse error.
-        return Ok(());
-    };
-    let Some(unavailable) = first_unavailable_job_condition_reference(&expr) else {
-        return Ok(());
-    };
-    Err(PlanError::JobConditionUnavailable {
-        job: job_id.clone(),
-        unavailable,
-        span: span.clone(),
+    let shell = job_run
+        .and_then(|run| run.value.shell.as_ref())
+        .or_else(|| workflow_run.and_then(|run| run.value.shell.as_ref()))
+        .map(|shell| {
+            plan_template_string(&shell.value, &shell.span, ctx).map_err(|source| {
+                LocatedEvalError {
+                    span: shell.span.clone(),
+                    source,
+                }
+            })
+        })
+        .transpose()?;
+    let working_directory = job_run
+        .and_then(|run| run.value.working_directory.as_ref())
+        .or_else(|| workflow_run.and_then(|run| run.value.working_directory.as_ref()))
+        .map(|directory| {
+            plan_scalar_string(directory, ctx).map_err(|source| LocatedEvalError {
+                span: directory.span.clone(),
+                source,
+            })
+        })
+        .transpose()?;
+
+    Ok(RunDefaultsPlan {
+        shell,
+        working_directory,
     })
-}
-
-fn first_unavailable_job_condition_reference(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => None,
-        Expr::NamedValue(name) => {
-            if ["github", "needs", "vars", "inputs"]
-                .iter()
-                .any(|allowed| name.eq_ignore_ascii_case(allowed))
-            {
-                None
-            } else {
-                Some(format!("the `{name}` context"))
-            }
-        }
-        Expr::Not(inner) | Expr::Wildcard { target: inner } => {
-            first_unavailable_job_condition_reference(inner)
-        }
-        Expr::Index { target, index }
-        | Expr::Binary {
-            lhs: target,
-            rhs: index,
-            ..
-        } => first_unavailable_job_condition_reference(target)
-            .or_else(|| first_unavailable_job_condition_reference(index)),
-        Expr::Call { name, args } => {
-            if name.eq_ignore_ascii_case("hashfiles") {
-                return Some("the `hashFiles` function".to_string());
-            }
-            args.iter()
-                .find_map(first_unavailable_job_condition_reference)
-        }
-    }
 }
 
 fn resolve_job_runner(
     job: &Job,
     job_id: &JobId,
     ctx: &FoldCtx<'_>,
-) -> Result<RunnerImage, PlanError> {
+) -> Result<RunnerPlan, PlanError> {
     let runs_on = job
         .runs_on
         .as_ref()
@@ -336,209 +368,4 @@ fn resolve_job_runner(
         job: job_id.clone(),
         source: Box::new(source),
     })
-}
-
-pub(crate) fn strip_wrapper(raw: &str) -> &str {
-    let trimmed = raw.trim();
-    trimmed
-        .strip_prefix("${{")
-        .and_then(|s| s.strip_suffix("}}"))
-        .map(str::trim)
-        .unwrap_or(trimmed)
-}
-
-pub(crate) fn eval_err(job: &JobId, step: Option<&str>, source: PartialEvalError) -> PlanError {
-    PlanError::Eval {
-        job: job.clone(),
-        step: step.map(str::to_string),
-        source: Box::new(source),
-    }
-}
-
-/// Design memo's implicit-`success()`-gate rule, computed from the
-/// *authored* condition text (before folding) — see `JobPlan::implicit_status_gate`.
-pub(crate) fn expr_calls_status(raw: &str) -> bool {
-    match greenlit_expr::parse(strip_wrapper(raw)) {
-        Ok(expr) => greenlit_expr::expr_calls_status_function(&expr),
-        // A parse failure here would already have surfaced (as a real
-        // error) from `fold_job_condition`'s own `plan_condition` call, so
-        // this is only reached defensively; treating it as "no status
-        // function" is the conservative (implicit-gate-applies) default.
-        Err(_) => false,
-    }
-}
-
-pub(crate) fn matrix_leg_value(leg: &MatrixLeg) -> Value {
-    Value::object(
-        leg.values
-            .iter()
-            .map(|(k, v)| (k.clone(), matrix_value_to_expr_value(v)))
-            .collect(),
-    )
-}
-
-fn matrix_value_to_expr_value(v: &MatrixValue) -> Value {
-    match v {
-        MatrixValue::Null => Value::Null,
-        MatrixValue::Bool(b) => Value::Bool(*b),
-        MatrixValue::Number(n) => Value::Number(*n),
-        MatrixValue::String(s) => Value::String(s.clone()),
-        MatrixValue::Sequence(items) => {
-            Value::array(items.iter().map(matrix_value_to_expr_value).collect())
-        }
-        MatrixValue::Mapping(m) => Value::object(
-            m.iter()
-                .map(|(k, v)| (k.clone(), matrix_value_to_expr_value(v)))
-                .collect(),
-        ),
-    }
-}
-
-/// Design memo §4.3, "Reference-to-producer check (error)": every
-/// `needs.<job>.outputs.*`/`.result` reference found anywhere in this job
-/// (its own condition, each leg's condition, every step's condition, and
-/// every output value) must name a job in this job's own `needs:` list.
-/// Also emits the design memo §4.3 "declared-output check (warning)":
-/// referencing a real dependency's output it never declares is a lint, not
-/// an error, since GitHub itself accepts it (yielding an empty string).
-fn validate_needs_references(
-    referencing: &ReferencingJob<'_>,
-    parts: &JobPlanParts<'_>,
-    workflow: &Workflow,
-    lints: &mut Vec<Lint>,
-) -> Result<(), PlanError> {
-    let mut reasons = std::collections::BTreeSet::new();
-    if let Some(c) = parts.condition {
-        collect_condition_reasons(c, &mut reasons);
-    }
-    for leg in parts.legs {
-        collect_step_reasons(&leg.steps, &mut reasons);
-        collect_output_reasons(&leg.outputs, &mut reasons);
-    }
-    collect_step_reasons(parts.steps, &mut reasons);
-    collect_output_reasons(parts.outputs, &mut reasons);
-
-    for reason in &reasons {
-        let referenced = match reason {
-            DeferReason::NeedsOutput { job, .. } => Some(job),
-            DeferReason::NeedsResult { job } => Some(job),
-            _ => None,
-        };
-        let Some(referenced) = referenced else {
-            continue;
-        };
-        if !referencing.needs.contains(referenced) {
-            return Err(PlanError::NeedsReferenceNotDeclared {
-                job: referencing.id.clone(),
-                referenced: referenced.clone(),
-            });
-        }
-        if let DeferReason::NeedsOutput {
-            output: Some(name), ..
-        } = reason
-        {
-            let declares_it = workflow
-                .jobs
-                .iter()
-                .find(|j| j.id.value == referenced.0)
-                .map(|j| j.outputs.iter().any(|(k, _)| &k.value == name))
-                .unwrap_or(false);
-            if !declares_it {
-                lints.push(Lint::undeclared_needed_output(
-                    referencing.span.clone(),
-                    &referenced.0,
-                    name,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The referencing job's identity, for [`validate_needs_references`].
-struct ReferencingJob<'a> {
-    id: &'a JobId,
-    span: &'a greenlit_workflow::Span,
-    needs: &'a [JobId],
-}
-
-/// The parts of a not-yet-assembled [`JobPlan`] [`validate_needs_references`]
-/// needs to scan — bundled to keep the function's argument count small.
-struct JobPlanParts<'a> {
-    condition: &'a Option<Condition>,
-    legs: &'a [LegPlan],
-    steps: &'a [StepPlan],
-    outputs: &'a JobOutputsPlan,
-}
-
-fn collect_condition_reasons(c: &Condition, out: &mut std::collections::BTreeSet<DeferReason>) {
-    if let crate::condition::PlannedCond::Deferred(d) = &c.eval {
-        out.extend(d.defers_on.iter().cloned());
-    }
-}
-
-fn collect_step_reasons(steps: &[StepPlan], out: &mut std::collections::BTreeSet<DeferReason>) {
-    for step in steps {
-        if let Some(condition) = &step.condition {
-            collect_condition_reasons(condition, out);
-        }
-    }
-}
-
-fn collect_output_reasons(
-    outputs: &JobOutputsPlan,
-    out: &mut std::collections::BTreeSet<DeferReason>,
-) {
-    for output in outputs.entries.values() {
-        if let crate::outputs::PlannedValue::Deferred(deferred) = &output.value {
-            out.extend(deferred.defers_on.iter().cloned());
-        }
-    }
-}
-
-/// Design memo §4.3, "Matrix-outputs collision (warning)": a matrix job's
-/// output map is shared across all its legs (the last leg to finish always
-/// wins — a well-known GHA limitation); warn when such a job's outputs are
-/// actually read by a dependent, since that dependent's result is then
-/// effectively nondeterministic across parallel legs.
-pub(crate) fn lint_matrix_output_collisions(jobs: &[JobPlan], lints: &mut Vec<Lint>) {
-    for producer in jobs {
-        if producer.legs.len() <= 1
-            || !producer
-                .legs
-                .iter()
-                .any(|leg| !leg.outputs.entries.is_empty())
-        {
-            continue;
-        }
-        let referenced = jobs.iter().any(|dependent| {
-            dependent.needs.contains(&producer.id)
-                && references_needs_output_of(dependent, &producer.id)
-        });
-        if referenced {
-            lints.push(Lint::matrix_outputs_collision(
-                producer.span.clone(),
-                &producer.id.0,
-            ));
-        }
-    }
-}
-
-fn references_needs_output_of(job: &JobPlan, producer: &JobId) -> bool {
-    let mut reasons = std::collections::BTreeSet::new();
-    if let Some(c) = &job.condition {
-        collect_condition_reasons(c, &mut reasons);
-    }
-    for leg in &job.legs {
-        if let Some(c) = &leg.condition {
-            collect_condition_reasons(c, &mut reasons);
-        }
-        collect_step_reasons(&leg.steps, &mut reasons);
-        collect_output_reasons(&leg.outputs, &mut reasons);
-    }
-    collect_step_reasons(&job.steps, &mut reasons);
-    collect_output_reasons(&job.outputs, &mut reasons);
-    reasons
-        .iter()
-        .any(|r| matches!(r, DeferReason::NeedsOutput { job, .. } if job == producer))
 }

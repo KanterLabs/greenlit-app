@@ -11,19 +11,21 @@
 //! `ubuntu-latest` resolves to 24.04 for v0 (`greenlit-v0-spec.md`
 //! "v0 scope (in)").
 
-use greenlit_expr::value::to_display_string;
 use greenlit_workflow::Span;
 use greenlit_workflow::Spanned;
 use greenlit_workflow::model::job::RunsOn;
 
-use crate::partial_eval::{FoldCtx, PartialEvalError, TemplateFold, fold_template};
+use crate::partial_eval::{FoldCtx, PartialEvalError};
+use crate::planned::{Evaluation, Planned, plan_template_string};
 
 /// The stable x64 Ubuntu runner images v0 supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum RunnerImage {
     /// `ubuntu-24.04` (also what `ubuntu-latest` resolves to in v0).
+    #[serde(rename = "ubuntu-24.04")]
     Ubuntu2404,
     /// `ubuntu-22.04`.
+    #[serde(rename = "ubuntu-22.04")]
     Ubuntu2204,
 }
 
@@ -40,6 +42,16 @@ impl RunnerImage {
         }
     }
 }
+
+/// A runner selection folded as far as the currently available contexts
+/// permit.
+///
+/// Static selections have already passed the v0 label allowlist and carry
+/// their resolved image. Deferred selections retain the authored expression
+/// and exact runtime dependencies; execution must evaluate them before it
+/// provisions a container, then validate the resulting label with
+/// [`resolve_runner_label`].
+pub type RunnerPlan = Planned<RunnerImage>;
 
 /// Every `runs-on:` label v0 accepts, as written in the workflow file —
 /// `ubuntu-latest` included, even though it resolves to
@@ -79,10 +91,8 @@ pub enum RunnerError {
         /// The unsupported label text.
         label: String,
     },
-    /// `runs-on:` used a construct v0 does not accept at all:
-    /// `runs-on: [...]` (a self-hosted AND-matched label list) or
-    /// `runs-on: { group: ..., labels: [...] }` (a custom runner group) —
-    /// both are documented `Out (v0)` (`greenlit-v0-spec.md`).
+    /// `runs-on:` used a construct v0 does not accept: a multi-label
+    /// AND-matched list (self-hosted selection) or a custom runner group.
     #[error(
         "{span}: {construct} is not supported in v0 — v0 supports only: {SUPPORTED_RUNNER_LABELS_DISPLAY}"
     )]
@@ -91,15 +101,6 @@ pub enum RunnerError {
         span: Span,
         /// A short description of the construct.
         construct: &'static str,
-    },
-    /// `runs-on: ${{ ... }}` depends on data not statically knowable at
-    /// plan time (e.g. `needs.<id>.outputs.<name>`) — the runner image must
-    /// be known before any container work happens, so this is a hard v0
-    /// error rather than a deferral.
-    #[error("{span}: runs-on depends on data not available at plan time")]
-    NotStatic {
-        /// Where the `runs-on:` value appears.
-        span: Span,
     },
     /// An embedded expression failed to parse or evaluate.
     #[error("{span}: {source}")]
@@ -113,25 +114,24 @@ pub enum RunnerError {
 }
 
 /// Resolves `runs-on:` for one job (or one matrix leg — `ctx.roots.matrix`
-/// carries that leg's `matrix` value) into a [`RunnerImage`].
+/// carries that leg's `matrix` value) into a [`RunnerPlan`].
 ///
 /// A literal label is checked directly; `runs-on: ${{ matrix.os }}` (an
 /// extremely common pattern) is supported by folding the whole-field
-/// expression against `ctx` and checking the resulting string — but only
-/// when it is statically resolvable *now*: unlike `if:`/outputs, a runner
-/// label can never be left "runtime-deferred", since Greenlit must know
-/// which image to use before any container work starts. Anything else
-/// (multiple interpolations, literal text mixed in, or a reference to
-/// non-static data) is rejected rather than guessed at.
+/// expression against `ctx` and checking the resulting string. A label that
+/// depends on a runtime-only context (most commonly a direct dependency's
+/// output) remains explicitly deferred without an invented image; execution
+/// must finish that evaluation before any container work starts.
 pub(crate) fn resolve_runs_on(
     runs_on: &Spanned<RunsOn>,
     ctx: &FoldCtx<'_>,
-) -> Result<RunnerImage, RunnerError> {
+) -> Result<RunnerPlan, RunnerError> {
     match &runs_on.value {
         RunsOn::Label(s) => resolve_label_text(s, ctx),
+        RunsOn::Labels(labels) if labels.len() == 1 => resolve_label_text(&labels[0], ctx),
         RunsOn::Labels(_) => Err(RunnerError::UnsupportedConstruct {
             span: runs_on.span.clone(),
-            construct: "a self-hosted `runs-on: [...]` label list",
+            construct: "a multi-label `runs-on: [...]` self-hosted selection",
         }),
         RunsOn::Group { .. } => Err(RunnerError::UnsupportedConstruct {
             span: runs_on.span.clone(),
@@ -140,20 +140,22 @@ pub(crate) fn resolve_runs_on(
     }
 }
 
-fn resolve_label_text(s: &Spanned<String>, ctx: &FoldCtx<'_>) -> Result<RunnerImage, RunnerError> {
-    if !s.value.contains("${{") {
-        return lookup_or_error(&s.value, &s.span);
-    }
-    match fold_template(&s.value, ctx) {
-        Ok(TemplateFold::Static(v)) => lookup_or_error(&to_display_string(&v), &s.span),
-        Ok(TemplateFold::Deferred { .. }) => Err(RunnerError::NotStatic {
-            span: s.span.clone(),
-        }),
-        Err(source) => Err(RunnerError::PartialEval {
+fn resolve_label_text(s: &Spanned<String>, ctx: &FoldCtx<'_>) -> Result<RunnerPlan, RunnerError> {
+    let planned = plan_template_string(&s.value, &s.span, ctx).map_err(|source| {
+        RunnerError::PartialEval {
             span: s.span.clone(),
             source,
-        }),
-    }
+        }
+    })?;
+    let evaluation = match planned.evaluation {
+        Evaluation::Static(label) => Evaluation::Static(lookup_or_error(&label, &s.span)?),
+        Evaluation::Deferred(deferred) => Evaluation::Deferred(deferred),
+    };
+    Ok(Planned {
+        span: planned.span,
+        source: planned.source,
+        evaluation,
+    })
 }
 
 fn lookup_or_error(label: &str, span: &Span) -> Result<RunnerImage, RunnerError> {
