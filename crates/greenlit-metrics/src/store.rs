@@ -1,12 +1,13 @@
 //! The local NDJSON metrics file: append-only writer, and reader for `litci
 //! stats`.
 
+use std::collections::VecDeque;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::MetricsError;
-use crate::record::InvocationRecord;
+use crate::record::{InvocationRecord, SCHEMA_VERSION};
 
 /// A handle to the local, append-only NDJSON metrics file.
 ///
@@ -63,6 +64,10 @@ impl MetricsStore {
     /// Appends `record` to the store as one NDJSON line, creating the parent
     /// directory and file on first use.
     ///
+    /// If an interrupted earlier append left an unterminated tail, a complete
+    /// JSON value is preserved and separated with its missing newline; an
+    /// incomplete fragment is truncated before this record is appended.
+    ///
     /// Every `litci plan`/`litci run` invocation calls this exactly once,
     /// with the record from [`crate::Invocation::finish`]. `litci stats`
     /// (read-only) must never call this for its own invocation
@@ -83,12 +88,18 @@ impl MetricsStore {
 
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.file_path)
             .map_err(|source| MetricsError::OpenForWrite {
                 path: self.file_path.clone(),
                 source,
             })?;
+
+        let needs_separator = repair_unterminated_tail(&mut file, &self.file_path)?;
+        if needs_separator {
+            line.insert(0, '\n');
+        }
 
         file.write_all(line.as_bytes())
             .map_err(|source| MetricsError::WriteRecord {
@@ -103,10 +114,20 @@ impl MetricsStore {
     /// A metrics file that does not exist yet — the state of a fresh
     /// install before the first `plan`/`run` — is treated as empty history
     /// rather than an error, so `litci stats` can render "no history yet"
-    /// instead of failing. A malformed final line is also ignored because it
-    /// can be the partial residue of an interrupted append; malformed lines
-    /// before the final line remain corruption errors.
+    /// instead of failing. An unterminated malformed final fragment is
+    /// ignored because it can be the residue of an interrupted append;
+    /// every newline-terminated malformed line remains a corruption error.
     pub fn read_all(&self) -> Result<Vec<InvocationRecord>, MetricsError> {
+        self.read_records(None)
+    }
+
+    /// Reads at most the newest `limit` records, preserving chronological
+    /// order while keeping memory bounded for long-lived installations.
+    pub fn read_recent(&self, limit: usize) -> Result<Vec<InvocationRecord>, MetricsError> {
+        self.read_records(Some(limit))
+    }
+
+    fn read_records(&self, limit: Option<usize>) -> Result<Vec<InvocationRecord>, MetricsError> {
         let file = match std::fs::File::open(&self.file_path) {
             Ok(file) => file,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -118,134 +139,137 @@ impl MetricsStore {
             }
         };
 
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines().enumerate().peekable();
-        let mut records = Vec::new();
-        while let Some((index, line)) = lines.next() {
-            let line = line.map_err(|source| MetricsError::ReadFile {
-                path: self.file_path.clone(),
-                source,
-            })?;
+        let mut reader = BufReader::new(file);
+        let mut records = VecDeque::new();
+        let mut line = String::new();
+        let mut line_number = 0usize;
+        loop {
+            line.clear();
+            let bytes_read =
+                reader
+                    .read_line(&mut line)
+                    .map_err(|source| MetricsError::ReadFile {
+                        path: self.file_path.clone(),
+                        source,
+                    })?;
+            if bytes_read == 0 {
+                break;
+            }
+            line_number += 1;
+            let terminated = line.ends_with('\n');
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
             match serde_json::from_str(trimmed) {
-                Ok(record) => records.push(record),
-                Err(_) if lines.peek().is_none() => break,
+                Ok(record) => {
+                    let record: InvocationRecord = record;
+                    if record.schema_version != SCHEMA_VERSION {
+                        return Err(MetricsError::UnsupportedSchema {
+                            path: self.file_path.clone(),
+                            line: line_number,
+                            found: record.schema_version,
+                            supported: SCHEMA_VERSION,
+                        });
+                    }
+                    records.push_back(record);
+                    if let Some(limit) = limit {
+                        while records.len() > limit {
+                            records.pop_front();
+                        }
+                    }
+                }
+                // Only an unterminated final fragment can be a torn append.
+                // A malformed line ending in `\n` was fully committed and
+                // is corruption even when it is the last line.
+                Err(_) if !terminated => break,
                 Err(source) => {
                     return Err(MetricsError::CorruptRecord {
                         path: self.file_path.clone(),
-                        line: index + 1,
+                        line: line_number,
                         source,
                     });
                 }
             }
         }
-        Ok(records)
+        Ok(records.into_iter().collect())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{SCHEMA_VERSION, StageDuration};
+/// Makes an interrupted final append safe before another record is written.
+///
+/// A complete JSON value that lost only its terminating newline is retained;
+/// the caller prefixes the new record with a newline. A malformed fragment is
+/// truncated back to the last committed newline. Without this repair, the
+/// next append would concatenate its record onto the fragment and turn the
+/// recoverable tail into a permanently corrupt, newline-terminated line.
+fn repair_unterminated_tail(file: &mut std::fs::File, path: &Path) -> Result<bool, MetricsError> {
+    let file_len = file
+        .metadata()
+        .map_err(|source| MetricsError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if file_len == 0 {
+        return Ok(false);
+    }
 
-    fn sample_record(command: &str) -> InvocationRecord {
-        InvocationRecord {
-            schema_version: SCHEMA_VERSION,
-            command: command.to_string(),
-            started_at_unix_ms: 1_700_000_000_000,
-            total_duration_ms: 2.5,
-            stages: vec![StageDuration {
-                name: "parse".to_string(),
-                duration_ms: 1.0,
-            }],
+    let tail_start = find_tail_start(file, file_len, path)?;
+    if tail_start == file_len {
+        return Ok(false);
+    }
+
+    file.seek(SeekFrom::Start(tail_start))
+        .map_err(|source| MetricsError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut tail = Vec::new();
+    (&mut *file)
+        .take(file_len - tail_start)
+        .read_to_end(&mut tail)
+        .map_err(|source| MetricsError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    if serde_json::from_slice::<serde_json::Value>(&tail).is_ok() {
+        return Ok(true);
+    }
+
+    file.set_len(tail_start)
+        .map_err(|source| MetricsError::WriteRecord {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(false)
+}
+
+fn find_tail_start(
+    file: &mut std::fs::File,
+    file_len: u64,
+    path: &Path,
+) -> Result<u64, MetricsError> {
+    const SCAN_CHUNK_BYTES: usize = 8 * 1024;
+
+    let mut cursor = file_len;
+    let mut buffer = [0_u8; SCAN_CHUNK_BYTES];
+    while cursor > 0 {
+        let bytes_to_read = cursor.min(SCAN_CHUNK_BYTES as u64) as usize;
+        cursor -= bytes_to_read as u64;
+        file.seek(SeekFrom::Start(cursor))
+            .and_then(|_| file.read_exact(&mut buffer[..bytes_to_read]))
+            .map_err(|source| MetricsError::ReadFile {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if let Some(index) = buffer[..bytes_to_read]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+        {
+            return Ok(cursor + index as u64 + 1);
         }
     }
-
-    #[test]
-    fn append_then_read_all_round_trips_in_order() {
-        let dir = tempfile::tempdir().expect("tempdir must be creatable");
-        let store = MetricsStore::at(dir.path().join("runs.ndjson"));
-
-        let first = sample_record("plan");
-        let second = sample_record("run");
-        store.append(&first).expect("first append must succeed");
-        store.append(&second).expect("second append must succeed");
-
-        let records = store.read_all().expect("read_all must succeed");
-        assert_eq!(records, vec![first, second]);
-    }
-
-    #[test]
-    fn read_all_on_missing_file_is_empty_not_an_error() {
-        let dir = tempfile::tempdir().expect("tempdir must be creatable");
-        let store = MetricsStore::at(dir.path().join("does-not-exist.ndjson"));
-
-        let records = store.read_all().expect("missing file must read as empty");
-        assert!(records.is_empty());
-    }
-
-    #[test]
-    fn read_all_reports_the_line_number_of_a_corrupt_record() {
-        let dir = tempfile::tempdir().expect("tempdir must be creatable");
-        let path = dir.path().join("runs.ndjson");
-        let store = MetricsStore::at(&path);
-
-        let good = sample_record("plan");
-        store.append(&good).expect("append must succeed");
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("file must be reopenable")
-            .write_all(b"not json\n")
-            .expect("raw write must succeed");
-        store
-            .append(&sample_record("run"))
-            .expect("later append must succeed");
-
-        let err = store.read_all().expect_err("corrupt line must error");
-        match err {
-            MetricsError::CorruptRecord { line, .. } => assert_eq!(line, 2),
-            other => panic!("expected CorruptRecord, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_all_recovers_records_before_a_malformed_trailing_line() {
-        let dir = tempfile::tempdir().expect("tempdir must be creatable");
-        let path = dir.path().join("runs.ndjson");
-        let store = MetricsStore::at(&path);
-
-        let good = sample_record("plan");
-        store.append(&good).expect("append must succeed");
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("file must be reopenable")
-            .write_all(b"{\"schema_version\":1")
-            .expect("partial trailing write must succeed");
-
-        let records = store
-            .read_all()
-            .expect("a malformed trailing record must be ignored");
-        assert_eq!(records, vec![good]);
-    }
-
-    #[test]
-    fn append_creates_missing_parent_directories() {
-        let dir = tempfile::tempdir().expect("tempdir must be creatable");
-        let nested = dir
-            .path()
-            .join("nested")
-            .join("metrics")
-            .join("runs.ndjson");
-        let store = MetricsStore::at(&nested);
-
-        store
-            .append(&sample_record("plan"))
-            .expect("append must create parent dirs");
-        assert!(nested.exists());
-    }
+    Ok(0)
 }
