@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/greenlit-app",
+    "crates/greenlit-workflow",
+    "crates/greenlit-expr",
+    "crates/greenlit-engine",
+    "crates/greenlit-metrics",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ShaneKanterman04/greenlit-app"

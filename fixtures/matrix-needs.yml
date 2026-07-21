@@ -1,0 +1,73 @@
+# Phase 1 exit-criteria fixture (`PHASE-1-engine-core.md`): 3 jobs, a
+# `strategy.matrix` using both `include` (adding a new key to an existing
+# combo) and `exclude` (removing combos by partial key match), a 3-job
+# `needs` chain where the third job needs both of the first two, a declared
+# job output consumed downstream via `needs.<id>.outputs.<name>`, and a mix
+# of a statically-evaluable `if:` (`github.event_name`) and a
+# runtime-deferred one (`needs.<id>.result`). This fixture must plan
+# successfully with no `--var`/`.litci/vars` overrides -- it is the exact
+# fixture the Phase 1 exit criteria and `crates/greenlit-app/tests/` drive.
+name: matrix-needs fixture
+on:
+  push:
+    branches: [main]
+
+env:
+  GREETING: hello
+
+jobs:
+  build:
+    # `runs-on: ${{ matrix.os }}` -- resolved per leg (`greenlit-engine`
+    # `runner::resolve_runs_on`), never once for the whole job.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        channel: [stable, beta]
+        # Partial-key match: removes both `channel: beta` combos regardless
+        # of `os` (design memo's exclude semantics; also exercised in
+        # `greenlit-engine::matrix::expand`'s own oracle tests).
+        exclude:
+          - channel: beta
+        # Adds a new key to the one surviving combo it matches
+        # (`os: ubuntu-24.04, channel: stable`) rather than creating a
+        # standalone leg.
+        include:
+          - os: ubuntu-24.04
+            channel: stable
+            canary: true
+    outputs:
+      # Deferred: no step output exists at plan time
+      # (`crate::outputs::plan_outputs` never invents a value).
+      artifact-name: ${{ steps.pack.outputs.name }}
+    steps:
+      - id: pack
+        name: Package build artifact
+        run: |
+          echo "name=build-artifact" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run unit tests
+        run: echo running tests
+      - name: Upload coverage
+        # Runtime-deferred: `needs.<id>.result` only exists once `build`
+        # actually finishes (`crate::defer::DeferReason::NeedsResult`).
+        if: needs.build.result == 'success'
+        run: echo "uploading coverage for ${{ needs.build.outputs.artifact-name }}"
+
+  deploy:
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    # Statically evaluable against the synthetic push event
+    # (`crate::event::build_synthetic_event`): folds to `Static(true)`.
+    if: github.event_name == 'push'
+    outputs:
+      # Consumes `build`'s declared output across the needs edge -- also
+      # deferred, since `build.outputs.artifact-name` is itself deferred.
+      release-tag: ${{ needs.build.outputs.artifact-name }}-deployed
+    steps:
+      - name: Deploy artifact
+        run: echo "deploying ${{ needs.build.outputs.artifact-name }}"

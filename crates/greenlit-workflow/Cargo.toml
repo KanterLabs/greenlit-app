@@ -1,0 +1,44 @@
+[package]
+name = "greenlit-workflow"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "YAML workflow parser: typed workflow model, job DAG, static extraction."
+
+[dependencies]
+# Low-level pull-based YAML 1.2 parser (event stream with a line/column
+# `Span` on every event). We depend on the parser crate directly rather than
+# the higher-level `saphyr` convenience crate (the design memo's literal
+# recommendation): GitHub's workflow YAML dialect rejects duplicate mapping
+# keys and treats `<<:` as an ordinary (and therefore unsupported) key
+# rather than performing a YAML-1.1 merge (design memo §6.1/§6.3). Neither
+# is expressible by configuring `saphyr::YamlLoader`, whose tree-building
+# internals (`doc_stack`/`key_stack`/silent-overwrite-on-duplicate `insert`)
+# are private and not hookable. So this crate drives `saphyr-parser`'s event
+# stream directly into its own span-preserving tree (`yaml::raw`), detecting
+# duplicate keys itself, and applies GitHub's own (not plain YAML's) scalar
+# typing while doing so. This is exactly the memo's own documented fallback
+# path ("build that same internal spanned tree from events") applied to the
+# *primary* choice instead of only as a contingency, for a concrete
+# correctness reason rather than churn-avoidance. All saphyr-parser types are
+# confined to `crate::yaml::raw`, so a future API break is a one-module fix.
+saphyr-parser = "0.0.11"
+# Typed errors for every fallible parse path, per `AGENTS.md` "Errors:
+# thiserror in library crates".
+thiserror = "2.0.19"
+# `crate::extract`'s static-extraction pass parses each `${{ }}` body with
+# the real expression grammar and walks the resulting AST for
+# `secrets.*`/`vars.*` references, now that this sibling crate has a stable
+# public lexer/parser entry point (reconciling that module's earlier
+# interim raw-text scan — see `crate::extract`'s module doc comment).
+# `version` is pinned alongside `path` per this workspace's `deny.toml`
+# `bans.wildcards = "deny"` policy.
+greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "parse"
+harness = false

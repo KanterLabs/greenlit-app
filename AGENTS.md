@@ -82,7 +82,7 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 
 | Phase | File | Status |
 |---|---|---|
-| 1 — Engine core | `PHASE-1-engine-core.md` | in progress |
+| 1 — Engine core | `PHASE-1-engine-core.md` | complete — pending owner review |
 | 2 — Execution | `PHASE-2-execution.md` | not started |
 | 3 — Actions | `PHASE-3-actions.md` | not started |
 | 4 — Environment | `PHASE-4-environment.md` | not started |

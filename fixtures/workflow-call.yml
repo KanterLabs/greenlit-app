@@ -1,0 +1,13 @@
+# Exercises the "not in v0" rejection for a reusable-workflow trigger
+# (`greenlit-v0-spec.md` "Out (v0)": "reusable workflows (workflow_call)").
+# `greenlit-workflow` parses this successfully (`Trigger::WorkflowCall`);
+# `greenlit-engine::plan` is where it is precisely rejected with location
+# (`PlanError::NotSupportedInV0`).
+on:
+  workflow_call: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
