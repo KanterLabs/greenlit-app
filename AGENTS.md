@@ -31,7 +31,7 @@ Precedence on conflict: phase file over spec for implementation detail; spec ove
 
 - **Head agent:** reads all documents once for orientation, then owns sequencing and enforcement — activates one phase at a time, delegates it, verifies exit criteria by *running* the verification commands, maintains the Phase status and Stub registry tables, and writes each phase summary. Never implements ahead of the active phase.
 - **Worker agents:** receive exactly four documents — this file, the spec, TESTING.md, and the active phase file — and implement only that phase.
-- **Owner (human):** supplies the Owner-provided inputs below on their listed schedule, and reviews each phase summary before the next phase activates. Phase completion is not final until owner review.
+- **Owner (human):** supplies the Owner-provided inputs below on their listed schedule and performs one cumulative review after Phase 5. Phases 1–4 advance automatically after their mechanical completion gates pass; Phase 6 activates only after the post-Phase-5 owner approval.
 
 ## Owner-provided inputs
 
@@ -44,7 +44,7 @@ Agents must request these from the owner at the listed point and stop rather tha
 | Dashboard deploy target: host, path, SSH access | Phase 6 |
 | crates.io token + repo release permissions | Phase 6 |
 | Explicit authorization and timing for public launch posts | End of Phase 6 |
-| Phase summary review/approval | End of every phase |
+| Cumulative Phases 1–5 summary review/approval | End of Phase 5, before Phase 6 activates |
 
 ## First actions
 
@@ -58,7 +58,7 @@ The crate tree below is the target layout, not a requirement to create future-ph
 
 1. Read this file, the spec, `TESTING.md`, and the **current phase file only**. The head agent's one-time orientation read of every phase is the sole exception. Do not read ahead or implement anything from a later phase.
 2. Work strictly within the current phase's scope. If a task requires something from a later phase, do not build it early — and do not fake it silently. Follow the **Stub discipline** below; it is the only permitted form of deferral.
-3. A phase is complete only when every item in its **Exit criteria** passes via the listed verification commands and the complete cumulative pipeline in TESTING.md passes. Then update the status table below and stop.
+3. A phase is complete only when every item in its **Exit criteria** passes via the listed verification commands and the complete cumulative pipeline in TESTING.md passes. Then update the status table and write the phase summary. Phases 1–4 activate the next phase immediately; Phase 5 stops for the cumulative owner review before Phase 6 activates.
 4. Never mark a criterion passed without running its verification.
 5. If the spec and a phase file conflict, the phase file wins for implementation detail; the spec wins for product behavior. Flag the conflict in your summary.
 
@@ -82,7 +82,7 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 
 | Phase | File | Status |
 |---|---|---|
-| 1 — Engine core | `PHASE-1-engine-core.md` | complete — pending owner review |
+| 1 — Engine core | `PHASE-1-engine-core.md` | in progress |
 | 2 — Execution | `PHASE-2-execution.md` | not started |
 | 3 — Actions | `PHASE-3-actions.md` | not started |
 | 4 — Environment | `PHASE-4-environment.md` | not started |
@@ -164,4 +164,4 @@ Cleanliness is enforced mechanically, not aspirationally:
 
 ## Definition of done (per phase)
 
-Code + tests + the complete TESTING.md pipeline passing + status table updated + `tools/check-stubs` clean for the active and all earlier phases + a short summary listing: what was built, deviations from the phase file, new dependencies, tests added/deleted, stubs created (with registry rows), and stubs realized (with commits).
+Code + tests + the complete TESTING.md pipeline passing + status table updated + `tools/check-stubs` clean for the active and all earlier phases + a short summary listing: what was built, deviations from the phase file, new dependencies, tests added/deleted, stubs created (with registry rows), and stubs realized (with commits). Phases 1–4 transition immediately after this mechanical gate; Phase 5 additionally requires the cumulative owner approval before Phase 6 begins.
