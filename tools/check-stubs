@@ -1,49 +1,59 @@
 #!/usr/bin/env python3
-"""Validate Greenlit's stub discipline (see AGENTS.md "Stub discipline").
+"""Enforce Greenlit's stub discipline from AGENTS.md.
 
-A stub's body is exactly:
+The only permitted incomplete Rust body is an exact, registered marker:
 
     unimplemented!("STUB(phase-N): <missing behavior>")
 
-Every such marker in source must have exactly one corresponding OPEN row in
-AGENTS.md's "Stub registry" table (same location, same owning phase, and an
-un-filled "Realized in" column), and that owning phase must be "not started"
-in the "Phase status" table. A registry row whose "Realized in" column has
-been filled in (closed) must have no matching marker left in source.
+Every marker and open registry row must match one-to-one on source location,
+description, and owning phase. Open stubs must belong to a future phase whose
+status is ``not started``. Closed rows must name the realizing commit and must
+not retain a marker. ``todo!`` and every other ``unimplemented!`` form are
+rejected, including calls hidden from the exact-marker regular expression by a
+different delimiter, extra argument, non-literal message, or malformed text.
 
-This script is intentionally dependency-free (stdlib only) so it runs with
-any Python 3 interpreter in CI without an install step.
+This script intentionally uses only the Python standard library so CI needs no
+setup beyond the Python 3 already present on GitHub-hosted runners.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
 CRATES_DIR = REPO_ROOT / "crates"
 
-# Cell values that mean "no value here" in the registry tables (the
-# placeholder dash row, or an outright empty cell).
 PLACEHOLDER_CELLS = {"", "-", "--", "—"}
+REGISTRY_HEADER = ("Location", "Missing behavior", "Owning phase", "Realized in")
+PHASE_STATUS_HEADER = ("Phase", "File", "Status")
+VALID_PHASE_STATUSES = ("completed", "in progress", "not started")
 
-# The exact stub marker: a call to `unimplemented!` whose sole argument is a
-# double-quoted string literal starting with "STUB(phase-N): ". Deliberately
-# does not accept `format!`-style interpolation — AGENTS.md mandates the
-# literal-string form so the message is inspectable by this script without
-# running the macro.
-STUB_MARKER_RE = re.compile(
-    r'unimplemented!\(\s*"STUB\(phase-(?P<phase>\d+)\):\s*(?P<desc>[^"]*)"\s*\)'
+MACRO_INVOCATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?P<name>todo|unimplemented)(?![A-Za-z0-9_])\s*!"
 )
+VALID_STUB_CALL_RE = re.compile(
+    r'\Aunimplemented!\(\s*"STUB\(phase-(?P<phase>[1-9][0-9]*)\): '
+    r'(?P<description>[^"\\\r\n]+)"\s*\)\Z'
+)
+LOCATION_RE = re.compile(r"(?P<file>crates/[^:\r\n]+\.rs):(?P<line>[1-9][0-9]*)")
+OWNER_RE = re.compile(r"[1-9][0-9]*")
+PHASE_CELL_RE = re.compile(r"(?P<number>[1-9][0-9]*)\s+—\s+\S.*")
+COMMIT_RE = re.compile(r"[0-9a-f]{7,40}")
+SEPARATOR_ROW_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
 
 
 @dataclass(frozen=True)
 class Marker:
-    file: str  # repo-relative, forward-slash path
+    """One syntactically valid STUB marker found in Rust source."""
+
+    file: str
     line: int
     phase: int
     description: str
@@ -52,19 +62,34 @@ class Marker:
     def location(self) -> str:
         return f"{self.file}:{self.line}"
 
+    @property
+    def identity(self) -> tuple[str, str, int]:
+        return (self.location, self.description, self.phase)
+
 
 @dataclass(frozen=True)
 class RegistryRow:
+    """One data row in AGENTS.md's Stub registry table."""
+
     location: str
     missing_behavior: str
     owning_phase_raw: str
     realized_in_raw: str
-    row_number: int  # 1-based index among data rows, for error messages
+    markdown_line: int
+
+    @property
+    def label(self) -> str:
+        return f"AGENTS.md:{self.markdown_line}"
 
     @property
     def is_placeholder(self) -> bool:
-        cells = (self.location, self.missing_behavior, self.owning_phase_raw, self.realized_in_raw)
-        return all(c.strip() in PLACEHOLDER_CELLS for c in cells)
+        cells = (
+            self.location,
+            self.missing_behavior,
+            self.owning_phase_raw,
+            self.realized_in_raw,
+        )
+        return all(cell.strip() in PLACEHOLDER_CELLS for cell in cells)
 
     @property
     def is_open(self) -> bool:
@@ -72,46 +97,59 @@ class RegistryRow:
 
     @property
     def owning_phase(self) -> int | None:
-        m = re.search(r"\d+", self.owning_phase_raw)
-        return int(m.group()) if m else None
+        raw = self.owning_phase_raw.strip()
+        return int(raw) if OWNER_RE.fullmatch(raw) else None
+
+    @property
+    def identity(self) -> tuple[str, str, int] | None:
+        owner = self.owning_phase
+        if owner is None:
+            return None
+        return (self.location, self.missing_behavior, owner)
 
 
 @dataclass(frozen=True)
 class PhaseStatusRow:
+    """One data row in AGENTS.md's Phase status table."""
+
     phase_raw: str
     file_raw: str
-    status: str
+    status_raw: str
+    markdown_line: int
+
+    @property
+    def label(self) -> str:
+        return f"AGENTS.md:{self.markdown_line}"
 
     @property
     def phase_number(self) -> int | None:
-        m = re.search(r"\d+", self.phase_raw)
-        return int(m.group()) if m else None
+        match = PHASE_CELL_RE.fullmatch(self.phase_raw.strip())
+        return int(match.group("number")) if match else None
+
+    @property
+    def status(self) -> str:
+        return self.status_raw.strip()
 
 
-def fail(messages: list[str]) -> None:
+def report_failure(messages: list[str]) -> int:
+    """Print every independent validation error and return a failing status."""
     print("check-stubs: FAILED", file=sys.stderr)
-    for msg in messages:
-        print(f"  - {msg}", file=sys.stderr)
-    sys.exit(1)
+    for message in dict.fromkeys(messages):
+        print(f"  - {message}", file=sys.stderr)
+    return 1
 
 
 def list_source_files() -> list[Path]:
-    """Every tracked-or-would-be-tracked file under crates/, git-ignore aware.
-
-    Uses `git ls-files` (cached + others-minus-ignored) so build artifacts
-    under crates/*/target/ are never scanned, matching "tracked source
-    files" without requiring files to already be committed. Falls back to a
-    plain filesystem walk (skipping `target` directories) if git is
-    unavailable, so the check still runs outside a git checkout.
-    """
+    """List tracked or unignored, untracked Rust files below ``crates/``."""
     if not CRATES_DIR.is_dir():
         return []
 
     try:
-        out = subprocess.run(
+        result = subprocess.run(
             [
                 "git",
                 "ls-files",
+                "-z",
                 "--cached",
                 "--others",
                 "--exclude-standard",
@@ -120,50 +158,281 @@ def list_source_files() -> list[Path]:
             ],
             cwd=REPO_ROOT,
             capture_output=True,
-            text=True,
             check=True,
         )
-        rel_paths = [line for line in out.stdout.splitlines() if line]
-        return [REPO_ROOT / p for p in rel_paths if (REPO_ROOT / p).is_file()]
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        found = []
-        for path in CRATES_DIR.rglob("*"):
-            if not path.is_file():
-                continue
-            if "target" in path.relative_to(CRATES_DIR).parts:
-                continue
-            found.append(path)
-        return found
+        relative_paths = [
+            Path(os.fsdecode(raw_path))
+            for raw_path in result.stdout.split(b"\0")
+            if raw_path
+        ]
+        return sorted(
+            REPO_ROOT / path
+            for path in relative_paths
+            if path.suffix == ".rs" and (REPO_ROOT / path).is_file()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(
+            path
+            for path in CRATES_DIR.rglob("*.rs")
+            if path.is_file() and "target" not in path.relative_to(CRATES_DIR).parts
+        )
 
 
-def scan_markers() -> list[Marker]:
-    markers: list[Marker] = []
-    for path in sorted(list_source_files()):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (UnicodeDecodeError, OSError):
+def blank_non_newlines(mask: list[str], start: int, end: int) -> None:
+    """Blank a non-code span while preserving offsets and line boundaries."""
+    for index in range(start, end):
+        if mask[index] not in "\r\n":
+            mask[index] = " "
+
+
+def quoted_string_end(text: str, quote_index: int) -> int:
+    """Return the byte-compatible character offset after a Rust string."""
+    cursor = quote_index + 1
+    while cursor < len(text):
+        if text[cursor] == "\\":
+            cursor += 2
+        elif text[cursor] == '"':
+            return cursor + 1
+        else:
+            cursor += 1
+    return len(text)
+
+
+def raw_string_end(text: str, start: int) -> int | None:
+    """Return the end of a raw string beginning at ``start``, if any."""
+    if start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_"):
+        return None
+
+    prefix_length = None
+    for prefix in ("br", "cr", "r"):
+        if text.startswith(prefix, start):
+            prefix_length = len(prefix)
+            break
+    if prefix_length is None:
+        return None
+
+    cursor = start + prefix_length
+    while cursor < len(text) and text[cursor] == "#":
+        cursor += 1
+    if cursor >= len(text) or text[cursor] != '"':
+        return None
+
+    hashes = text[start + prefix_length : cursor]
+    closing = '"' + hashes
+    closing_index = text.find(closing, cursor + 1)
+    return len(text) if closing_index < 0 else closing_index + len(closing)
+
+
+def char_literal_end(text: str, quote_index: int) -> int | None:
+    """Return the end of a Rust char literal, without mistaking lifetimes."""
+    value_index = quote_index + 1
+    if value_index >= len(text) or text[value_index] in "\r\n'":
+        return None
+
+    if text[value_index] != "\\":
+        closing_index = value_index + 1
+    else:
+        escape_index = value_index + 1
+        if escape_index >= len(text):
+            return None
+        escape = text[escape_index]
+        if escape == "x":
+            closing_index = escape_index + 3
+        elif escape == "u" and text.startswith("{", escape_index + 1):
+            brace_index = text.find("}", escape_index + 2)
+            if brace_index < 0:
+                return None
+            closing_index = brace_index + 1
+        else:
+            closing_index = escape_index + 1
+
+    if closing_index < len(text) and text[closing_index] == "'":
+        return closing_index + 1
+    return None
+
+
+def rust_code_mask(text: str) -> str:
+    """Mask Rust comments and literals so macro-like text inside them is inert."""
+    mask = list(text)
+    cursor = 0
+    while cursor < len(text):
+        if text.startswith("//", cursor):
+            end = text.find("\n", cursor + 2)
+            end = len(text) if end < 0 else end
+            blank_non_newlines(mask, cursor, end)
+            cursor = end
             continue
-        rel = path.relative_to(REPO_ROOT).as_posix()
-        for match in STUB_MARKER_RE.finditer(text):
-            line = text.count("\n", 0, match.start()) + 1
-            markers.append(
-                Marker(
-                    file=rel,
-                    line=line,
-                    phase=int(match.group("phase")),
-                    description=match.group("desc").strip(),
-                )
+
+        if text.startswith("/*", cursor):
+            depth = 1
+            end = cursor + 2
+            while end < len(text) and depth:
+                if text.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif text.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            blank_non_newlines(mask, cursor, end)
+            cursor = end
+            continue
+
+        raw_end = raw_string_end(text, cursor)
+        if raw_end is not None:
+            blank_non_newlines(mask, cursor, raw_end)
+            cursor = raw_end
+            continue
+
+        if (
+            cursor + 1 < len(text)
+            and text[cursor] in "bc"
+            and text[cursor + 1] == '"'
+            and (cursor == 0 or not (text[cursor - 1].isalnum() or text[cursor - 1] == "_"))
+        ):
+            end = quoted_string_end(text, cursor + 1)
+            blank_non_newlines(mask, cursor, end)
+            cursor = end
+            continue
+
+        if text[cursor] == '"':
+            end = quoted_string_end(text, cursor)
+            blank_non_newlines(mask, cursor, end)
+            cursor = end
+            continue
+
+        if (
+            cursor + 1 < len(text)
+            and text[cursor] == "b"
+            and text[cursor + 1] == "'"
+            and (cursor == 0 or not (text[cursor - 1].isalnum() or text[cursor - 1] == "_"))
+        ):
+            end = char_literal_end(text, cursor + 1)
+            if end is not None:
+                blank_non_newlines(mask, cursor, end)
+                cursor = end
+                continue
+
+        if text[cursor] == "'":
+            end = char_literal_end(text, cursor)
+            if end is not None:
+                blank_non_newlines(mask, cursor, end)
+                cursor = end
+                continue
+
+        cursor += 1
+
+    return "".join(mask)
+
+
+def matching_parenthesis(mask: str, opening_index: int) -> int | None:
+    """Find the closing parenthesis of a macro call in masked Rust code."""
+    depth = 0
+    for index in range(opening_index, len(mask)):
+        if mask[index] == "(":
+            depth += 1
+        elif mask[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def scan_source_file(path: Path) -> tuple[list[Marker], list[str], str | None]:
+    """Find exact markers and malformed incomplete-code macros in one file."""
+    relative = path.relative_to(REPO_ROOT).as_posix()
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [], [f"{relative}: cannot read Rust source as UTF-8: {error}"], None
+
+    mask = rust_code_mask(source)
+    markers: list[Marker] = []
+    problems: list[str] = []
+    for invocation in MACRO_INVOCATION_RE.finditer(mask):
+        name = invocation.group("name")
+        line = source.count("\n", 0, invocation.start()) + 1
+        location = f"{relative}:{line}"
+
+        if name == "todo":
+            problems.append(
+                f"{location}: todo! is forbidden; a cross-phase placeholder must use "
+                "the exact registered unimplemented!(\"STUB(phase-N): <missing behavior>\") form"
             )
-    return markers
+            continue
+
+        prefix = mask[: invocation.start()].rstrip()
+        if prefix.endswith("::") or prefix.endswith(("#", ".", "$")):
+            problems.append(
+                f"{location}: malformed unimplemented! path or token prefix; the marker "
+                "must invoke unimplemented! directly"
+            )
+            continue
+
+        opening_index = invocation.end()
+        while opening_index < len(mask) and mask[opening_index].isspace():
+            opening_index += 1
+        if opening_index >= len(mask) or mask[opening_index] != "(":
+            problems.append(
+                f"{location}: malformed unimplemented!; the only permitted form is "
+                'unimplemented!("STUB(phase-N): <missing behavior>")'
+            )
+            continue
+
+        closing_index = matching_parenthesis(mask, opening_index)
+        if closing_index is None:
+            problems.append(
+                f"{location}: malformed unimplemented! has no closing parenthesis; "
+                "only an exact registered STUB marker is permitted"
+            )
+            continue
+
+        call = source[invocation.start() : closing_index + 1]
+        exact = VALID_STUB_CALL_RE.fullmatch(call)
+        if exact is None:
+            problems.append(
+                f"{location}: malformed unimplemented! call {call!r}; the only permitted "
+                'form is unimplemented!("STUB(phase-N): <missing behavior>")'
+            )
+            continue
+
+        description = exact.group("description")
+        if description != description.strip() or any(ord(char) < 32 for char in description):
+            problems.append(
+                f"{location}: STUB description must be nonempty plain text without "
+                "leading, trailing, or control whitespace"
+            )
+            continue
+
+        markers.append(
+            Marker(
+                file=relative,
+                line=line,
+                phase=int(exact.group("phase")),
+                description=description,
+            )
+        )
+
+    return markers, problems, source
+
+
+def scan_sources() -> tuple[list[Marker], list[str], dict[str, str]]:
+    """Scan the complete Rust source set and retain text for line validation."""
+    markers: list[Marker] = []
+    problems: list[str] = []
+    sources: dict[str, str] = {}
+    for path in list_source_files():
+        found, file_problems, source = scan_source_file(path)
+        markers.extend(found)
+        problems.extend(file_problems)
+        if source is not None:
+            sources[path.relative_to(REPO_ROOT).as_posix()] = source
+    return markers, problems, sources
 
 
 def split_table_row(line: str) -> list[str]:
-    """Split one markdown table row into trimmed cell texts.
-
-    Honors `\\|` as a literal pipe (not a cell delimiter) rather than
-    naively `str.split("|")`-ing, and drops the empty leading/trailing
-    cells produced by a row's outer `|` delimiters.
-    """
+    r"""Split a Markdown table row, treating only ``\|`` as an escaped pipe."""
     stripped = line.strip()
     if stripped.startswith("|"):
         stripped = stripped[1:]
@@ -172,170 +441,346 @@ def split_table_row(line: str) -> list[str]:
 
     cells: list[str] = []
     current: list[str] = []
-    escape = False
-    for ch in stripped:
-        if escape:
-            current.append(ch)
-            escape = False
-        elif ch == "\\":
-            escape = True
-        elif ch == "|":
+    cursor = 0
+    while cursor < len(stripped):
+        char = stripped[cursor]
+        if char == "\\" and cursor + 1 < len(stripped) and stripped[cursor + 1] == "|":
+            current.append("|")
+            cursor += 2
+        elif char == "|":
             cells.append("".join(current).strip())
             current = []
+            cursor += 1
         else:
-            current.append(ch)
+            current.append(char)
+            cursor += 1
     cells.append("".join(current).strip())
     return cells
 
 
-SEPARATOR_ROW_RE = re.compile(r"^\s*\|?(\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
-
-
-def find_table_rows(markdown: str, heading: str) -> list[list[str]]:
-    """Return the data rows (as split cells) of the first table under `heading`.
-
-    `heading` must match a whole markdown heading line exactly (e.g.
-    "## Stub registry"). Raises ValueError with a precise complaint if the
-    heading or a well-formed table under it cannot be found.
-    """
+def find_table_rows(
+    markdown: str, heading: str, expected_header: tuple[str, ...]
+) -> list[tuple[int, list[str]]]:
+    """Return ``(Markdown line, cells)`` rows for one exact headed table."""
     lines = markdown.splitlines()
     try:
-        start = next(i for i, line in enumerate(lines) if line.strip() == heading)
-    except StopIteration as exc:
-        raise ValueError(f"AGENTS.md: no {heading!r} heading found") from exc
+        start = next(index for index, line in enumerate(lines) if line.strip() == heading)
+    except StopIteration as error:
+        raise ValueError(f"AGENTS.md: no {heading!r} heading found") from error
 
-    # Walk forward to the first table row (a line starting with '|'),
-    # stopping if we hit the next heading first.
-    i = start + 1
-    while i < len(lines) and not lines[i].strip().startswith("|"):
-        if lines[i].strip().startswith("#"):
+    index = start + 1
+    while index < len(lines) and not lines[index].strip().startswith("|"):
+        if lines[index].strip().startswith("#"):
             raise ValueError(f"AGENTS.md: no table found under {heading!r} before the next heading")
-        i += 1
-    if i >= len(lines):
+        index += 1
+    if index >= len(lines):
         raise ValueError(f"AGENTS.md: no table found under {heading!r}")
 
-    header = split_table_row(lines[i])
-    i += 1
-    if i >= len(lines) or not SEPARATOR_ROW_RE.match(lines[i]):
-        raise ValueError(f"AGENTS.md: table under {heading!r} is missing its '---' separator row")
-    i += 1
+    header = tuple(split_table_row(lines[index]))
+    if header != expected_header:
+        raise ValueError(
+            f"AGENTS.md:{index + 1}: table under {heading!r} has header {header!r}; "
+            f"expected exactly {expected_header!r}"
+        )
 
-    rows: list[list[str]] = []
-    while i < len(lines) and lines[i].strip().startswith("|"):
-        cells = split_table_row(lines[i])
-        if len(cells) != len(header):
+    index += 1
+    if index >= len(lines) or not SEPARATOR_ROW_RE.fullmatch(lines[index]):
+        raise ValueError(
+            f"AGENTS.md:{index + 1}: table under {heading!r} is missing its separator row"
+        )
+    index += 1
+
+    rows: list[tuple[int, list[str]]] = []
+    while index < len(lines) and lines[index].strip().startswith("|"):
+        cells = split_table_row(lines[index])
+        if len(cells) != len(expected_header):
             raise ValueError(
-                f"AGENTS.md: row {cells!r} under {heading!r} has {len(cells)} cells, "
-                f"expected {len(header)} to match header {header!r}"
+                f"AGENTS.md:{index + 1}: row under {heading!r} has {len(cells)} cells; "
+                f"expected {len(expected_header)}"
             )
-        rows.append(cells)
-        i += 1
-
+        rows.append((index + 1, cells))
+        index += 1
     return rows
 
 
-def load_stub_registry() -> list[RegistryRow]:
+def load_tables() -> tuple[list[RegistryRow], list[PhaseStatusRow]]:
+    """Load and structurally validate both governing AGENTS.md tables."""
     markdown = AGENTS_MD.read_text(encoding="utf-8")
-    rows = find_table_rows(markdown, "## Stub registry")
-    registry = []
-    for n, cells in enumerate(rows, start=1):
-        location, missing_behavior, owning_phase, realized_in = cells
-        registry.append(RegistryRow(location, missing_behavior, owning_phase, realized_in, n))
-    return registry
+    registry_rows = find_table_rows(markdown, "## Stub registry", REGISTRY_HEADER)
+    phase_rows = find_table_rows(markdown, "## Phase status", PHASE_STATUS_HEADER)
+    registry = [RegistryRow(*cells, markdown_line=line) for line, cells in registry_rows]
+    phases = [PhaseStatusRow(*cells, markdown_line=line) for line, cells in phase_rows]
+    return registry, phases
 
 
-def load_phase_status() -> list[PhaseStatusRow]:
-    markdown = AGENTS_MD.read_text(encoding="utf-8")
-    rows = find_table_rows(markdown, "## Phase status")
-    return [PhaseStatusRow(phase, file_, status) for phase, file_, status in rows]
+def line_count(source: str) -> int:
+    """Count addressable one-based lines in a source file."""
+    if not source:
+        return 0
+    return source.count("\n") + (0 if source.endswith("\n") else 1)
 
 
-def main() -> int:
-    try:
-        registry = load_stub_registry()
-        phase_status = load_phase_status()
-    except ValueError as exc:
-        fail([str(exc)])
-        return 1  # unreachable, fail() exits
+def validate_location(row: RegistryRow, sources: dict[str, str], problems: list[str]) -> bool:
+    """Validate a registry location as a canonical, existing Rust source line."""
+    match = LOCATION_RE.fullmatch(row.location)
+    if match is None:
+        problems.append(
+            f"{row.label}: Location {row.location!r} must be exactly "
+            "'crates/<path>.rs:<positive-line>'"
+        )
+        return False
 
-    markers = scan_markers()
+    relative = match.group("file")
+    pure_path = PurePosixPath(relative)
+    if pure_path.as_posix() != relative or any(part in {"", ".", ".."} for part in pure_path.parts):
+        problems.append(f"{row.label}: Location path {relative!r} is not canonical")
+        return False
 
-    real_rows = [row for row in registry if not row.is_placeholder]
-    open_rows = {(row.location, row.owning_phase): row for row in real_rows if row.is_open}
-    closed_rows = [row for row in real_rows if not row.is_open]
+    source = sources.get(relative)
+    if source is None:
+        problems.append(
+            f"{row.label}: Location file {relative!r} is not an existing, unignored Rust "
+            "source file below crates/"
+        )
+        return False
 
-    phase_by_number = {
-        row.phase_number: row.status.strip().lower()
-        for row in phase_status
-        if row.phase_number is not None
-    }
+    requested_line = int(match.group("line"))
+    maximum_line = line_count(source)
+    if requested_line > maximum_line:
+        problems.append(
+            f"{row.label}: Location {row.location!r} names line {requested_line}, but "
+            f"{relative!r} has only {maximum_line} line(s)"
+        )
+        return False
+    return True
 
-    problems: list[str] = []
 
-    marker_locations = {(m.file, m.line) for m in markers}
+def validate_phase_table(
+    rows: list[PhaseStatusRow], problems: list[str]
+) -> dict[int, str]:
+    """Validate canonical statuses, uniqueness, and chronological ordering."""
+    if not rows:
+        problems.append("AGENTS.md: Phase status table has no data rows")
+        return {}
 
-    def parse_location(loc: str) -> tuple[str, int] | None:
-        if "/" not in loc or ":" not in loc:
-            return None
-        file_part, _, line_part = loc.rpartition(":")
-        try:
-            return (file_part, int(line_part))
-        except ValueError:
-            return None
+    phase_by_number: dict[int, str] = {}
+    seen_phase_numbers: set[int] = set()
+    previous_phase_number = 0
+    seen_status_rank = -1
+    in_progress_count = 0
+    status_rank = {status: rank for rank, status in enumerate(VALID_PHASE_STATUSES)}
 
-    # Rule: a closed registry row (Realized in filled) must have no
-    # remaining marker at its location.
-    closed_locations: set[tuple[str, int]] = set()
-    for row in closed_rows:
-        loc_key = parse_location(row.location)
-        if loc_key is not None:
-            closed_locations.add(loc_key)
-        if loc_key is not None and loc_key in marker_locations:
+    for row in rows:
+        number = row.phase_number
+        if number is None:
             problems.append(
-                f"registry row #{row.row_number} (location {row.location!r}) has "
-                f"'Realized in' = {row.realized_in_raw!r} filled in, but a STUB marker "
-                f"still exists at that location — remove the marker, it was implemented"
+                f"{row.label}: Phase cell {row.phase_raw!r} must be '<positive-number> — <name>'"
             )
+        else:
+            if number in seen_phase_numbers:
+                problems.append(f"{row.label}: duplicate Phase status entry for phase {number}")
+            if number <= previous_phase_number:
+                problems.append(
+                    f"{row.label}: phase {number} is out of numeric order in the Phase status table"
+                )
+            seen_phase_numbers.add(number)
+            previous_phase_number = max(previous_phase_number, number)
 
-    # Rule: every marker needs a corresponding OPEN registry row (same
-    # location, same owning phase). Skip markers already reported above as
-    # sitting at a closed row's location — that diagnosis is more specific
-    # and repeating "no open row" for the same spot is just noise.
-    for m in markers:
-        row = open_rows.get((m.location, m.phase))
-        if row is None:
-            if (m.file, m.line) in closed_locations:
-                continue
+        status = row.status
+        if status not in VALID_PHASE_STATUSES:
             problems.append(
-                f"{m.location}: STUB(phase-{m.phase}) marker "
-                f"({m.description!r}) has no open row in AGENTS.md's Stub "
-                f"registry table — add one with Location = {m.location!r} "
-                f"and Owning phase = {m.phase}"
+                f"{row.label}: invalid phase status {row.status_raw!r}; expected one of "
+                f"{VALID_PHASE_STATUSES!r}"
             )
             continue
 
-        # Rule: the owning phase must be "not started".
-        status = phase_by_number.get(m.phase)
-        if status is None:
+        rank = status_rank[status]
+        if rank < seen_status_rank:
             problems.append(
-                f"{m.location}: STUB(phase-{m.phase}) names a phase not present in "
-                f"AGENTS.md's Phase status table"
+                f"{row.label}: phase status {status!r} is out of order; statuses must progress "
+                "from completed to at most one in-progress phase, then not started"
             )
-        elif status != "not started":
+        seen_status_rank = max(seen_status_rank, rank)
+        if status == "in progress":
+            in_progress_count += 1
+
+        if number is not None and number not in phase_by_number:
+            phase_by_number[number] = status
+
+    if in_progress_count > 1:
+        problems.append(
+            f"AGENTS.md: Phase status table has {in_progress_count} phases in progress; at most one is allowed"
+        )
+    return phase_by_number
+
+
+def validate_registry_rows(
+    rows: list[RegistryRow],
+    phase_by_number: dict[int, str],
+    sources: dict[str, str],
+    problems: list[str],
+) -> tuple[list[RegistryRow], list[RegistryRow]]:
+    """Validate every registry cell and return real open/closed rows."""
+    if not rows:
+        problems.append("AGENTS.md: Stub registry table has no data rows")
+        return [], []
+
+    placeholders = [row for row in rows if row.is_placeholder]
+    real_rows = [row for row in rows if not row.is_placeholder]
+    if len(placeholders) > 1:
+        problems.append("AGENTS.md: Stub registry contains more than one placeholder row")
+    if placeholders and real_rows:
+        problems.append(
+            "AGENTS.md: remove the all-dash Stub registry placeholder once real rows exist"
+        )
+
+    in_progress = [number for number, status in phase_by_number.items() if status == "in progress"]
+    active_phase = in_progress[0] if len(in_progress) == 1 else None
+    open_rows: list[RegistryRow] = []
+    closed_rows: list[RegistryRow] = []
+
+    for row in real_rows:
+        validate_location(row, sources, problems)
+
+        description = row.missing_behavior
+        if (
+            not description
+            or description.strip() in PLACEHOLDER_CELLS
+            or description != description.strip()
+            or any(ord(char) < 32 for char in description)
+        ):
             problems.append(
-                f"{m.location}: STUB(phase-{m.phase}) is owned by phase {m.phase}, "
-                f"whose status is {status!r} — only markers owned by a 'not started' "
-                f"phase are permitted (see AGENTS.md Stub discipline)"
+                f"{row.label}: Missing behavior must be nonempty plain text without "
+                "leading, trailing, or control whitespace"
             )
+
+        owner = row.owning_phase
+        if owner is None:
+            problems.append(
+                f"{row.label}: Owning phase {row.owning_phase_raw!r} must be exactly a positive phase number"
+            )
+        elif owner not in phase_by_number:
+            problems.append(
+                f"{row.label}: Owning phase {owner} has no valid row in the Phase status table"
+            )
+        else:
+            status = phase_by_number[owner]
+            if row.is_open and status != "not started":
+                problems.append(
+                    f"{row.label}: open stub is owned by phase {owner}, whose status is {status!r}; "
+                    "open stubs may only belong to a not-started future phase"
+                )
+            if row.is_open and active_phase is not None and owner <= active_phase:
+                problems.append(
+                    f"{row.label}: open stub owner phase {owner} is not later than active phase {active_phase}"
+                )
+            if not row.is_open and status == "not started":
+                problems.append(
+                    f"{row.label}: closed stub claims realization by not-started phase {owner}"
+                )
+
+        if row.is_open:
+            open_rows.append(row)
+        else:
+            realized = row.realized_in_raw.strip()
+            if COMMIT_RE.fullmatch(realized) is None:
+                problems.append(
+                    f"{row.label}: closed stub's Realized in value {row.realized_in_raw!r} "
+                    "must be a 7-to-40-character lowercase hexadecimal commit id"
+                )
+            closed_rows.append(row)
+
+    return open_rows, closed_rows
+
+
+def validate_correspondence(
+    markers: list[Marker],
+    open_rows: list[RegistryRow],
+    closed_rows: list[RegistryRow],
+    problems: list[str],
+) -> None:
+    """Enforce unique, exact, bidirectional marker/registry correspondence."""
+    marker_locations: dict[str, list[Marker]] = defaultdict(list)
+    for marker in markers:
+        marker_locations[marker.location].append(marker)
+    for location, at_location in marker_locations.items():
+        if len(at_location) > 1:
+            problems.append(
+                f"{location}: {len(at_location)} STUB markers share one line; each marker needs a unique location"
+            )
+
+    all_real_rows = [*open_rows, *closed_rows]
+    row_locations: dict[str, list[RegistryRow]] = defaultdict(list)
+    for row in all_real_rows:
+        row_locations[row.location].append(row)
+    for location, at_location in row_locations.items():
+        if len(at_location) > 1:
+            lines = ", ".join(row.label for row in at_location)
+            problems.append(
+                f"AGENTS.md: Stub registry location {location!r} is repeated at {lines}; locations must be unique"
+            )
+
+    marker_identities = Counter(marker.identity for marker in markers)
+    open_identities = Counter(
+        row.identity for row in open_rows if row.identity is not None
+    )
+    for identity, count in open_identities.items():
+        if count > 1:
+            problems.append(
+                f"AGENTS.md: open Stub registry identity {identity!r} appears {count} times; expected exactly once"
+            )
+
+    for marker in markers:
+        matches = open_identities[marker.identity]
+        if matches != 1:
+            problems.append(
+                f"{marker.location}: STUB marker must have exactly one open registry row matching "
+                f"Location={marker.location!r}, Missing behavior={marker.description!r}, and "
+                f"Owning phase={marker.phase}; found {matches}"
+            )
+
+    for row in open_rows:
+        identity = row.identity
+        if identity is None:
+            continue
+        matches = marker_identities[identity]
+        if matches != 1:
+            problems.append(
+                f"{row.label}: open Stub registry row must match exactly one source marker on "
+                f"location, description, and owner; found {matches}"
+            )
+
+    for row in closed_rows:
+        remaining = marker_locations.get(row.location, [])
+        if remaining:
+            problems.append(
+                f"{row.label}: closed Stub registry row at {row.location!r} still has "
+                f"{len(remaining)} STUB marker(s) in source"
+            )
+
+
+def main() -> int:
+    """Run the complete validation and return a process exit status."""
+    try:
+        registry, phase_status = load_tables()
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        return report_failure([str(error)])
+
+    markers, problems, sources = scan_sources()
+    phase_by_number = validate_phase_table(phase_status, problems)
+    open_rows, closed_rows = validate_registry_rows(
+        registry, phase_by_number, sources, problems
+    )
+    validate_correspondence(markers, open_rows, closed_rows, problems)
 
     if problems:
-        fail(problems)
-        return 1  # unreachable, fail() exits
+        return report_failure(problems)
 
+    real_count = len(open_rows) + len(closed_rows)
     print(
         "check-stubs: OK — "
-        f"{len(markers)} marker(s) in source, {len(real_rows)} registered stub row(s) "
-        f"({len(open_rows)} open, {len(closed_rows)} closed), all consistent"
+        f"{len(markers)} marker(s), {real_count} registered row(s) "
+        f"({len(open_rows)} open, {len(closed_rows)} closed), all exact and consistent"
     )
     return 0
 
