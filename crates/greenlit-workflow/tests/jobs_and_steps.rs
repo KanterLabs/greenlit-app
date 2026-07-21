@@ -1,13 +1,11 @@
-//! Oracle table: `jobs.<id>:` and `jobs.<id>.steps[]:` field coverage
-//! (`PHASE-1-engine-core.md` greenlit-workflow section) — `runs-on`,
-//! `needs`, `if`, `outputs`, `env`, `defaults`, `services`, `container`, and
-//! every step field.
+//! Oracle table: documented `jobs.<id>:` and `jobs.<id>.steps[]:` fields,
+//! including identifier, runner, dependency, environment, and action rules.
 
 use greenlit_workflow::model::job::RunsOn;
 use greenlit_workflow::model::step::StepAction;
-use greenlit_workflow::model::value::ScalarOrExpr;
+use greenlit_workflow::model::value::{ScalarOrExpr, YamlScalar};
 use greenlit_workflow::model::workflow::{PermissionLevel, PermissionLevelAll, Permissions};
-use greenlit_workflow::{ParseError, extract_static, parse_workflow};
+use greenlit_workflow::{Location, ParseError, extract_static, parse_workflow};
 
 const HEADER: &str = "on: push\n";
 
@@ -105,10 +103,7 @@ fn runs_on_group_form() {
 fn missing_runs_on_is_a_missing_key_error() {
     let source = format!("{HEADER}jobs:\n  build:\n    steps:\n      - run: echo hi\n");
     let err = parse_workflow("t.yml", &source).expect_err("must fail");
-    assert!(
-        matches!(err, ParseError::MissingKey { key: "runs-on", .. }),
-        "got {err:?}"
-    );
+    assert!(matches!(err, ParseError::MissingKey { key: "runs-on", .. }));
 }
 
 #[test]
@@ -149,9 +144,7 @@ fn job_env_and_defaults() {
     assert_eq!(job.env[0].0.value, "FOO");
     assert_eq!(
         job.env[0].1.value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::String(
-            "bar".into()
-        ))
+        ScalarOrExpr::Literal(YamlScalar::String("bar".into()))
     );
     let defaults = job.defaults.as_ref().unwrap();
     let run = defaults.value.run.as_ref().unwrap();
@@ -245,17 +238,13 @@ fn services_and_container_share_the_same_shape() {
     let container = &job.container.as_ref().unwrap().value;
     assert_eq!(
         container.image.value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::String(
-            "node:20".into()
-        ))
+        ScalarOrExpr::Literal(YamlScalar::String("node:20".into()))
     );
     let (svc_name, svc) = &job.services[0];
     assert_eq!(svc_name.value, "redis");
     assert_eq!(
         svc.value.ports[0].value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::String(
-            "6379:6379".into()
-        ))
+        ScalarOrExpr::Literal(YamlScalar::String("6379:6379".into()))
     );
     let creds = svc.value.credentials.as_ref().unwrap();
     assert!(matches!(
@@ -273,11 +262,50 @@ fn container_bare_string_shorthand() {
     let container = &workflow.jobs[0].container.as_ref().unwrap().value;
     assert_eq!(
         container.image.value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::String(
-            "node:20-slim".into()
-        ))
+        ScalarOrExpr::Literal(YamlScalar::String("node:20-slim".into()))
     );
     assert!(container.credentials.is_none());
+}
+
+#[test]
+fn job_and_step_identifiers_follow_githubs_identifier_rules() {
+    let valid = format!(
+        "{HEADER}jobs:\n  _Build-2:\n    runs-on: ubuntu-latest\n    steps:\n      - id: Step_1-x\n        run: echo hi\n"
+    );
+    parse_workflow("ids.yml", &valid).expect("documented identifiers parse");
+
+    let rows = [
+        ("2build", "id", 3, 3, 9),
+        ("build.test", "id", 3, 3, 13),
+        ("build", "-step", 6, 13, 18),
+        ("build", "stép", 6, 13, 17),
+    ];
+    for (job_id, step_id, line, column, end_column) in rows {
+        let source = format!(
+            "{HEADER}jobs:\n  {job_id}:\n    runs-on: ubuntu-latest\n    steps:\n      - id: {step_id}\n        run: echo hi\n"
+        );
+        match parse_workflow("ids.yml", &source) {
+            Err(ParseError::Schema { span, message }) => {
+                assert_eq!(span.start, Location::new(line, column));
+                assert_eq!(span.end, Location::new(line, end_column));
+                assert!(message.contains("must start with a letter"), "{message}");
+            }
+            result => panic!("invalid identifier must fail: {result:?}"),
+        }
+    }
+
+    let source = format!(
+        "{HEADER}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - id: Compile\n        run: echo first\n      - id: compile\n        run: echo second\n"
+    );
+    match parse_workflow("ids.yml", &source) {
+        Err(ParseError::Schema { span, message }) => {
+            assert_eq!(span.start, Location::new(8, 13));
+            assert_eq!(span.end, Location::new(8, 20));
+            assert!(message.contains("case-insensitive; rename it"));
+            assert!(message.contains("first declared at ids.yml:6:13"));
+        }
+        result => panic!("case-colliding step ids must fail: {result:?}"),
+    }
 }
 
 #[test]
@@ -294,11 +322,11 @@ fn step_fields_run_form() {
     );
     assert_eq!(
         step.continue_on_error.as_ref().unwrap().value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::Bool(true))
+        ScalarOrExpr::Literal(YamlScalar::Bool(true))
     );
     assert_eq!(
         step.timeout_minutes.as_ref().unwrap().value,
-        ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::Number(5.0))
+        ScalarOrExpr::Literal(YamlScalar::Number(5.0))
     );
     match &step.action {
         StepAction::Run { script, shell } => {
@@ -320,9 +348,7 @@ fn step_fields_uses_form() {
             assert_eq!(reference.value, "actions/checkout@v4");
             assert_eq!(
                 with[1].1.value,
-                ScalarOrExpr::Literal(greenlit_workflow::model::value::YamlScalar::String(
-                    "sub".into()
-                ))
+                ScalarOrExpr::Literal(YamlScalar::String("sub".into()))
             );
         }
         other => panic!("expected Uses, got {other:?}"),

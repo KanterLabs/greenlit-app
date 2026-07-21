@@ -9,6 +9,7 @@ use crate::model::step::{Step, StepAction};
 use crate::model::value::{ScalarOrExpr, YamlValue};
 use crate::model::workflow::{Defaults, Workflow};
 use crate::span::Spanned;
+use std::collections::HashMap;
 
 pub(crate) fn validate_workflow(workflow: &Workflow) -> Result<(), ParseError> {
     if let Some(name) = &workflow.name {
@@ -27,6 +28,7 @@ pub(crate) fn validate_workflow(workflow: &Workflow) -> Result<(), ParseError> {
 }
 
 fn validate_job(job: &Job) -> Result<(), ParseError> {
+    validate_identifier(&job.id, "job id")?;
     let prefix = format!("jobs.{}", job.id.value);
     if let Some(name) = &job.name {
         validate_template(
@@ -76,10 +78,60 @@ fn validate_job(job: &Job) -> Result<(), ParseError> {
     if let Some(container) = &job.container {
         validate_container(&container.value, &format!("{prefix}.container"))?;
     }
+    // The workflow syntax requires every authored step id to be unique. The
+    // runner stores the `steps` context in `DictionaryContextData`, whose key
+    // index uses `StringComparer.OrdinalIgnoreCase`; two ids differing only in
+    // ASCII case therefore address the same step-context slot:
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepsid
+    // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/DTPipelines/Pipelines/ContextData/DictionaryContextData.cs#L71-L84
+    let mut step_ids = HashMap::new();
     for (index, step) in job.steps.iter().enumerate() {
-        validate_step(step, &format!("{prefix}.steps[{index}]"))?;
+        let context = format!("{prefix}.steps[{index}]");
+        if let Some(id) = &step.id {
+            validate_step_id(id, &context)?;
+            let folded = id.value.to_ascii_lowercase();
+            if let Some(first_span) = step_ids.get(&folded) {
+                return Err(ParseError::Schema {
+                    span: id.span.clone(),
+                    message: format!(
+                        "step id '{}' is not unique within job '{}' because step ids are case-insensitive; rename it (first declared at {first_span})",
+                        id.value, job.id.value
+                    ),
+                });
+            }
+            step_ids.insert(folded, id.span.clone());
+        }
+        validate_step(step, &context)?;
     }
     Ok(())
+}
+
+fn validate_step_id(id: &Spanned<String>, context: &str) -> Result<(), ParseError> {
+    reject_template(&id.value, &id.span, &format!("{context}.id"))?;
+    validate_identifier(id, "step id")
+}
+
+fn validate_identifier(id: &Spanned<String>, kind: &str) -> Result<(), ParseError> {
+    // GitHub documents this grammar for `jobs.<job_id>` and for context
+    // property names, which is how an authored step id is referenced:
+    // https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-jobs#setting-an-id-for-a-job
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#about-contexts
+    let mut bytes = id.value.bytes();
+    let valid = bytes
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(ParseError::Schema {
+            span: id.span.clone(),
+            message: format!(
+                "{kind} '{}' must start with a letter or '_' and contain only ASCII letters, digits, '-' or '_'",
+                id.value
+            ),
+        })
+    }
 }
 
 fn validate_runs_on(runs_on: &RunsOn, prefix: &str) -> Result<(), ParseError> {
@@ -207,9 +259,6 @@ fn validate_container(container: &ContainerSpec, context: &str) -> Result<(), Pa
 }
 
 fn validate_step(step: &Step, context: &str) -> Result<(), ParseError> {
-    if let Some(id) = &step.id {
-        reject_template(&id.value, &id.span, &format!("{context}.id"))?;
-    }
     if let Some(condition) = &step.if_condition {
         validate_if(
             &condition.value,
