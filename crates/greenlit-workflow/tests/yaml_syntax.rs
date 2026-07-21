@@ -2,9 +2,34 @@
 //! keys, merge keys (`<<`), anchors/aliases, one document per file, and the
 //! unknown-key policy.
 
-use greenlit_workflow::{ParseError, parse_workflow};
+use greenlit_workflow::{Location, ParseError, Span, parse_workflow};
 
 const HEADER: &str = "on: push\n";
+
+#[test]
+fn root_trigger_job_and_step_nodes_preserve_exact_source_spans() {
+    let source = concat!(
+        "on: push\n",
+        "jobs:\n",
+        "  build:\n",
+        "    runs-on: ubuntu-latest\n",
+        "    steps:\n",
+        "      - run: echo hi\n",
+    );
+    let workflow = parse_workflow("spans.yml", source).expect("parses");
+    let span = |start_line, start_column, end_line, end_column| {
+        Span::new(
+            "spans.yml".into(),
+            Location::new(start_line, start_column),
+            Location::new(end_line, end_column),
+        )
+    };
+
+    assert_eq!(workflow.span, span(1, 1, 7, 1));
+    assert_eq!(workflow.on[0].span, span(1, 5, 1, 9));
+    assert_eq!(workflow.jobs[0].span, span(4, 5, 7, 1));
+    assert_eq!(workflow.jobs[0].steps[0].span, span(6, 9, 7, 1));
+}
 
 #[test]
 fn duplicate_mapping_keys_are_rejected() {

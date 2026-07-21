@@ -72,9 +72,9 @@ pub fn resolve_runner_label(label: &str) -> Option<RunnerImage> {
 
 /// The [`SUPPORTED_RUNNER_LABELS`] list, pre-joined for error messages —
 /// kept as a literal (rather than computed at the `#[error(...)]` site) so
-/// the message text is unambiguous `thiserror` syntax; the unit test below
-/// pins it against [`SUPPORTED_RUNNER_LABELS`] itself so the two can never
-/// silently drift.
+/// the message text is unambiguous `thiserror` syntax. The supported-runner
+/// rejection integration test pins the displayed list so it cannot silently
+/// drift from [`SUPPORTED_RUNNER_LABELS`].
 const SUPPORTED_RUNNER_LABELS_DISPLAY: &str = "ubuntu-latest, ubuntu-24.04, ubuntu-22.04";
 
 /// Everything that can go wrong resolving `runs-on:`.

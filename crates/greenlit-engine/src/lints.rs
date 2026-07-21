@@ -1,13 +1,16 @@
 //! [`Lint`]: a plan-time warning that never blocks planning — as opposed to
 //! a [`crate::plan::PlanError`], which does.
 //!
-//! Every case here is a warning rather than a hard error because GitHub
-//! accepts the workflow and behaves in a specific (if sometimes surprising)
-//! documented way: a dead `exclude` entry, a `needs.<job>.outputs.<name>`
-//! reference to an output job `<job>` never declares (§4.3 — "GitHub
-//! silently yields the empty string here, so hard-failing would reject
-//! workflows GitHub accepts"), a matrix job's outputs being read by a
-//! dependent (§4.3 — last-writer-wins across parallel legs).
+//! Warnings preserve a valid execution plan while calling attention to
+//! suspicious declarations. GitHub documents that dereferencing a missing
+//! context property evaluates to an empty string:
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#about-contexts>.
+//! It also documents that matrix-job execution order is not guaranteed and
+//! that the last matrix job to finish overwrites a duplicate output name:
+//! <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#using-job-outputs-in-a-matrix-job>.
+//! The non-blocking dead-`exclude` and duplicate-`needs` diagnostics are
+//! pinned by
+//! `crates/greenlit-app/tests/plan_contracts.rs::dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics`.
 
 use greenlit_workflow::Span;
 

@@ -17,16 +17,16 @@ env:
 
 jobs:
   build:
-    # `runs-on: ${{ matrix.os }}` -- resolved per leg (`greenlit-engine`
-    # `runner::resolve_runs_on`), never once for the whole job.
+    # GitHub resolves `matrix.os` separately for every expanded job:
+    # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategymatrix
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
         channel: [stable, beta]
-        # Partial-key match: removes both `channel: beta` combos regardless
-        # of `os` (design memo's exclude semantics; also exercised in
-        # `greenlit-engine::matrix::expand`'s own oracle tests).
+        # GitHub specifies that an excluded configuration need only be a
+        # partial match, so this removes both `channel: beta` combinations:
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstrategymatrixexclude
         exclude:
           - channel: beta
         # Adds a new key to the one surviving combo it matches
@@ -37,8 +37,10 @@ jobs:
             channel: stable
             canary: true
     outputs:
-      # Deferred: no step output exists at plan time
-      # (`crate::outputs::plan_outputs` never invents a value).
+      # Step outputs are produced while a job runs, so planning preserves
+      # this expression for runtime evaluation. The plan contract is pinned
+      # by `crates/greenlit-app/tests/plan_matrix_needs.rs` in
+      # `job_output_is_deferred_and_consumed_by_a_downstream_jobs_output`.
       artifact-name: ${{ steps.pack.outputs.name }}
     steps:
       - id: pack
@@ -53,16 +55,17 @@ jobs:
       - name: Run unit tests
         run: echo running tests
       - name: Upload coverage
-        # Runtime-deferred: `needs.<id>.result` only exists once `build`
-        # actually finishes (`crate::defer::DeferReason::NeedsResult`).
+        # `needs.<job_id>.result` contains the completed dependency result:
+        # https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context
         if: needs.build.result == 'success'
         run: echo "uploading coverage for ${{ needs.build.outputs.artifact-name }}"
 
   deploy:
     needs: [build, test]
     runs-on: ubuntu-latest
-    # Statically evaluable against the synthetic push event
-    # (`crate::event::build_synthetic_event`): folds to `Static(true)`.
+    # The synthetic push event makes this statically true; the integration
+    # contract is pinned by `crates/greenlit-app/tests/plan_matrix_needs.rs`
+    # in `static_and_deferred_if_conditions_are_both_present`.
     if: github.event_name == 'push'
     outputs:
       # Consumes `build`'s declared output across the needs edge -- also
