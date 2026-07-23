@@ -190,7 +190,7 @@ pub(crate) fn plan_scalar_number(
     })
 }
 
-fn scalar_source(value: &ScalarOrExpr) -> String {
+pub(crate) fn scalar_source(value: &ScalarOrExpr) -> String {
     match value {
         ScalarOrExpr::Literal(value) => {
             greenlit_expr::value::to_display_string(&scalar_to_value(value))

@@ -12,14 +12,25 @@ use crate::graph::{JobGraph, JobId};
 use crate::lints::Lint;
 use crate::matrix::{MatrixLeg, plan_strategy};
 use crate::outputs::JobOutputsPlan;
-use crate::partial_eval::{EnvChain, FoldCtx, StaticRoots, StrategyDeferred};
+use crate::partial_eval::{
+    EnvChain, FoldCtx, NeedsContextSlots, StaticRoots, StepsContextSlots, StrategyDeferred,
+};
 use crate::planned::Planned;
 
+use super::budget::PlanSizeBudget;
 use super::conditions::{expr_calls_status, fold_job_condition};
 use super::contexts::{matrix_leg_value, strategy_context_value};
 use super::instance::plan_instance;
-use super::references::{ReferencingJob, lint_needs_output_references};
+use super::references::{ReferencingJob, WorkflowReferenceIndex, lint_needs_output_references};
 use super::{JobPlan, LegPlan, PlanError, PlanOptions, RunDefaultsPlan};
+
+pub(super) struct PlanningState<'state, 'env> {
+    pub(super) lints: &'state mut Vec<Lint>,
+    pub(super) size_budget: &'state mut PlanSizeBudget,
+    pub(super) workflow_env: &'env EnvChain,
+    pub(super) references: &'env WorkflowReferenceIndex<'env>,
+    pub(super) job_index: usize,
+}
 
 pub(crate) fn plan_job(
     workflow: &Workflow,
@@ -27,7 +38,7 @@ pub(crate) fn plan_job(
     event: &SyntheticEvent,
     options: &PlanOptions,
     graph: &JobGraph,
-    lints: &mut Vec<Lint>,
+    state: &mut PlanningState<'_, '_>,
 ) -> Result<JobPlan, PlanError> {
     let job_id = JobId(job.id.value.clone());
     let needs: Vec<JobId> = {
@@ -38,16 +49,36 @@ pub(crate) fn plan_job(
             .map(|n| JobId(n.value.clone()))
             .collect()
     };
+    let needs_slots = NeedsContextSlots::new(
+        needs
+            .iter()
+            .filter_map(|need| {
+                graph.idx_of(need).and_then(|dependency_index| {
+                    state
+                        .references
+                        .output_names(dependency_index.0 as usize)
+                        .map(|outputs| (need.clone(), outputs))
+                })
+            })
+            .collect(),
+    );
+    let needs_context = needs_slots.static_value();
 
     let roots_null = Value::Null;
+    let empty_context = Value::object(vec![]);
+    let empty_steps_slots = StepsContextSlots::default();
     let static_roots = StaticRoots {
         github: &event.github,
+        github_deferred: &event.deferred_github_properties,
         vars: &options.vars,
-        needs: None,
+        needs: &needs_context,
+        needs_slots: &needs_slots,
         matrix: &roots_null,
         matrix_deferred: false,
         strategy: &roots_null,
         strategy_deferred: StrategyDeferred::default(),
+        steps: &empty_context,
+        steps_slots: &empty_steps_slots,
         inputs: &event.inputs,
     };
 
@@ -86,7 +117,12 @@ pub(crate) fn plan_job(
         job: job_id.clone(),
         source: Box::new(source),
     })?;
-    lints.append(&mut strategy_lints);
+    state.lints.append(&mut strategy_lints);
+    let strategy_span = job
+        .strategy
+        .as_ref()
+        .map_or(&job.id.span, |strategy| &strategy.span);
+    state.size_budget.add(&strategy, strategy_span)?;
 
     let raw_outputs: Vec<(String, String, greenlit_workflow::Span)> = job
         .outputs
@@ -122,6 +158,7 @@ pub(crate) fn plan_job(
                 deferred_roots,
                 &raw_outputs,
                 &template_leg,
+                state,
             )?;
             (
                 Some(instance.runner),
@@ -145,19 +182,26 @@ pub(crate) fn plan_job(
                     strategy_deferred: deferred_strategy_fields(&strategy, false),
                     ..static_roots
                 };
-                let instance = plan_instance(workflow, job, &job_id, leg_roots, &raw_outputs, leg)?;
-                legs.push(LegPlan {
+                let instance =
+                    plan_instance(workflow, job, &job_id, leg_roots, &raw_outputs, leg, state)?;
+                // Reserve the cloned condition and leg envelope before the
+                // clone joins the retained aggregate.
+                state.size_budget.add(&condition, &job.id.span)?;
+                state.size_budget.add_bytes(160, &job.id.span)?;
+                let leg_condition = condition.clone();
+                let leg_plan = LegPlan {
                     name: instance.name,
                     runner: instance.runner,
                     container: instance.container,
                     services: instance.services,
                     env: instance.env,
                     defaults: instance.defaults,
-                    condition: condition.clone(),
+                    condition: leg_condition,
                     skip: None,
                     outputs: instance.outputs,
                     steps: instance.steps,
-                });
+                };
+                legs.push(leg_plan);
             }
             (
                 None,
@@ -187,6 +231,7 @@ pub(crate) fn plan_job(
                 static_roots,
                 &raw_outputs,
                 &implicit_leg,
+                state,
             )?;
             (
                 Some(instance.runner),
@@ -200,6 +245,19 @@ pub(crate) fn plan_job(
                 Vec::new(),
             )
         };
+
+    let is_static_matrix = strategy.is_matrix() && !strategy.is_matrix_deferred();
+    // All potentially large instance fields were charged individually.
+    // Reserve the remaining metadata and envelope before assembling the
+    // complete retained job.
+    state.size_budget.add(&job_id, &job.id.span)?;
+    state.size_budget.add(&needs, &job.id.span)?;
+    if is_static_matrix {
+        state.size_budget.add(&name, &job.id.span)?;
+    } else {
+        state.size_budget.add(&condition, &job.id.span)?;
+    }
+    state.size_budget.add_bytes(320, &job.id.span)?;
 
     let plan = JobPlan {
         id: job_id,
@@ -216,6 +274,7 @@ pub(crate) fn plan_job(
         services,
         env,
         defaults,
+        permissions: None,
         condition: if strategy.is_matrix() && !strategy.is_matrix_deferred() {
             None
         } else {
@@ -230,13 +289,11 @@ pub(crate) fn plan_job(
     };
 
     lint_needs_output_references(
-        &ReferencingJob {
-            span: &job.id.span,
-            needs: &plan.needs,
-        },
-        &plan,
-        workflow,
-        lints,
+        &ReferencingJob { needs: &plan.needs },
+        state.job_index,
+        state.references,
+        graph,
+        state.lints,
     );
 
     Ok(plan)

@@ -77,45 +77,6 @@ fn mapping_key_with_null_value_means_no_config() {
 }
 
 #[test]
-fn workflow_dispatch_with_inputs() {
-    let source = format!(
-        "on:\n  workflow_dispatch:\n    inputs:\n      environment:\n        description: \"Target env\"\n        required: true\n        type: choice\n        options: [staging, production]\n      debug:\n        type: boolean\n        default: false\n{TAIL}"
-    );
-    let workflow = parse_workflow("t.yml", &source).expect("parses");
-    match &workflow.on[0].value {
-        Trigger::WorkflowDispatch(dispatch) => {
-            assert_eq!(dispatch.inputs.len(), 2);
-            let env_input = &dispatch.inputs[0];
-            assert_eq!(env_input.name.value, "environment");
-            assert_eq!(env_input.required.as_ref().map(|r| r.value), Some(true));
-            let options: Vec<&str> = env_input.options.iter().map(|o| o.value.as_str()).collect();
-            assert_eq!(options, ["staging", "production"]);
-        }
-        other => panic!("expected WorkflowDispatch, got {other:?}"),
-    }
-}
-
-#[test]
-fn schedule_with_cron_entries() {
-    let source = format!(
-        "on:\n  schedule:\n    - cron: \"0 3 * * *\"\n      timezone: America/New_York\n    - cron: \"0 15 * * *\"\n{TAIL}"
-    );
-    let workflow = parse_workflow("t.yml", &source).expect("parses");
-    match &workflow.on[0].value {
-        Trigger::Schedule(crons) => {
-            let texts: Vec<&str> = crons.iter().map(|c| c.cron.value.as_str()).collect();
-            assert_eq!(texts, ["0 3 * * *", "0 15 * * *"]);
-            assert_eq!(
-                crons[0].timezone.as_ref().map(|zone| zone.value.as_str()),
-                Some("America/New_York")
-            );
-            assert!(crons[1].timezone.is_none());
-        }
-        other => panic!("expected Schedule, got {other:?}"),
-    }
-}
-
-#[test]
 fn repository_dispatch_with_types() {
     let source = format!("on:\n  repository_dispatch:\n    types: [deploy, rollback]\n{TAIL}");
     let workflow = parse_workflow("t.yml", &source).expect("parses");

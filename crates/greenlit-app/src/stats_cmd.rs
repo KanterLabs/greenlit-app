@@ -3,49 +3,91 @@
 //! must NOT append a new metrics record itself").
 
 use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::Path;
 
 use greenlit_metrics::{InvocationRecord, MetricsStore};
+
+use crate::errors;
+
+const RECENT_INVOCATION_LIMIT: usize = 20;
 
 pub(crate) fn run() -> anyhow::Result<()> {
     // Read-only: `MetricsStore::append` is never called here
     // (`PHASE-1-engine-core.md`, `AGENTS.md` Metrics section: "Read-only
     // reporting commands such as `stats` do not append records").
-    let store = MetricsStore::open_default()?;
-    let records = store.read_all()?;
+    let store = MetricsStore::open_default().map_err(|error| errors::metrics_error(&error))?;
+    let records = store
+        .read_recent(RECENT_INVOCATION_LIMIT)
+        .map_err(|error| errors::metrics_error(&error))?;
 
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    crate::render::terminal::render_sanitized(&mut handle, |buffer| {
+        render(&records, store.path(), buffer)
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "could not write metrics history to stdout: {error}\n  fix: ensure stdout is writable, then retry"
+        )
+    })
+}
+
+fn render(
+    records: &[InvocationRecord],
+    store_path: &Path,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     if records.is_empty() {
-        println!(
+        let safe_store_path = crate::render::terminal::inline_escape(&store_path.to_string_lossy());
+        writeln!(
+            out,
             "no invocation history yet at {} -- run `litci plan` to record one",
-            store.path().display()
-        );
+            safe_store_path
+        )?;
         return Ok(());
     }
 
-    println!("recent invocations ({} total):", records.len());
-    for record in &records {
+    writeln!(
+        out,
+        "recent invocations (up to {RECENT_INVOCATION_LIMIT}, {} shown):",
+        records.len()
+    )?;
+    for record in records {
         let stages = record
             .stages
             .iter()
-            .map(|s| format!("{}={:.2}ms", s.name, s.duration_ms))
+            .map(|s| {
+                format!(
+                    "{}={:.2}ms",
+                    crate::render::terminal::inline_escape(&s.name),
+                    s.duration_ms
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
+        let command = crate::render::terminal::inline_escape(&record.command);
+        writeln!(
+            out,
             "  t={} {:<6} total={:.2}ms stages=[{stages}]",
-            record.started_at_unix_ms, record.command, record.total_duration_ms
-        );
+            record.started_at_unix_ms, command, record.total_duration_ms
+        )?;
     }
 
-    println!();
-    println!(
+    writeln!(out)?;
+    writeln!(
+        out,
         "stage trends (avg / min / max over {} invocations):",
         records.len()
-    );
-    for (name, durations) in stage_trends(&records) {
+    )?;
+    for (name, durations) in stage_trends(records) {
         let (avg, min, max) = summarize(&durations);
-        println!(
+        let name = crate::render::terminal::inline_escape(&name);
+        writeln!(
+            out,
             "  {name:<10} avg={avg:.2}ms min={min:.2}ms max={max:.2}ms n={}",
             durations.len()
-        );
+        )?;
     }
 
     Ok(())

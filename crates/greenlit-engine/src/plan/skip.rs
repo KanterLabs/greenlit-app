@@ -28,7 +28,7 @@ pub(crate) fn propagate_static_skip(graph: &JobGraph, jobs: &mut [JobPlan]) {
             .find(|need| fully_skipped.get(*need).copied().unwrap_or(false))
             .cloned();
 
-        if !jobs[i].strategy.is_matrix {
+        if !jobs[i].strategy.is_matrix() || jobs[i].strategy.is_matrix_deferred() {
             let skip = decide_skip(
                 jobs[i].condition.as_ref(),
                 jobs[i].implicit_status_gate,

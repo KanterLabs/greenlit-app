@@ -196,6 +196,7 @@ pub(crate) fn plan_strategy(
                     lints,
                 )
             } else {
+                expand::validate_static_fragments(&source.value, &source.span, ctx, cap)?;
                 (
                     Some(MatrixPlan::Deferred {
                         span: source.span.clone(),

@@ -7,6 +7,7 @@
 //! cross-referenced against GitHub's
 //! [Expressions reference](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions).
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 mod coercion;
@@ -16,7 +17,7 @@ pub use coercion::{format_g15, is_falsy, is_truthy, to_display_string, to_number
 pub use comparison::{
     abstract_equal, abstract_not_equal, greater_or_equal, greater_than, less_or_equal, less_than,
     ordinal_ignore_case_cmp, ordinal_ignore_case_contains, ordinal_ignore_case_ends_with,
-    ordinal_ignore_case_eq, ordinal_ignore_case_starts_with,
+    ordinal_ignore_case_eq, ordinal_ignore_case_key, ordinal_ignore_case_starts_with,
 };
 
 /// A GitHub Actions expression value. There are exactly six runner value
@@ -50,7 +51,7 @@ pub enum Value {
     String(String),
     /// An array (see [`ArrayValue`] for the plain-vs-filtered distinction).
     Array(ArrayValue),
-    /// An object (insertion-ordered, case-insensitive key lookup).
+    /// An object (insertion-ordered, with an explicit key-comparison policy).
     Object(ObjectValue),
 }
 
@@ -97,12 +98,22 @@ impl Value {
     }
 
     /// Builds an object value from owned, insertion-ordered entries. Keys
-    /// are looked up case-insensitively later (see [`ObjectValue::get`]);
-    /// duplicate keys are the caller's responsibility to avoid (matching
-    /// GitHub's `DictionaryContextData`, which is itself a single map — the
-    /// last write for a given key wins if a caller inserts a duplicate).
+    /// are looked up case-insensitively later (see [`ObjectValue::get`]).
+    /// Case-insensitive duplicates collapse in place: the first spelling
+    /// and position are preserved while the last value wins, matching
+    /// GitHub's `DictionaryContextData` string indexer.
     pub fn object(entries: Vec<(String, Value)>) -> Value {
-        Value::Object(ObjectValue::new(entries))
+        Value::Object(ObjectValue::new(entries, false))
+    }
+
+    /// Builds an insertion-ordered object with case-sensitive key lookup.
+    ///
+    /// Most Actions context objects use ordinal-ignore-case keys; the Linux
+    /// `env` context is the important exception. [`crate::Context::with_env`]
+    /// applies this policy automatically, so callers normally need this
+    /// constructor only for a custom context implementation.
+    pub fn case_sensitive_object(entries: Vec<(String, Value)>) -> Value {
+        Value::Object(ObjectValue::new(entries, true))
     }
 }
 
@@ -157,39 +168,81 @@ impl ArrayValue {
     }
 }
 
-/// An object value: insertion-ordered key/value pairs, looked up
-/// case-insensitively.
+/// An object value: insertion-ordered key/value pairs with either exact or
+/// ordinal-ignore-case lookup, selected when the object is constructed.
 ///
-/// The runner's `DictionaryContextData` uses
-/// `StringComparer.OrdinalIgnoreCase` while retaining a list for insertion
-/// order:
+/// The runner's ordinary `DictionaryContextData` uses
+/// `StringComparer.OrdinalIgnoreCase`, while its Linux `env` context uses
+/// `CaseSensitiveDictionaryContextData`; both retain insertion order:
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ContextData/DictionaryContextData.cs>.
-/// A linear scan is used here rather than a second case-folded index: context
-/// objects in practice (env maps, `github.event` sub-objects, matrix entries)
-/// are small, and one representation cannot drift from another.
+/// <https://github.com/actions/runner/blob/main/src/Runner.Worker/ExecutionContext.cs>.
+/// A canonical-key index makes lookup constant-time while the ordered entry
+/// vector remains the source of truth for iteration and serialization.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectValue {
     entries: Rc<Vec<(String, Value)>>,
+    positions: Rc<HashMap<String, usize>>,
+    case_sensitive: bool,
 }
 
 impl ObjectValue {
-    fn new(entries: Vec<(String, Value)>) -> Self {
+    fn new(entries: Vec<(String, Value)>, case_sensitive: bool) -> Self {
+        // `DictionaryContextData`'s string indexer replaces an existing
+        // value under its configured comparer while preserving the first
+        // key's spelling and position. This matters for values such as
+        // `fromJSON('{"A": 1, "a": 2}')`: ordinary expression objects
+        // compare keys ordinal-ignore-case, so `a` replaces `A` rather than
+        // creating a second property.
+        // https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ContextData/DictionaryContextData.cs
+        let mut normalized: Vec<(String, Value)> = Vec::with_capacity(entries.len());
+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(entries.len());
+        for (key, value) in entries {
+            let lookup_key = if case_sensitive {
+                key.clone()
+            } else {
+                comparison::ordinal_ignore_case_key(&key)
+            };
+            match positions.entry(lookup_key) {
+                std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                    if let Some((_, stored_value)) = normalized.get_mut(*occupied.get()) {
+                        *stored_value = value;
+                    } else {
+                        // Keep construction total even if the private index
+                        // invariant is changed later: repair the index and
+                        // retain the entry instead of indexing with a panic.
+                        *occupied.get_mut() = normalized.len();
+                        normalized.push((key, value));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(normalized.len());
+                    normalized.push((key, value));
+                }
+            }
+        }
         ObjectValue {
-            entries: Rc::new(entries),
+            entries: Rc::new(normalized),
+            positions: Rc::new(positions),
+            case_sensitive,
         }
     }
 
-    /// Case-insensitive ordinal key lookup (see the module doc comment on
-    /// [`ordinal_ignore_case_eq`] for exactly what "ordinal" means here).
+    /// Looks up a key using this object's exact or ordinal-ignore-case
+    /// comparison policy.
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.entries
-            .iter()
-            .find(|(k, _)| ordinal_ignore_case_eq(k, key))
-            .map(|(_, v)| v)
+        let lookup_key = if self.case_sensitive {
+            key.to_string()
+        } else {
+            comparison::ordinal_ignore_case_key(key)
+        };
+        self.positions
+            .get(&lookup_key)
+            .and_then(|index| self.entries.get(*index))
+            .map(|(_, value)| value)
     }
 
     /// Iterates entries in insertion order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = (&str, &Value)> + ExactSizeIterator {
         self.entries.iter().map(|(k, v)| (k.as_str(), v))
     }
 

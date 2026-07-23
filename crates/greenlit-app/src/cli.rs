@@ -49,8 +49,13 @@ pub(crate) struct PlanArgs {
     /// A local variable override, `KEY=VALUE`. Repeatable; the highest
     /// priority source in the `vars.*` resolution chain (CLI override, then
     /// same-named process environment variable, then `.litci/vars`).
-    #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     pub(crate) vars: Vec<(String, String)>,
+
+    /// A `workflow_dispatch` input, `KEY=VALUE`. Repeatable; later entries
+    /// for the same key win.
+    #[arg(long = "input", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    pub(crate) inputs: Vec<(String, String)>,
 }
 
 /// Which synthetic trigger event `-e`/`--event` selects -- mirrors
@@ -83,7 +88,18 @@ fn parse_key_val(raw: &str) -> Result<(String, String), String> {
     match raw.split_once('=') {
         Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
         _ => Err(format!(
-            "invalid --var '{raw}': expected KEY=VALUE with a non-empty KEY"
+            "invalid KEY=VALUE argument '{raw}': expected a non-empty KEY"
         )),
     }
+}
+
+/// Parses and validates one GitHub configuration-variable override.
+fn parse_var(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = parse_key_val(raw)?;
+    crate::vars::validate_name(&key).map_err(|reason| {
+        format!(
+            "invalid --var name '{key}': {reason}\n  fix: rename it to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_"
+        )
+    })?;
+    Ok((key, value))
 }

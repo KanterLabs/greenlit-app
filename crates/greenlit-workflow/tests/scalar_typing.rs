@@ -164,15 +164,22 @@ fn resolves_float_spellings() {
 }
 
 #[test]
-fn out_of_range_decimal_number_is_a_parse_error() {
-    // Once `MatchFloat` recognizes the grammar, the runner reports a failed
-    // finite-range conversion as invalid rather than retaining infinity:
-    // https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs
-    let err = env_error("1e9999");
-    assert!(
-        matches!(err, ParseError::Schema { ref message, .. } if message.contains("out of range")),
-        "got {err:?}"
-    );
+fn out_of_range_decimal_number_resolves_to_infinity() {
+    // The pinned runner targets .NET 8, whose `Double.TryParse` returns
+    // infinity for an otherwise valid out-of-range magnitude.
+    // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/WorkflowParser/Conversion/YamlObjectReader.cs#L497-L616
+    match env_value("1e9999") {
+        ScalarOrExpr::Literal(YamlScalar::Number(number)) => {
+            assert_eq!(number, f64::INFINITY)
+        }
+        other => panic!("expected +inf, got {other:?}"),
+    }
+    match env_value("-1e9999") {
+        ScalarOrExpr::Literal(YamlScalar::Number(number)) => {
+            assert_eq!(number, f64::NEG_INFINITY)
+        }
+        other => panic!("expected -inf, got {other:?}"),
+    }
 }
 
 #[test]
@@ -224,31 +231,44 @@ fn quoted_and_block_scalars_are_always_strings_regardless_of_content() {
 }
 
 #[test]
-fn explicit_core_tags_are_honored_and_override_style() {
+fn explicit_core_tags_follow_runner_style_rules() {
     // `!!str 123` forces the string "123" even though `123` unquoted would
     // resolve as a Number.
     assert_eq!(
         env_value("!!str 123"),
         ScalarOrExpr::Literal(YamlScalar::String("123".to_owned()))
     );
-    // `!!int` on a quoted scalar still forces Integer, overriding the
-    // quoting-implies-string default.
     assert_eq!(
-        env_value("!!int \"42\""),
+        env_value("!!int 42"),
         ScalarOrExpr::Literal(YamlScalar::Number(42.0))
     );
     assert_eq!(
-        env_value("!!bool \"true\""),
+        env_value("!!bool true"),
         ScalarOrExpr::Literal(YamlScalar::Bool(true))
     );
     assert_eq!(
-        env_value("!!float \"1\""),
+        env_value("!!float 1"),
         ScalarOrExpr::Literal(YamlScalar::Number(1.0))
     );
     assert_eq!(
-        env_value("!!null \"~\""),
+        env_value("!!null ~"),
         ScalarOrExpr::Literal(YamlScalar::Null)
     );
+
+    // Only `!!str` is valid on a non-plain scalar. The runner rejects every
+    // other explicit core tag before attempting to parse its value.
+    for raw in [
+        "!!int \"42\"",
+        "!!bool 'true'",
+        "!!float |\n    1.0",
+        "!!null >\n    null",
+    ] {
+        let err = env_error(raw);
+        assert!(
+            matches!(err, ParseError::InvalidTagStyle { .. }),
+            "case {raw:?}: got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -267,6 +287,11 @@ fn unknown_yaml_tags_are_a_parse_error() {
         "got {err:?}"
     );
     let err = env_error("!custom foo");
+    assert!(
+        matches!(err, ParseError::UnsupportedTag { .. }),
+        "got {err:?}"
+    );
+    let err = env_error("!!seq foo");
     assert!(
         matches!(err, ParseError::UnsupportedTag { .. }),
         "got {err:?}"

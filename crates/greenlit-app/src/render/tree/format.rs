@@ -5,11 +5,13 @@ use greenlit_engine::{
     StepStatusField,
 };
 
-pub(super) fn display_planned_string(value: &Planned<String>) -> &str {
-    match &value.evaluation {
+use crate::render::terminal::inline_escape;
+
+pub(super) fn display_planned_string(value: &Planned<String>) -> String {
+    inline_escape(match &value.evaluation {
         Evaluation::Static(value) => value,
         Evaluation::Deferred(deferred) => &deferred.residual_text,
-    }
+    })
 }
 
 pub(super) fn format_planned_string(value: &Planned<String>) -> String {
@@ -34,7 +36,7 @@ pub(super) fn format_planned<T>(
     planned: &Planned<T>,
     format_static: impl FnOnce(&T) -> String,
 ) -> String {
-    match &planned.evaluation {
+    let rendered = match &planned.evaluation {
         Evaluation::Static(value) => {
             format!("static({}) <- {}", format_static(value), planned.source)
         }
@@ -43,11 +45,12 @@ pub(super) fn format_planned<T>(
             deferred.residual_text,
             format_defer_reasons(&deferred.defers_on)
         ),
-    }
+    };
+    inline_escape(&rendered)
 }
 
 pub(super) fn format_runner(runner: &RunnerPlan) -> String {
-    match &runner.evaluation {
+    let rendered = match &runner.evaluation {
         Evaluation::Static(image) => {
             format!("static({}) <- {}", image.image_identifier(), runner.source)
         }
@@ -56,7 +59,8 @@ pub(super) fn format_runner(runner: &RunnerPlan) -> String {
             deferred.residual_text,
             format_defer_reasons(&deferred.defers_on)
         ),
-    }
+    };
+    inline_escape(&rendered)
 }
 
 pub(super) fn format_condition(
@@ -68,7 +72,7 @@ pub(super) fn format_condition(
     } else {
         ""
     };
-    match condition {
+    let rendered = match condition {
         None => format!("(none){status_gate}"),
         Some(condition) => match &condition.eval {
             PlannedCond::Static(value) => {
@@ -80,25 +84,29 @@ pub(super) fn format_condition(
                 format_defer_reasons(&deferred.defers_on)
             ),
         },
-    }
+    };
+    inline_escape(&rendered)
 }
 
 pub(super) fn skip_suffix(skip: Option<&StaticSkip>) -> String {
-    match skip {
+    let rendered = match skip {
         None => String::new(),
         Some(StaticSkip::ConditionFalse) => " [skipped: condition is statically false]".to_string(),
         Some(StaticSkip::NeedSkipped { need }) => {
             format!(" [skipped: dependency '{need}' is skipped]")
         }
-    }
+    };
+    inline_escape(&rendered)
 }
 
 pub(super) fn format_defer_reasons(reasons: &[DeferReason]) -> String {
-    reasons
-        .iter()
-        .map(format_defer_reason)
-        .collect::<Vec<_>>()
-        .join(", ")
+    inline_escape(
+        &reasons
+            .iter()
+            .map(format_defer_reason)
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 fn format_defer_reason(reason: &DeferReason) -> String {
@@ -132,6 +140,10 @@ fn format_defer_reason(reason: &DeferReason) -> String {
         ),
         DeferReason::HashFiles => "hashFiles(...)".to_string(),
         DeferReason::DynamicEnv { name } => format!("env.{name}"),
+        DeferReason::GithubContext {
+            property: Some(property),
+        } => format!("github.{property}"),
+        DeferReason::GithubContext { property: None } => "github".to_string(),
         DeferReason::RunnerContext => "runner.*".to_string(),
         DeferReason::JobContext => "job.*".to_string(),
         DeferReason::MatrixContext => "matrix.*".to_string(),

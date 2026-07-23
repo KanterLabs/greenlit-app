@@ -23,6 +23,14 @@ pub enum MetricsError {
     )]
     HomeDirUnavailable,
 
+    /// `HOME` was present but did not name an absolute user-home path. An
+    /// empty or relative value would redirect the supposedly user-local
+    /// metrics store into the invocation's repository.
+    #[error(
+        "could not determine the user home directory (HOME is empty, relative, inaccessible, or not a directory) — set HOME to an accessible absolute user home directory"
+    )]
+    InvalidHomeDir,
+
     /// Creating the metrics directory (`~/.litci/metrics` by default) failed.
     #[error("failed to create metrics directory {path}: {source}")]
     CreateDir {
@@ -41,6 +49,27 @@ pub enum MetricsError {
         source: std::io::Error,
     },
 
+    /// The metrics path resolved to a symbolic link, directory, FIFO,
+    /// device, or another non-regular file. Following or blocking on such a
+    /// target would violate the local-file boundary.
+    #[error(
+        "metrics path component {path} is a symbolic link or special file — replace it with a real directory or regular file owned by the current user"
+    )]
+    InvalidPathComponent {
+        /// The unsafe or unsupported path component.
+        path: PathBuf,
+    },
+
+    /// Acquiring the cross-process lock that serializes append/repair and
+    /// excludes readers during mutation failed.
+    #[error("failed to lock metrics file {path}: {source}")]
+    LockFile {
+        /// The metrics file that could not be locked.
+        path: PathBuf,
+        /// The underlying locking error.
+        source: std::io::Error,
+    },
+
     /// Serializing a record to JSON failed. In practice this cannot happen
     /// for the record types this crate defines (no non-finite floats, no
     /// non-string map keys), but serialization is still a fallible API that
@@ -51,6 +80,15 @@ pub enum MetricsError {
         path: PathBuf,
         /// The underlying serialization error.
         source: serde_json::Error,
+    },
+
+    /// A newly produced record exceeded the bounded on-disk record size.
+    #[error("metrics record for {path} exceeds the {max_bytes}-byte per-record safety limit")]
+    RecordWriteLimit {
+        /// The metrics file the record was going to be appended to.
+        path: PathBuf,
+        /// Maximum accepted serialized record bytes, excluding its newline.
+        max_bytes: usize,
     },
 
     /// Writing the serialized record line to disk failed.
@@ -72,11 +110,22 @@ pub enum MetricsError {
         source: std::io::Error,
     },
 
-    /// A non-final line in the NDJSON file did not parse as a valid
+    /// One stored record or unterminated tail exceeded the bounded size
+    /// Greenlit can safely parse or repair.
+    #[error("metrics record at {path} exceeds the {max_bytes}-byte per-record safety limit")]
+    RecordReadLimit {
+        /// The metrics file containing the oversized record or tail.
+        path: PathBuf,
+        /// Maximum accepted record bytes, excluding its newline.
+        max_bytes: usize,
+    },
+
+    /// A newline-terminated line in the NDJSON file did not parse as a valid
     /// [`InvocationRecord`](crate::InvocationRecord). Since this file is
     /// written exclusively by [`MetricsStore::append`](crate::MetricsStore::append),
-    /// this indicates corruption rather than a torn final append, which
-    /// [`MetricsStore::read_all`](crate::MetricsStore::read_all) tolerates.
+    /// this indicates corruption rather than an unterminated torn final
+    /// append, which the metrics-store readers tolerate within the per-record
+    /// bound.
     #[error("corrupt metrics record at {path}:{line} — {source}")]
     CorruptRecord {
         /// The metrics file containing the bad line.
@@ -85,5 +134,49 @@ pub enum MetricsError {
         line: usize,
         /// The underlying parse error.
         source: serde_json::Error,
+    },
+
+    /// A newest-window record found by bounded reverse reading was malformed.
+    /// Reverse reading deliberately does not count every older newline, so a
+    /// byte offset is truthful where a line number would not be.
+    #[error("corrupt metrics record at {path} byte offset {offset} — {source}")]
+    CorruptRecentRecord {
+        /// The metrics file containing the bad record.
+        path: PathBuf,
+        /// Byte offset where the record begins.
+        offset: u64,
+        /// The underlying parse error.
+        source: serde_json::Error,
+    },
+
+    /// A well-formed record uses a schema version this build cannot read.
+    #[error(
+        "unsupported metrics schema version {found} at {path}:{line} (this build supports {supported})"
+    )]
+    UnsupportedSchema {
+        /// Metrics file containing the record.
+        path: PathBuf,
+        /// 1-based record line.
+        line: usize,
+        /// Version found on disk.
+        found: u64,
+        /// Version this build understands.
+        supported: u32,
+    },
+
+    /// A newest-window record found by bounded reverse reading uses a schema
+    /// version this build cannot read.
+    #[error(
+        "unsupported metrics schema version {found} at {path} byte offset {offset} (this build supports {supported})"
+    )]
+    UnsupportedRecentSchema {
+        /// Metrics file containing the record.
+        path: PathBuf,
+        /// Byte offset where the record begins.
+        offset: u64,
+        /// Version found on disk.
+        found: u64,
+        /// Version this build understands.
+        supported: u32,
     },
 }

@@ -2,9 +2,9 @@
 //! evaluating one `if:` expression (job- or step-level).
 //!
 //! This implements `PHASE-1-engine-core.md`'s static/deferred condition
-//! planning and stable `--json` contract. The implicit `success()` gate this crate's callers
-//! (`crate::plan`) attach alongside a [`Condition`] is modeled structurally,
-//! not folded into the expression itself — see
+//! planning and stable `--json` contract. The implicit `success()` gate
+//! this crate's callers (`crate::plan`) attach alongside a [`Condition`] is
+//! modeled structurally, not folded into the expression itself — see
 //! `greenlit_expr::expr_calls_status_function`'s own doc comment, which this
 //! crate's job/step planning consults directly.
 
@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use greenlit_expr::Expr;
 use greenlit_expr::value::is_truthy;
+use greenlit_workflow::Span;
 
 use crate::defer::DeferReason;
 use crate::json_shape::EvaluatedJson;
@@ -20,8 +21,9 @@ use crate::partial_eval::{FoldCtx, Folded, PartialEvalError, fold_expr, pretty_p
 /// One `if:` condition, fully resolved as far as plan time allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Condition {
-    /// Verbatim authored text, with the `${{ }}` wrapper stripped if the
-    /// whole field was exactly one such wrapper.
+    /// Location of the authored `if:` value.
+    pub span: Span,
+    /// Verbatim authored text, including a `${{ }}` wrapper when present.
     pub source: String,
     /// The partial-evaluation result.
     pub eval: PlannedCond,
@@ -60,6 +62,7 @@ impl Serialize for Condition {
     {
         match &self.eval {
             PlannedCond::Static(b) => EvaluatedJson {
+                span: self.span.to_string(),
                 source: &self.source,
                 evaluation: "static",
                 value: Some(b),
@@ -68,6 +71,7 @@ impl Serialize for Condition {
             }
             .serialize(serializer),
             PlannedCond::Deferred(d) => EvaluatedJson::<bool> {
+                span: self.span.to_string(),
                 source: &self.source,
                 evaluation: "deferred",
                 value: None,
@@ -99,9 +103,12 @@ fn strip_if_wrapper(raw: &str) -> &str {
 }
 
 /// Partially evaluates one `if:` field's raw text into a [`Condition`].
-pub(crate) fn plan_condition(raw: &str, ctx: &FoldCtx<'_>) -> Result<Condition, PartialEvalError> {
-    let source = strip_if_wrapper(raw).to_string();
-    let expr = greenlit_expr::parse(&source)?;
+pub(crate) fn plan_condition(
+    raw: &str,
+    span: &Span,
+    ctx: &FoldCtx<'_>,
+) -> Result<Condition, PartialEvalError> {
+    let expr = greenlit_expr::parse(strip_if_wrapper(raw))?;
     let eval = match fold_expr(&expr, ctx)? {
         // GitHub conditionals use expression truthiness, so a fully-static
         // condition always lands as `Static(bool)`.
@@ -112,5 +119,9 @@ pub(crate) fn plan_condition(raw: &str, ctx: &FoldCtx<'_>) -> Result<Condition, 
             defers_on: defers_on.into_iter().collect(),
         }),
     };
-    Ok(Condition { source, eval })
+    Ok(Condition {
+        span: span.clone(),
+        source: raw.to_string(),
+        eval,
+    })
 }

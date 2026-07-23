@@ -110,21 +110,29 @@ pub enum BinOp {
 /// get it); this function only answers the tree-search question.
 pub fn expr_calls_status_function(expr: &Expr) -> bool {
     const STATUS_FUNCTIONS: [&str; 4] = ["success", "failure", "cancelled", "always"];
-    match expr {
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::NamedValue(_) => false,
-        Expr::Call { name, args } => {
-            STATUS_FUNCTIONS
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(name))
-                || args.iter().any(expr_calls_status_function)
-        }
-        Expr::Index { target, index } => {
-            expr_calls_status_function(target) || expr_calls_status_function(index)
-        }
-        Expr::Wildcard { target } => expr_calls_status_function(target),
-        Expr::Not(inner) => expr_calls_status_function(inner),
-        Expr::Binary { lhs, rhs, .. } => {
-            expr_calls_status_function(lhs) || expr_calls_status_function(rhs)
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) | Expr::NamedValue(_) => {}
+            Expr::Call { name, args } => {
+                if STATUS_FUNCTIONS
+                    .iter()
+                    .any(|function| function.eq_ignore_ascii_case(name))
+                {
+                    return true;
+                }
+                stack.extend(args);
+            }
+            Expr::Index { target, index } => {
+                stack.push(target);
+                stack.push(index);
+            }
+            Expr::Wildcard { target } | Expr::Not(target) => stack.push(target),
+            Expr::Binary { lhs, rhs, .. } => {
+                stack.push(lhs);
+                stack.push(rhs);
+            }
         }
     }
+    false
 }

@@ -19,7 +19,17 @@ pub(crate) fn fold_expr(expr: &Expr, ctx: &FoldCtx<'_>) -> Result<Folded, Partia
     let mut defers = BTreeSet::new();
     collect_defer_reasons(expr, ctx, &mut defers)?;
     if defers.is_empty() {
-        let value = greenlit_expr::evaluate(expr, &ctx.static_context())?;
+        // Workflow-template evaluation supplies the surrounding template's
+        // 10 MiB budget instead of the expression SDK's standalone 1 MiB
+        // default. This is the runner's `TemplateToken` call path.
+        // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/DTObjectTemplating/ObjectTemplating/Tokens/TemplateToken.cs#L52-L65
+        let value = greenlit_expr::evaluate_with_options(
+            expr,
+            &ctx.static_context(),
+            greenlit_expr::EvaluationOptions::new(
+                greenlit_expr::WORKFLOW_TEMPLATE_MAX_MEMORY_BYTES,
+            ),
+        )?;
         return Ok(Folded::Value(value));
     }
     match expr {

@@ -42,8 +42,7 @@ pub enum YamlScalar {
 /// `Null`/`NULL` case variants beyond these exact four, nor bare `N`/`n`).
 ///
 /// Exposed for explicit-tag handling (`!!null`): [`crate::yaml::raw`] uses
-/// this directly when a scalar is force-typed by tag, bypassing style
-/// checks (a tag always wins over the plain/quoted distinction).
+/// this directly after explicit-tag style validation.
 pub(crate) fn as_null(raw: &str) -> bool {
     matches!(raw, "" | "null" | "Null" | "NULL" | "~")
 }
@@ -64,8 +63,8 @@ pub(crate) fn as_bool(raw: &str) -> Option<bool> {
 /// GitHub runner Integer grammar: `[0-9]+`, `[+-][0-9]+`,
 /// `0x[0-9a-fA-F]+`, or `0o[0-7]+`. The sign belongs only to the decimal
 /// branch; `-0x1` and `+0o7` therefore remain strings. Hex/octal literals
-/// are parsed within `i32` range, while decimal literals must fit a finite
-/// `f64`; either overflow is a parse error, not a silent fallback to string.
+/// are parsed within `i32` range. Decimal overflow resolves to signed
+/// infinity, matching `Double.TryParse` on the runner's .NET 8 target.
 /// These branches transcribe `MatchInteger` in the current runner source:
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
 ///
@@ -85,18 +84,19 @@ pub(crate) fn as_integer(raw: &str) -> Option<Result<f64, NumberParseError>> {
     }
     let decimal_digits = raw.strip_prefix(['+', '-']).unwrap_or(raw);
     if !decimal_digits.is_empty() && decimal_digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Some(parse_finite_number(raw));
+        return Some(parse_decimal_number(raw));
     }
     None
 }
 
-/// A number-shaped scalar matched GitHub's grammar but failed its range
-/// conversion.
+/// A number-shaped scalar matched GitHub's grammar but failed conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NumberParseError {
     /// An unsigned hexadecimal/octal magnitude did not fit `i32`.
     RadixIntegerOverflow,
-    /// A decimal integer/float did not fit a finite `f64`.
+    /// Rust's decimal parser rejected a grammar-valid scalar. The runner's
+    /// `Double.TryParse` accepts overflow as infinity on .NET 8, so this is
+    /// reserved for any residual parser mismatch rather than finite range.
     OutOfRange,
 }
 
@@ -111,10 +111,9 @@ fn parse_radix_within_i32(digits: &str, radix: u32) -> Result<f64, NumberParseEr
 /// spellings `.inf`/`.Inf`/`.INF` (optionally signed) and
 /// `.nan`/`.NaN`/`.NAN`.
 ///
-/// Once the grammar matches, the runner's `MatchFloat` requires
-/// `Double.TryParse` to succeed and reports an invalid value on range
-/// failure; a decimal overflow must therefore not become an implicit
-/// infinity. Source: `MatchFloat` in
+/// Once the grammar matches, the runner's `MatchFloat` uses
+/// `Double.TryParse`. On its .NET 8 target, an out-of-range magnitude parses
+/// successfully to signed infinity. Source: `MatchFloat` in
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
 ///
 /// Exposed for explicit `!!float` tag handling; see [`as_null`].
@@ -128,17 +127,14 @@ pub(crate) fn as_float(raw: &str) -> Option<Result<f64, NumberParseError>> {
         _ => {}
     }
     if matches_float_grammar(raw) {
-        Some(parse_finite_number(raw))
+        Some(parse_decimal_number(raw))
     } else {
         None
     }
 }
 
-fn parse_finite_number(raw: &str) -> Result<f64, NumberParseError> {
-    raw.parse::<f64>()
-        .ok()
-        .filter(|number| number.is_finite())
-        .ok_or(NumberParseError::OutOfRange)
+fn parse_decimal_number(raw: &str) -> Result<f64, NumberParseError> {
+    raw.parse::<f64>().map_err(|_| NumberParseError::OutOfRange)
 }
 
 /// Character-level conformance check for

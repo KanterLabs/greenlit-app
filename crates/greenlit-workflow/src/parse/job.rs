@@ -10,6 +10,7 @@ use crate::parse::util::{
     Entries, as_mapping, find, find_pair, key_text, parse_defaults, raw_string,
     reject_unknown_keys, require, scalar_or_expr_map, string_list,
 };
+use crate::parse::workflow::parse_permissions;
 use crate::span::Spanned;
 use crate::yaml::raw::RawNode;
 
@@ -21,7 +22,17 @@ type JobOutputs = Vec<(Spanned<String>, Spanned<String>)>;
 /// spec (shared with `container:` — see [`crate::parse::container`]).
 type ServiceList = Vec<(Spanned<String>, Spanned<ContainerSpec>)>;
 
-const REUSABLE_JOB_KEYS: &[&str] = &["name", "needs", "if", "uses", "with", "secrets"];
+const REUSABLE_JOB_KEYS: &[&str] = &[
+    "name",
+    "needs",
+    "if",
+    "uses",
+    "with",
+    "secrets",
+    "strategy",
+    "concurrency",
+    "permissions",
+];
 const JOB_KEYS: &[&str] = &[
     "name",
     "runs-on",
@@ -30,6 +41,7 @@ const JOB_KEYS: &[&str] = &[
     "outputs",
     "env",
     "defaults",
+    "permissions",
     "strategy",
     "services",
     "container",
@@ -67,6 +79,7 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
         let if_condition = find(entries, "if")
             .map(|v| raw_string(v, &context))
             .transpose()?;
+        let permissions = parse_job_permissions(entries, &context)?;
         return Ok(Job {
             span: value.span.clone(),
             id,
@@ -77,6 +90,7 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
             outputs: Vec::new(),
             env: Vec::new(),
             defaults: None,
+            permissions,
             strategy: None,
             services: Vec::new(),
             container: None,
@@ -111,6 +125,7 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
     let defaults = find(entries, "defaults")
         .map(|v| Ok::<_, ParseError>(Spanned::new(parse_defaults(v, &context)?, v.span.clone())))
         .transpose()?;
+    let permissions = parse_job_permissions(entries, &context)?;
     let strategy = find(entries, "strategy")
         .map(|v| Ok::<_, ParseError>(Spanned::new(parse_strategy(v)?, v.span.clone())))
         .transpose()?;
@@ -145,6 +160,7 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
         outputs,
         env,
         defaults,
+        permissions,
         strategy,
         services,
         container,
@@ -153,6 +169,20 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
         concurrency,
         reusable_call: None,
     })
+}
+
+fn parse_job_permissions(
+    entries: &Entries,
+    context: &str,
+) -> Result<Option<Spanned<crate::model::workflow::Permissions>>, ParseError> {
+    find(entries, "permissions")
+        .map(|node| {
+            Ok(Spanned::new(
+                parse_permissions(node, &format!("{context}.permissions"))?,
+                node.span.clone(),
+            ))
+        })
+        .transpose()
 }
 
 fn parse_needs(entries: &Entries) -> Result<Vec<Spanned<String>>, ParseError> {

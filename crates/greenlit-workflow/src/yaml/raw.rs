@@ -16,19 +16,34 @@
 //! that event-stream approach to `saphyr-parser`, the actively maintained
 //! low-level half of the same project.
 //!
-//! Duplicate detection operates on each scalar key's decoded string value,
-//! independent of whether YAML wrote it plain or quoted. This matches the
-//! runner template reader, which converts a key to `StringToken` and adds
-//! `nextKey.Value` to its duplicate set without carrying scalar style:
+//! Duplicate detection operates case-insensitively on each scalar key's
+//! decoded string value, independent of whether YAML wrote it plain or
+//! quoted. This matches the runner template reader, which converts a key to
+//! `StringToken` and adds `nextKey.Value` to an `OrdinalIgnoreCase`
+//! duplicate set without carrying scalar style:
 //! <https://github.com/actions/runner/blob/main/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateReader.cs>.
 
 use crate::error::ParseError;
 use crate::span::{Location, Span, Spanned};
 use crate::yaml::scalar::YamlScalar;
-use crate::yaml::tag::{resolve_core_tag, typed_scalar};
-use saphyr_parser::{Event, Marker, Parser, ScalarStyle, SpannedEventReceiver};
+use saphyr_parser::{Marker, Parser, ScalarStyle};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+mod receiver;
+mod state;
+
+// The current GitHub runner rejects after traversing 50,000 YAML events,
+// counting events replayed through aliases each time. Its outer template
+// reader independently permits at most 50 nested collection elements.
+// Pinned sources:
+// https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/WorkflowParser/Conversion/YamlObjectReader.cs
+// https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/WorkflowParser/ParseOptions.cs
+const MAX_TRAVERSED_YAML_NODES: usize = 50_000;
+const MAX_YAML_DEPTH: usize = 50;
+const MAX_YAML_RESULT_BYTES: usize = 10 * 1024 * 1024;
+const MIN_TOKEN_BYTES: usize = 24;
+const STRING_BASE_BYTES: usize = 26;
 
 /// A YAML scalar node before workflow-schema interpretation: its raw text,
 /// the YAML style it was written in, and its resolved [`YamlScalar`] value
@@ -45,8 +60,14 @@ pub(crate) struct RawScalar {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RawNode {
     Scalar(RawScalar),
-    Sequence(Vec<Spanned<RawNode>>),
-    Mapping(Vec<(Spanned<RawNode>, Spanned<RawNode>)>),
+    // Collections are shared because an alias is a replay of one already
+    // parsed event subtree. Keeping the children behind `Arc` makes cloning
+    // an anchored collection O(1), including when anchors are nested, while
+    // preserving a distinct outer `Spanned` value for each alias use-site.
+    // The runner's logical event/result budgets are still charged for every
+    // replay before the shared node is materialized below.
+    Sequence(Arc<[Spanned<RawNode>]>),
+    Mapping(Arc<[(Spanned<RawNode>, Spanned<RawNode>)]>),
 }
 
 impl RawNode {
@@ -124,12 +145,27 @@ fn span_from(file: &Arc<str>, s: saphyr_parser::Span) -> Span {
     )
 }
 
+fn scalar_result_bytes(node: &RawNode) -> usize {
+    let RawNode::Scalar(scalar) = node else {
+        return MIN_TOKEN_BYTES;
+    };
+    match &scalar.value {
+        YamlScalar::String(value) => MIN_TOKEN_BYTES
+            .saturating_add(STRING_BASE_BYTES)
+            .saturating_add(value.encode_utf16().count().saturating_mul(2)),
+        YamlScalar::Null | YamlScalar::Bool(_) | YamlScalar::Number(_) => MIN_TOKEN_BYTES,
+    }
+}
+
 /// One open sequence/mapping while walking the event stream.
 enum Frame {
     Sequence {
         start: Marker,
         anchor_id: usize,
         items: Vec<Spanned<RawNode>>,
+        event_count: usize,
+        collection_depth: usize,
+        result_bytes: usize,
     },
     Mapping {
         start: Marker,
@@ -137,13 +173,26 @@ enum Frame {
         pending_key: Option<Spanned<RawNode>>,
         entries: Vec<(Spanned<RawNode>, Spanned<RawNode>)>,
         seen: HashMap<String, Span>,
+        event_count: usize,
+        collection_depth: usize,
+        result_bytes: usize,
     },
+}
+
+struct AnchoredNode {
+    node: Spanned<RawNode>,
+    event_count: usize,
+    collection_depth: usize,
+    result_bytes: usize,
 }
 
 struct Builder {
     file: Arc<str>,
     stack: Vec<Frame>,
-    anchors: HashMap<usize, Spanned<RawNode>>,
+    anchors: HashMap<usize, AnchoredNode>,
+    traversed_nodes: usize,
+    result_bytes: usize,
+    discard_events: bool,
     /// One entry per YAML document seen (`None` for an empty document);
     /// checked against `== 1` once parsing finishes.
     documents: Vec<Option<Spanned<RawNode>>>,
@@ -155,188 +204,4 @@ struct Builder {
     /// recorded so the event stream stays balanced, but `parse_raw` returns
     /// this instead of the tree once found.
     error: Option<ParseError>,
-}
-
-impl Builder {
-    fn new(file: Arc<str>) -> Self {
-        Self {
-            file,
-            stack: Vec::new(),
-            anchors: HashMap::new(),
-            documents: Vec::new(),
-            root: None,
-            error: None,
-        }
-    }
-
-    fn record_error(&mut self, err: ParseError) {
-        if self.error.is_none() {
-            self.error = Some(err);
-        }
-    }
-
-    fn finish_node(&mut self, node: Spanned<RawNode>, anchor_id: usize) {
-        if anchor_id > 0 {
-            self.anchors.insert(anchor_id, node.clone());
-        }
-        match self.stack.last_mut() {
-            Some(Frame::Sequence { items, .. }) => items.push(node),
-            Some(Frame::Mapping {
-                pending_key,
-                entries,
-                seen,
-                ..
-            }) => match pending_key.take() {
-                None => {
-                    if node.value.as_key_text().is_none() {
-                        // A direct field access (not `self.record_error(..)`,
-                        // a whole-`&mut self` method call) so it can coexist
-                        // with the active `self.stack.last_mut()` borrow —
-                        // same reasoning as the `self.error.get_or_insert`
-                        // call just below for duplicate keys.
-                        self.error.get_or_insert(ParseError::Schema {
-                            span: node.span.clone(),
-                            message: "mapping keys must be scalars".to_owned(),
-                        });
-                    }
-                    *pending_key = Some(node);
-                }
-                Some(key) => {
-                    if let Some(key_text) = key.value.as_key_text() {
-                        // `key_text` is saphyr's decoded scalar value; quote
-                        // style lives separately on `RawScalar` and must not
-                        // participate in identity (see module-level runner
-                        // source citation).
-                        let dedup_key = key_text.to_owned();
-                        if let Some(first_span) = seen.get(&dedup_key) {
-                            self.error.get_or_insert(ParseError::DuplicateKey {
-                                span: key.span.clone(),
-                                key: key_text.to_owned(),
-                                first_span: first_span.clone(),
-                            });
-                        } else {
-                            seen.insert(dedup_key, key.span.clone());
-                        }
-                    }
-                    entries.push((key, node));
-                }
-            },
-            None => self.root = Some(node),
-        }
-    }
-}
-
-impl<'input> SpannedEventReceiver<'input> for Builder {
-    fn on_event(&mut self, ev: Event<'input>, span: saphyr_parser::Span) {
-        let file = self.file.clone();
-        let node_span = span_from(&file, span);
-        match ev {
-            Event::Nothing | Event::StreamStart | Event::StreamEnd => {}
-            Event::DocumentStart(_) => {
-                self.root = None;
-            }
-            Event::DocumentEnd => {
-                let doc = self.root.take();
-                self.documents.push(doc);
-            }
-            Event::Alias(id) => {
-                let mut node = match self.anchors.get(&id) {
-                    Some(n) => n.clone(),
-                    None => {
-                        // Unreachable in practice: `saphyr_parser::Parser`
-                        // validates an alias against its registered anchors
-                        // before ever emitting `Event::Alias` (see
-                        // `Parser::next_event_impl`'s "found unknown anchor"
-                        // scan error) — this branch only guards against that
-                        // invariant being violated rather than panicking.
-                        self.record_error(ParseError::Schema {
-                            span: node_span.clone(),
-                            message: "alias refers to an undefined anchor".to_owned(),
-                        });
-                        Spanned::new(
-                            RawNode::Scalar(RawScalar {
-                                raw: String::new(),
-                                style: ScalarStyle::Plain,
-                                value: YamlScalar::Null,
-                            }),
-                            node_span.clone(),
-                        )
-                    }
-                };
-                // Matches the behavior of `saphyr`'s own `YamlLoader`: the
-                // alias use-site's span replaces the node's own (top-level)
-                // span, but nested children keep the spans from the
-                // anchor's original definition. This follows `saphyr`'s
-                // own `YamlLoader` alias cloning behavior; the public span
-                // contract is exercised through `parse_workflow`.
-                node.span = node_span;
-                self.finish_node(node, 0);
-            }
-            Event::Scalar(text, style, anchor_id, tag) => {
-                let tag_kind = resolve_core_tag(&tag, &node_span, &mut self.error);
-                let value = typed_scalar(&text, style, tag_kind, &node_span, &mut self.error);
-                let node = Spanned::new(
-                    RawNode::Scalar(RawScalar {
-                        raw: text.into_owned(),
-                        style,
-                        value,
-                    }),
-                    node_span,
-                );
-                self.finish_node(node, anchor_id);
-            }
-            Event::SequenceStart(anchor_id, tag) => {
-                resolve_core_tag(&tag, &node_span, &mut self.error);
-                self.stack.push(Frame::Sequence {
-                    start: span.start,
-                    anchor_id,
-                    items: Vec::new(),
-                });
-            }
-            Event::SequenceEnd => {
-                if let Some(Frame::Sequence {
-                    start,
-                    anchor_id,
-                    items,
-                }) = self.stack.pop()
-                {
-                    let full_span = Span::new(
-                        file.clone(),
-                        location_from_marker(start),
-                        location_from_marker(span.start),
-                    );
-                    self.finish_node(Spanned::new(RawNode::Sequence(items), full_span), anchor_id);
-                }
-            }
-            Event::MappingStart(anchor_id, tag) => {
-                resolve_core_tag(&tag, &node_span, &mut self.error);
-                self.stack.push(Frame::Mapping {
-                    start: span.start,
-                    anchor_id,
-                    pending_key: None,
-                    entries: Vec::new(),
-                    seen: HashMap::new(),
-                });
-            }
-            Event::MappingEnd => {
-                if let Some(Frame::Mapping {
-                    start,
-                    anchor_id,
-                    entries,
-                    ..
-                }) = self.stack.pop()
-                {
-                    let full_span = Span::new(
-                        file.clone(),
-                        location_from_marker(start),
-                        location_from_marker(span.start),
-                    );
-                    self.finish_node(
-                        Spanned::new(RawNode::Mapping(entries), full_span),
-                        anchor_id,
-                    );
-                }
-            }
-        }
-    }
 }

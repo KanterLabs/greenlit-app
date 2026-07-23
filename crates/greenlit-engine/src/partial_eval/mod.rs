@@ -25,10 +25,12 @@
 
 mod calls;
 mod classify;
+mod env;
 mod fold;
 mod printer;
 mod template;
 
+pub(crate) use env::{EnvChain, build_env_chain, extend_env_chain};
 pub(crate) use fold::fold_expr;
 pub(crate) use printer::{pretty_print, value_to_literal_expr};
 pub(crate) use template::fold_template;
@@ -36,15 +38,14 @@ pub(crate) use template::fold_template;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
-use greenlit_expr::value::to_display_string;
-use greenlit_expr::{Context, DirEntry, Expr, HashFilesFs, Value};
-use greenlit_workflow::Spanned;
+use greenlit_expr::{Context, EntryKind, Expr, HashFilesFs, OpenedDir, Value};
 use greenlit_workflow::model::value::ScalarOrExpr;
 
 use crate::convert::scalar_to_value;
 use crate::defer::DeferReason;
+use crate::graph::JobId;
 
 /// The result of folding one [`Expr`] against a [`FoldCtx`]: either it
 /// collapsed all the way to a value, or some part of it could not be
@@ -116,18 +117,24 @@ pub(crate) struct LocatedEvalError {
     pub(crate) source: PartialEvalError,
 }
 
-/// The five contexts this crate can materialize a concrete [`Value`] for at
-/// plan time: `github`, `vars`, `matrix`, `strategy` (both `Null` outside a
-/// matrix leg), and `inputs`.
+/// Context roots and runtime-slot metadata available to one partial
+/// evaluation. `needs` and `steps` use an empty static object for missing
+/// properties plus explicit slot metadata so only values that can actually
+/// materialize later are deferred.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StaticRoots<'a> {
     /// The `github` context root.
     pub github: &'a Value,
+    /// Event-specific `github.*` properties whose values remain unknown at
+    /// planning time even though their documented types are fixed.
+    pub github_deferred: &'a BTreeSet<String>,
     /// The `vars` context root.
     pub vars: &'a Value,
-    /// A completed direct-dependency context. `None` means the job's
-    /// prerequisites have not finished and every `needs.*` lookup defers.
-    pub needs: Option<&'a Value>,
+    /// Static portion of the `needs` context. Runtime result/output values
+    /// are represented by [`NeedsContextSlots`] instead of invented data.
+    pub needs: &'a Value,
+    /// Direct dependency slots that can materialize at runtime.
+    pub needs_slots: &'a NeedsContextSlots,
     /// The `matrix` context root (`Null` outside a matrix leg).
     pub matrix: &'a Value,
     /// Whether `matrix` is pending expansion rather than statically null.
@@ -136,8 +143,142 @@ pub(crate) struct StaticRoots<'a> {
     pub strategy: &'a Value,
     /// Which fixed `strategy` properties still require runtime data.
     pub strategy_deferred: StrategyDeferred,
+    /// Static portion of the `steps` context.
+    pub steps: &'a Value,
+    /// Prior authored step IDs whose status/outputs can exist here.
+    pub steps_slots: &'a StepsContextSlots,
     /// The `inputs` context root.
     pub inputs: &'a Value,
+}
+
+/// Direct `needs` entries visible to one job, with the output names each
+/// dependency actually declares. A missing job or undeclared output is a
+/// statically absent property, while `result` and declared outputs remain
+/// runtime slots.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DeclaredOutputs {
+    names: std::sync::Arc<[String]>,
+    canonical_names: std::sync::Arc<std::collections::HashSet<String>>,
+}
+
+impl DeclaredOutputs {
+    pub(crate) fn new(names: Vec<String>) -> Self {
+        let canonical_names = names
+            .iter()
+            .map(|name| greenlit_expr::value::ordinal_ignore_case_key(name))
+            .collect();
+        Self {
+            names: names.into(),
+            canonical_names: std::sync::Arc::new(canonical_names),
+        }
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.canonical_names
+            .contains(&greenlit_expr::value::ordinal_ignore_case_key(name))
+    }
+
+    fn names(&self) -> &[String] {
+        &self.names
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NeedsContextSlots {
+    entries: Vec<(JobId, DeclaredOutputs)>,
+    by_job: HashMap<String, usize>,
+}
+
+impl NeedsContextSlots {
+    pub(crate) fn new(entries: Vec<(JobId, DeclaredOutputs)>) -> Self {
+        let by_job = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (job, _))| (greenlit_expr::value::ordinal_ignore_case_key(&job.0), index))
+            .collect();
+        Self { entries, by_job }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Builds the known shape of GitHub's direct-dependency map without
+    /// inventing runtime results or output values. Declared slots contain
+    /// `Null` placeholders only as structural sentinels; the classifier
+    /// prevents those runtime paths from reaching static evaluation.
+    /// <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context>
+    pub(crate) fn static_value(&self) -> Value {
+        Value::object(
+            self.entries
+                .iter()
+                .map(|(job, outputs)| {
+                    let output_shape = Value::object(
+                        outputs
+                            .names()
+                            .iter()
+                            .map(|name| (name.clone(), Value::Null))
+                            .collect(),
+                    );
+                    (
+                        job.0.clone(),
+                        Value::object(vec![
+                            ("outputs".to_string(), output_shape),
+                            ("result".to_string(), Value::Null),
+                        ]),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn canonical_job_id(&self, name: &str) -> Option<&JobId> {
+        self.by_job
+            .get(&greenlit_expr::value::ordinal_ignore_case_key(name))
+            .and_then(|index| self.entries.get(*index))
+            .map(|(job, _)| job)
+    }
+
+    pub(crate) fn has_declared_outputs(&self, name: &str) -> bool {
+        self.outputs_for(name)
+            .is_some_and(|outputs| !outputs.names().is_empty())
+    }
+
+    pub(crate) fn declares_output(&self, job: &str, output: &str) -> bool {
+        self.outputs_for(job)
+            .is_some_and(|outputs| outputs.contains(output))
+    }
+
+    fn outputs_for(&self, name: &str) -> Option<&DeclaredOutputs> {
+        self.by_job
+            .get(&greenlit_expr::value::ordinal_ignore_case_key(name))
+            .and_then(|index| self.entries.get(*index))
+            .map(|(_, outputs)| outputs)
+    }
+}
+
+/// Step IDs whose `steps.<id>` context entry exists at a particular
+/// evaluation point. Step fields see only earlier IDs; job outputs see all
+/// authored IDs after the step sequence completes.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StepsContextSlots {
+    ids: Vec<String>,
+}
+
+impl StepsContextSlots {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.ids
+            .iter()
+            .any(|id| greenlit_expr::value::ordinal_ignore_case_eq(id, name))
+    }
+
+    pub(crate) fn add(&mut self, id: String) {
+        self.ids.push(id);
+    }
 }
 
 /// Per-property availability for GitHub's fixed-shape `strategy` context.
@@ -171,100 +312,6 @@ impl StrategyDeferred {
     }
 }
 
-/// The resolved `env:` chain for one job or step: workflow-then-job(-then-
-/// step) layers already folded, split into names whose value is fully
-/// known (`resolved`) and names whose own definition is itself deferred
-/// (`deferred`, with the reasons why). A name absent from both was never
-/// declared anywhere in the chain and defers with
-/// [`DeferReason::DynamicEnv`] because runtime commands may still set it.
-#[derive(Debug, Clone)]
-pub(crate) struct EnvChain {
-    resolved: Value,
-    deferred: HashMap<String, BTreeSet<DeferReason>>,
-}
-
-impl EnvChain {
-    /// An env chain with nothing declared anywhere — every `env.*`
-    /// reference against it defers as [`DeferReason::DynamicEnv`]. Used by
-    /// `crate::matrix`/`crate::runner` folding contexts that have no `env:`
-    /// to layer (matrix axis values, `runs-on` labels), and by tests.
-    pub(crate) fn empty() -> Self {
-        EnvChain {
-            resolved: Value::object(vec![]),
-            deferred: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn is_declared(&self, name: &str) -> bool {
-        self.deferred.contains_key(name)
-            || matches!(&self.resolved, Value::Object(o) if o.get(name).is_some())
-    }
-
-    pub(crate) fn deferred_reasons(&self, name: &str) -> Option<&BTreeSet<DeferReason>> {
-        self.deferred.get(name)
-    }
-}
-
-/// Folds each `env:` layer (workflow, then job, then step — later layers
-/// override earlier ones by key, matching GitHub's env-layering rule) into
-/// one [`EnvChain`]. Layers should be passed outermost-first (workflow,
-/// job, step). Job-instance fields use `[workflow_env, job_env]`; step
-/// fields use all three. Job-level `if:` does not use this chain because
-/// GitHub does not make the `env` context available at that workflow key.
-///
-/// Each layer is evaluated against the completed outer layers, never
-/// against sibling entries in the same map. This preserves GitHub's
-/// workflow < job < step precedence while honoring its rule that variables
-/// in one `env` map cannot be defined in terms of other variables in that
-/// same map.
-/// https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#env
-pub(crate) fn build_env_chain(
-    layers: &[&[(Spanned<String>, Spanned<ScalarOrExpr>)]],
-    roots: StaticRoots<'_>,
-) -> Result<EnvChain, LocatedEvalError> {
-    let mut resolved_entries: Vec<(String, Value)> = Vec::new();
-    let mut deferred: HashMap<String, BTreeSet<DeferReason>> = HashMap::new();
-    for layer in layers {
-        let outer_chain = EnvChain {
-            resolved: Value::object(resolved_entries.clone()),
-            deferred: deferred.clone(),
-        };
-        let layer_ctx = FoldCtx {
-            roots,
-            env: &outer_chain,
-            secrets_forbidden: false,
-        };
-        let mut folded_layer = Vec::with_capacity(layer.len());
-        for (name, value) in *layer {
-            folded_layer.push((
-                name.value.clone(),
-                fold_scalar_or_expr(&value.value, &layer_ctx).map_err(|source| {
-                    LocatedEvalError {
-                        span: value.span.clone(),
-                        source,
-                    }
-                })?,
-            ));
-        }
-        for (name, folded) in folded_layer {
-            resolved_entries.retain(|(key, _)| key != &name);
-            deferred.remove(&name);
-            match folded {
-                Folded::Value(v) => {
-                    resolved_entries.push((name, Value::String(to_display_string(&v))));
-                }
-                Folded::Residual { defers_on, .. } => {
-                    deferred.insert(name, defers_on);
-                }
-            }
-        }
-    }
-    Ok(EnvChain {
-        resolved: Value::object(resolved_entries),
-        deferred,
-    })
-}
-
 /// Everything [`fold_expr`]/[`fold_template`] need: the static context
 /// values, the resolved `env:` chain, and whether a bare `secrets`
 /// reference is a hard error here (job-level `if:`) or merely deferred
@@ -286,17 +333,15 @@ impl FoldCtx<'_> {
     /// only roots any subtree reaching this path can have touched — see
     /// this module's doc comment.
     pub(crate) fn static_context(&self) -> Context {
-        let context = Context::new(Rc::new(StaticFs))
+        Context::new(Arc::new(StaticFs))
             .with_github(self.roots.github.clone())
             .with_env(self.env.resolved.clone())
             .with_vars(self.roots.vars.clone())
+            .with_needs(self.roots.needs.clone())
             .with_matrix(self.roots.matrix.clone())
             .with_strategy(self.roots.strategy.clone())
-            .with_inputs(self.roots.inputs.clone());
-        match self.roots.needs {
-            Some(needs) => context.with_needs(needs.clone()),
-            None => context,
-        }
+            .with_steps(self.roots.steps.clone())
+            .with_inputs(self.roots.inputs.clone())
     }
 }
 
@@ -312,10 +357,17 @@ impl HashFilesFs for StaticFs {
     fn workspace_root(&self) -> &Path {
         Path::new("/")
     }
-    fn read_dir(&self, _path: &Path) -> io::Result<Vec<DirEntry>> {
+    fn open_dir(&self, _path: &Path) -> io::Result<OpenedDir<'_>> {
         Err(unavailable_io_error())
     }
-    fn read_file(&self, _path: &Path) -> io::Result<Vec<u8>> {
+    fn entry_kind(&self, _path: &Path) -> io::Result<EntryKind> {
+        Err(unavailable_io_error())
+    }
+    fn hash_file_sha256(
+        &self,
+        _path: &Path,
+        _check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
         Err(unavailable_io_error())
     }
 }

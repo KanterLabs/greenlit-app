@@ -1,0 +1,549 @@
+{
+  "schema_version": 1,
+  "event_name": "push",
+  "run_name": null,
+  "env": {
+    "GREETING": {
+      "span": "fixtures/matrix-needs.yml:16:13",
+      "source": "hello",
+      "evaluation": "static",
+      "value": "hello"
+    }
+  },
+  "defaults": {
+    "shell": null,
+    "working_directory": null
+  },
+  "permissions": null,
+  "jobs": [
+    {
+      "id": "build",
+      "span": "fixtures/matrix-needs.yml:19:3",
+      "name": {
+        "span": "fixtures/matrix-needs.yml:19:3",
+        "source": "build",
+        "evaluation": "static",
+        "value": "build"
+      },
+      "name_is_default": true,
+      "needs": [],
+      "wave": 0,
+      "runner": null,
+      "container": null,
+      "services": {},
+      "env": {},
+      "defaults": {
+        "shell": null,
+        "working_directory": null
+      },
+      "permissions": null,
+      "condition": null,
+      "implicit_status_gate": true,
+      "skip": null,
+      "strategy": {
+        "fail_fast": true,
+        "max_parallel": null,
+        "matrix": {
+          "evaluation": "static",
+          "span": "fixtures/matrix-needs.yml:25:9",
+          "legs": [
+            {
+              "index": 0,
+              "values": {
+                "os": {
+                  "kind": "string",
+                  "value": "ubuntu-22.04"
+                },
+                "channel": {
+                  "kind": "string",
+                  "value": "stable"
+                }
+              },
+              "origin": {
+                "kind": "product"
+              }
+            },
+            {
+              "index": 1,
+              "values": {
+                "os": {
+                  "kind": "string",
+                  "value": "ubuntu-24.04"
+                },
+                "channel": {
+                  "kind": "string",
+                  "value": "stable"
+                },
+                "canary": {
+                  "kind": "boolean",
+                  "value": true
+                }
+              },
+              "origin": {
+                "kind": "product"
+              }
+            }
+          ]
+        }
+      },
+      "legs": [
+        {
+          "name": {
+            "span": "fixtures/matrix-needs.yml:19:3",
+            "source": "build",
+            "evaluation": "static",
+            "value": "build (ubuntu-22.04, stable)"
+          },
+          "runner": {
+            "span": "fixtures/matrix-needs.yml:22:14",
+            "source": "${{ matrix.os }}",
+            "evaluation": "static",
+            "value": "ubuntu-22.04"
+          },
+          "container": null,
+          "services": {},
+          "env": {},
+          "defaults": {
+            "shell": null,
+            "working_directory": null
+          },
+          "condition": null,
+          "skip": null,
+          "outputs": {
+            "entries": {
+              "artifact-name": {
+                "span": "fixtures/matrix-needs.yml:44:22",
+                "source": "${{ steps.pack.outputs.name }}",
+                "evaluation": "deferred",
+                "residual": "steps.pack.outputs.name",
+                "defers_on": [
+                  {
+                    "kind": "step-output",
+                    "step": "pack",
+                    "output": "name"
+                  }
+                ]
+              },
+              "lazy-format": {
+                "span": "fixtures/matrix-needs.yml:48:20",
+                "source": "${{ format('{0}', steps.pack.outputs.name, fromJSON('bad')) }}",
+                "evaluation": "deferred",
+                "residual": "format('{0}', steps.pack.outputs.name, fromJSON('bad'))",
+                "defers_on": [
+                  {
+                    "kind": "step-output",
+                    "step": "pack",
+                    "output": "name"
+                  }
+                ]
+              },
+              "guarded-contains": {
+                "span": "fixtures/matrix-needs.yml:49:25",
+                "source": "${{ contains(fromJSON('{}'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-starts-with": {
+                "span": "fixtures/matrix-needs.yml:50:28",
+                "source": "${{ startsWith(fromJSON('[]'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-ends-with": {
+                "span": "fixtures/matrix-needs.yml:51:26",
+                "source": "${{ endsWith(fromJSON('{}'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-join": {
+                "span": "fixtures/matrix-needs.yml:52:21",
+                "source": "${{ join(fromJSON('[]'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": ""
+              },
+              "lazy-case": {
+                "span": "fixtures/matrix-needs.yml:53:18",
+                "source": "${{ case(steps.pack.outcome == 'success', 'selected', fromJSON('bad')) }}",
+                "evaluation": "deferred",
+                "residual": "case(steps.pack.outcome == 'success', 'selected', fromJSON('bad'))",
+                "defers_on": [
+                  {
+                    "kind": "step-status",
+                    "step": "pack",
+                    "field": "outcome"
+                  }
+                ]
+              }
+            }
+          },
+          "steps": [
+            {
+              "id": "pack",
+              "name": {
+                "span": "fixtures/matrix-needs.yml:56:15",
+                "source": "Package build artifact",
+                "evaluation": "static",
+                "value": "Package build artifact"
+              },
+              "env": {},
+              "working_directory": null,
+              "continue_on_error": null,
+              "timeout_minutes": null,
+              "condition": null,
+              "implicit_status_gate": true,
+              "kind": {
+                "kind": "run",
+                "script": {
+                  "span": "fixtures/matrix-needs.yml:58:11",
+                  "source": "echo \"name=build-artifact\" >> \"$GITHUB_OUTPUT\"\n",
+                  "evaluation": "static",
+                  "value": "echo \"name=build-artifact\" >> \"$GITHUB_OUTPUT\"\n"
+                },
+                "shell": null
+              }
+            }
+          ]
+        },
+        {
+          "name": {
+            "span": "fixtures/matrix-needs.yml:19:3",
+            "source": "build",
+            "evaluation": "static",
+            "value": "build (ubuntu-24.04, stable, true)"
+          },
+          "runner": {
+            "span": "fixtures/matrix-needs.yml:22:14",
+            "source": "${{ matrix.os }}",
+            "evaluation": "static",
+            "value": "ubuntu-24.04"
+          },
+          "container": null,
+          "services": {},
+          "env": {},
+          "defaults": {
+            "shell": null,
+            "working_directory": null
+          },
+          "condition": null,
+          "skip": null,
+          "outputs": {
+            "entries": {
+              "artifact-name": {
+                "span": "fixtures/matrix-needs.yml:44:22",
+                "source": "${{ steps.pack.outputs.name }}",
+                "evaluation": "deferred",
+                "residual": "steps.pack.outputs.name",
+                "defers_on": [
+                  {
+                    "kind": "step-output",
+                    "step": "pack",
+                    "output": "name"
+                  }
+                ]
+              },
+              "lazy-format": {
+                "span": "fixtures/matrix-needs.yml:48:20",
+                "source": "${{ format('{0}', steps.pack.outputs.name, fromJSON('bad')) }}",
+                "evaluation": "deferred",
+                "residual": "format('{0}', steps.pack.outputs.name, fromJSON('bad'))",
+                "defers_on": [
+                  {
+                    "kind": "step-output",
+                    "step": "pack",
+                    "output": "name"
+                  }
+                ]
+              },
+              "guarded-contains": {
+                "span": "fixtures/matrix-needs.yml:49:25",
+                "source": "${{ contains(fromJSON('{}'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-starts-with": {
+                "span": "fixtures/matrix-needs.yml:50:28",
+                "source": "${{ startsWith(fromJSON('[]'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-ends-with": {
+                "span": "fixtures/matrix-needs.yml:51:26",
+                "source": "${{ endsWith(fromJSON('{}'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": "false"
+              },
+              "guarded-join": {
+                "span": "fixtures/matrix-needs.yml:52:21",
+                "source": "${{ join(fromJSON('[]'), fromJSON('bad')) }}",
+                "evaluation": "static",
+                "value": ""
+              },
+              "lazy-case": {
+                "span": "fixtures/matrix-needs.yml:53:18",
+                "source": "${{ case(steps.pack.outcome == 'success', 'selected', fromJSON('bad')) }}",
+                "evaluation": "deferred",
+                "residual": "case(steps.pack.outcome == 'success', 'selected', fromJSON('bad'))",
+                "defers_on": [
+                  {
+                    "kind": "step-status",
+                    "step": "pack",
+                    "field": "outcome"
+                  }
+                ]
+              }
+            }
+          },
+          "steps": [
+            {
+              "id": "pack",
+              "name": {
+                "span": "fixtures/matrix-needs.yml:56:15",
+                "source": "Package build artifact",
+                "evaluation": "static",
+                "value": "Package build artifact"
+              },
+              "env": {},
+              "working_directory": null,
+              "continue_on_error": null,
+              "timeout_minutes": null,
+              "condition": null,
+              "implicit_status_gate": true,
+              "kind": {
+                "kind": "run",
+                "script": {
+                  "span": "fixtures/matrix-needs.yml:58:11",
+                  "source": "echo \"name=build-artifact\" >> \"$GITHUB_OUTPUT\"\n",
+                  "evaluation": "static",
+                  "value": "echo \"name=build-artifact\" >> \"$GITHUB_OUTPUT\"\n"
+                },
+                "shell": null
+              }
+            }
+          ]
+        }
+      ],
+      "outputs": {
+        "entries": {}
+      },
+      "steps": []
+    },
+    {
+      "id": "test",
+      "span": "fixtures/matrix-needs.yml:60:3",
+      "name": {
+        "span": "fixtures/matrix-needs.yml:60:3",
+        "source": "test",
+        "evaluation": "static",
+        "value": "test"
+      },
+      "name_is_default": true,
+      "needs": [
+        "build"
+      ],
+      "wave": 1,
+      "runner": {
+        "span": "fixtures/matrix-needs.yml:62:14",
+        "source": "ubuntu-latest",
+        "evaluation": "static",
+        "value": "ubuntu-24.04"
+      },
+      "container": null,
+      "services": {},
+      "env": {},
+      "defaults": {
+        "shell": null,
+        "working_directory": null
+      },
+      "permissions": null,
+      "condition": null,
+      "implicit_status_gate": true,
+      "skip": null,
+      "strategy": {
+        "fail_fast": true,
+        "max_parallel": null,
+        "matrix": null
+      },
+      "legs": [],
+      "outputs": {
+        "entries": {}
+      },
+      "steps": [
+        {
+          "id": null,
+          "name": {
+            "span": "fixtures/matrix-needs.yml:64:15",
+            "source": "Run unit tests",
+            "evaluation": "static",
+            "value": "Run unit tests"
+          },
+          "env": {},
+          "working_directory": null,
+          "continue_on_error": null,
+          "timeout_minutes": null,
+          "condition": null,
+          "implicit_status_gate": true,
+          "kind": {
+            "kind": "run",
+            "script": {
+              "span": "fixtures/matrix-needs.yml:65:14",
+              "source": "echo running tests",
+              "evaluation": "static",
+              "value": "echo running tests"
+            },
+            "shell": null
+          }
+        },
+        {
+          "id": null,
+          "name": {
+            "span": "fixtures/matrix-needs.yml:66:15",
+            "source": "Upload coverage",
+            "evaluation": "static",
+            "value": "Upload coverage"
+          },
+          "env": {},
+          "working_directory": null,
+          "continue_on_error": null,
+          "timeout_minutes": null,
+          "condition": {
+            "span": "fixtures/matrix-needs.yml:69:13",
+            "source": "needs.build.result == 'success'",
+            "evaluation": "deferred",
+            "residual": "needs.build.result == 'success'",
+            "defers_on": [
+              {
+                "kind": "needs-result",
+                "job": "build"
+              }
+            ]
+          },
+          "implicit_status_gate": true,
+          "kind": {
+            "kind": "run",
+            "script": {
+              "span": "fixtures/matrix-needs.yml:70:14",
+              "source": "echo \"uploading coverage for ${{ needs.build.outputs.artifact-name }}\"",
+              "evaluation": "deferred",
+              "residual": "echo \"uploading coverage for ${{ needs.build.outputs.artifact-name }}\"",
+              "defers_on": [
+                {
+                  "kind": "needs-output",
+                  "job": "build",
+                  "output": "artifact-name"
+                }
+              ]
+            },
+            "shell": null
+          }
+        }
+      ]
+    },
+    {
+      "id": "deploy",
+      "span": "fixtures/matrix-needs.yml:72:3",
+      "name": {
+        "span": "fixtures/matrix-needs.yml:72:3",
+        "source": "deploy",
+        "evaluation": "static",
+        "value": "deploy"
+      },
+      "name_is_default": true,
+      "needs": [
+        "build",
+        "test"
+      ],
+      "wave": 2,
+      "runner": {
+        "span": "fixtures/matrix-needs.yml:74:14",
+        "source": "ubuntu-latest",
+        "evaluation": "static",
+        "value": "ubuntu-24.04"
+      },
+      "container": null,
+      "services": {},
+      "env": {},
+      "defaults": {
+        "shell": null,
+        "working_directory": null
+      },
+      "permissions": null,
+      "condition": {
+        "span": "fixtures/matrix-needs.yml:78:9",
+        "source": "github.event_name == 'push'",
+        "evaluation": "static",
+        "value": true
+      },
+      "implicit_status_gate": true,
+      "skip": null,
+      "strategy": {
+        "fail_fast": true,
+        "max_parallel": null,
+        "matrix": null
+      },
+      "legs": [],
+      "outputs": {
+        "entries": {
+          "release-tag": {
+            "span": "fixtures/matrix-needs.yml:82:20",
+            "source": "${{ needs.build.outputs.artifact-name }}-deployed",
+            "evaluation": "deferred",
+            "residual": "${{ needs.build.outputs.artifact-name }}-deployed",
+            "defers_on": [
+              {
+                "kind": "needs-output",
+                "job": "build",
+                "output": "artifact-name"
+              }
+            ]
+          }
+        }
+      },
+      "steps": [
+        {
+          "id": null,
+          "name": {
+            "span": "fixtures/matrix-needs.yml:84:15",
+            "source": "Deploy artifact",
+            "evaluation": "static",
+            "value": "Deploy artifact"
+          },
+          "env": {},
+          "working_directory": null,
+          "continue_on_error": null,
+          "timeout_minutes": null,
+          "condition": null,
+          "implicit_status_gate": true,
+          "kind": {
+            "kind": "run",
+            "script": {
+              "span": "fixtures/matrix-needs.yml:85:14",
+              "source": "echo \"deploying ${{ needs.build.outputs.artifact-name }}\"",
+              "evaluation": "deferred",
+              "residual": "echo \"deploying ${{ needs.build.outputs.artifact-name }}\"",
+              "defers_on": [
+                {
+                  "kind": "needs-output",
+                  "job": "build",
+                  "output": "artifact-name"
+                }
+              ]
+            },
+            "shell": null
+          }
+        }
+      ]
+    }
+  ],
+  "topo_order": [
+    "build",
+    "test",
+    "deploy"
+  ],
+  "lints": [
+    {
+      "span": "fixtures/matrix-needs.yml:19:3",
+      "message": "job 'build' is a matrix job with declared outputs read by a dependent; the last leg to finish wins (a well-known GitHub Actions limitation)",
+      "kind": "matrix-outputs-collision"
+    }
+  ]
+}

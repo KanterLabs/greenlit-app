@@ -34,7 +34,10 @@ where
 /// The shared tagged-union shape for every serializable planned value.
 #[derive(Debug, Serialize)]
 pub(crate) struct EvaluatedJson<'a, T: Serialize> {
-    /// Verbatim authored text.
+    /// Authored field location.
+    pub span: String,
+    /// Verbatim expression/template text, or a typed YAML literal's
+    /// canonical spelling.
     pub source: &'a str,
     /// `"static"` or `"deferred"`.
     pub evaluation: &'static str,
@@ -76,8 +79,14 @@ enum DeferReasonJson<'a> {
     DynamicEnv {
         name: &'a str,
     },
+    GithubContext {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        property: Option<&'a str>,
+    },
     RunnerContext,
     JobContext,
+    MatrixContext,
+    StrategyContext,
     SecretsContext,
     NeedsContext,
     StepsContext,
@@ -115,8 +124,13 @@ impl Serialize for DeferReason {
             },
             DeferReason::HashFiles => DeferReasonJson::HashFiles,
             DeferReason::DynamicEnv { name } => DeferReasonJson::DynamicEnv { name },
+            DeferReason::GithubContext { property } => DeferReasonJson::GithubContext {
+                property: property.as_deref(),
+            },
             DeferReason::RunnerContext => DeferReasonJson::RunnerContext,
             DeferReason::JobContext => DeferReasonJson::JobContext,
+            DeferReason::MatrixContext => DeferReasonJson::MatrixContext,
+            DeferReason::StrategyContext => DeferReasonJson::StrategyContext,
             DeferReason::SecretsContext => DeferReasonJson::SecretsContext,
             DeferReason::NeedsContextWhole => DeferReasonJson::NeedsContext,
             DeferReason::StepsContextWhole => DeferReasonJson::StepsContext,

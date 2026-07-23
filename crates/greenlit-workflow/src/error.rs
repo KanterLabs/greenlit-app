@@ -22,6 +22,27 @@ pub enum ParseError {
         message: String,
     },
 
+    /// The workflow file was readable but was not valid UTF-8. GitHub
+    /// workflow source is UTF-8 text, so this is distinct from a filesystem
+    /// access failure and needs a different user action.
+    #[error("{path}: workflow file is not valid UTF-8: {message}")]
+    Encoding {
+        /// The path whose contents could not be decoded.
+        path: Arc<str>,
+        /// The UTF-8 decoder's diagnostic.
+        message: String,
+    },
+
+    /// The workflow source exceeds GitHub's default 1 MiB character limit.
+    /// The runner measures .NET `String.Length`, i.e. UTF-16 code units.
+    #[error("{path}: workflow file exceeds GitHub's {max_characters}-character YAML limit")]
+    SourceLimit {
+        /// The workflow file name.
+        path: Arc<str>,
+        /// GitHub's maximum accepted UTF-16 code-unit count.
+        max_characters: usize,
+    },
+
     /// The input was not well-formed YAML at all (unterminated string,
     /// bad indentation, unknown anchor, …). Reported at a bare `line:column`
     /// (not a [`Span`]) because the scanner only gives a single position for
@@ -75,6 +96,15 @@ pub enum ParseError {
         message: String,
     },
 
+    /// YAML traversal exceeded one of GitHub's parser resource limits.
+    #[error("{span}: {message}")]
+    YamlLimit {
+        /// The node that crossed the limit.
+        span: Span,
+        /// Which runner-compatible limit was exceeded.
+        message: String,
+    },
+
     /// A `${{ ... }}` template was not closed, its inner expression did
     /// not parse, or it referenced a context/special function unavailable
     /// at the workflow key where it appeared. GitHub validates all three at
@@ -90,10 +120,11 @@ pub enum ParseError {
         message: String,
     },
 
-    /// An explicit YAML tag other than the four honored core-schema scalar
-    /// tags (`!!str`, `!!bool`, `!!int`, `!!float`, `!!null`) or the two
-    /// honored (no-op) collection tags (`!!seq`, `!!map`). This follows the
-    /// runner's workflow YAML reader:
+    /// A scalar used an explicit YAML tag other than the five honored
+    /// core-schema scalar tags (`!!str`, `!!bool`, `!!int`, `!!float`,
+    /// `!!null`). Collection tags are a separate runner behavior: every tag
+    /// on a sequence or mapping is ignored. This follows the runner's
+    /// workflow YAML reader:
     /// <https://github.com/actions/runner/blob/main/src/Sdk/DTPipelines/Pipelines/ObjectTemplating/YamlObjectReader.cs>.
     #[error("{span}: unsupported YAML tag '{tag}'")]
     UnsupportedTag {
@@ -112,6 +143,20 @@ pub enum ParseError {
         /// The scalar's raw text.
         raw: String,
         /// The tag suffix that was not honored (`"bool"`, `"int"`, …).
+        tag_name: &'static str,
+    },
+
+    /// A non-string explicit YAML tag was attached to a quoted or block
+    /// scalar. The runner accepts `!!bool`, `!!int`, `!!float`, and `!!null`
+    /// only on plain-style scalars; `!!str` remains valid for every scalar
+    /// style.
+    #[error("{span}: scalar style '{style}' is not valid with explicit tag '!!{tag_name}'")]
+    InvalidTagStyle {
+        /// Where the tagged scalar appears.
+        span: Span,
+        /// The scalar style rendered for a user-facing diagnostic.
+        style: &'static str,
+        /// The explicit core-tag suffix (`"bool"`, `"int"`, …).
         tag_name: &'static str,
     },
 
@@ -171,12 +216,16 @@ impl ParseError {
             ParseError::UnknownKey { span, .. }
             | ParseError::MissingKey { span, .. }
             | ParseError::Schema { span, .. }
+            | ParseError::YamlLimit { span, .. }
             | ParseError::Expression { span, .. }
             | ParseError::UnsupportedTag { span, .. }
             | ParseError::TagMismatch { span, .. }
+            | ParseError::InvalidTagStyle { span, .. }
             | ParseError::IntegerOverflow { span, .. }
             | ParseError::DuplicateKey { span, .. } => Some(span),
             ParseError::Io { .. }
+            | ParseError::Encoding { .. }
+            | ParseError::SourceLimit { .. }
             | ParseError::Yaml { .. }
             | ParseError::MultipleDocuments { .. }
             | ParseError::EmptyDocument { .. } => None,

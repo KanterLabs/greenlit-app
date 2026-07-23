@@ -23,6 +23,11 @@ pub struct ExecutionPlan {
     /// The simulated trigger's event name (`"push"`, `"pull_request"`,
     /// `"workflow_dispatch"`).
     pub event_name: String,
+    /// Authored `run-name:`, resolved against its allowed workflow contexts.
+    /// `None` means GitHub's event-specific default is used, including when
+    /// an authored value folded to only whitespace. A deferred value must
+    /// apply the same whitespace check after runtime evaluation.
+    pub run_name: Option<Planned<String>>,
     /// Workflow-level `env:` entries. Runtime layering is represented
     /// explicitly as this outer layer, [`JobPlan::env`], then
     /// [`StepPlan::env`], with the more specific layer winning.
@@ -52,15 +57,21 @@ pub struct JobPlan {
     /// the id). For a matrix job this is the stable job id; each concrete
     /// instance's resolved display name is in [`LegPlan::name`].
     pub name: Planned<String>,
+    /// Whether `name:` was omitted. A runtime-deferred matrix uses this to
+    /// apply GitHub's default `job-id (matrix values...)` naming after its
+    /// concrete values become available, without confusing an explicitly
+    /// authored name that happens to equal the job id.
+    pub name_is_default: bool,
     /// Direct dependencies, in `needs:` declaration order, deduplicated.
     pub needs: Vec<JobId>,
     /// `wave(j)`: `0` if `needs` is empty, else `1 + max` of its
     /// dependencies' waves.
     pub wave: u32,
-    /// Planned runner image for a **non-matrix** job (`strategy.legs`
-    /// empty). `None` when this job has a matrix strategy — see each
-    /// [`LegPlan`] instead. A runtime-derived label carries no invented
-    /// image and must be materialized before container provisioning.
+    /// Planned runner image for a non-matrix job, or the runner template for
+    /// a matrix whose expansion is runtime-deferred. `None` for a statically
+    /// expanded matrix — see each [`LegPlan`] instead. A runtime-derived
+    /// label carries no invented image and must be materialized before
+    /// container provisioning.
     pub runner: Option<RunnerPlan>,
     /// `container:` configuration with each context-sensitive value folded
     /// or explicitly marked runtime-deferred.
@@ -72,29 +83,35 @@ pub struct JobPlan {
     pub env: IndexMap<String, EnvValue>,
     /// Effective workflow/job run defaults for this job.
     pub defaults: RunDefaultsPlan,
-    /// This job's `if:`, resolved for a **non-matrix** job. `None` when
-    /// this job has a matrix strategy — see each [`LegPlan`] instead; also
-    /// `None` when there is no `if:` at all (in which case
-    /// [`JobPlan::implicit_status_gate`] is still meaningful).
+    /// Effective `GITHUB_TOKEN` permissions for this job. A job-level
+    /// declaration replaces the workflow-level declaration rather than
+    /// merging with it; `None` means GitHub's configured default applies.
+    pub permissions: Option<PermissionsPlan>,
+    /// This job's `if:`, resolved for a non-matrix job or retained once on a
+    /// runtime-deferred matrix template. `None` for a statically expanded
+    /// matrix — see each [`LegPlan`] instead — and when no `if:` was authored.
     pub condition: Option<Condition>,
     /// `true` iff `if:` (or its absence) contains no status-check function
     /// — the implicit `success()` gate applies. Identical across every leg
     /// of a matrix job (a purely syntactic property of the authored text).
     pub implicit_status_gate: bool,
-    /// Statically decided skip, for a **non-matrix** job.
+    /// Statically decided skip for a non-matrix job or for the single
+    /// template representing a runtime-deferred matrix.
     pub skip: Option<StaticSkip>,
     /// `strategy:`, resolved.
     pub strategy: StrategyPlan,
-    /// One entry per [`StrategyPlan::legs`] leg, aligned by index — empty
-    /// for a non-matrix job.
+    /// One entry per [`StrategyPlan::legs`] leg, aligned by index. Empty for
+    /// a non-matrix job, a zero-leg static matrix, or a matrix awaiting
+    /// runtime materialization; [`StrategyPlan::matrix`] distinguishes them.
     pub legs: Vec<LegPlan>,
-    /// `outputs:`, resolved as far as possible for a non-matrix job. Empty
-    /// for a matrix job; every concrete instance retains its own output
-    /// finalization plan in [`LegPlan::outputs`].
+    /// `outputs:`, resolved as far as possible for a non-matrix job or a
+    /// deferred matrix template. Empty for a statically expanded matrix;
+    /// every concrete instance then retains its own plan in
+    /// [`LegPlan::outputs`].
     pub outputs: JobOutputsPlan,
-    /// The step sequence for a non-matrix job, in file order. Empty for a
-    /// matrix job; each concrete instance has independently planned steps
-    /// in [`LegPlan::steps`].
+    /// The step sequence for a non-matrix job or deferred matrix template,
+    /// in file order. Empty for a statically expanded matrix; each concrete
+    /// instance then has independently planned steps in [`LegPlan::steps`].
     pub steps: Vec<StepPlan>,
 }
 
@@ -203,7 +220,7 @@ pub struct RunDefaultsPlan {
     pub working_directory: Option<Planned<String>>,
 }
 
-/// Workflow token permission declaration.
+/// Workflow- or job-level token permission declaration.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum PermissionsPlan {
@@ -218,7 +235,7 @@ pub enum PermissionsPlan {
     },
 }
 
-/// One explicit workflow token permission level.
+/// One explicit token permission level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevelPlan {

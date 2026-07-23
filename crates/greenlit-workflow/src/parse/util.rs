@@ -5,10 +5,8 @@
 //! Every mapping-shaped construct (the workflow root, a job, a step, …) is
 //! validated against a fixed list of the keys this crate models. Any other
 //! key is a hard [`ParseError::UnknownKey`] — including real GitHub keys
-//! this phase simply does not model (see the crate-level docs' "Known
-//! limitations" for the specific list, e.g. job-level `permissions:`,
-//! `run-name:`). This mirrors GitHub's own strict schema validation more
-//! closely than silently ignoring unrecognized keys would, and keeps the
+//! this phase simply does not model. This mirrors GitHub's own strict schema
+//! validation more closely than silently ignoring unrecognized keys would, and keeps the
 //! model's shape exactly what `PHASE-1-engine-core.md` specifies rather
 //! than silently accepting-and-dropping fields nobody asked for.
 
@@ -306,7 +304,7 @@ pub(crate) fn to_yaml_value(node: &Spanned<RawNode>) -> YamlValue {
         ),
         RawNode::Mapping(entries) => {
             let mut out = Vec::with_capacity(entries.len());
-            for (k, v) in entries {
+            for (k, v) in entries.iter() {
                 // Guaranteed scalar by the raw-tree invariant (see
                 // `key_text` docs); an empty-string fallback is harmless
                 // and keeps this conversion infallible.

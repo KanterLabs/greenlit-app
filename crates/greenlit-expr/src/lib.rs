@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! `greenlit-expr`: the GitHub Actions `${{ }}` expression language.
 //!
@@ -7,9 +8,9 @@
 //! (`contains`, `startsWith`, `endsWith`, `format`, `join`, `toJSON`,
 //! `fromJSON`, `hashFiles`, `case`, and the status functions), GitHub's exact
 //! type-coercion and loose-equality rules, and the typed context model
-//! (`github`, `env`, `vars`, `secrets`, `needs`, `matrix`, `steps`, `runner`,
-//! `job`, `inputs`). See `PHASE-1-engine-core.md` for the full task list this
-//! crate implements.
+//! (`github`, `env`, `vars`, `secrets`, `needs`, `matrix`, `strategy`,
+//! `steps`, `runner`, `job`, `inputs`). See `PHASE-1-engine-core.md` for the
+//! full task list this crate implements.
 //!
 //! # Entry points for other crates
 //!
@@ -40,6 +41,7 @@ pub mod error;
 pub mod eval;
 pub mod functions;
 mod lexer;
+mod memory;
 mod parser;
 pub mod value;
 
@@ -49,9 +51,15 @@ mod oracle_tests;
 pub use ast::{BinOp, Expr, expr_calls_status_function};
 pub use context::{Context, RunStatus};
 pub use error::{EvalError, ParseError};
-pub use eval::evaluate;
+pub use eval::{
+    DEFAULT_MAX_MEMORY_BYTES, EvaluationOptions, WORKFLOW_TEMPLATE_MAX_MEMORY_BYTES, evaluate,
+    evaluate_with_options,
+};
 pub use functions::format::FormatError;
-pub use functions::hash_files::{DirEntry, EntryKind, HashFilesError, HashFilesFs, RealFs};
+pub use functions::hash_files::{
+    DirEntry, EntryKind, HashFilesClock, HashFilesError, HashFilesFs, OpenDirectory, OpenedDir,
+    RealFs,
+};
 pub use functions::json::FromJsonError;
 pub use value::{ArrayValue, ObjectValue, Value, ValueKind};
 
@@ -71,8 +79,11 @@ pub use value::{ArrayValue, ObjectValue, Value, ValueKind};
 /// ```
 /// use greenlit_expr::parse;
 ///
-/// let expr = parse("github.event_name == 'push'").unwrap();
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let expr = parse("github.event_name == 'push'")?;
 /// assert!(matches!(expr, greenlit_expr::Expr::Binary { .. }));
+/// # Ok(())
+/// # }
 /// ```
 pub fn parse(source: &str) -> Result<Expr, ParseError> {
     parser::parse(source)

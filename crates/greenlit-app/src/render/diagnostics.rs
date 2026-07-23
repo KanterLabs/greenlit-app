@@ -10,10 +10,17 @@ use greenlit_metrics::InvocationRecord;
 /// Renders every plan-time [`Lint`] as one `warning: file:line:col: message`
 /// line.
 pub(crate) fn render_lints(lints: &[Lint], out: &mut impl Write) -> std::io::Result<()> {
-    for lint in lints {
-        writeln!(out, "warning: {}: {}", lint.span, lint.message)?;
-    }
-    Ok(())
+    super::terminal::render_sanitized(out, |buffer| {
+        for lint in lints {
+            writeln!(
+                buffer,
+                "warning: {}: {}",
+                super::terminal::inline_escape(&lint.span.to_string()),
+                super::terminal::inline_escape(&lint.message)
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// Renders one invocation's stage-by-stage timing breakdown as a small
@@ -23,14 +30,16 @@ pub(crate) fn render_timings(
     record: &InvocationRecord,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
-    writeln!(out, "stage timings ({}):", record.command)?;
-    for stage in &record.stages {
-        writeln!(out, "  {:<10} {:>9.2} ms", stage.name, stage.duration_ms)?;
-    }
-    writeln!(
-        out,
-        "  {:<10} {:>9.2} ms",
-        "total", record.total_duration_ms
-    )?;
-    Ok(())
+    super::terminal::render_sanitized(out, |buffer| {
+        writeln!(buffer, "stage timings ({}):", record.command)?;
+        for stage in &record.stages {
+            writeln!(buffer, "  {:<10} {:>9.2} ms", stage.name, stage.duration_ms)?;
+        }
+        writeln!(
+            buffer,
+            "  {:<10} {:>9.2} ms",
+            "total", record.total_duration_ms
+        )?;
+        Ok(())
+    })
 }

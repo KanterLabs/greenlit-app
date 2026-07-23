@@ -17,6 +17,9 @@ pub use strategy::{MatrixPlan, StrategyControl, StrategyPlan};
 
 use greenlit_expr::Value;
 use indexmap::IndexMap;
+use serde::ser::SerializeStruct;
+use std::borrow::Borrow;
+use std::sync::Arc;
 
 use greenlit_workflow::Span;
 
@@ -35,9 +38,53 @@ pub struct MatrixLeg {
     /// Stable ordinal within the job (final leg list order).
     pub index: usize,
     /// This leg's `axis: value` pairs, in key declaration order.
-    pub values: IndexMap<String, MatrixValue>,
+    pub values: IndexMap<MatrixKey, MatrixValue>,
     /// Where this leg came from.
     pub origin: LegOrigin,
+}
+
+/// An interned matrix property name.
+///
+/// Matrix expansion repeats every axis name in as many as 256 concrete
+/// legs. Sharing the immutable string keeps that repository-controlled
+/// multiplication bounded while serializing exactly like the original JSON
+/// object key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MatrixKey(Arc<str>);
+
+impl MatrixKey {
+    /// Returns the property name as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Borrow<str> for MatrixKey {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl From<String> for MatrixKey {
+    fn from(value: String) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<&str> for MatrixKey {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
+
+impl serde::Serialize for MatrixKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 impl MatrixLeg {
@@ -75,8 +122,14 @@ pub enum LegOrigin {
 /// A deep-equality-comparable mirror of a matrix axis/`include`/`exclude`
 /// value. GitHub permits object values here, addressed as
 /// `matrix.key.subkey`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(untagged)]
+///
+/// Stable plan JSON uses a tagged representation for every variant:
+/// `{ "kind": "null" }` or `{ "kind": "...", "value": ... }`.
+/// Tagging keeps JSON strings, mappings, and non-finite numbers
+/// unambiguous. Finite numbers use a JSON number; `NaN`, positive infinity,
+/// and negative infinity use those canonical strings inside the tagged
+/// number value because JSON has no native non-finite numeric literals.
+#[derive(Debug, Clone, PartialEq)]
 pub enum MatrixValue {
     /// `null`.
     Null,
@@ -85,11 +138,66 @@ pub enum MatrixValue {
     /// A number.
     Number(f64),
     /// A string.
-    String(String),
+    String(Arc<str>),
     /// A sequence.
-    Sequence(Vec<MatrixValue>),
+    Sequence(Arc<[MatrixValue]>),
     /// A mapping, insertion-ordered.
-    Mapping(IndexMap<String, MatrixValue>),
+    Mapping(Arc<IndexMap<String, MatrixValue>>),
+}
+
+impl serde::Serialize for MatrixValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut value = serializer.serialize_struct(
+            "MatrixValue",
+            if matches!(self, Self::Null) { 1 } else { 2 },
+        )?;
+        match self {
+            Self::Null => value.serialize_field("kind", "null")?,
+            Self::Bool(boolean) => {
+                value.serialize_field("kind", "boolean")?;
+                value.serialize_field("value", boolean)?;
+            }
+            Self::Number(number) => {
+                value.serialize_field("kind", "number")?;
+                value.serialize_field("value", &SerializableMatrixNumber(*number))?;
+            }
+            Self::String(string) => {
+                value.serialize_field("kind", "string")?;
+                value.serialize_field("value", string.as_ref())?;
+            }
+            Self::Sequence(sequence) => {
+                value.serialize_field("kind", "sequence")?;
+                value.serialize_field("value", sequence.as_ref())?;
+            }
+            Self::Mapping(mapping) => {
+                value.serialize_field("kind", "mapping")?;
+                value.serialize_field("value", mapping.as_ref())?;
+            }
+        }
+        value.end()
+    }
+}
+
+struct SerializableMatrixNumber(f64);
+
+impl serde::Serialize for SerializableMatrixNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.0.is_nan() {
+            serializer.serialize_str("NaN")
+        } else if self.0 == f64::INFINITY {
+            serializer.serialize_str("Infinity")
+        } else if self.0 == f64::NEG_INFINITY {
+            serializer.serialize_str("-Infinity")
+        } else {
+            serializer.serialize_f64(self.0)
+        }
+    }
 }
 
 impl MatrixValue {
@@ -100,7 +208,7 @@ impl MatrixValue {
             MatrixValue::Null => "null".to_string(),
             MatrixValue::Bool(b) => b.to_string(),
             MatrixValue::Number(n) => greenlit_expr::value::format_g15(*n),
-            MatrixValue::String(s) => s.clone(),
+            MatrixValue::String(s) => s.to_string(),
             MatrixValue::Sequence(_) => "[…]".to_string(),
             MatrixValue::Mapping(_) => "{…}".to_string(),
         }

@@ -7,47 +7,113 @@
 use std::path::{Path, PathBuf};
 
 const WORKFLOWS_DIR: &str = ".github/workflows";
+const MAX_REPORTED_CANDIDATES: usize = 20;
 
-/// Resolves the workflow file to plan: `explicit` if given, else the sole
-/// `*.yml`/`*.yaml` file under [`WORKFLOWS_DIR`] relative to `cwd`.
+fn safe_path(path: &Path) -> String {
+    crate::render::terminal::inline_escape(&path.display().to_string())
+}
+
+fn safe_error(error: &std::io::Error) -> String {
+    crate::render::terminal::inline_escape(&error.to_string())
+}
+
+/// One workflow path with separate filesystem and user-facing forms. Reads
+/// always use the canonical absolute path; source spans use the stable
+/// repository-relative name GitHub exposes through `github.workflow` and
+/// `github.workflow_ref`.
+pub(crate) struct ResolvedWorkflowPath {
+    pub(crate) read_path: PathBuf,
+    pub(crate) source_name: String,
+}
+
+/// Resolves the workflow file to plan: an explicit relative path is resolved
+/// from `invocation_cwd`; otherwise the sole `*.yml`/`*.yaml` file under
+/// [`WORKFLOWS_DIR`] in `repo_root` is selected. A workflow outside the
+/// repository is rejected because it has no truthful repository-relative
+/// identity in GitHub's context.
 pub(crate) fn resolve_workflow_path(
     explicit: Option<&Path>,
-    cwd: &Path,
-) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
-    }
-    let dir = cwd.join(WORKFLOWS_DIR);
-    let mut candidates = discover_candidates(&dir)?;
+    invocation_cwd: &Path,
+    repo_root: &Path,
+) -> Result<ResolvedWorkflowPath, String> {
+    let selected = if let Some(path) = explicit {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            invocation_cwd.join(path)
+        }
+    } else {
+        discover_workflow(repo_root)?
+    };
+    normalize_workflow_path(&selected, repo_root)
+}
+
+fn discover_workflow(repo_root: &Path) -> Result<PathBuf, String> {
+    let dir = repo_root.join(WORKFLOWS_DIR);
+    let (mut candidates, additional_candidates) = discover_candidates(&dir)?;
     candidates.sort();
     match candidates.len() {
         0 => Err(format!(
             "no workflow file found under {}\n  fix: pass -W <path> to select a workflow file, or add one under {WORKFLOWS_DIR}",
-            dir.display()
+            safe_path(&dir)
         )),
         1 => Ok(candidates.remove(0)),
         _ => {
-            let list = candidates
+            let mut list = candidates
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|path| safe_path(path))
                 .collect::<Vec<_>>()
                 .join(", ");
+            if additional_candidates {
+                list.push_str(", ... (additional candidates omitted)");
+            }
             Err(format!(
                 "multiple workflow files found under {}: {list}\n  fix: pass -W <path> to select one explicitly",
-                dir.display()
+                safe_path(&dir)
             ))
         }
     }
 }
 
-fn discover_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
+fn normalize_workflow_path(path: &Path, repo_root: &Path) -> Result<ResolvedWorkflowPath, String> {
+    let read_path = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "{}: could not resolve workflow file: {error}\n  fix: pass -W <path> naming a readable workflow file inside {}",
+            safe_path(path),
+            safe_path(repo_root),
+            error = safe_error(&error)
+        )
+    })?;
+    if !read_path.is_file() {
+        return Err(format!(
+            "{}: workflow path is not a file\n  fix: pass -W <path> naming a readable workflow file inside {}",
+            safe_path(path),
+            safe_path(repo_root)
+        ));
+    }
+    let relative = read_path.strip_prefix(repo_root).map_err(|_| {
+        format!(
+            "{}: workflow file resolves outside repository {}\n  fix: pass -W <path> naming a workflow file inside the repository",
+            safe_path(path),
+            safe_path(repo_root)
+        )
+    })?;
+    let source_name = relative.to_string_lossy().replace('\\', "/");
+    Ok(ResolvedWorkflowPath {
+        read_path,
+        source_name,
+    })
+}
+
+fn discover_candidates(dir: &Path) -> Result<(Vec<PathBuf>, bool), String> {
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
         Err(e) => {
             return Err(format!(
                 "{}: could not read workflows directory: {e}\n  fix: check permissions, or pass -W <path> directly",
-                dir.display()
+                safe_path(dir),
+                e = safe_error(&e)
             ));
         }
     };
@@ -56,7 +122,8 @@ fn discover_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
         let entry = entry.map_err(|e| {
             format!(
                 "{}: could not read a directory entry: {e}\n  fix: check permissions, or pass -W <path> directly",
-                dir.display()
+                safe_path(dir),
+                e = safe_error(&e)
             )
         })?;
         let path = entry.path();
@@ -69,8 +136,11 @@ fn discover_candidates(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .map(|e| e.eq_ignore_ascii_case("yml") || e.eq_ignore_ascii_case("yaml"))
             .unwrap_or(false);
         if is_yaml {
+            if out.len() == MAX_REPORTED_CANDIDATES {
+                return Ok((out, true));
+            }
             out.push(path);
         }
     }
-    Ok(out)
+    Ok((out, false))
 }

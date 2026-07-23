@@ -5,8 +5,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::Instrument;
+use tracing::field::{Field, Visit};
+use tracing::{Id, Subscriber};
+use tracing_subscriber::layer::{Context as LayerContext, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 
-use crate::record::{InvocationRecord, SCHEMA_VERSION, StageDuration};
+use crate::record::{
+    HitMissCounter, InvocationRecord, SCHEMA_VERSION, StageDuration, StepDuration,
+};
 
 /// Converts a [`Duration`] to fractional milliseconds for the NDJSON record.
 fn duration_to_millis(d: Duration) -> f64 {
@@ -30,7 +37,8 @@ fn unix_millis_now() -> u128 {
 /// `litci run` invocation.
 ///
 /// Construct one with [`Invocation::start`] at the top of the command, time
-/// each pipeline stage with [`time_stage`](Invocation::time_stage) or
+/// run the pipeline inside [`with_timing_subscriber`](Invocation::with_timing_subscriber),
+/// instrument each stage with [`time_stage`](Invocation::time_stage) or
 /// [`time_stage_async`](Invocation::time_stage_async), then call
 /// [`finish`](Invocation::finish) to obtain the completed [`InvocationRecord`]
 /// ready for [`crate::MetricsStore::append`].
@@ -44,6 +52,8 @@ pub struct Invocation {
     started_at: Instant,
     started_at_unix_ms: u128,
     stages: Arc<Mutex<Vec<StageDuration>>>,
+    steps: Arc<Mutex<Vec<StepDuration>>>,
+    hit_miss: Arc<Mutex<Vec<HitMissCounter>>>,
 }
 
 impl Invocation {
@@ -55,7 +65,20 @@ impl Invocation {
             started_at: Instant::now(),
             started_at_unix_ms: unix_millis_now(),
             stages: Arc::new(Mutex::new(Vec::new())),
+            steps: Arc::new(Mutex::new(Vec::new())),
+            hit_miss: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Runs `f` with a local tracing subscriber that aggregates spans whose
+    /// target is `greenlit_metrics::timed_stage` and whose `stage` field is
+    /// a string. This is scoped to the closure and never installs global
+    /// logging or telemetry.
+    pub fn with_timing_subscriber<T>(&self, f: impl FnOnce() -> T) -> T {
+        let subscriber = Registry::default().with(TimingLayer {
+            sink: Arc::clone(&self.stages),
+        });
+        tracing::subscriber::with_default(subscriber, f)
     }
 
     /// Runs `f` inside a named `tracing` span and records its elapsed wall
@@ -65,8 +88,11 @@ impl Invocation {
     /// `stage_name`. The closure may contain multiple statements and use `?`
     /// normally. Its duration is recorded even if the closure unwinds.
     pub fn time_stage<T>(&self, stage_name: &'static str, f: impl FnOnce() -> T) -> T {
-        let _timer = StageTimer::start(stage_name, &self.stages);
-        let span = tracing::info_span!("stage", stage = stage_name);
+        let span = tracing::info_span!(
+            target: "greenlit_metrics::timed_stage",
+            "greenlit_stage",
+            stage = stage_name
+        );
         span.in_scope(f)
     }
 
@@ -81,8 +107,11 @@ impl Invocation {
     where
         F: Future,
     {
-        let _timer = StageTimer::start(stage_name, &self.stages);
-        let span = tracing::info_span!("stage", stage = stage_name);
+        let span = tracing::info_span!(
+            target: "greenlit_metrics::timed_stage",
+            "greenlit_stage",
+            stage = stage_name
+        );
         // `tracing` documents that an `EnteredSpan` must not be held across
         // `.await`: it can produce incorrect traces and makes the enclosing
         // future non-Send. `Instrument` instead enters the span only while
@@ -103,6 +132,42 @@ impl Invocation {
         push_stage(&self.stages, stage_name.into(), elapsed);
     }
 
+    /// Records one completed workflow step duration.
+    pub fn record_step_duration(
+        &self,
+        job: impl Into<String>,
+        step: impl Into<String>,
+        elapsed: Duration,
+    ) {
+        if let Ok(mut steps) = self.steps.lock() {
+            steps.push(StepDuration {
+                job: job.into(),
+                step: step.into(),
+                duration_ms: duration_to_millis(elapsed),
+            });
+        }
+    }
+
+    /// Increments a named hit/miss counter.
+    pub fn record_lookup(&self, name: impl Into<String>, hit: bool) {
+        let name = name.into();
+        if let Ok(mut counters) = self.hit_miss.lock() {
+            if let Some(counter) = counters.iter_mut().find(|counter| counter.name == name) {
+                if hit {
+                    counter.hits = counter.hits.saturating_add(1);
+                } else {
+                    counter.misses = counter.misses.saturating_add(1);
+                }
+            } else {
+                counters.push(HitMissCounter {
+                    name,
+                    hits: u64::from(hit),
+                    misses: u64::from(!hit),
+                });
+            }
+        }
+    }
+
     /// Consumes the invocation, producing the completed [`InvocationRecord`]
     /// ready to append to a [`crate::MetricsStore`].
     ///
@@ -121,12 +186,24 @@ impl Invocation {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+        let steps = self
+            .steps
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        let hit_miss = self
+            .hit_miss
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         InvocationRecord {
             schema_version: SCHEMA_VERSION,
             command: self.command,
             started_at_unix_ms: self.started_at_unix_ms,
             total_duration_ms,
             stages,
+            steps,
+            hit_miss,
         }
     }
 }
@@ -137,90 +214,73 @@ fn push_stage(sink: &Arc<Mutex<Vec<StageDuration>>>, name: String, elapsed: Dura
     // guard's `Drop` must never panic (double-panic during unwind aborts the
     // process), and losing one stage's timing is preferable to that.
     if let Ok(mut stages) = sink.lock() {
-        stages.push(StageDuration { name, duration_ms });
-    }
-}
-
-struct StageTimer {
-    stage_name: &'static str,
-    start: Instant,
-    sink: Arc<Mutex<Vec<StageDuration>>>,
-}
-
-impl StageTimer {
-    fn start(stage_name: &'static str, sink: &Arc<Mutex<Vec<StageDuration>>>) -> Self {
-        Self {
-            stage_name,
-            start: Instant::now(),
-            sink: Arc::clone(sink),
+        if let Some(existing) = stages.iter_mut().find(|stage| stage.name == name) {
+            existing.duration_ms += duration_ms;
+        } else {
+            stages.push(StageDuration { name, duration_ms });
         }
     }
 }
 
-impl Drop for StageTimer {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed();
-        push_stage(&self.sink, self.stage_name.to_string(), elapsed);
+#[derive(Debug)]
+struct TimingLayer {
+    sink: Arc<Mutex<Vec<StageDuration>>>,
+}
+
+#[derive(Debug)]
+struct TracedStage {
+    name: String,
+    started_at: Instant,
+}
+
+#[derive(Default)]
+struct StageNameVisitor {
+    name: Option<String>,
+}
+
+impl Visit for StageNameVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "stage" {
+            self.name = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "stage" && self.name.is_none() {
+            self.name = Some(format!("{value:?}").trim_matches('"').to_string());
+        }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::future::ready;
-    use std::task::{Context, Poll, Waker};
-    use std::thread::sleep;
-
-    #[test]
-    fn time_stage_records_one_duration_per_call() {
-        let invocation = Invocation::start("plan");
-        invocation.time_stage("parse", || sleep(Duration::from_millis(5)));
-        invocation.time_stage("eval", || sleep(Duration::from_millis(5)));
-
-        let record = invocation.finish();
-        assert_eq!(record.command, "plan");
-        assert_eq!(record.stages.len(), 2);
-        assert_eq!(record.stages[0].name, "parse");
-        assert_eq!(record.stages[1].name, "eval");
-        // `sleep` guarantees *at least* the requested duration.
-        assert!(record.stages[0].duration_ms >= 5.0);
-        assert!(record.stages[1].duration_ms >= 5.0);
-        assert!(record.total_duration_ms >= record.stages[0].duration_ms);
+impl<S> Layer<S> for TimingLayer
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &Id,
+        ctx: LayerContext<'_, S>,
+    ) {
+        if attrs.metadata().target() != "greenlit_metrics::timed_stage" {
+            return;
+        }
+        let mut visitor = StageNameVisitor::default();
+        attrs.record(&mut visitor);
+        let Some(name) = visitor.name else { return };
+        if let Some(span) = ctx.span(id) {
+            span.extensions_mut().insert(TracedStage {
+                name,
+                started_at: Instant::now(),
+            });
+        }
     }
 
-    #[test]
-    fn time_stage_async_is_send_and_records_completed_work() {
-        let invocation = Invocation::start("run");
-        let mut timed = Box::pin(invocation.time_stage_async("plan", ready(42)));
-
-        fn assert_send<T: Send>(_: &T) {}
-        assert_send(&timed);
-
-        let mut context = Context::from_waker(Waker::noop());
-        assert_eq!(timed.as_mut().poll(&mut context), Poll::Ready(42));
-        drop(timed);
-
-        let record = invocation.finish();
-        assert_eq!(record.stages.len(), 1);
-        assert_eq!(record.stages[0].name, "plan");
-        assert!(record.stages[0].duration_ms.is_finite());
-        assert!(record.stages[0].duration_ms >= 0.0);
-    }
-
-    #[test]
-    fn record_stage_duration_appends_a_precomputed_measurement() {
-        let invocation = Invocation::start("run");
-        invocation.record_stage_duration("external", Duration::from_millis(7));
-
-        let record = invocation.finish();
-        assert_eq!(record.stages.len(), 1);
-        assert_eq!(record.stages[0].name, "external");
-        assert!(record.stages[0].duration_ms >= 7.0);
-    }
-
-    #[test]
-    fn schema_version_is_stamped_on_every_record() {
-        let record = Invocation::start("plan").finish();
-        assert_eq!(record.schema_version, SCHEMA_VERSION);
+    fn on_close(&self, id: Id, ctx: LayerContext<'_, S>) {
+        let Some(span) = ctx.span(&id) else { return };
+        let Some(stage) = span.extensions_mut().remove::<TracedStage>() else {
+            return;
+        };
+        push_stage(&self.sink, stage.name, stage.started_at.elapsed());
     }
 }

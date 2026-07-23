@@ -25,17 +25,29 @@ use format::{
 
 /// Renders the whole plan as an indented tree.
 pub(crate) fn render(plan: &ExecutionPlan, out: &mut impl Write) -> std::io::Result<()> {
+    super::terminal::render_sanitized(out, |buffer| render_unescaped(plan, buffer))
+}
+
+fn render_unescaped(plan: &ExecutionPlan, out: &mut impl Write) -> std::io::Result<()> {
     writeln!(out, "plan schema: {}", plan.schema_version)?;
     writeln!(out, "event: {}", plan.event_name)?;
+    match &plan.run_name {
+        Some(run_name) => writeln!(out, "run name: {}", format_planned_string(run_name))?,
+        None => writeln!(out, "run name: (event default)")?,
+    }
     render_env("env", &plan.env, out, "")?;
     render_defaults(&plan.defaults, out, "")?;
-    render_permissions(plan.permissions.as_ref(), out)?;
+    render_permissions(plan.permissions.as_ref(), out, "")?;
     let order = plan
         .topo_order
         .iter()
         .map(|id| id.0.as_str())
         .collect::<Vec<_>>();
-    writeln!(out, "topo order: {}", order.join(" -> "))?;
+    writeln!(
+        out,
+        "topo order: {}",
+        super::terminal::inline_escape(&order.join(" -> "))
+    )?;
     writeln!(out)?;
     writeln!(out, "jobs:")?;
     for job in &plan.jobs {
@@ -62,8 +74,13 @@ fn render_job(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
         needs,
         skip_suffix(job.skip.as_ref())
     )?;
-    writeln!(out, "    id: {}", job.id)?;
+    writeln!(
+        out,
+        "    id: {}",
+        super::terminal::inline_escape(&job.id.to_string())
+    )?;
     writeln!(out, "    name: {}", format_planned_string(&job.name))?;
+    render_permissions(job.permissions.as_ref(), out, "    ")?;
 
     if job.strategy.is_matrix() {
         render_strategy(job, out)?;
@@ -123,8 +140,8 @@ fn render_strategy(job: &JobPlan, out: &mut impl Write) -> std::io::Result<()> {
             writeln!(
                 out,
                 "      {}: deferred <- {} (defers on: {})",
-                expression.path,
-                expression.residual,
+                super::terminal::inline_escape(&expression.path),
+                super::terminal::inline_escape(&expression.residual),
                 format_defer_reasons(&expression.defers_on)
             )?;
         }
@@ -219,7 +236,11 @@ fn render_steps(
 
 fn render_step(step: &StepPlan, out: &mut impl Write, indent: &str) -> std::io::Result<()> {
     let id = step.id.as_deref().unwrap_or("(none)");
-    writeln!(out, "{indent}step [id: {id}]")?;
+    writeln!(
+        out,
+        "{indent}step [id: {}]",
+        super::terminal::inline_escape(id)
+    )?;
     match &step.name {
         Some(name) => writeln!(out, "{indent}  name: {}", format_planned_string(name))?,
         None => writeln!(out, "{indent}  name: (none)")?,

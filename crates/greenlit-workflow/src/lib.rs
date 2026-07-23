@@ -1,25 +1,27 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! `greenlit-workflow`: YAML workflow parsing into a typed workflow model.
 //!
 //! Parses `.github/workflows/*.yml` into a typed representation covering
 //! triggers, jobs, matrices, containers, services, and steps; and exposes a
-//! static-extraction API (referenced `secrets.*`/`vars.*` names, `uses:`
-//! references, `runs-on` values) consumed by `greenlit-engine` during
-//! planning. See `PHASE-1-engine-core.md` for the full task list this crate
-//! implements.
+//! static-extraction API (referenced `secrets.*`/`vars.*` names, authored
+//! `needs` output paths, `uses:` references, `runs-on` values) consumed by
+//! `greenlit-engine` during planning. See `PHASE-1-engine-core.md` for the
+//! full task list this crate implements.
 //!
 //! # Entry points
 //! - [`parse_workflow`] / [`parse_workflow_file`] — parse a workflow's YAML
 //!   source (or a path on disk) into a [`model::workflow::Workflow`].
 //! - [`extract::extract_static`] — scan an already-parsed [`model::workflow::Workflow`]
 //!   for every statically-discoverable `secrets.*`/`vars.*` reference,
-//!   `uses:` reference, and `runs-on` value.
+//!   statically identifiable `needs.<job>.outputs.<name>` path, `uses:`
+//!   reference, and `runs-on` value.
 //!
 //! Every node in the returned model carries a [`span::Span`] (file, line,
 //! column) so callers can render precise error/prompt locations.
 //!
-//! # Known limitations (deliberate v0 scope decisions)
+//! # Deliberate v0 scope decisions
 //!
 //! These are flagged here rather than silently guessed at, per `AGENTS.md`
 //! "Every conflict found gets flagged in the phase summary" — each is a
@@ -30,8 +32,6 @@
 //!   against a fixed allow-list of the keys this crate models (see
 //!   `parse::util` module docs); any other key — including real GitHub
 //!   keys this phase does not model — is a hard [`error::ParseError::UnknownKey`].
-//!   Concretely not modeled in v0: the workflow-level `run-name:` key, and
-//!   job-level `permissions:` (workflow-level `permissions:` *is* modeled).
 //! - **Job-level `name:`** is modeled even though it is not in
 //!   `PHASE-1-engine-core.md`'s literal per-job field list, since omitting
 //!   a basic display-name string would make nearly every realistically-named
@@ -47,7 +47,8 @@
 //!   (`greenlit-v0-spec.md` "Out (v0)").
 //! - **Static extraction** (`extract` module) parses each `${{ }}` body
 //!   with `greenlit-expr`'s real grammar and walks the resulting AST for
-//!   `secrets.*`/`vars.*` references (see `extract` module docs) — an
+//!   `secrets.*`/`vars.*` and `needs` output references (see `extract`
+//!   module docs) — an
 //!   earlier interim version of this module did its own best-effort
 //!   raw-text scan instead, written before `greenlit-expr` exposed a usable
 //!   public lexer/parser entry point; that reconciliation is now done.
@@ -62,6 +63,9 @@ mod validate;
 mod yaml;
 
 pub use error::ParseError;
-pub use extract::{StaticExtraction, extract_static};
-pub use parse::{parse_workflow, parse_workflow_file};
+pub use extract::{NeedsOutputReference, StaticExtraction, extract_static};
+pub use parse::{
+    MAX_WORKFLOW_SOURCE_CHARACTERS, parse_workflow, parse_workflow_file,
+    parse_workflow_file_with_name,
+};
 pub use span::{Location, Span, Spanned};

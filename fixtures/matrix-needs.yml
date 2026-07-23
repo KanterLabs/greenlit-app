@@ -8,9 +8,9 @@
 # successfully with no `--var`/`.litci/vars` overrides -- it is the exact
 # fixture the Phase 1 exit criteria and `crates/greenlit-app/tests/` drive.
 name: matrix-needs fixture
-on:
-  push:
-    branches: [main]
+# The phase verification command must work from any branch, so this
+# synthetic push is intentionally unfiltered.
+on: push
 
 env:
   GREETING: hello
@@ -40,8 +40,17 @@ jobs:
       # Step outputs are produced while a job runs, so planning preserves
       # this expression for runtime evaluation. The plan contract is pinned
       # by `crates/greenlit-app/tests/plan_matrix_needs.rs` in
-      # `job_output_is_deferred_and_consumed_by_a_downstream_jobs_output`.
+      # `golden_plan_owns_the_matrix_needs_structure_and_is_byte_stable`.
       artifact-name: ${{ steps.pack.outputs.name }}
+      # Built-ins evaluate arguments lazily. The invalid `fromJSON` calls
+      # below are unreachable at runtime and therefore must not fail plan;
+      # the same integration test pins these results.
+      lazy-format: ${{ format('{0}', steps.pack.outputs.name, fromJSON('bad')) }}
+      guarded-contains: ${{ contains(fromJSON('{}'), fromJSON('bad')) }}
+      guarded-starts-with: ${{ startsWith(fromJSON('[]'), fromJSON('bad')) }}
+      guarded-ends-with: ${{ endsWith(fromJSON('{}'), fromJSON('bad')) }}
+      guarded-join: ${{ join(fromJSON('[]'), fromJSON('bad')) }}
+      lazy-case: ${{ case(steps.pack.outcome == 'success', 'selected', fromJSON('bad')) }}
     steps:
       - id: pack
         name: Package build artifact
@@ -63,9 +72,9 @@ jobs:
   deploy:
     needs: [build, test]
     runs-on: ubuntu-latest
-    # The synthetic push event makes this statically true; the integration
-    # contract is pinned by `crates/greenlit-app/tests/plan_matrix_needs.rs`
-    # in `static_and_deferred_if_conditions_are_both_present`.
+    # The synthetic push keeps the checked-in golden deterministic; the same
+    # integration fixture derives variable and missing-property oracle cases
+    # by replacing only this condition in `plan_matrix_needs.rs`.
     if: github.event_name == 'push'
     outputs:
       # Consumes `build`'s declared output across the needs edge -- also

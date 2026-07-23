@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! `greenlit-metrics`: local, instrumentation-first run metrics.
 //!
@@ -27,9 +28,12 @@
 //! # fn assemble_plan() -> Result<(), std::io::Error> { Ok(()) }
 //! # fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let invocation = Invocation::start("plan");
-//! invocation.time_stage("parse", parse_workflow)?;
-//! invocation.time_stage("eval", evaluate_expressions)?;
-//! invocation.time_stage("plan", assemble_plan)?;
+//! invocation.with_timing_subscriber(|| -> Result<(), std::io::Error> {
+//!     invocation.time_stage("parse", parse_workflow)?;
+//!     invocation.time_stage("eval", evaluate_expressions)?;
+//!     invocation.time_stage("plan", assemble_plan)?;
+//!     Ok(())
+//! })?;
 //!
 //! let record = invocation.finish();
 //! // Render `record.stages` as a stderr table here, then append the record.
@@ -39,8 +43,9 @@
 //! # }
 //! ```
 //!
-//! `litci stats` instead calls only [`MetricsStore::read_all`] — it must
-//! never append a record for its own invocation.
+//! `litci stats` instead calls only [`MetricsStore::read_recent`] — it must
+//! never append a record for its own invocation. [`MetricsStore::read_all`]
+//! remains available to callers that explicitly need the complete history.
 
 mod error;
 mod invocation;
@@ -49,5 +54,5 @@ mod store;
 
 pub use error::MetricsError;
 pub use invocation::Invocation;
-pub use record::{InvocationRecord, SCHEMA_VERSION, StageDuration};
+pub use record::{HitMissCounter, InvocationRecord, SCHEMA_VERSION, StageDuration, StepDuration};
 pub use store::MetricsStore;

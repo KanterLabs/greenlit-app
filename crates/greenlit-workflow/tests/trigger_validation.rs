@@ -143,7 +143,7 @@ fn schedule_requires_nonempty_mappings_with_string_cron_and_optional_timezone() 
 #[test]
 fn workflow_dispatch_models_all_types_and_type_checked_defaults() {
     let source = format!(
-        "on:\n  workflow_dispatch:\n    inputs:\n      implicit_string:\n        default: hello\n      explicit_string:\n        type: string\n        default: world\n      boolean_value:\n        type: boolean\n        default: false\n      number_value:\n        type: number\n        default: 2.5\n      choice_value:\n        type: choice\n        options: [one, two]\n        default: one\n      environment_value:\n        type: environment\n        default: staging\n{TAIL}"
+        "on:\n  workflow_dispatch:\n    inputs:\n      implicit_string:\n        default: hello\n      explicit_string:\n        type: string\n        default: world\n      boolean_value:\n        type: boolean\n        default: false\n      number_value:\n        type: number\n        default: 2.5\n      choice_value:\n        description: Pick one\n        required: true\n        type: choice\n        options: [one, two]\n        default: one\n      environment_value:\n        type: environment\n        default: staging\n{TAIL}"
     );
     let workflow = parse_workflow("dispatch.yml", &source).expect("dispatch parses");
     let inputs = match &workflow.on[0].value {
@@ -162,7 +162,27 @@ fn workflow_dispatch_models_all_types_and_type_checked_defaults() {
             false
         ))))
     );
-    assert_eq!(inputs[4].options.len(), 2);
+    let choice = &inputs[4];
+    assert_eq!(choice.name.value, "choice_value");
+    assert_eq!(
+        choice
+            .description
+            .as_ref()
+            .map(|value| value.value.as_str()),
+        Some("Pick one")
+    );
+    assert_eq!(
+        choice.required.as_ref().map(|value| value.value),
+        Some(true)
+    );
+    assert_eq!(
+        choice
+            .options
+            .iter()
+            .map(|option| option.value.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
 }
 
 #[test]

@@ -15,6 +15,17 @@ pub(crate) fn validate_workflow(workflow: &Workflow) -> Result<(), ParseError> {
     if let Some(name) = &workflow.name {
         reject_template(&name.value, &name.span, "name")?;
     }
+    if let Some(run_name) = &workflow.run_name {
+        // GitHub's context-availability table restricts `run-name` to the
+        // `github`, `inputs`, and `vars` contexts.
+        // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
+        validate_template(
+            &run_name.value,
+            &run_name.span,
+            "run-name",
+            ExpressionPolicy::RunName,
+        )?;
+    }
     for (_, value) in &workflow.env {
         validate_scalar(value, "env", ExpressionPolicy::WorkflowEnv)?;
     }
@@ -292,12 +303,10 @@ fn validate_step(step: &Step, context: &str) -> Result<(), ParseError> {
                 ExpressionPolicy::Step,
             )?;
             if let Some(shell) = shell {
-                validate_template(
-                    &shell.value,
-                    &shell.span,
-                    &format!("{context}.shell"),
-                    ExpressionPolicy::Step,
-                )?;
+                // Step-level `shell` is a plain `non-empty-string` in the
+                // runner template schema, unlike job-level defaults:
+                // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/DTPipelines/workflow-v1.0.json#L292-L307
+                reject_template(&shell.value, &shell.span, &format!("{context}.shell"))?;
             }
         }
         StepAction::Uses { reference, with } => {

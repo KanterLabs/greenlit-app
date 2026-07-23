@@ -116,7 +116,7 @@ pub enum ParseError {
     /// case-insensitive registry independent of any context *data* (only
     /// which workflow key the expression lives in restricts which of
     /// `hashFiles`/the status functions are legal; `greenlit-workflow`
-    /// applies that per-key policy after this syntax parser succeeds. This
+    /// and `greenlit-engine` apply that per-key policy after this syntax parser succeeds. This
     /// remains a parse-time registry error because it needs no context data.
     #[error("'{0}' is not a recognized function")]
     UnrecognizedFunction(String),
@@ -124,13 +124,12 @@ pub enum ParseError {
     /// this crate recognizes (`github`, `env`, `vars`, `secrets`, `needs`,
     /// `matrix`, `strategy`, `steps`, `runner`, `job`, `inputs`). Contrast
     /// with an unrecognized *property* on a recognized root, which evaluates
-    /// to an empty string (see "About contexts" in the Contexts
-    /// reference: "If you attempt to dereference a nonexistent property, it
-    /// will evaluate to an empty string" — that rule is about properties,
-    /// not roots). Real GitHub additionally restricts *which* of these eleven
-    /// roots are legal per workflow key (the "Context availability" table);
-    /// `greenlit-workflow` enforces that site-specific policy because this
-    /// standalone parser intentionally has no workflow-key location.
+    /// to the runner's internal `Null` and converts to the empty string at a
+    /// string-rendering boundary. Real GitHub additionally restricts *which*
+    /// of these eleven roots are legal per workflow key (the "Context
+    /// availability" table); the workflow parser/planner enforce that
+    /// site-specific policy because this standalone parser intentionally has
+    /// no workflow-key location.
     #[error("'{0}' is not a recognized named-value (context) in this expression")]
     UnrecognizedNamedValue(String),
     /// Extra input remained after a complete expression was parsed.
@@ -160,6 +159,19 @@ pub enum ParseError {
 /// specific variant/fields they care about instead.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
+    /// A caller hand-built an AST deeper than the runner's documented
+    /// expression limit instead of obtaining it from [`crate::parse`].
+    #[error("expression nesting exceeds the maximum depth of {MAX_EXPRESSION_DEPTH}")]
+    ExpressionTooDeep,
+    /// Live evaluation results exceeded the configured Actions expression
+    /// memory budget.
+    #[error(
+        "the maximum allowed memory size of {max_bytes} bytes was exceeded while evaluating the expression"
+    )]
+    MemoryLimitExceeded {
+        /// The configured maximum number of live result bytes.
+        max_bytes: usize,
+    },
     /// See [`ParseError::UnrecognizedFunction`] — same check, re-applied
     /// defensively at evaluation time.
     #[error("'{0}' is not a recognized function")]

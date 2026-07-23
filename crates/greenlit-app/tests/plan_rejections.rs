@@ -1,9 +1,8 @@
-//! Integration tests: the two v0 rejection paths
-//! (`PHASE-1-engine-core.md` exit criterion 4) -- a `workflow_call` trigger
-//! ("not in v0" with location) and an unsupported `runs-on:` label (the
-//! accepted stable-x64 list).
+//! Integration tests: v0 scope rejections (`PHASE-1-engine-core.md` exit
+//! criterion 4 and `greenlit-v0-spec.md`'s Out list), plus unsupported
+//! `runs-on:` labels (with the accepted stable-x64 list).
 
-mod support;
+pub mod support;
 
 use support::Sandbox;
 
@@ -33,23 +32,122 @@ fn workflow_call_is_rejected_as_not_in_v0_with_location() {
 }
 
 #[test]
-fn unsupported_runner_label_is_rejected_with_the_accepted_list() {
+fn every_unsupported_runner_form_is_rejected_with_the_accepted_list() {
+    let rows = [
+        ("Windows", UNSUPPORTED_RUNNER_FIXTURE, "windows-latest"),
+        (
+            "macOS",
+            "on: push\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo hi\n",
+            "macos-latest",
+        ),
+        (
+            "ARM",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04-arm\n    steps:\n      - run: echo hi\n",
+            "ubuntu-24.04-arm",
+        ),
+        (
+            "preview/slim",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-slim\n    steps:\n      - run: echo hi\n",
+            "ubuntu-slim",
+        ),
+        (
+            "self-hosted labels",
+            "on: push\njobs:\n  build:\n    runs-on: [self-hosted, linux, x64]\n    steps:\n      - run: echo hi\n",
+            "multi-label `runs-on: [...]` self-hosted selection",
+        ),
+        (
+            "runner group",
+            "on: push\njobs:\n  build:\n    runs-on:\n      group: production-runners\n      labels: [linux, x64]\n    steps:\n      - run: echo hi\n",
+            "custom `runs-on: { group: ... }` runner group",
+        ),
+        (
+            "larger runner",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-24.04-16core\n    steps:\n      - run: echo hi\n",
+            "ubuntu-24.04-16core",
+        ),
+    ];
+
+    for (name, source, rejected) in rows {
+        let sandbox = Sandbox::new();
+        sandbox.write("fixtures/unsupported-runner.yml", source);
+        sandbox.init_git();
+
+        let output = sandbox.run(&["plan", "-W", "fixtures/unsupported-runner.yml"]);
+        assert!(
+            !output.status.success(),
+            "row '{name}' unexpectedly planned"
+        );
+        let stderr = support::stderr_text(&output);
+        assert!(stderr.contains(rejected), "row '{name}': {stderr}");
+        assert!(
+            stderr.contains("fixtures/unsupported-runner.yml:"),
+            "row '{name}' lacks a source location: {stderr}"
+        );
+        for accepted in ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"] {
+            assert!(stderr.contains(accepted), "row '{name}': {stderr}");
+        }
+        assert!(stderr.contains("fix:"), "row '{name}': {stderr}");
+    }
+}
+
+#[test]
+fn oidc_write_permissions_are_rejected_while_none_is_harmless() {
     let sandbox = Sandbox::new();
-    sandbox.write(
-        "fixtures/unsupported-runner.yml",
-        UNSUPPORTED_RUNNER_FIXTURE,
-    );
     sandbox.init_git();
 
-    let output = sandbox.run(&["plan", "-W", "fixtures/unsupported-runner.yml"]);
+    for (name, permission) in [
+        ("workflow scope", "permissions:\n  id-token: write\n"),
+        ("write-all", "permissions: write-all\n"),
+    ] {
+        sandbox.write(
+            ".github/workflows/oidc.yml",
+            &format!(
+                "on: push\n{permission}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n"
+            ),
+        );
+        let output = sandbox.run(&["plan", "-W", ".github/workflows/oidc.yml"]);
+        assert!(!output.status.success(), "{name} unexpectedly planned");
+        let stderr = support::stderr_text(&output);
+        assert!(stderr.contains("OIDC"), "{name}: {stderr}");
+        assert!(stderr.contains("id-token: write"), "{name}: {stderr}");
+        assert!(stderr.contains("not in v0"), "{name}: {stderr}");
+        assert!(stderr.contains("fix:"), "{name}: {stderr}");
+    }
+
+    sandbox.write(
+        ".github/workflows/oidc.yml",
+        "on: push\npermissions:\n  id-token: none\njobs:\n  build:\n    permissions:\n      id-token: none\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n",
+    );
+    let output = sandbox.run(&["plan", "-W", ".github/workflows/oidc.yml"]);
+    assert!(
+        output.status.success(),
+        "id-token: none must remain harmless: {}",
+        support::stderr_text(&output)
+    );
+
+    // Job-level permissions replace, rather than merge with, workflow-level
+    // permissions. An explicit job map therefore neutralizes inherited OIDC.
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idpermissions
+    sandbox.write(
+        ".github/workflows/oidc.yml",
+        "on: push\npermissions:\n  id-token: write\njobs:\n  build:\n    permissions:\n      contents: read\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n",
+    );
+    let output = sandbox.run(&["plan", "-W", ".github/workflows/oidc.yml"]);
+    assert!(
+        output.status.success(),
+        "job-level permission replacement must disable inherited OIDC: {}",
+        support::stderr_text(&output)
+    );
+
+    sandbox.write(
+        ".github/workflows/oidc.yml",
+        "on: push\njobs:\n  build:\n    permissions:\n      id-token: write\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo build\n",
+    );
+    let output = sandbox.run(&["plan", "-W", ".github/workflows/oidc.yml"]);
     assert!(!output.status.success());
     let stderr = support::stderr_text(&output);
-
-    assert!(stderr.contains("windows-latest"));
-    assert!(stderr.contains("ubuntu-latest"));
-    assert!(stderr.contains("ubuntu-24.04"));
-    assert!(stderr.contains("ubuntu-22.04"));
-    assert!(stderr.contains("fix:"));
+    assert!(stderr.contains("OIDC"));
+    assert!(stderr.contains("not in v0"));
 }
 
 #[test]
@@ -61,6 +159,21 @@ fn stdout_stays_empty_when_planning_fails() {
     let output = sandbox.run(&["plan", "-W", "fixtures/workflow-call.yml", "--json"]);
     assert!(!output.status.success());
     assert!(support::stdout_text(&output).is_empty());
+}
+
+#[test]
+fn yaml_depth_limit_is_actionable_before_model_recursion() {
+    let sandbox = Sandbox::new();
+    let nested = format!("on: {}x{}\njobs: {{}}\n", "[".repeat(51), "]".repeat(51));
+    sandbox.write("deep.yml", &nested);
+    sandbox.init_git();
+
+    let output = sandbox.run(&["plan", "-W", "deep.yml"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("deep.yml:1:"), "{stderr}");
+    assert!(stderr.contains("depth of 50"), "{stderr}");
+    assert!(stderr.contains("fix:"), "{stderr}");
 }
 
 #[test]

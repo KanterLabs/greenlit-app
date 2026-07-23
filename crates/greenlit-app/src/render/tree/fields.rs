@@ -8,6 +8,7 @@ use greenlit_engine::{
 };
 
 use super::format::{format_defer_reasons, format_planned_string};
+use crate::render::terminal::inline_escape;
 
 pub(super) fn render_env<'a>(
     label: &str,
@@ -21,7 +22,12 @@ pub(super) fn render_env<'a>(
     }
     writeln!(out, "{indent}{label}:")?;
     for (name, value) in entries {
-        writeln!(out, "{indent}  {name}: {}", format_planned_string(value))?;
+        writeln!(
+            out,
+            "{indent}  {}: {}",
+            inline_escape(name),
+            format_planned_string(value)
+        )?;
     }
     Ok(())
 }
@@ -53,14 +59,15 @@ pub(super) fn render_defaults(
 pub(super) fn render_permissions(
     permissions: Option<&PermissionsPlan>,
     out: &mut impl Write,
+    indent: &str,
 ) -> std::io::Result<()> {
     match permissions {
-        None => writeln!(out, "permissions: (GitHub default)"),
-        Some(PermissionsPlan::ReadAll) => writeln!(out, "permissions: read-all"),
-        Some(PermissionsPlan::WriteAll) => writeln!(out, "permissions: write-all"),
+        None => writeln!(out, "{indent}permissions: (GitHub default)"),
+        Some(PermissionsPlan::ReadAll) => writeln!(out, "{indent}permissions: read-all"),
+        Some(PermissionsPlan::WriteAll) => writeln!(out, "{indent}permissions: write-all"),
         Some(permissions @ PermissionsPlan::Scoped { .. }) => {
             let serialized = serde_json::to_string(permissions).map_err(std::io::Error::other)?;
-            writeln!(out, "permissions: {serialized}")
+            writeln!(out, "{indent}permissions: {serialized}")
         }
     }
 }
@@ -89,7 +96,7 @@ pub(super) fn render_services<'a>(
     }
     writeln!(out, "{indent}services:")?;
     for (name, service) in services {
-        writeln!(out, "{indent}  {name}:")?;
+        writeln!(out, "{indent}  {}:", inline_escape(name))?;
         render_container_fields(service, out, &format!("{indent}    "))?;
     }
     Ok(())
@@ -139,8 +146,7 @@ fn format_password(value: &EnvValue) -> String {
     match &value.evaluation {
         Evaluation::Static(_) => "static([masked])".to_string(),
         Evaluation::Deferred(deferred) => format!(
-            "deferred <- {} (defers on: {})",
-            deferred.residual_text,
+            "deferred <- [masked] (defers on: {})",
             format_defer_reasons(&deferred.defers_on)
         ),
     }
@@ -172,18 +178,24 @@ pub(super) fn render_outputs(
     }
     writeln!(out, "{indent}outputs:")?;
     for (name, output) in &outputs.entries {
-        writeln!(out, "{indent}  {name}: {}", format_output(output))?;
+        writeln!(
+            out,
+            "{indent}  {}: {}",
+            inline_escape(name),
+            format_output(output)
+        )?;
     }
     Ok(())
 }
 
 fn format_output(output: &PlannedOutput) -> String {
-    match &output.value {
+    let rendered = match &output.value {
         PlannedValue::Static(value) => format!("static({value:?}) <- {}", output.source),
         PlannedValue::Deferred(deferred) => format!(
             "deferred <- {} (defers on: {})",
             deferred.residual_text,
             format_defer_reasons(&deferred.defers_on)
         ),
-    }
+    };
+    inline_escape(&rendered)
 }

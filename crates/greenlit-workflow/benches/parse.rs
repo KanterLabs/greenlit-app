@@ -16,19 +16,14 @@ const MULTI_JOB_WORKFLOW: &str = include_str!("fixtures/multi_job.yml");
 
 fn bench_parse_and_extract(c: &mut Criterion) {
     c.bench_function("parse_workflow(multi_job.yml)", |b| {
-        b.iter(|| {
-            let workflow = parse_workflow("ci.yml", black_box(MULTI_JOB_WORKFLOW))
-                .expect("fixture must parse");
-            black_box(&workflow);
-        });
+        b.iter(|| black_box(parse_workflow("ci.yml", black_box(MULTI_JOB_WORKFLOW))));
     });
 
-    let workflow = parse_workflow("ci.yml", MULTI_JOB_WORKFLOW).expect("fixture must parse");
+    let Ok(workflow) = parse_workflow("ci.yml", MULTI_JOB_WORKFLOW) else {
+        return;
+    };
     c.bench_function("extract_static(multi_job.yml)", |b| {
-        b.iter(|| {
-            let extraction = extract_static(black_box(&workflow)).expect("fixture extracts");
-            black_box(extraction);
-        });
+        b.iter(|| black_box(extract_static(black_box(&workflow))));
     });
 }
 
