@@ -258,17 +258,19 @@ fn public_hash_files_deadline_interrupts_blocked_io_and_stops_expired_streams() 
 
     // Finding 3: a worker stuck in an uninterruptible host syscall can
     // never be killed from within this library, so the number of
-    // simultaneously stranded workers is bounded. Each call below is
-    // backed by a worker that blocks for a short real duration while an
-    // accelerated clock makes the caller give up almost immediately,
-    // leaving that worker stranded (still running, but abandoned) until
-    // its sleep elapses. Enough of these in a row must eventually hit the
-    // fixed cap and fail fast rather than starting yet another one; once
-    // every stranded worker has actually finished, the cap must recover.
+    // simultaneously live workers is bounded. Each call below is backed by
+    // a worker that blocks for a short real duration while an accelerated
+    // clock makes the caller give up almost immediately, leaving that
+    // worker stranded (still running, but abandoned) until its sleep
+    // elapses. Enough of these in a row must eventually hit the fixed cap
+    // and fail fast rather than starting yet another one; once every
+    // stranded worker has actually finished, the cap must recover. The loop
+    // bound is generous (well beyond any plausible cap value) so this stays
+    // robust to the exact fixed cap rather than encoding it twice.
     const STRAND_BLOCK: Duration = Duration::from_millis(250);
     let mut saw_ordinary_timeout = false;
     let mut saw_stranded_limit = false;
-    for _ in 0..8 {
+    for _ in 0..40 {
         let blocked = Arc::new(AtomicBool::new(false));
         let context = Context::new(Arc::new(ShortBlockFs {
             root: PathBuf::from("/workspace"),
@@ -320,4 +322,178 @@ fn public_hash_files_deadline_interrupts_blocked_io_and_stops_expired_streams() 
         ),
         "the stranded-worker cap must recover once every prior worker has exited"
     );
+    // Let the recovery call's own worker actually finish (it slept
+    // `STRAND_BLOCK`) so the live-worker counter is genuinely back to zero
+    // before the next block reasons about it from scratch.
+    thread::sleep(STRAND_BLOCK * 2);
+
+    // Finding 3's actual race: the earlier sequential loop above only ever
+    // has one call in flight at a time, so it cannot tell a real per-spawn
+    // reservation from one that merely increments once a call is later
+    // detected as stranded — both look identical when calls never overlap.
+    // This drives genuinely concurrent call starts (real OS threads, all
+    // spawned before any of them can finish) against a fake that blocks
+    // long enough for spawn/scheduling jitter to be negligible next to it,
+    // and records the peak number of workers the fake ever saw running at
+    // once. The fixed cap must hold under that real concurrency: no more
+    // workers are ever concurrently live than were admitted, and every call
+    // beyond whatever the cap turns out to be must fail fast with the
+    // corrective `StrandedWorkerLimit` message instead of also starting a
+    // worker.
+    const CONCURRENT_BLOCK: Duration = Duration::from_millis(500);
+    const CONCURRENT_STARTS: usize = 20;
+    let live = Arc::new(AtomicUsize::new(0));
+    let peak_live = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..CONCURRENT_STARTS)
+        .map(|_| {
+            let live = Arc::clone(&live);
+            let peak_live = Arc::clone(&peak_live);
+            // `Context` is not `Send` (it can hold `Rc`-based `Value`
+            // payloads), so it must be built *inside* the spawned thread
+            // rather than moved into it; only the plain, `Send + Sync`
+            // fake filesystem state crosses the spawn boundary. `evaluate`'s
+            // `Ok` case is likewise not `Send`, so the outcome is classified
+            // to an owned, `Send` summary before this closure returns.
+            thread::spawn(move || {
+                let context = Context::new(Arc::new(ConcurrentBlockFs {
+                    root: PathBuf::from("/workspace"),
+                    block_for: CONCURRENT_BLOCK,
+                    live,
+                    peak_live,
+                }));
+                let expression =
+                    parse("hashFiles('**')").expect("parse concurrent-start hashFiles expression");
+                match evaluate(&expression, &context) {
+                    Err(EvalError::HashFiles(HashFilesError::Io { .. })) => {
+                        ConcurrentOutcome::Admitted
+                    }
+                    Err(EvalError::HashFiles(HashFilesError::StrandedWorkerLimit { max })) => {
+                        ConcurrentOutcome::Rejected(max)
+                    }
+                    other => ConcurrentOutcome::Other(format!("{other:?}")),
+                }
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| {
+            handle
+                .join()
+                .expect("concurrent-start worker thread panicked")
+        })
+        .collect();
+
+    let admitted = results
+        .iter()
+        .filter(|result| matches!(result, ConcurrentOutcome::Admitted))
+        .count();
+    let rejected: Vec<_> = results
+        .iter()
+        .filter_map(|result| match result {
+            ConcurrentOutcome::Rejected(max) => Some(*max),
+            _ => None,
+        })
+        .collect();
+    let unexpected: Vec<&str> = results
+        .iter()
+        .filter_map(|result| match result {
+            ConcurrentOutcome::Other(message) => Some(message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        unexpected.is_empty(),
+        "unexpected concurrent-start outcome(s): {unexpected:?}"
+    );
+    assert_eq!(
+        admitted + rejected.len(),
+        CONCURRENT_STARTS,
+        "every concurrent call must either run its worker or fail fast at the cap: {results:?}"
+    );
+    assert!(
+        !rejected.is_empty(),
+        "more concurrent starts than the live-worker cap must produce at least one fast failure"
+    );
+    assert!(
+        admitted > 0,
+        "the cap must have headroom: at least one concurrent call must be admitted"
+    );
+    let cap = rejected[0];
+    assert!(
+        rejected.iter().all(|max| *max == cap),
+        "the fixed cap must be reported identically by every rejection: {rejected:?}"
+    );
+    let peak = peak_live.load(Ordering::Acquire);
+    assert!(
+        peak <= cap,
+        "the cap must hold: at most {cap} workers may ever be concurrently live, saw {peak}"
+    );
+    assert!(
+        admitted <= cap,
+        "no more calls than the fixed cap can ever be admitted at once: admitted {admitted}, cap {cap}"
+    );
+    let rendered = HashFilesError::StrandedWorkerLimit { max: cap }.to_string();
+    assert!(
+        rendered.contains("wait for concurrent evaluations to finish"),
+        "strand-cap error lacked its corrective action: {rendered}"
+    );
+}
+
+/// An owned, `Send` classification of one concurrent-start call's outcome
+/// (`evaluate`'s own `Result<Value, EvalError>` is not `Send`, since `Value`
+/// can hold `Rc`-based array/object payloads).
+#[derive(Debug)]
+enum ConcurrentOutcome {
+    /// The call's worker actually ran (and, for this fake, then failed with
+    /// a plain I/O error once its block elapsed).
+    Admitted,
+    /// The call was refused before starting a worker because the live cap
+    /// was already reserved.
+    Rejected(usize),
+    /// Anything else is a test-setup bug, not a case this test means to
+    /// classify.
+    Other(String),
+}
+
+/// Records the number of `hashFiles` filesystem workers concurrently
+/// blocked inside `open_dir` at once (`peak_live`), to prove the live-worker
+/// cap is a real per-spawn reservation rather than something only detected
+/// after the fact. Each call sleeps for a fixed real duration far longer
+/// than thread-spawn/scheduling jitter, so calls started at (approximately)
+/// the same instant are guaranteed to overlap for the whole test.
+#[derive(Debug)]
+struct ConcurrentBlockFs {
+    root: PathBuf,
+    block_for: Duration,
+    live: Arc<AtomicUsize>,
+    peak_live: Arc<AtomicUsize>,
+}
+
+impl HashFilesFs for ConcurrentBlockFs {
+    fn workspace_root(&self) -> &Path {
+        &self.root
+    }
+
+    fn open_dir(&self, _path: &Path) -> io::Result<OpenedDir<'_>> {
+        let now_live = self.live.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_live.fetch_max(now_live, Ordering::AcqRel);
+        thread::sleep(self.block_for);
+        self.live.fetch_sub(1, Ordering::AcqRel);
+        Err(io::Error::other(
+            "concurrent-block fs never yields a real directory",
+        ))
+    }
+
+    fn entry_kind(&self, _path: &Path) -> io::Result<EntryKind> {
+        Ok(EntryKind::Dir)
+    }
+
+    fn hash_file_sha256(
+        &self,
+        _path: &Path,
+        _check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        Err(io::Error::other("concurrent-block fs never hashes a file"))
+    }
 }

@@ -82,6 +82,13 @@ impl InMemoryFs {
         self
     }
 
+    /// Adds a symbolic link from `path` to `target`. `target` need not
+    /// resolve to anything, modeling a dangling link.
+    pub fn with_symlink(mut self, path: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
+        self.symlinks.insert(path.into(), target.into());
+        self
+    }
+
     fn is_directory(&self, path: &Path) -> bool {
         path == self.root
             || self.home.as_deref() == Some(path)

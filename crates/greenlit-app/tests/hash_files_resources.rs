@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use greenlit_expr::{
     Context, DirEntry, EntryKind, EvalError, HashFilesError, HashFilesFs, OpenDirectory, OpenedDir,
@@ -425,6 +425,130 @@ impl HashFilesFs for PruningRecorderFs {
     }
 }
 
+/// Records every `DT_UNKNOWN` resolution attempt by child name, to pin
+/// finding 5 of the hashFiles hardening re-verification against the case
+/// the previous fake couldn't express at all: a directory-enumeration
+/// result whose kind is unreported must be pruned from the name/path alone,
+/// exactly like a directly-reported kind, *before* the extra resolution
+/// call `DT_UNKNOWN` requires is ever made — not merely before an unrelated
+/// directory is opened.
+/// https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts
+#[derive(Debug)]
+struct UnknownKindPruningFs {
+    root: PathBuf,
+    resolved: Arc<Mutex<Vec<String>>>,
+}
+
+impl HashFilesFs for UnknownKindPruningFs {
+    fn workspace_root(&self) -> &Path {
+        &self.root
+    }
+
+    fn open_dir(&self, path: &Path) -> io::Result<OpenedDir<'_>> {
+        if path != self.root.join("src") {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unexpected directory open: {}", path.display()),
+            ));
+        }
+        let entries: Box<dyn Iterator<Item = io::Result<DirEntry>>> = Box::new(
+            vec![
+                Ok(DirEntry {
+                    name: "app.js".to_string(),
+                    kind: EntryKind::Unknown,
+                }),
+                Ok(DirEntry {
+                    name: "vendor".to_string(),
+                    kind: EntryKind::Unknown,
+                }),
+            ]
+            .into_iter(),
+        );
+        Ok(OpenedDir::new(
+            path.to_path_buf(),
+            Box::new(UnknownKindOpenDir { fs: self, entries }),
+        ))
+    }
+
+    fn hash_file_sha256(
+        &self,
+        path: &Path,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        check_timeout()?;
+        if path == self.root.join("src/app.js") {
+            return Ok([7_u8; 32]);
+        }
+        Err(io::Error::other(format!(
+            "unexpected file hash request: {}",
+            path.display()
+        )))
+    }
+
+    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
+        if path == self.root.join("src") {
+            Ok(EntryKind::Dir)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unexpected entry_kind query: {}", path.display()),
+            ))
+        }
+    }
+}
+
+struct UnknownKindOpenDir<'a> {
+    fs: &'a UnknownKindPruningFs,
+    entries: Box<dyn Iterator<Item = io::Result<DirEntry>> + 'a>,
+}
+
+impl<'a> OpenDirectory<'a> for UnknownKindOpenDir<'a> {
+    fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
+        self.entries.next().transpose()
+    }
+
+    fn open_child_dir(&self, _name: &str, path: &Path, _follow: bool) -> io::Result<OpenedDir<'a>> {
+        self.fs.open_dir(path)
+    }
+
+    fn hash_child_file(
+        &self,
+        _name: &str,
+        path: &Path,
+        _follow: bool,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        self.fs.hash_file_sha256(path, check_timeout)
+    }
+
+    fn resolve_unknown_kind(&self, name: &str, lexical_path: &Path) -> io::Result<EntryKind> {
+        self.fs
+            .resolved
+            .lock()
+            .expect("resolved-kind recorder mutex")
+            .push(name.to_string());
+        if lexical_path == self.fs.root.join("src/app.js") {
+            Ok(EntryKind::File)
+        } else if lexical_path == self.fs.root.join("src/vendor") {
+            // Reached only if the invariant this test pins is broken; a
+            // plain I/O error surfaces through `evaluate` rather than
+            // panicking this thread, matching every other "unexpected"
+            // fixture query in this file.
+            Err(io::Error::other(
+                "an irrelevant DT_UNKNOWN entry must never be resolved: src/vendor",
+            ))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "unexpected resolve_unknown_kind query: {}",
+                    lexical_path.display()
+                ),
+            ))
+        }
+    }
+}
+
 #[test]
 fn public_hash_files_prunes_unrelated_directories_before_opening_them() {
     // Invariant class: an unreadable (or merely irrelevant) directory that
@@ -446,6 +570,30 @@ fn public_hash_files_prunes_unrelated_directories_before_opening_them() {
         vendor_open_attempts.load(Ordering::Acquire),
         0,
         "an unrelated directory must never be opened, not merely tolerated when it errors"
+    );
+
+    // Finding 5's `DT_UNKNOWN` case specifically: both siblings' native
+    // enumeration type is unreported, so resolving either one costs an
+    // extra call. Only the one pruning decides is still relevant may ever
+    // pay that cost.
+    let resolved = Arc::new(Mutex::new(Vec::new()));
+    let context = Context::new(Arc::new(UnknownKindPruningFs {
+        root: PathBuf::from("/workspace"),
+        resolved: Arc::clone(&resolved),
+    }));
+    let value = evaluate_source("hashFiles('src/*.js')", &context)
+        .expect("pruned hashFiles evaluation over DT_UNKNOWN entries");
+    assert!(
+        matches!(&value, Value::String(digest) if digest.len() == 64),
+        "a relevant DT_UNKNOWN entry must still be resolved, matched, and hashed: {value:?}"
+    );
+    assert_eq!(
+        resolved
+            .lock()
+            .expect("resolved-kind recorder mutex")
+            .as_slice(),
+        ["app.js"],
+        "an irrelevant DT_UNKNOWN sibling must never be resolved, only the matching one"
     );
 }
 

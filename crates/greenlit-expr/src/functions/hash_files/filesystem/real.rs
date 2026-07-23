@@ -8,14 +8,14 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, ResolveFlags, Stat, openat2};
 use sha2::{Digest, Sha256};
 
 use self::directory::RealOpenDir;
-use self::node::{DirNode, Resolved, components};
+use self::node::{Resolved, components};
 use self::root::{RootOpenError, establish};
 use super::{EntryKind, HashFilesFs, OpenedDir};
 
@@ -23,19 +23,22 @@ const RESOLVE_FLAGS: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_XDEV);
 
-/// The production [`HashFilesFs`], confined beneath one held workspace
-/// descriptor for its full lifetime.
+/// The production [`HashFilesFs`], confined beneath one pinned workspace
+/// root descriptor for its full lifetime.
 ///
-/// Every access — the workspace root, a literal search root, or a child of
-/// an already-open directory — is opened relative to a held ancestor
-/// descriptor with `openat2` and no-follow inspection; see `filesystem/
-/// real/node.rs` for the resolver and its rationale. Root establishment and
-/// `$HOME` canonicalization are both lazy (behind `OnceLock`) so that
-/// neither blocking host filesystem call happens outside the caller's
-/// supervised, deadline-checked worker: `RealFs::new` performs no I/O, and
-/// every trait method that first touches the filesystem is only ever
-/// called from inside `hash_files_worker` (finding 2 of the hashFiles
-/// hardening review).
+/// Every access — the workspace root itself, a literal search root, or a
+/// child of an already-open directory — resolves its full path relative to
+/// that one pinned root descriptor in a single `openat2` call with
+/// `RESOLVE_BENEATH`; see `filesystem/real/node.rs` for the resolver and why
+/// re-deriving the whole path from the root on every access (rather than
+/// stepping through held intermediate descriptors) is what actually keeps a
+/// concurrent rename from being followed outside the workspace. Root
+/// establishment and `$HOME` canonicalization are both lazy (behind
+/// `OnceLock`) so that neither blocking host filesystem call happens
+/// outside the caller's supervised, deadline-checked worker: `RealFs::new`
+/// performs no I/O, and every trait method that first touches the
+/// filesystem is only ever called from inside `hash_files_worker` (finding
+/// 2 of the hashFiles hardening review).
 #[derive(Debug)]
 pub struct RealFs {
     requested_root: PathBuf,
@@ -45,7 +48,7 @@ pub struct RealFs {
 
 struct Established {
     path: PathBuf,
-    root: Option<Arc<DirNode>>,
+    root: Option<OwnedFd>,
     error: Option<RootOpenError>,
 }
 
@@ -84,7 +87,7 @@ impl RealFs {
             let established = establish(self.requested_root.clone());
             Established {
                 path: established.path,
-                root: established.fd.map(DirNode::root),
+                root: established.fd,
                 error: established.error,
             }
         })
@@ -94,7 +97,7 @@ impl RealFs {
         &self.established().path
     }
 
-    fn root_node(&self) -> io::Result<&Arc<DirNode>> {
+    fn root_fd(&self) -> io::Result<&OwnedFd> {
         let established = self.established();
         established.root.as_ref().ok_or_else(|| {
             established.error.as_ref().map_or_else(
@@ -112,20 +115,21 @@ impl RealFs {
     }
 
     /// Opens one entry point: the workspace root, `$HOME`, or a literal
-    /// search root. Called at most once per entry point — see
-    /// `HashFilesFs::open_dir`'s contract.
+    /// search root — as a single `openat2` call, root-relative, walking
+    /// every component of `path` fresh (finding 1 of the hashFiles
+    /// hardening re-verification; see `filesystem/real/node.rs`).
     fn open_entry_point(
         &self,
         path: &Path,
         follow_final: bool,
         access: Access,
     ) -> io::Result<Resolved> {
-        let root = self.root_node()?;
+        let root = self.root_fd()?;
         let pending = self.pending_for(path)?;
         node::resolve(
             root,
             self.root_path(),
-            root,
+            Path::new(""),
             pending,
             follow_final,
             access,
@@ -133,12 +137,15 @@ impl RealFs {
         )
     }
 
-    /// Opens `name`, relative to the already-held `parent`, never by
-    /// re-deriving `lexical_path` and re-resolving it from the workspace
-    /// root (findings 1 and 6 of the hashFiles hardening review).
+    /// Opens `name`, a child of the directory whose own workspace-root-
+    /// relative path is `parent_relative` — resolved from the pinned root in
+    /// one `openat2` call over the whole accumulated path, never relative to
+    /// a held intermediate descriptor (finding 1) and never by re-deriving
+    /// `lexical_path` and re-splitting it from scratch (finding 6) of the
+    /// hashFiles hardening review.
     fn open_relative(
         &self,
-        parent: &Arc<DirNode>,
+        parent_relative: &Path,
         name: &str,
         lexical_path: &Path,
         follow: bool,
@@ -150,13 +157,13 @@ impl RealFs {
                 "hashFiles child name contained a path separator",
             ));
         }
-        let root = self.root_node()?;
+        let root = self.root_fd()?;
         let mut pending = VecDeque::new();
         pending.push_back(OsString::from(name));
         node::resolve(
             root,
             self.root_path(),
-            parent,
+            parent_relative,
             pending,
             follow,
             access,

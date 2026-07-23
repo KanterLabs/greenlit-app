@@ -130,7 +130,26 @@ pub(super) fn walk_search_root<'fs>(
     let mut stack: Vec<Frame<'fs>> = Vec::new();
 
     match root_kind {
-        EntryKind::File => return visit_file(&path, HashSource::EntryPoint, false),
+        // `entry_kind` always resolves the real type via `fstat` (finding 5
+        // only concerns directory *enumeration*'s `DT_UNKNOWN`); kept only
+        // for `match` exhaustiveness.
+        EntryKind::Unknown => {
+            return Err(deadline.map_io(
+                &path,
+                io::Error::other("hashFiles entry_kind unexpectedly returned an unresolved kind"),
+            ));
+        }
+        // New defect: a search root reached here is only a candidate —
+        // GitHub yields a non-directory only on a *full* pattern match
+        // (`match`, negatives folded), never merely because it was the
+        // literal prefix a glob pattern rooted at.
+        // https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts
+        EntryKind::File => {
+            if is_included(compiled, &path) {
+                return visit_file(&path, HashSource::EntryPoint, false);
+            }
+            return Ok(());
+        }
         EntryKind::Dir => {
             let opened = fs
                 .open_dir(&path)
@@ -166,10 +185,16 @@ pub(super) fn walk_search_root<'fs>(
                 }
                 Err(_) => {
                     // lstat exposes the link itself as a non-directory
-                    // match; the outer hasher's own read decides whether a
-                    // dangling target is a lenient skip or a hard failure
-                    // (finding 8 of the hashFiles hardening review).
-                    return visit_file(&path, HashSource::EntryPoint, true);
+                    // candidate; the outer hasher's own read decides
+                    // whether a dangling target is a lenient skip or a hard
+                    // failure (finding 8) — but only on a *full* match (new
+                    // defect: a partial-only match — a dangling link merely
+                    // sitting at a glob's literal search root — must yield
+                    // nothing, not a `DanglingSymlink` failure).
+                    if is_included(compiled, &path) {
+                        return visit_file(&path, HashSource::EntryPoint, true);
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -221,7 +246,49 @@ fn drive<'fs>(
 
         path.push(&entry.name);
 
-        match entry.kind {
+        let kind = if entry.kind == EntryKind::Unknown {
+            // Finding 5: decide relevance from the name/path alone
+            // (toolkit's own `match || partialMatch`) *before* spending the
+            // extra resolution call `DT_UNKNOWN` forces — an irrelevant
+            // entry must never be opened or `stat`ed just because its
+            // native type was unreported.
+            // https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts
+            if !is_included(compiled, path) && !could_match_descendant(compiled, path) {
+                path.pop();
+                continue;
+            }
+            let parent = &stack
+                .last()
+                .ok_or_else(|| io::Error::other("hashFiles traversal stack is empty"))
+                .map_err(|source| deadline.map_io(path, source))?
+                .opened;
+            match parent.resolve_unknown_kind(&entry.name, path) {
+                Ok(resolved) => {
+                    deadline.check()?;
+                    resolved
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    // Vanished between enumeration and resolution — never a
+                    // hard failure (see the `EntryKind::Dir` vanished-entry
+                    // handling below for the same rationale).
+                    path.pop();
+                    continue;
+                }
+                Err(source) => return Err(deadline.map_io(path, source)),
+            }
+        } else {
+            entry.kind
+        };
+
+        match kind {
+            EntryKind::Unknown => {
+                // `resolve_unknown_kind` implementations must resolve to a
+                // concrete kind; this exists only for `match` exhaustiveness.
+                return Err(deadline.map_io(
+                    path,
+                    io::Error::other("hashFiles resolved an entry to an unknown kind"),
+                ));
+            }
             EntryKind::Other => {
                 path.pop();
             }
@@ -261,6 +328,16 @@ fn drive<'fs>(
                             } else {
                                 path.pop();
                             }
+                        }
+                        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                            // The rename-escape fix (finding 1) turns a
+                            // renamed-away ancestor into `ENOENT` instead of
+                            // silently resolving through the stale object;
+                            // an entry a moment ago listed is now simply
+                            // gone, exactly like the search root's own
+                            // vanished-before-traversal case above — never
+                            // a hard failure, and never outside content.
+                            path.pop();
                         }
                         Err(source) => return Err(deadline.map_io(path, source)),
                     }

@@ -1,29 +1,56 @@
-//! The held-ancestor directory chain and the single component-at-a-time
-//! resolver every access — entry point or child — walks through.
+//! The root-relative resolver every access — entry point or child — walks
+//! through, re-derived fresh from the one pinned root on every single call.
 //!
-//! Findings 1/6/7 of the hardening review: the previous implementation
-//! re-resolved a full lexical path from the workspace root on every
-//! directory or file access, which (a) let a rename of an already-inspected
-//! ancestor substitute a different object before the next access reached
-//! it, and (b) reopened a final file by name a second time after
-//! validating its type, racing a replacement. `DirNode` instead keeps every
-//! currently-open ancestor's descriptor alive for as long as the traversal
-//! is anywhere beneath it (in an `Arc` chain mirroring the DFS stack), so a
-//! child is always opened via `openat2(ancestor_fd, single_component, …)`
-//! relative to the object that was actually inspected — never by
-//! re-deriving and re-walking a path string. `Arc` (not `Rc`) because the
-//! root node is shared across every worker thread this `RealFs` ever
-//! serves (see `filesystem.rs`'s thread-safety note). Every `DirNode::fd`
-//! is `O_PATH`-only (navigation, never reads); a readable handle is minted
-//! fresh, from that exact descriptor's own `/proc/self/fd` entry, only at
-//! the point something is actually enumerated or hashed.
+//! Finding 1 of the hashFiles hardening re-verification: an earlier revision
+//! held each ancestor directory as its own `openat2`-opened descriptor,
+//! cached for as long as its `OpenedDir` stayed on the traversal stack, and
+//! resolved a child relative to that held fd. `RESOLVE_BENEATH` is scoped to
+//! the dirfd actually passed to `openat2`, not to some original root, so once
+//! a held ancestor's name was renamed out from under the workspace (e.g.
+//! `workspace/a` renamed to `outside/a`), the held fd still named the exact
+//! same (now-relocated) inode and further opens relative to it kept
+//! succeeding — reading outside the workspace despite every individual
+//! `openat2` call being, in isolation, "correct".
+//!
+//! The fix: never cache an intermediate ancestor descriptor across separate
+//! accesses. Every open instead re-walks the *entire* chain from the one
+//! pinned workspace root, one path component and one `openat2` call per hop,
+//! discarding each intermediate descriptor the moment the next hop has used
+//! it. `RESOLVE_BENEATH` (plus `RESOLVE_NO_MAGICLINKS`/`RESOLVE_NO_XDEV`, see
+//! `filesystem/real.rs`) makes each individual hop fail outright — `ENOENT`,
+//! not a silent escape — the instant its own immediate parent is no longer
+//! what it was expected to be, and re-deriving every ancestor hop-by-hop on
+//! every access means a rename anywhere along the chain is caught, not just
+//! at the final component. This is the real invariant: "every object was
+//! reached via a path beneath the root at its open instant", re-checked by
+//! the kernel on every single access rather than assumed to still hold from
+//! an earlier check.
+//!
+//! One hop per hashFiles path component (not one `openat2` call for a
+//! *joined* multi-component path string) is deliberate: the deep-traversal
+//! invariant already pins a lexical chain whose *joined* length exceeds
+//! Linux's `PATH_MAX`, which a single combined-path `openat2` call would
+//! reject outright (`ENAMETOOLONG`) long before any containment check ran.
+//! Walking hop-by-hop keeps every individual syscall argument bounded by one
+//! component's own name length regardless of how deep the chain is, at the
+//! cost of `O(depth)` syscalls per access instead of `O(1)` — an acceptable
+//! trade given hashFiles' own security invariant requires re-validating the
+//! whole ancestor chain on every access anyway.
+//!
+//! Directory *enumeration* keeps reading from its own already-open `Dir`
+//! handle (see `directory.rs`) — only further *access* (a child open, or a
+//! file hash) goes through this resolver again. `DirNode`'s held-ancestor
+//! chain and its `..`-via-parent-pointer are gone with it: the accumulated
+//! relative path (a plain `PathBuf`, walked hop-by-hop from root on demand)
+//! is enough to support `..` (pop a component) without ever asking the
+//! kernel to resolve it, and a directory's continuation state for its own
+//! future children is just that same relative path, not a descriptor.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 
 use rustix::fd::{AsRawFd, OwnedFd};
 use rustix::fs::{FileType, Mode, OFlags, Stat, fstat, readlinkat};
@@ -33,78 +60,69 @@ use super::{Access, access_flags, errno_to_io, open_component, outside_workspace
 
 const MAX_SYMLINKS: usize = 40;
 
-/// One held ancestor directory descriptor. The chain terminates at the
-/// pinned workspace root, whose `parent` is `None`.
-pub(super) struct DirNode {
-    pub(super) fd: OwnedFd,
-    parent: Option<Arc<DirNode>>,
-}
-
-impl DirNode {
-    pub(super) fn root(fd: OwnedFd) -> Arc<Self> {
-        Arc::new(Self { fd, parent: None })
-    }
-}
-
 pub(super) struct OpenedTarget {
     pub(super) fd: OwnedFd,
     pub(super) stat: Stat,
 }
 
 /// The outcome of [`resolve`]: a readable target descriptor, plus — only
-/// when that target is itself a directory — the ancestor node for it,
-/// ready to become the parent of further held-relative resolution.
+/// when that target is itself a directory — its own path relative to the
+/// workspace root, ready to seed further root-relative resolution for its
+/// children.
 pub(super) struct Resolved {
     pub(super) target: OpenedTarget,
-    pub(super) directory: Option<Arc<DirNode>>,
+    pub(super) directory: Option<PathBuf>,
 }
 
 /// Resolves `pending` (one or more path components, e.g. a single child
-/// name, or more after a symbolic link target expands it) relative to
-/// `start`, which must already be a held, inspected directory. `..` is
-/// handled by walking `start`'s own `parent` chain rather than by asking
-/// the kernel to resolve it, so it can never climb above the node the
-/// traversal actually pinned as its root — the same containment guarantee
-/// `openat2`'s `RESOLVE_BENEATH` gives a single call, but now honored
-/// across the whole multi-step traversal instead of only within one.
+/// name, or more after a symbolic link target expands it) starting from
+/// `start` — the workspace-root-relative path of an already-inspected
+/// directory (empty for the workspace root itself). Before touching
+/// `pending` at all, `start` itself is re-walked hop-by-hop, fresh from
+/// `root`, via [`open_chain`] — never relative to a held intermediate
+/// descriptor from some earlier call — so a rename of any ancestor since it
+/// was last inspected surfaces as `ENOENT` here rather than silently
+/// resolving through the stale object (finding 1 of the hashFiles hardening
+/// re-verification).
 pub(super) fn resolve(
-    root: &Arc<DirNode>,
+    root: &OwnedFd,
     root_path: &Path,
-    start: &Arc<DirNode>,
+    start: &Path,
     mut pending: VecDeque<OsString>,
     follow_final: bool,
     access: Access,
     lexical_path: &Path,
 ) -> io::Result<Resolved> {
-    let mut current = Arc::clone(start);
+    let mut accumulated = start.to_path_buf();
     let mut symlinks = 0_usize;
 
     loop {
+        // Every iteration re-derives the current directory fresh from
+        // `root`, one hop per already-accumulated component: see the module
+        // doc for why this, rather than a held descriptor or a single
+        // joined-path `openat2` call, is both the actual security fix and
+        // the only way to stay within `PATH_MAX` for an arbitrarily deep
+        // chain.
+        let current = open_chain(root, &accumulated)?;
+
         let Some(component) = pending.pop_front() else {
             // Resolving `start` itself (e.g. an entry point whose lexical
-            // path was exactly the already-open directory): duplicate its
-            // descriptor rather than moving it, since `current` here is
-            // only ever borrowed from a caller-held `Arc`.
-            let inspected = fcntl_dupfd_cloexec(&current.fd, 0).map_err(errno_to_io)?;
-            let inspected_stat = fstat(&inspected).map_err(errno_to_io)?;
-            let parent = current.parent.clone();
-            return finalize(inspected, inspected_stat, access, lexical_path, parent);
+            // path was exactly an already-open directory).
+            let inspected_stat = fstat(&current).map_err(errno_to_io)?;
+            return finalize(current, inspected_stat, access, lexical_path, accumulated);
         };
         if component == OsStr::new(".") {
             continue;
         }
         if component == OsStr::new("..") {
-            match &current.parent {
-                Some(parent) => {
-                    current = Arc::clone(parent);
-                    continue;
-                }
-                None => return Err(outside_workspace(lexical_path)),
+            if !accumulated.pop() {
+                return Err(outside_workspace(lexical_path));
             }
+            continue;
         }
 
         let inspected = open_component(
-            &current.fd,
+            &current,
             &component,
             OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         )?;
@@ -122,7 +140,7 @@ pub(super) fn resolve(
             let target = readlinkat(&inspected, "", Vec::new()).map_err(errno_to_io)?;
             let target = PathBuf::from(OsString::from_vec(target.into_bytes()));
             let target_components = if target.is_absolute() {
-                current = Arc::clone(root);
+                accumulated = PathBuf::new();
                 absolute_target_components(root_path, &target)?
             } else {
                 components(&target, &target)?
@@ -131,14 +149,9 @@ pub(super) fn resolve(
             continue;
         }
 
+        let candidate = accumulated.join(&component);
         if is_final {
-            return finalize(
-                inspected,
-                inspected_stat,
-                access,
-                lexical_path,
-                Some(current),
-            );
+            return finalize(inspected, inspected_stat, access, lexical_path, candidate);
         }
 
         if file_type != FileType::Directory {
@@ -147,11 +160,39 @@ pub(super) fn resolve(
                 format!("not a directory: {}", lexical_path.display()),
             ));
         }
-        current = Arc::new(DirNode {
-            fd: inspected,
-            parent: Some(current),
-        });
+        accumulated = candidate;
     }
+}
+
+/// Walks `relative` (workspace-root-relative; empty meaning the root
+/// itself) from `root`, one path component and one `openat2` call per hop,
+/// discarding each intermediate descriptor as soon as the next hop has used
+/// it. Every call re-derives the whole chain — nothing from a previous call
+/// is ever reused — which is what actually closes finding 1: a rename of
+/// any ancestor, at any depth, since the last time it was inspected, breaks
+/// the very next hop through it (`ENOENT`) instead of silently resolving
+/// through a stale intermediate. Splitting the walk into single-component
+/// hops (rather than one `openat2` call over the whole joined path) also
+/// keeps every individual syscall argument bounded by `NAME_MAX`, never
+/// `PATH_MAX`, regardless of how deep `relative` is.
+fn open_chain(root: &OwnedFd, relative: &Path) -> io::Result<OwnedFd> {
+    let mut current = fcntl_dupfd_cloexec(root, 0).map_err(errno_to_io)?;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            // `relative` is always built from `components()`'s own Normal-
+            // only output (see below) plus workspace-root-relative
+            // directory paths this module itself produced; any other
+            // component would mean a caller-supplied path leaked in
+            // unnormalized, which must never silently resolve.
+            return Err(outside_workspace(relative));
+        };
+        current = open_component(
+            &current,
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        )?;
+    }
+    Ok(current)
 }
 
 /// Finishes resolving one final component: validates its type, then — for
@@ -164,17 +205,18 @@ pub(super) fn resolve(
 /// hardening review, finding 7, and `fifo(7)` on why a plain second
 /// `open()` by name remains exploitable even with `O_NONBLOCK`.
 ///
-/// `inspected` is `O_PATH`-only and, when the target is a directory,
-/// becomes that directory's held [`DirNode`] (parented by `parent`) so
-/// later children resolve relative to it; the reopened descriptor is a
-/// separate, independent readable handle used only for this one
-/// enumeration or hash.
+/// `inspected` is `O_PATH`-only; when the target is a directory, `at`
+/// (its own workspace-root-relative path) becomes the seed later children
+/// resolve from — never the descriptor itself, so nothing about this
+/// directory is trusted for access once this call returns; the reopened
+/// descriptor is a separate, independent readable handle used only for this
+/// one enumeration or hash.
 fn finalize(
     inspected: OwnedFd,
     inspected_stat: Stat,
     access: Access,
     lexical_path: &Path,
-    parent: Option<Arc<DirNode>>,
+    at: PathBuf,
 ) -> io::Result<Resolved> {
     let file_type = FileType::from_raw_mode(inspected_stat.st_mode);
     if matches!(access, Access::Identity) || file_type == FileType::Symlink {
@@ -205,12 +247,7 @@ fn finalize(
         ));
     }
     validate_type(lexical_path, access, &stat)?;
-    let directory = (file_type == FileType::Directory).then(|| {
-        Arc::new(DirNode {
-            fd: inspected,
-            parent,
-        })
-    });
+    let directory = (file_type == FileType::Directory).then_some(at);
     Ok(Resolved {
         target: OpenedTarget { fd: reopened, stat },
         directory,
@@ -240,11 +277,13 @@ pub(super) fn validate_type(path: &Path, access: Access, stat: &Stat) -> io::Res
 
 fn absolute_target_components(root_path: &Path, target: &Path) -> io::Result<VecDeque<OsString>> {
     // Accept the runner-relevant absolute spelling of a target beneath the
-    // canonical workspace. Following it would otherwise require leaving the
-    // held-root namespace merely to prove it eventually returns; `current`
-    // is already reset to the root node by the caller, so rejecting
-    // anything whose lexical spelling doesn't fall under the workspace here
-    // keeps that reset meaningful. Absolute aliases elsewhere are rejected.
+    // canonical workspace. `RESOLVE_BENEATH` itself rejects an absolute
+    // symlink target outright (see `filesystem/real.rs`'s known-issues
+    // citation), so this manual rewrite — stripping the workspace prefix
+    // and continuing root-relative resolution with what remains — is the
+    // only way to keep that documented allowance without ever asking the
+    // kernel to follow the absolute spelling directly. Absolute aliases
+    // elsewhere are rejected.
     let relative = target
         .strip_prefix(root_path)
         .map_err(|_| outside_workspace(target))?;

@@ -23,6 +23,23 @@ fn hash_files_documented_patterns_hashing_and_workspace_boundary() {
             .with_file("/workspace/inside.txt", b"inside".to_vec())
             .with_file("/outside/outside.txt", b"outside".to_vec()),
     ));
+    // New defect (partial-match overreach): GitHub's toolkit globber yields
+    // a non-directory only on a *full* pattern match, negatives folded
+    // (`match`, not `partialMatch`) — never merely because it is the
+    // literal search root a glob pattern's non-glob prefix rooted at.
+    // https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts
+    // https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-pattern-helper.ts
+    let partial_match_file = Context::new(Arc::new(InMemoryFs::new("/workspace").with_file(
+        "/workspace/src",
+        b"src is a plain file here, not a directory".to_vec(),
+    )));
+    let partial_match_dangling_symlink = Context::new(Arc::new(
+        InMemoryFs::new("/workspace").with_symlink("/workspace/src", "/workspace/does-not-exist"),
+    ));
+    let negated_exact_match = Context::new(Arc::new(InMemoryFs::new("/workspace").with_file(
+        "/workspace/a.txt",
+        b"folded out by its own negation".to_vec(),
+    )));
     let rows = [
         (
             "single package-lock pattern",
@@ -66,6 +83,25 @@ fn hash_files_documented_patterns_hashing_and_workspace_boundary() {
             &boundary,
             "hashFiles('**/*.txt')",
             "09d0f5f66b683cd56297add2f1d75e2c9c83b1a7a4c3aad81ada0f71cb04e578",
+        ),
+        (
+            "a plain file at a glob's literal search root is only a partial match",
+            &partial_match_file,
+            "hashFiles('src/*.js')",
+            "",
+        ),
+        (
+            "a dangling symlink at a glob's literal search root is only a partial \
+             match — no DanglingSymlink failure",
+            &partial_match_dangling_symlink,
+            "hashFiles('src/*.js')",
+            "",
+        ),
+        (
+            "an exact literal pattern folded out by its own negation matches nothing",
+            &negated_exact_match,
+            "hashFiles('a.txt', '!a.txt')",
+            "",
         ),
     ];
 
