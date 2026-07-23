@@ -69,7 +69,9 @@ pub(crate) struct RunArgs {
     /// After the run, export each ran job's overlay changes, list them, and
     /// (after confirmation) apply them to the working tree. Requires overlay
     /// isolation — refused together with `--isolation copy-in`, and with
-    /// `--no-input` (the confirmation cannot be skipped in v0).
+    /// `--no-input` (the confirmation cannot be skipped in v0). Implies
+    /// `--isolation overlay`: the run fails if overlay cannot be mounted
+    /// rather than falling back to copy-in and discarding the changes.
     #[arg(long = "write-back")]
     pub(crate) write_back: bool,
 

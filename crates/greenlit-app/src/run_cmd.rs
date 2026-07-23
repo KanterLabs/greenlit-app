@@ -22,9 +22,9 @@ use greenlit_engine::{
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
-    ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, RunConfig, RunReport,
-    StepReport, SystemProber, WriteBackOutcome, detect, run_plan, run_write_back, validate_host,
-    validate_request,
+    ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, IsolationStrategy, RunConfig,
+    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, run_plan, run_write_back,
+    validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -45,6 +45,20 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let code = outcome?;
     metrics_result?;
     Ok(code)
+}
+
+/// The isolation strategy the run actually uses. `--write-back` upgrades the
+/// default `auto` to a hard overlay requirement: under `auto`, a host where
+/// unprivileged overlayfs is unavailable falls back to copy-in at container
+/// start, leaving the exported upper layer empty — the run would then report
+/// "no changes" while silently discarding every write the workflow made.
+/// (`--write-back` with `--isolation copy-in` is already rejected up front.)
+fn resolved_strategy(isolation: IsolationArg, write_back: bool) -> IsolationStrategy {
+    if write_back {
+        IsolationStrategy::Overlay
+    } else {
+        isolation.into()
+    }
 }
 
 fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> {
@@ -123,7 +137,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let config = RunConfig {
         repo_host_path: repo_root.clone(),
         workspace: workspace.clone(),
-        strategy: args.isolation.into(),
+        strategy: resolved_strategy(args.isolation, args.write_back),
         runner_env: build_runner_env(&git, event_kind, workflow_name, workspace),
         github: event.github.clone(),
         vars: vars_value,
@@ -370,5 +384,41 @@ fn format_duration(step: &StepReport) -> String {
         format!("{:.1}s", step.duration.as_secs_f64())
     } else {
         format!("{millis}ms")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_back_requires_overlay_never_auto() {
+        // `auto` may fall back to copy-in at container start, which would turn
+        // `--write-back` into a silent no-op; requesting write-back must
+        // therefore pin the strategy to a required overlay.
+        assert_eq!(
+            resolved_strategy(IsolationArg::Auto, true),
+            IsolationStrategy::Overlay
+        );
+        assert_eq!(
+            resolved_strategy(IsolationArg::Overlay, true),
+            IsolationStrategy::Overlay
+        );
+    }
+
+    #[test]
+    fn without_write_back_the_requested_isolation_passes_through() {
+        assert_eq!(
+            resolved_strategy(IsolationArg::Auto, false),
+            IsolationStrategy::Auto
+        );
+        assert_eq!(
+            resolved_strategy(IsolationArg::Overlay, false),
+            IsolationStrategy::Overlay
+        );
+        assert_eq!(
+            resolved_strategy(IsolationArg::CopyIn, false),
+            IsolationStrategy::CopyIn
+        );
     }
 }
