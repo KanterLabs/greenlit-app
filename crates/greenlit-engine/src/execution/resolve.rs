@@ -8,6 +8,7 @@
 
 use greenlit_expr::value::{is_truthy, to_display_string, to_number};
 use greenlit_expr::{Context, EvalError, evaluate};
+use greenlit_workflow::Span;
 
 use crate::condition::{Condition, PlannedCond};
 use crate::planned::{Evaluation, Planned};
@@ -46,11 +47,50 @@ pub fn resolve_bool(planned: &Planned<bool>, ctx: &Context) -> Result<bool, Eval
     }
 }
 
+/// A deferred `timeout-minutes` value either failed to evaluate or resolved
+/// outside GitHub's supported range.
+#[derive(Debug, thiserror::Error)]
+pub enum TimeoutMinutesError {
+    /// The residual expression itself failed to evaluate.
+    #[error(transparent)]
+    Eval(#[from] EvalError),
+    /// The evaluated value is not a whole number of minutes from 1 through
+    /// 360 (including non-finite values such as `Infinity`/`NaN`, which would
+    /// otherwise panic `Duration::from_secs_f64` downstream).
+    #[error(
+        "{span}: timeout-minutes resolved to {value}, which is not a whole number of minutes from 1 through 360\n  fix: ensure the referenced value (e.g. a prior step's output) is an integer in that range"
+    )]
+    OutOfRange {
+        /// Where `timeout-minutes` was authored.
+        span: Span,
+        /// The out-of-range evaluated value.
+        value: f64,
+    },
+}
+
 /// Resolves a planned `timeout-minutes` value to a number of minutes.
-pub fn resolve_minutes(planned: &Planned<f64>, ctx: &Context) -> Result<f64, EvalError> {
+///
+/// A statically-authored value was already validated at plan time
+/// (`crate::planned::plan_scalar_number`: finite, integer, `1..=360`); a
+/// deferred value (e.g. `${{ steps.x.outputs.minutes }}`) only becomes known
+/// at runtime and must be validated the same way here — otherwise a
+/// non-finite result such as `"Infinity"` would reach
+/// `Duration::from_secs_f64`, which panics for non-finite input.
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idstepstimeout-minutes>
+pub fn resolve_minutes(planned: &Planned<f64>, ctx: &Context) -> Result<f64, TimeoutMinutesError> {
     match &planned.evaluation {
         Evaluation::Static(value) => Ok(*value),
-        Evaluation::Deferred(deferred) => Ok(to_number(&evaluate(&deferred.residual, ctx)?)),
+        Evaluation::Deferred(deferred) => {
+            let value = to_number(&evaluate(&deferred.residual, ctx)?);
+            if value.is_finite() && value.fract() == 0.0 && (1.0..=360.0).contains(&value) {
+                Ok(value)
+            } else {
+                Err(TimeoutMinutesError::OutOfRange {
+                    span: planned.span.clone(),
+                    value,
+                })
+            }
+        }
     }
 }
 

@@ -63,7 +63,9 @@ pub struct EngineFix {
     pub action: String,
 }
 
-/// The outcome of engine detection — exactly the spec's three states.
+/// The outcome of engine detection — the spec's three reachability states,
+/// plus one hard-rejection state for a `DOCKER_HOST` value v0's engine
+/// backend must refuse outright rather than probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineState {
     /// A daemon was reached at `endpoint`; the caller connects the engine to it.
@@ -76,6 +78,13 @@ pub enum EngineState {
     DaemonStopped(EngineFix),
     /// No engine is installed at all. Carries the `litci setup` action.
     NotInstalled(EngineFix),
+    /// `DOCKER_HOST` names a transport or a non-local daemon v0's engine
+    /// backend refuses outright (see `reject_docker_host`) — reported
+    /// immediately rather than silently falling back to the local Docker/
+    /// Podman socket, since that would ignore the operator's explicit
+    /// `DOCKER_HOST` and run against the wrong daemon by surprise. Carries the
+    /// one action that resolves it.
+    UnsupportedDockerHost(EngineFix),
 }
 
 /// The injected boundary that performs detection's real I/O.
@@ -106,13 +115,25 @@ pub trait EngineProber: Send + Sync {
     async fn reachable(&self, endpoint: &Endpoint) -> bool;
 }
 
-/// Detects the container engine, returning one of the three [`EngineState`]s.
+/// Detects the container engine, returning one of the four [`EngineState`]s.
 ///
 /// Never returns an error: each failing state carries its own [`EngineFix`], so
-/// the caller always has a message plus one action. Candidates are probed in
-/// the spec order — `DOCKER_HOST`, then the Docker socket, then each Podman
-/// socket — and the first reachable one wins.
+/// the caller always has a message plus one action. An explicitly-set
+/// `DOCKER_HOST` is validated *before* any probing: a rejected value (see
+/// `reject_docker_host`) short-circuits straight to
+/// [`EngineState::UnsupportedDockerHost`] rather than falling back to the
+/// Docker/Podman socket candidates, since silently ignoring the operator's
+/// `DOCKER_HOST` would run the workflow against a different daemon than the
+/// one they named. Otherwise, candidates are probed in the spec order —
+/// `DOCKER_HOST`, then the Docker socket, then each Podman socket — and the
+/// first reachable one wins.
 pub async fn detect(prober: &dyn EngineProber) -> EngineState {
+    if let Some(host) = prober.docker_host()
+        && let Some(rejection) = reject_docker_host(&host)
+    {
+        return EngineState::UnsupportedDockerHost(unsupported_docker_host_fix(&host, rejection));
+    }
+
     for endpoint in candidate_endpoints(prober) {
         if prober.reachable(&endpoint).await {
             return EngineState::Available { endpoint };
@@ -123,6 +144,90 @@ pub async fn detect(prober: &dyn EngineProber) -> EngineState {
         EngineState::DaemonStopped(daemon_stopped_fix(prober.rootless()))
     } else {
         EngineState::NotInstalled(not_installed_fix())
+    }
+}
+
+/// Why a `DOCKER_HOST` value is rejected outright rather than merely found
+/// unreachable — shared between [`detect`] (so a rejected value is reported
+/// immediately) and [`crate::docker::connect_docker_host`] (the actual
+/// connector, which enforces the same rule again as defense in depth), so the
+/// rule can never drift between the two call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockerHostRejection {
+    /// `ssh://` — bollard's `ssh` transport is a feature v0 does not enable.
+    UnsupportedTransport,
+    /// A `tcp://`/`http(s)://` host that is not `localhost`/loopback.
+    Remote,
+}
+
+/// Classifies a `DOCKER_HOST` value, returning the rejection reason if v0's
+/// engine backend must refuse it outright (as opposed to it simply being
+/// unreachable, which is a normal candidate-probing miss).
+pub(crate) fn reject_docker_host(url: &str) -> Option<DockerHostRejection> {
+    if url.starts_with("ssh://") {
+        return Some(DockerHostRejection::UnsupportedTransport);
+    }
+    let is_tcp =
+        url.starts_with("tcp://") || url.starts_with("http://") || url.starts_with("https://");
+    if is_tcp && !docker_host_is_local(url) {
+        return Some(DockerHostRejection::Remote);
+    }
+    None
+}
+
+/// Whether a `tcp://`/`http(s)://` `DOCKER_HOST` URL's host is `localhost` or
+/// a loopback address — the only hosts where the daemon resolving a
+/// bind-mount path lands on the same filesystem `litci` read the repository
+/// from (<https://docs.docker.com/engine/storage/bind-mounts/>).
+///
+/// A host that fails to parse (empty, or not a recognized literal) is treated
+/// as non-local: fail closed rather than guess.
+fn docker_host_is_local(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host_and_port = after_scheme
+        .split(['/', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host = strip_port(host_and_port);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Strips a trailing `:port` from a `host:port` (or bracketed `[ipv6]:port`)
+/// pair, leaving the bare host.
+fn strip_port(host_and_port: &str) -> &str {
+    if let Some(after_bracket) = host_and_port.strip_prefix('[') {
+        return after_bracket.split(']').next().unwrap_or("");
+    }
+    match host_and_port.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host_and_port,
+    }
+}
+
+/// The fix for a `DOCKER_HOST` value [`reject_docker_host`] refused.
+fn unsupported_docker_host_fix(host: &str, rejection: DockerHostRejection) -> EngineFix {
+    match rejection {
+        DockerHostRejection::UnsupportedTransport => EngineFix {
+            message: format!(
+                "DOCKER_HOST (`{host}`) uses a transport Greenlit's engine backend does not support."
+            ),
+            action: "point DOCKER_HOST at a unix:// socket or tcp:// endpoint, or unset it so \
+                     Greenlit uses the local Docker/Podman socket"
+                .to_string(),
+        },
+        DockerHostRejection::Remote => EngineFix {
+            message: format!(
+                "DOCKER_HOST (`{host}`) points at a remote daemon. Greenlit v0 targets a \
+                 single local Linux x86_64 daemon and binds the repository checkout by host \
+                 path, which a remote daemon would resolve on its own filesystem instead."
+            ),
+            action: "point DOCKER_HOST at localhost/127.0.0.1 (or a unix:// socket), or run \
+                     litci directly on the machine whose daemon should build and bind the repo"
+                .to_string(),
+        },
     }
 }
 

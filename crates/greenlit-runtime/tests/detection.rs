@@ -50,11 +50,15 @@ impl EngineProber for FakeProber {
 #[tokio::test]
 async fn docker_host_wins_over_socket_in_detection_order() {
     // Both DOCKER_HOST and the Docker socket answer; the spec's order
-    // (DOCKER_HOST first) must select DOCKER_HOST.
+    // (DOCKER_HOST first) must select DOCKER_HOST. A local (loopback)
+    // DOCKER_HOST is used here — v0 rejects a non-local one outright
+    // (`docker_host_is_rejected_before_any_probing_when_it_points_remote`),
+    // which is a distinct behavior from this test's "which candidate wins"
+    // concern.
     let prober = FakeProber {
-        docker_host: Some("tcp://10.0.0.2:2375".to_string()),
+        docker_host: Some("tcp://127.0.0.1:2375".to_string()),
         reachable: vec![
-            Endpoint::DockerHost("tcp://10.0.0.2:2375".to_string()),
+            Endpoint::DockerHost("tcp://127.0.0.1:2375".to_string()),
             Endpoint::DockerSocket,
         ],
         ..Default::default()
@@ -63,9 +67,71 @@ async fn docker_host_wins_over_socket_in_detection_order() {
     assert_eq!(
         state,
         EngineState::Available {
-            endpoint: Endpoint::DockerHost("tcp://10.0.0.2:2375".to_string()),
+            endpoint: Endpoint::DockerHost("tcp://127.0.0.1:2375".to_string()),
         }
     );
+}
+
+// --- DOCKER_HOST rejection (finding: a remote daemon binds the wrong host
+// path for the repository) ---------------------------------------------
+
+#[tokio::test]
+async fn docker_host_is_rejected_before_any_probing_when_it_points_remote() {
+    // A non-local host is refused immediately — it must never fall back to
+    // the local Docker socket even when that socket also answers, since that
+    // would silently ignore the operator's explicit `DOCKER_HOST`.
+    let prober = FakeProber {
+        docker_host: Some("tcp://10.0.0.2:2375".to_string()),
+        reachable: vec![
+            Endpoint::DockerHost("tcp://10.0.0.2:2375".to_string()),
+            Endpoint::DockerSocket,
+        ],
+        ..Default::default()
+    };
+    match detect(&prober).await {
+        EngineState::UnsupportedDockerHost(fix) => {
+            assert!(fix.message.contains("remote daemon"));
+            assert!(fix.action.contains("localhost"));
+        }
+        other => panic!("expected UnsupportedDockerHost, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn docker_host_ssh_transport_is_rejected() {
+    let prober = FakeProber {
+        docker_host: Some("ssh://build-box".to_string()),
+        ..Default::default()
+    };
+    match detect(&prober).await {
+        EngineState::UnsupportedDockerHost(fix) => {
+            assert!(fix.action.contains("unix://") || fix.action.contains("tcp://"));
+        }
+        other => panic!("expected UnsupportedDockerHost, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn docker_host_loopback_variants_are_accepted_by_detection() {
+    for host in [
+        "tcp://localhost:2375",
+        "tcp://127.0.0.1:2375",
+        "tcp://[::1]:2375",
+        "http://127.0.0.1:2375",
+    ] {
+        let prober = FakeProber {
+            docker_host: Some(host.to_string()),
+            reachable: vec![Endpoint::DockerHost(host.to_string())],
+            ..Default::default()
+        };
+        assert_eq!(
+            detect(&prober).await,
+            EngineState::Available {
+                endpoint: Endpoint::DockerHost(host.to_string()),
+            },
+            "expected {host} to be accepted as local"
+        );
+    }
 }
 
 #[tokio::test]

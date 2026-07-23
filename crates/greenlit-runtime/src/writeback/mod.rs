@@ -14,6 +14,7 @@
 
 mod diff;
 mod error;
+mod host_fs;
 
 use std::io::{BufRead, Write};
 use std::path::Path;

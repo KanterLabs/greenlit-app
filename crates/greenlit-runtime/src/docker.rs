@@ -21,7 +21,7 @@ use bollard::query_parameters::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 
-use crate::detect::Endpoint;
+use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
@@ -80,29 +80,44 @@ impl DockerEngine {
 
 /// Dispatches a `DOCKER_HOST` URL to the matching bollard connector by scheme.
 ///
-/// v0 supports the local-first transports (`unix://`, `tcp://`/`http(s)://`);
-/// `ssh://` is rejected with a fix action rather than silently mis-connecting.
-/// bollard's `ssh` transport is an off-by-default feature we do not enable —
-/// enabling it would pull an SSH stack into the one distributable host binary
-/// for a transport v0 does not target.
+/// v0 supports the local-first transports (`unix://`, `tcp://`/`http(s)://`
+/// against `localhost`/a loopback address). `ssh://`, and a non-local
+/// `tcp://`/`http(s)://` host, are rejected outright — [`reject_docker_host`]
+/// is the single shared rule ([`crate::detect::detect`] enforces the same
+/// classification before even probing reachability, so a rejected value is
+/// reported immediately rather than silently falling back to the local
+/// socket; this is defense in depth for anyone constructing a [`DockerEngine`]
+/// directly).
 fn connect_docker_host(url: &str) -> Result<Docker, RuntimeError> {
     let describe = Endpoint::DockerHost(url.to_string()).describe();
-    if url.starts_with("ssh://") {
-        return Err(RuntimeError::UnsupportedDockerHost {
-            value: url.to_string(),
-            fix: "point DOCKER_HOST at a unix:// socket or tcp:// endpoint, or unset it \
-                  so Greenlit uses the local Docker/Podman socket"
-                .to_string(),
-        });
+    match reject_docker_host(url) {
+        Some(DockerHostRejection::UnsupportedTransport) => {
+            return Err(RuntimeError::UnsupportedDockerHost {
+                value: url.to_string(),
+                fix: "point DOCKER_HOST at a unix:// socket or tcp:// endpoint, or unset it \
+                      so Greenlit uses the local Docker/Podman socket"
+                    .to_string(),
+            });
+        }
+        Some(DockerHostRejection::Remote) => {
+            return Err(RuntimeError::RemoteDockerHost {
+                value: url.to_string(),
+                fix: "point DOCKER_HOST at localhost/127.0.0.1 (or a unix:// socket), or run \
+                      litci directly on the machine whose daemon should build and bind the repo"
+                    .to_string(),
+            });
+        }
+        None => {}
     }
-    let result =
-        if url.starts_with("tcp://") || url.starts_with("http://") || url.starts_with("https://") {
-            Docker::connect_with_http(url, CONNECT_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
-        } else {
-            // `unix://<path>` or a bare socket path; `connect_with_unix` strips the
-            // scheme itself.
-            Docker::connect_with_unix(url, CONNECT_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
-        };
+    let is_tcp =
+        url.starts_with("tcp://") || url.starts_with("http://") || url.starts_with("https://");
+    let result = if is_tcp {
+        Docker::connect_with_http(url, CONNECT_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+    } else {
+        // `unix://<path>` or a bare socket path; `connect_with_unix` strips the
+        // scheme itself.
+        Docker::connect_with_unix(url, CONNECT_TIMEOUT_SECS, bollard::API_DEFAULT_VERSION)
+    };
     result.map_err(|source| RuntimeError::Connect {
         endpoint: describe,
         source,
@@ -334,5 +349,43 @@ impl ContainerEngine for DockerEngine {
             .remove_network(name)
             .await
             .map_err(|e| RuntimeError::api(Operation::RemoveNetwork, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A remote `tcp://` `DOCKER_HOST` is refused before any connection
+    /// attempt, never silently binding the repository at the wrong path on
+    /// another machine.
+    #[test]
+    fn connect_docker_host_rejects_a_remote_tcp_endpoint() {
+        let err = connect_docker_host("tcp://10.0.0.2:2375").unwrap_err();
+        assert!(matches!(err, RuntimeError::RemoteDockerHost { .. }));
+        assert!(err.to_string().contains("remote daemon"));
+    }
+
+    #[test]
+    fn connect_docker_host_rejects_ssh_transport() {
+        let err = connect_docker_host("ssh://build-box").unwrap_err();
+        assert!(matches!(err, RuntimeError::UnsupportedDockerHost { .. }));
+    }
+
+    #[test]
+    fn connect_docker_host_accepts_local_endpoints() {
+        // Constructing a bollard HTTP/unix client is pure local setup — no
+        // network round-trip — so these succeed even without a live daemon.
+        for host in [
+            "tcp://localhost:2375",
+            "tcp://127.0.0.1:2375",
+            "tcp://[::1]:2375",
+            "unix:///var/run/docker.sock",
+        ] {
+            assert!(
+                connect_docker_host(host).is_ok(),
+                "expected {host} to be accepted"
+            );
+        }
     }
 }

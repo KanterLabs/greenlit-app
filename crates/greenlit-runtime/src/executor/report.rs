@@ -41,6 +41,13 @@ pub struct JobReport {
     pub outputs: IndexMap<String, String>,
     /// Wall-clock duration from container boot through the last step.
     pub duration: Duration,
+    /// This job's container id, kept alive rather than torn down, when the
+    /// run was started with `--write-back` (`RunConfig::write_back`) — `None`
+    /// for a skipped job (no container ever existed) or when write-back was
+    /// not requested (the container is already removed by the time the
+    /// report is built). The caller uses this to export/confirm/apply each
+    /// ran job's overlay diff after the whole run finishes.
+    pub container_id: Option<String>,
 }
 
 /// The whole run's structured result.

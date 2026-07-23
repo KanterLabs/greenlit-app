@@ -15,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use tar::{Archive, EntryType};
 
 use super::error::WriteBackError;
+use super::host_fs::HostRoot;
 
 /// One change the workflow made to its workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,8 +90,13 @@ impl OverlayDiff {
     ///
     /// Only regular files, directories, and symlinks are reproduced; other node
     /// types are skipped. Every destination is re-validated to stay within
-    /// `host_root` before any write, so a malformed archive cannot touch the
-    /// host outside the working tree.
+    /// `host_root` lexically (`workspace_relative`) *and* every write goes
+    /// through `HostRoot`, which resolves each path component by
+    /// descriptor rather than through the kernel's ordinary (symlink-
+    /// following) path lookup — so a malformed archive, or a host-side
+    /// symlink the repository itself checked in, cannot make a write land
+    /// outside the working tree (finding: write-back symlink traversal; see
+    /// `host_fs`'s module doc for the full rationale).
     ///
     /// # Errors
     ///
@@ -98,6 +104,10 @@ impl OverlayDiff {
     /// [`WriteBackError::UnsafePath`] on an escaping entry, or
     /// [`WriteBackError::Apply`] on an I/O failure writing the host tree.
     pub fn apply(&self, host_root: &Path) -> Result<(), WriteBackError> {
+        let root = HostRoot::open(host_root).map_err(|source| WriteBackError::Apply {
+            path: host_root.to_path_buf(),
+            source,
+        })?;
         let mut archive = Archive::new(self.tar.as_slice());
         let entries = archive.entries().map_err(WriteBackError::Read)?;
         for entry in entries {
@@ -106,23 +116,23 @@ impl OverlayDiff {
             let Some(rel) = workspace_relative(&raw)? else {
                 continue;
             };
-            let dest = host_root.join(&rel);
-            match entry.header().entry_type() {
-                EntryType::Char => remove_path(&dest)?,
-                EntryType::Directory => ensure_dir(&dest)?,
+            let result = match entry.header().entry_type() {
+                EntryType::Char => root.remove_path(&rel),
+                EntryType::Directory => root.ensure_dir(&rel),
                 EntryType::Symlink => {
                     let target = entry
                         .link_name()
                         .map_err(WriteBackError::Read)?
                         .map(|t| t.into_owned())
                         .unwrap_or_default();
-                    write_symlink(&dest, &target)?;
+                    root.write_symlink(&rel, &target)
                 }
-                EntryType::Regular | EntryType::GNUSparse => write_file(&dest, &mut entry)?,
+                EntryType::Regular | EntryType::GNUSparse => root.write_file(&rel, &mut entry),
                 // Block devices, FIFOs, sockets, and metadata-only entries are
                 // not workspace content — skip them.
-                _ => {}
-            }
+                _ => Ok(()),
+            };
+            result.map_err(|source| apply_err(&host_root.join(&rel), source))?;
         }
         Ok(())
     }
@@ -152,49 +162,6 @@ fn workspace_relative(raw: &Path) -> Result<Option<PathBuf>, WriteBackError> {
     } else {
         Ok(Some(rel))
     }
-}
-
-/// Remove a whiteout target from the host (file or directory tree). A missing
-/// target is not an error — the deletion is already reflected.
-fn remove_path(dest: &Path) -> Result<(), WriteBackError> {
-    let meta = match std::fs::symlink_metadata(dest) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(apply_err(dest, e)),
-    };
-    let result = if meta.is_dir() {
-        std::fs::remove_dir_all(dest)
-    } else {
-        std::fs::remove_file(dest)
-    };
-    result.map_err(|e| apply_err(dest, e))
-}
-
-/// Create a directory (and parents) on the host.
-fn ensure_dir(dest: &Path) -> Result<(), WriteBackError> {
-    std::fs::create_dir_all(dest).map_err(|e| apply_err(dest, e))
-}
-
-/// Write a regular-file entry to the host, creating parent directories.
-fn write_file(dest: &Path, entry: &mut dyn std::io::Read) -> Result<(), WriteBackError> {
-    if let Some(parent) = dest.parent() {
-        ensure_dir(parent)?;
-    }
-    let mut file = std::fs::File::create(dest).map_err(|e| apply_err(dest, e))?;
-    std::io::copy(entry, &mut file).map_err(|e| apply_err(dest, e))?;
-    Ok(())
-}
-
-/// Recreate a symlink on the host, replacing any existing entry at the path.
-fn write_symlink(dest: &Path, target: &Path) -> Result<(), WriteBackError> {
-    if let Some(parent) = dest.parent() {
-        ensure_dir(parent)?;
-    }
-    // Replace an existing node so a re-run is idempotent.
-    if std::fs::symlink_metadata(dest).is_ok() {
-        remove_path(dest)?;
-    }
-    std::os::unix::fs::symlink(target, dest).map_err(|e| apply_err(dest, e))
 }
 
 /// Build an [`WriteBackError::Apply`] for a host path.

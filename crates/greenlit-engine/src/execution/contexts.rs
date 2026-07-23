@@ -58,10 +58,20 @@ pub fn build_steps_context(records: &[StepRecord]) -> Value {
 pub struct NeedRecord {
     /// The dependency job id.
     pub job: JobId,
-    /// `needs.<id>.result`.
+    /// `needs.<id>.result` — this job's own conclusion, never adjusted for
+    /// its ancestors (GitHub always reports the dependency's own result
+    /// here, even when it inherits a skip from further upstream).
     pub result: Conclusion,
     /// `needs.<id>.outputs` (already matrix-merged for a matrix dependency).
     pub outputs: IndexMap<String, String>,
+    /// Whether this job or *any* job in its own ancestor chain failed
+    /// (transitively). Feeds [`crate::execution::outcome::needs_status`]
+    /// so `failure()` on a job downstream of a skipped-because-an-ancestor-
+    /// failed dependency still reads true.
+    pub chain_failed: bool,
+    /// Whether this job or any ancestor was cancelled (transitively). Same
+    /// propagation rule as `chain_failed`, for `cancelled()`.
+    pub chain_cancelled: bool,
 }
 
 /// Builds the `needs` context object from the current job's *direct*

@@ -262,6 +262,8 @@ async fn dag_propagation_rollup_gating_and_masking() {
         inputs: Value::object(vec![]),
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
     };
 
     let mut log: Vec<u8> = Vec::new();

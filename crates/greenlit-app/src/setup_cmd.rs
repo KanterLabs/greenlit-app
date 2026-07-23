@@ -58,6 +58,13 @@ pub(crate) fn run(args: SetupArgs) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::FAILURE)
             }
         }
+        EngineState::UnsupportedDockerHost(fix) => {
+            // Not a start/install case — there is nothing for `litci setup` to
+            // run privileged; the fix is a configuration change only.
+            println!("{}", fix.message);
+            println!("  fix: {}", fix.action);
+            Ok(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -71,7 +78,9 @@ fn report_after(runtime: &tokio::runtime::Runtime) -> anyhow::Result<ExitCode> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        EngineState::DaemonStopped(fix) | EngineState::NotInstalled(fix) => {
+        EngineState::DaemonStopped(fix)
+        | EngineState::NotInstalled(fix)
+        | EngineState::UnsupportedDockerHost(fix) => {
             println!(
                 "The container engine is still not reachable.\n  {}\n  fix: {}",
                 fix.message, fix.action

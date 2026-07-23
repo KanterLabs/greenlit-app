@@ -47,7 +47,6 @@ use crate::executor::context::ContextRoots;
 use crate::image::ImageError;
 use crate::isolation::IsolationStrategy;
 
-pub use cmdfiles::CommandFileError;
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
@@ -75,6 +74,24 @@ pub struct RunConfig {
     /// Values to mask from the first line of output (from `::add-mask::`-style
     /// pre-registration; secret-context masking arrives in Phase 3).
     pub initial_masks: Vec<String>,
+    /// A token unique to this `litci run` invocation, used to namespace any
+    /// `jobs.<id>.container.volumes:` named-volume source
+    /// (`crate::executor::container::validate_container`) so a workflow can
+    /// never target a pre-existing daemon-global named volume by name —
+    /// GitHub's own hosted runner gives the same guarantee for free (a fresh
+    /// VM per run has no pre-existing volumes to collide with); the local
+    /// daemon persists across runs, so Greenlit must manufacture the
+    /// equivalent isolation. Every job/leg within one run shares this token,
+    /// so two job containers in the same run that both name `cache:/data`
+    /// still share one (run-scoped) volume, matching the "reused across
+    /// containers within one VM" behavior a workflow author would observe on
+    /// GitHub.
+    pub volume_namespace: String,
+    /// Whether `--write-back` was requested. When `true`, a ran job's
+    /// container is kept alive (not torn down) so its overlay upper can be
+    /// exported after the whole run finishes (`JobReport::container_id`);
+    /// the caller is responsible for removing it once write-back has run.
+    pub write_back: bool,
 }
 
 /// A failure during execution. Detection-time engine conditions never travel
@@ -90,9 +107,22 @@ pub enum ExecError {
     /// A job container request was containment-breaking or unsupported.
     #[error(transparent)]
     Container(#[from] ContainerRejection),
-    /// A command file was malformed or could not be materialized.
-    #[error(transparent)]
-    CommandFile(#[from] CommandFileError),
+    /// A step's command file (`GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`, or
+    /// preparing the step's script) was malformed or could not be
+    /// materialized.
+    ///
+    /// The message is masked (`Masker::apply`) at the point this variant is
+    /// built — *before* it is wrapped as a `Display`-able error — because a
+    /// malformed `GITHUB_ENV`/`GITHUB_OUTPUT` line embeds the offending line
+    /// verbatim (`CommandFileError::InvalidLine`), and that line can itself be
+    /// (or contain) a value an earlier `::add-mask::` registered. Storing the
+    /// already-redacted `String` rather than the original typed error means
+    /// every downstream consumer of this error's `Display` (the live log,
+    /// `anyhow` chains, `litci`'s top-level stderr writer) sees only redacted
+    /// text, satisfying "secret values are masked in all log output"
+    /// (`AGENTS.md`) even for a failure path, not only successful output.
+    #[error("{0}")]
+    CommandFile(String),
     /// Finalizing a job's outputs failed.
     #[error(transparent)]
     JobOutput(#[from] JobOutputError),
@@ -107,6 +137,17 @@ pub enum ExecError {
         /// The underlying shell-resolution error.
         #[source]
         source: greenlit_engine::execution::shell::ShellError,
+    },
+    /// A step's `timeout-minutes` — possibly resolved from a deferred
+    /// expression — failed to evaluate or resolved outside GitHub's
+    /// supported range.
+    #[error("step '{label}': {source}")]
+    Timeout {
+        /// The step's display label.
+        label: String,
+        /// The underlying resolution error.
+        #[source]
+        source: greenlit_engine::execution::resolve::TimeoutMinutesError,
     },
     /// A `uses:` step was reached — action execution lands in Phase 3.
     #[error(
@@ -156,6 +197,14 @@ impl ExecError {
 struct CompletedJob {
     result: Conclusion,
     outputs: IndexMap<String, String>,
+    /// Whether this job or any job in its own ancestor chain failed
+    /// (transitively) — GitHub: "If you have a chain of dependent jobs,
+    /// failure() returns true if any ancestor job fails."
+    /// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions>
+    chain_failed: bool,
+    /// Whether this job or any ancestor was cancelled (transitively), mirroring
+    /// `chain_failed`'s propagation for `cancelled()`.
+    chain_cancelled: bool,
 }
 
 /// The run-wide, immutable context every job instance shares.
@@ -227,7 +276,32 @@ pub async fn run_plan(
             instance_results.push((report.result, report.outputs.clone()));
             job_reports.push(report);
         }
-        completed.insert(group.id.0.clone(), aggregate(&instance_results));
+        // The group's own ancestor-chain flags combine its own aggregate
+        // result with every direct dependency's already-computed chain
+        // flags, so a failure (or cancellation) keeps propagating downstream
+        // even through an intermediate job that itself only *skipped*
+        // because of it (finding: transitive `failure()` across ancestors).
+        let aggregated = aggregate(&instance_results);
+        let ancestors_failed = group
+            .needs
+            .iter()
+            .any(|need| completed.get(&need.0).is_some_and(|done| done.chain_failed));
+        let ancestors_cancelled = group.needs.iter().any(|need| {
+            completed
+                .get(&need.0)
+                .is_some_and(|done| done.chain_cancelled)
+        });
+        let chain_failed = ancestors_failed || matches!(aggregated.0, Conclusion::Failure);
+        let chain_cancelled = ancestors_cancelled || matches!(aggregated.0, Conclusion::Cancelled);
+        completed.insert(
+            group.id.0.clone(),
+            CompletedJob {
+                result: aggregated.0,
+                outputs: aggregated.1,
+                chain_failed,
+                chain_cancelled,
+            },
+        );
     }
 
     let overall = RunReport::overall_of(&job_reports);
@@ -246,6 +320,8 @@ fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> 
                 job: need.clone(),
                 result: done.result,
                 outputs: done.outputs.clone(),
+                chain_failed: done.chain_failed,
+                chain_cancelled: done.chain_cancelled,
             })
         })
         .collect()
@@ -257,7 +333,9 @@ fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> 
 /// GitHub reports a matrix job's `needs.<id>.result` as the worst leg outcome
 /// (a single failed leg fails the dependency) and merges leg outputs, the last
 /// writer winning per key (`greenlit_engine::execution::contexts`).
-fn aggregate(results: &[(Conclusion, IndexMap<String, String>)]) -> CompletedJob {
+fn aggregate(
+    results: &[(Conclusion, IndexMap<String, String>)],
+) -> (Conclusion, IndexMap<String, String>) {
     let result = if results.is_empty() {
         // A zero-leg matrix produced no instance; dependents see it as skipped.
         Conclusion::Skipped
@@ -280,7 +358,7 @@ fn aggregate(results: &[(Conclusion, IndexMap<String, String>)]) -> CompletedJob
         Conclusion::Success
     };
     let outputs = merge_matrix_outputs(results.iter().map(|(_, outputs)| outputs));
-    CompletedJob { result, outputs }
+    (result, outputs)
 }
 
 pub use crate::engine::ContainerEngine;

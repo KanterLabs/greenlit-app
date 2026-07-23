@@ -14,6 +14,8 @@ use serde::Serialize;
 
 use greenlit_expr::RunStatus;
 
+use crate::execution::contexts::NeedRecord;
+
 /// The four terminal states a step or job result can take. GitHub spells them
 /// `success`, `failure`, `cancelled`, and `skipped`; the same set populates a
 /// step's `outcome`/`conclusion` and a job's `needs.<id>.result`.
@@ -153,5 +155,38 @@ pub fn job_result_from_status(status: RunStatus) -> Conclusion {
         RunStatus::Success => Conclusion::Success,
         RunStatus::Failure => Conclusion::Failure,
         RunStatus::Cancelled => Conclusion::Cancelled,
+        // A job's own step-rolling status only ever moves between the three
+        // arms above (see `advance_status`); `Blocked` is produced solely by
+        // `needs_status` for a job-level `if:` and never reaches this call.
+        // Map it conservatively to `Skipped` rather than assuming success.
+        RunStatus::Blocked => Conclusion::Skipped,
+    }
+}
+
+/// The status a job's `if:` condition (when the implicit `success()` gate is
+/// not applied) evaluates against, derived from its direct dependencies.
+///
+/// GitHub computes this from the `needs` graph, not from steps: `failure()`
+/// is true "if any ancestor job fails" (transitively, through the whole
+/// dependency chain, even across an intermediate job that was itself skipped
+/// because *its* ancestor failed); `success()` requires every direct
+/// dependency to have actually concluded `success` — a skipped direct
+/// dependency (that itself was not caused by an ancestor failure/
+/// cancellation) makes both `success()` and `failure()` false, matching the
+/// observed GitHub behavior that a job downstream of a skipped-not-failed
+/// dependency does not run under an explicit `if: success()` either.
+/// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions>
+pub fn needs_status(needs: &[NeedRecord]) -> RunStatus {
+    if needs.iter().any(|need| need.chain_cancelled) {
+        RunStatus::Cancelled
+    } else if needs.iter().any(|need| need.chain_failed) {
+        RunStatus::Failure
+    } else if needs
+        .iter()
+        .all(|need| matches!(need.result, Conclusion::Success))
+    {
+        RunStatus::Success
+    } else {
+        RunStatus::Blocked
     }
 }

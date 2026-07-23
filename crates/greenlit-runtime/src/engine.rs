@@ -222,6 +222,51 @@ pub trait ContainerEngine: Send + Sync {
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError>;
 
+    /// Best-effort termination of a still-running exec whose process wrote its
+    /// own PID to `pid_file` at start (see `crate::executor::step`'s
+    /// timeout-wrapper).
+    ///
+    /// Docker's Engine API has no "kill this exec" endpoint — an exec's
+    /// process lives on independently of the container once started, so
+    /// dropping an awaited `exec` future (e.g. via `tokio::time::timeout`)
+    /// only stops *streaming* it, not the process itself, letting it keep
+    /// running and race a later step
+    /// (<https://github.com/moby/moby/issues/9098>). The reliable workaround —
+    /// implemented here once, for every backend, in terms of [`Self::exec`] —
+    /// is to signal the process from a *fresh exec into the same container*:
+    /// that new exec joins the container's own pid namespace, so the PID the
+    /// timed-out process observed about itself (its own `$$`, from inside
+    /// that same namespace) is meaningful there. This process (an ordinary,
+    /// non-root CLI) generally cannot signal the daemon's containerized
+    /// processes directly: the `Pid` Docker's exec-inspect API reports is
+    /// numbered in the *host's* pid namespace, and belongs to the daemon, not
+    /// the invoking user.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] only if the termination exec itself could
+    /// not be dispatched; a process that already exited is not an error.
+    async fn terminate(&self, container: &str, pid_file: &str) -> Result<(), RuntimeError> {
+        // Escalates SIGTERM to SIGKILL after a short grace period, targeting
+        // the process group first (falling back to the bare pid) so a still-
+        // running child of the step's shell is caught too. Every step of the
+        // pipeline tolerates the pid already being gone.
+        let script = format!(
+            "pid=$(cat {pid_file} 2>/dev/null) || exit 0; \
+             [ -n \"$pid\" ] || exit 0; \
+             kill -TERM -- -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true; \
+             sleep 1; \
+             kill -KILL -- -\"$pid\" 2>/dev/null || kill -KILL \"$pid\" 2>/dev/null || true"
+        );
+        let spec = ExecSpec {
+            cmd: vec!["sh".to_string(), "-c".to_string(), script],
+            env: Vec::new(),
+            working_dir: None,
+        };
+        self.exec(container, &spec, &mut SinkNull).await?;
+        Ok(())
+    }
+
     /// Export the filesystem subtree at `path` inside `container` as an
     /// uncompressed tar archive.
     ///

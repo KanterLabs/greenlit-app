@@ -65,6 +65,17 @@ pub(crate) struct RunArgs {
     /// Workspace isolation mechanism.
     #[arg(long = "isolation", value_enum, default_value = "auto")]
     pub(crate) isolation: IsolationArg,
+
+    /// After the run, export each ran job's overlay changes, list them, and
+    /// (after confirmation) apply them to the working tree. Requires overlay
+    /// isolation — refused together with `--isolation copy-in`, and with
+    /// `--no-input` (the confirmation cannot be skipped in v0).
+    #[arg(long = "write-back")]
+    pub(crate) write_back: bool,
+
+    /// Disable every interactive prompt. Conflicts with `--write-back`.
+    #[arg(long = "no-input")]
+    pub(crate) no_input: bool,
 }
 
 #[derive(Debug, clap::Args)]

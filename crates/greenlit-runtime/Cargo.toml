@@ -43,6 +43,15 @@ bytes = "1.12.1"
 # are USTAR archives; a maintained tar implementation avoids hand-rolling the
 # format and its checksum/whiteout handling.
 tar = "0.4.46"
+# `--write-back` applies the overlay diff to the host working tree by
+# descriptor (`*at()` syscalls with `O_NOFOLLOW`), never through the kernel's
+# ordinary symlink-following path lookup — a repository-checked-in symlink
+# must never let an applied write escape the working tree (see
+# `writeback::host_fs`). Already a pinned workspace dependency
+# (`greenlit-expr`'s `hashFiles` hardening); reused here at the same version
+# rather than hand-rolling raw libc FFI, which would need `unsafe` in a crate
+# that forbids it.
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 # Drives the async trait surface and detection state machine in tests without a

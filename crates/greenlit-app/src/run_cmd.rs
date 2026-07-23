@@ -22,11 +22,12 @@ use greenlit_engine::{
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
-    DockerEngine, EngineState, RunConfig, RunReport, StepReport, SystemProber, detect, run_plan,
-    validate_host,
+    ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, RunConfig, RunReport,
+    StepReport, SystemProber, WriteBackOutcome, detect, run_plan, run_write_back, validate_host,
+    validate_request,
 };
 
-use crate::cli::RunArgs;
+use crate::cli::{IsolationArg, RunArgs};
 use crate::{errors, render, vars, workflow_discovery};
 
 /// Run the command, returning the process exit code (a failed workflow run
@@ -48,6 +49,12 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
 fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> {
     validate_host().map_err(|host| anyhow::anyhow!("{host}\n  fix: {}", host.fix()))?;
+    validate_request(args.write_back, args.no_input).map_err(|error| anyhow::anyhow!("{error}"))?;
+    if args.write_back && args.isolation == IsolationArg::CopyIn {
+        anyhow::bail!(
+            "`--write-back` needs the container's overlay upper layer, which `--isolation copy-in` never creates (it copies the checkout in instead)\n  fix: drop `--isolation copy-in` (the default `auto` uses overlay when the host supports it), or omit `--write-back`"
+        );
+    }
 
     let cwd = std::env::current_dir().map_err(|error| {
         anyhow::anyhow!(
@@ -127,6 +134,8 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             .iter()
             .map(|(_, value)| value.clone())
             .collect(),
+        volume_namespace: run_volume_namespace(),
+        write_back: args.write_back,
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -159,11 +168,90 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         )
     })?;
 
+    if args.write_back {
+        // Every ran job kept its container alive (`RunConfig::write_back`,
+        // `JobReport::container_id`) specifically so its overlay diff can be
+        // exported here, after the whole run is known. Each job's diff is
+        // independent (own read-only lower + own throwaway upper), so each
+        // gets its own listing and confirmation, in the run's job order;
+        // containers are removed once write-back has finished with them
+        // (or if the run itself failed the writeback loop still runs, since
+        // a failed job's earlier steps may still have produced a diff worth
+        // reviewing).
+        let write_back_result = runtime.block_on(write_back_all(&engine, &report, &repo_root));
+        // Best-effort teardown of every preserved container, regardless of
+        // whether write-back itself succeeded — a leaked container must
+        // never be the difference between a successful and failed `run`.
+        for job in &report.jobs {
+            if let Some(container) = &job.container_id {
+                let _ = runtime.block_on(engine.remove_container(container));
+            }
+        }
+        write_back_result?;
+    }
+
     Ok(if report.failed() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Export, list, confirm, and apply every ran job's overlay diff, in the
+/// run's job order.
+///
+/// # Errors
+///
+/// Returns an error on the first job whose export/apply fails. Jobs already
+/// processed keep whatever they applied; write-back never rolls back an
+/// earlier job's confirmed changes because a later one failed.
+async fn write_back_all(
+    engine: &DockerEngine,
+    report: &RunReport,
+    repo_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    for job in &report.jobs {
+        let Some(container) = &job.container_id else {
+            continue;
+        };
+        let stdin = io::stdin();
+        let mut confirm = InteractiveConfirm::new(stdin.lock(), io::stderr(), repo_root);
+        let outcome = run_write_back(engine, container, repo_root, &mut confirm)
+            .await
+            .map_err(|error| anyhow::anyhow!("write-back failed for job '{}': {error}", job.id))?;
+        match outcome {
+            WriteBackOutcome::NoChanges => {
+                println!("write-back: job '{}' made no changes", job.id);
+            }
+            WriteBackOutcome::Cancelled => {
+                println!("write-back: job '{}' changes were not applied", job.id);
+            }
+            WriteBackOutcome::Applied(changes) => {
+                println!(
+                    "write-back: applied {} change(s) from job '{}'",
+                    changes.len(),
+                    job.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A token unique to this process invocation, used to namespace any job
+/// container named-volume source so it can never resolve to a pre-existing
+/// daemon-global volume (`RunConfig::volume_namespace`,
+/// `greenlit_runtime::executor::container::validate_container`). Wall-clock
+/// nanoseconds plus the process id is unique enough for this purpose — it
+/// need not be cryptographically random, only distinct from any name an
+/// attacker-controlled workflow could predict and target in advance from a
+/// *previous* run.
+fn run_volume_namespace() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
 }
 
 /// Detect and connect to the container engine, mapping every failure state to a
@@ -178,10 +266,9 @@ async fn connect_engine() -> anyhow::Result<DockerEngine> {
                 )
             })
         }
-        EngineState::DaemonStopped(fix) => {
-            Err(anyhow::anyhow!("{}\n  fix: {}", fix.message, fix.action))
-        }
-        EngineState::NotInstalled(fix) => {
+        EngineState::DaemonStopped(fix)
+        | EngineState::NotInstalled(fix)
+        | EngineState::UnsupportedDockerHost(fix) => {
             Err(anyhow::anyhow!("{}\n  fix: {}", fix.message, fix.action))
         }
     }

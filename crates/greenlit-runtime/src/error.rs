@@ -41,6 +41,24 @@ pub enum RuntimeError {
         fix: String,
     },
 
+    /// `DOCKER_HOST` named a `tcp://`/`http(s)://` endpoint whose host is not
+    /// `localhost` or a loopback address.
+    ///
+    /// v0 targets a single local Linux x86_64 daemon (`greenlit-v0-spec.md`
+    /// "Tech"): the repository checkout is bind-mounted by *host path*, and a
+    /// Docker bind-mount path is resolved by the daemon it is sent to
+    /// (<https://docs.docker.com/engine/storage/bind-mounts/>). Against a
+    /// remote daemon that path would resolve on the remote machine instead —
+    /// silently binding the wrong directory, or an unrelated one the daemon
+    /// happens to create. Carries the one action that resolves it.
+    #[error("DOCKER_HOST points at a remote daemon (`{value}`): {fix}")]
+    RemoteDockerHost {
+        /// The offending `DOCKER_HOST` value.
+        value: String,
+        /// The one action that resolves it.
+        fix: String,
+    },
+
     /// A Docker Engine API call returned an error (pull, build, commit,
     /// create/start/stop/remove container, exec, network op).
     #[error("Docker API request failed during {operation}: {source}")]

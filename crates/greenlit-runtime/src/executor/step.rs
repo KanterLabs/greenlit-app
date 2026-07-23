@@ -136,32 +136,14 @@ pub(crate) async fn execute_step(
         },
     );
 
-    let label = step_label(step, index, &pre_ctx)?;
-
-    let condition_true = match &step.condition {
-        Some(condition) => resolve_condition(condition, &pre_ctx).map_err(ExecError::eval)?,
-        None => true,
-    };
-    if !step_activates(state.status, step.implicit_status_gate, condition_true) {
-        record_skip(step, &mut state.records);
-        let _ = writeln!(out, "  \u{2013} {label} (skipped)");
-        return Ok(ExecutedStep {
-            result: step_result_skipped(),
-            label,
-            duration: Duration::ZERO,
-            ran: false,
-        });
-    }
-
-    let (script_planned, step_shell_planned) = match &step.kind {
-        StepKind::Run { script, shell } => (script.as_ref(), shell.as_ref()),
-        StepKind::Uses { reference, .. } => {
-            return Err(ExecError::UsesUnsupported {
-                reference: reference.clone(),
-            });
-        }
-    };
-
+    // The step's own `env:` layer must be resolved and folded in *before* its
+    // `name:` and `if:` are evaluated: GitHub exposes a step's own `env:` to
+    // its own `if:` condition (the env context reflects the step's declared
+    // env before the condition gates it) — see
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions
+    // ("env context") and the accompanying job-level `if:`/`env:` ordering
+    // notes. Resolving it here (rather than after the skip check) also lets a
+    // step's `name:` reference its own `env:`.
     let step_env = resolve_env_layer(&step.env, &pre_ctx).map_err(ExecError::eval)?;
     let mut full_env = layer_step_env(EnvLayers {
         base: job.base_env,
@@ -183,6 +165,40 @@ pub(crate) async fn execute_step(
             status: state.status,
         },
     );
+
+    // Mask immediately, before the label is printed anywhere or stored into
+    // the returned report: a `name:` can interpolate a prior step's output
+    // (e.g. `${{ steps.one.outputs.credential }}`), and that output may carry
+    // a value an earlier `::add-mask::`/masked secret registered. Every later
+    // use of `label` — the live skip/start/result lines below, and the
+    // `StepReport`/metrics record the caller builds from `ExecutedStep` — must
+    // see the redacted form, matching the "secret values are masked in all
+    // log output" security invariant (`AGENTS.md`).
+    let label = masker.apply(&step_label(step, index, &ctx)?);
+
+    let condition_true = match &step.condition {
+        Some(condition) => resolve_condition(condition, &ctx).map_err(ExecError::eval)?,
+        None => true,
+    };
+    if !step_activates(state.status, step.implicit_status_gate, condition_true) {
+        record_skip(step, &mut state.records);
+        let _ = writeln!(out, "  \u{2013} {label} (skipped)");
+        return Ok(ExecutedStep {
+            result: step_result_skipped(),
+            label,
+            duration: Duration::ZERO,
+            ran: false,
+        });
+    }
+
+    let (script_planned, step_shell_planned) = match &step.kind {
+        StepKind::Run { script, shell } => (script.as_ref(), shell.as_ref()),
+        StepKind::Uses { reference, .. } => {
+            return Err(ExecError::UsesUnsupported {
+                reference: reference.clone(),
+            });
+        }
+    };
 
     let paths = CommandFilePaths::new(job.cmdfiles_base, index);
     let step_shell = match step_shell_planned {
@@ -209,31 +225,62 @@ pub(crate) async fn execute_step(
         None => false,
     };
     let timeout = match &step.timeout_minutes {
-        Some(planned) => Some(resolve_minutes(planned, &ctx).map_err(ExecError::eval)?),
+        Some(planned) => {
+            Some(
+                resolve_minutes(planned, &ctx).map_err(|source| ExecError::Timeout {
+                    label: label.clone(),
+                    source,
+                })?,
+            )
+        }
         None => None,
     };
 
     cmdfiles::prepare(job.engine, job.container, &paths, &script)
         .await
-        .map_err(ExecError::CommandFile)?;
+        .map_err(|source| mask_command_file_error(masker, &source))?;
 
     let _ = writeln!(out, "\u{25b6} {label}");
     let exec_env = exec_env_vec(&full_env, &paths);
+    // Wrap the resolved shell invocation so the running process records its
+    // own PID (as observed from *inside* the container's own pid namespace)
+    // before `exec`-replacing itself in place — `exec` preserves the PID, so
+    // the file stays valid for the whole step body. This is what lets a
+    // timeout termination (`run_exec`) reliably signal the right process; see
+    // `ContainerEngine::terminate`'s doc comment for why the daemon-reported
+    // exec PID cannot be used directly.
+    let wrapped_cmd = {
+        let mut cmd = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("echo $$ > {} && exec \"$0\" \"$@\"", paths.pid),
+        ];
+        cmd.push(shell.program);
+        cmd.extend(shell.args);
+        cmd
+    };
     let spec = ExecSpec {
-        cmd: std::iter::once(shell.program)
-            .chain(shell.args)
-            .collect::<Vec<_>>(),
+        cmd: wrapped_cmd,
         env: exec_env,
         working_dir: Some(working_dir),
     };
 
     let started = Instant::now();
-    let exit = run_exec(job.engine, job.container, &spec, timeout, out, masker).await?;
+    let exit = run_exec(
+        job.engine,
+        job.container,
+        &spec,
+        &paths.pid,
+        timeout,
+        out,
+        masker,
+    )
+    .await?;
     let duration = started.elapsed();
 
     let effects = cmdfiles::collect(job.engine, job.container, &paths)
         .await
-        .map_err(ExecError::CommandFile)?;
+        .map_err(|source| mask_command_file_error(masker, &source))?;
     for assignment in &effects.env {
         state
             .accumulated
@@ -274,12 +321,27 @@ pub(crate) async fn execute_step(
     })
 }
 
+/// Build the masked [`ExecError::CommandFile`] for a command-file failure.
+///
+/// `CommandFileError::InvalidLine` embeds the offending line verbatim, which
+/// may itself be (or contain) a value an earlier `::add-mask::` registered —
+/// e.g. a step writes a bare masked token to `GITHUB_OUTPUT` without `=`. The
+/// error is masked here, immediately, rather than left to whichever consumer
+/// eventually prints it (this crate's caller may not even hold the masker).
+fn mask_command_file_error(
+    masker: &Masker,
+    source: &crate::executor::cmdfiles::CommandFileError,
+) -> ExecError {
+    ExecError::CommandFile(masker.apply(&source.to_string()))
+}
+
 /// Run the step exec, streaming output through a [`StepLogSink`], honoring an
 /// optional per-step timeout.
 async fn run_exec(
     engine: &dyn ContainerEngine,
     container: &str,
     spec: &ExecSpec,
+    pid_file: &str,
     timeout_minutes: Option<f64>,
     out: &mut (dyn Write + Send),
     masker: &mut Masker,
@@ -290,9 +352,19 @@ async fn run_exec(
             let duration = Duration::from_secs_f64((minutes * 60.0).max(0.0));
             match tokio::time::timeout(duration, engine.exec(container, spec, &mut sink)).await {
                 Ok(result) => exit_from(result?),
-                // A timed-out step is a failure (GitHub kills it); the dropped
-                // future stops streaming and container teardown reaps it.
-                Err(_elapsed) => StepExit::TimedOut,
+                // A timed-out step is a failure (GitHub kills it). Dropping
+                // the future here only stops *streaming* it — the process
+                // itself keeps running inside the container unless we
+                // explicitly terminate it, which would otherwise let its
+                // background writes race a later step
+                // (`ContainerEngine::terminate`'s doc comment has the full
+                // rationale). Terminate before reporting the timeout so the
+                // container is in a known state by the time the next step
+                // starts.
+                Err(_elapsed) => {
+                    engine.terminate(container, pid_file).await?;
+                    StepExit::TimedOut
+                }
             }
         }
         None => exit_from(engine.exec(container, spec, &mut sink).await?),

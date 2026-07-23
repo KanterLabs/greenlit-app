@@ -35,6 +35,9 @@ pub(crate) struct CommandFilePaths {
     pub summary: String,
     /// The step's script file (the shell's `{0}`).
     pub script: String,
+    /// Where the step's exec wrapper records its own PID (see
+    /// [`crate::executor::step`]'s timeout-termination path).
+    pub pid: String,
 }
 
 impl CommandFilePaths {
@@ -47,6 +50,7 @@ impl CommandFilePaths {
             path: format!("{dir}/path"),
             summary: format!("{dir}/summary"),
             script: format!("{dir}/script"),
+            pid: format!("{dir}/pid"),
             dir,
         }
     }
@@ -106,12 +110,14 @@ pub(crate) async fn prepare(
     // shell escaping is required.
     let program = format!(
         "mkdir -p {dir} && : > {env} && : > {output} && : > {path} && : > {summary} && \
+         : > {pid} && \
          cat > {script_path} <<'{delimiter}'\n{script}\n{delimiter}\n",
         dir = paths.dir,
         env = paths.env,
         output = paths.output,
         path = paths.path,
         summary = paths.summary,
+        pid = paths.pid,
         script_path = paths.script,
     );
     let spec = ExecSpec {

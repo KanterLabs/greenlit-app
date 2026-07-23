@@ -104,6 +104,8 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         inputs: Value::object(vec![]),
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
+        volume_namespace: "shell-ci-smoke".to_string(),
+        write_back: false,
     };
 
     let mut log: Vec<u8> = Vec::new();

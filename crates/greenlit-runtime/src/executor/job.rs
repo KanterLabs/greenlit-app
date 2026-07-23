@@ -10,7 +10,7 @@ use tracing::Instrument;
 
 use greenlit_engine::execution::env::{EnvLayers, apply_path_additions, layer_step_env};
 use greenlit_engine::execution::job_outputs::finalize_outputs;
-use greenlit_engine::execution::outcome::{advance_status, job_result_from_status};
+use greenlit_engine::execution::outcome::{advance_status, job_result_from_status, needs_status};
 use greenlit_engine::execution::resolve::{resolve_condition, resolve_string};
 use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
@@ -77,7 +77,12 @@ pub(crate) async fn run_instance(
         needs,
         needs_run_status,
     );
-    let display = resolve_string(instance.display, &activation_ctx).map_err(ExecError::eval)?;
+    // Masked before any print/report, same reasoning as a step's `name:`
+    // (`crate::executor::step::execute_step`): a job's display name can
+    // interpolate `${{ needs.<id>.outputs.* }}`, and an upstream job may have
+    // masked that value via `::add-mask::`.
+    let display =
+        masker.apply(&resolve_string(instance.display, &activation_ctx).map_err(ExecError::eval)?);
 
     if !job_activates(instance, needs, &activation_ctx)? {
         let _ = writeln!(out, "\n\u{2022} job {display}: skipped");
@@ -119,9 +124,16 @@ pub(crate) async fn run_instance(
     )
     .await;
 
-    // Best-effort teardown: a leaked container is not a run failure, and it must
-    // not mask the job's real result or error.
-    let _ = shared.engine.remove_container(&container).await;
+    // `--write-back` needs the container (and its overlay upper) reachable
+    // after the run to export the diff (`PHASE-2-execution.md` "Overlay
+    // isolation": "export the upper-layer diff ... after the run"); the
+    // caller (`litci run`) removes it once write-back has processed this
+    // job. Otherwise, best-effort teardown here and now: a leaked container
+    // is not a run failure, and it must not mask the job's real result or
+    // error.
+    if !shared.config.write_back {
+        let _ = shared.engine.remove_container(&container).await;
+    }
 
     let (step_reports, outputs, result) = outcome?;
     Ok(JobReport {
@@ -131,6 +143,7 @@ pub(crate) async fn run_instance(
         steps: step_reports,
         outputs,
         duration: started.elapsed(),
+        container_id: shared.config.write_back.then_some(container),
     })
 }
 
@@ -318,7 +331,11 @@ async fn resolve_image(
                 RunStatus::Success,
             );
             let resolved = resolve_container(container_plan, &ctx)?;
-            let additions = validate_container(&resolved)?;
+            let additions = validate_container(
+                &resolved,
+                &shared.config.workspace,
+                &shared.config.volume_namespace,
+            )?;
             // Pull only when absent, so a present image (and an offline host)
             // still runs, and re-runs skip the registry round-trip.
             let ensure = async {
@@ -488,24 +505,6 @@ fn helper_io_error(source: std::io::Error) -> ExecError {
     }
 }
 
-/// A job's needs status for status-check functions: failure/cancelled if any
-/// dependency was, else success (a skipped need does not set failure).
-fn needs_status(needs: &[NeedRecord]) -> RunStatus {
-    if needs
-        .iter()
-        .any(|need| matches!(need.result, Conclusion::Failure))
-    {
-        RunStatus::Failure
-    } else if needs
-        .iter()
-        .any(|need| matches!(need.result, Conclusion::Cancelled))
-    {
-        RunStatus::Cancelled
-    } else {
-        RunStatus::Success
-    }
-}
-
 /// Build a context for env/defaults/activation resolution.
 fn env_ctx(
     roots: &ContextRoots,
@@ -537,5 +536,6 @@ fn skipped_report(job_id: &JobId, display: String, started: Instant) -> JobRepor
         steps: Vec::new(),
         outputs: IndexMap::new(),
         duration: started.elapsed(),
+        container_id: None,
     }
 }

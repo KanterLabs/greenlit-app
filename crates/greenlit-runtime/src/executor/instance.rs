@@ -53,6 +53,11 @@ pub(crate) struct JobInstance<'a> {
 pub(crate) struct JobGroup<'a> {
     /// The job id.
     pub id: JobId,
+    /// This job's direct dependencies. Kept at the group level (not just per
+    /// instance) so a zero-leg matrix job — which produces no
+    /// [`JobInstance`] — still exposes its `needs` for ancestor-chain status
+    /// propagation to its dependents.
+    pub needs: &'a [JobId],
     /// Every instance of this job (one per matrix leg, or a single instance).
     pub instances: Vec<JobInstance<'a>>,
 }
@@ -73,6 +78,7 @@ pub(crate) fn expand(plan: &ExecutionPlan) -> Result<Vec<JobGroup<'_>>, ExecErro
         };
         groups.push(JobGroup {
             id: job_id.clone(),
+            needs: &job.needs,
             instances: expand_job(job)?,
         });
     }

@@ -184,6 +184,69 @@ async fn cancelled_write_back_leaves_the_host_untouched() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Finding: write-back symlink traversal. The repository (the write-back
+/// host root) already contains a symlink pointing *outside* it; the
+/// workflow's diff replaces that same workspace path with a regular file.
+/// Applying it must never open through the pre-existing symlink — the
+/// outside target must be untouched, and the workspace path must end up as
+/// the new regular file, not silently still a symlink.
+#[tokio::test]
+async fn write_back_replacing_a_pre_existing_symlink_never_writes_outside_the_repo() {
+    let mut builder = Builder::new(Vec::new());
+    let mut file = Header::new_gnu();
+    file.set_entry_type(EntryType::Regular);
+    file.set_mode(0o644);
+    file.set_size(11);
+    file.set_cksum();
+    builder
+        .append_data(&mut file, "upper/victim", &b"replacement"[..])
+        .expect("append replacement");
+    let engine = DiffEngine {
+        upper_tar: builder.into_inner().expect("finish tar"),
+    };
+
+    let root = seeded_worktree("symlink-escape");
+    let outside = std::env::temp_dir().join(format!(
+        "greenlit-wb-outside-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).expect("mk outside dir");
+    let outside_target = outside.join("secret.txt");
+    std::fs::write(&outside_target, b"do not touch").expect("seed outside target");
+    std::os::unix::fs::symlink(&outside_target, root.join("victim")).expect("seed victim symlink");
+
+    let mut confirm = FixedConfirm {
+        answer: true,
+        seen: Vec::new(),
+    };
+    let outcome = run_write_back(&engine, "c", &root, &mut confirm)
+        .await
+        .expect("write-back");
+
+    assert!(matches!(outcome, WriteBackOutcome::Applied(_)));
+    // The outside file is exactly what it was — never opened, never
+    // truncated, through the symlink.
+    assert_eq!(
+        std::fs::read(&outside_target).expect("outside target still readable"),
+        b"do not touch"
+    );
+    // The workspace path is now the plain replacement file, not a symlink.
+    let meta = std::fs::symlink_metadata(root.join("victim")).expect("stat victim");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "victim is no longer a symlink"
+    );
+    assert_eq!(
+        std::fs::read(root.join("victim")).expect("read victim"),
+        b"replacement"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
 #[tokio::test]
 async fn empty_overlay_reports_no_changes() {
     let engine = DiffEngine {

@@ -109,6 +109,8 @@ fn needs_context_carries_result_and_outputs_for_direct_deps() {
         job: JobId("build".to_string()),
         result: Conclusion::Success,
         outputs: map(&[("image", "sha256:abc")]),
+        chain_failed: false,
+        chain_cancelled: false,
     }]);
     let ctx = Context::new(Arc::new(NoFs)).with_needs(needs);
     assert_eq!(

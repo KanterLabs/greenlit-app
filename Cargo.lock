@@ -607,6 +607,7 @@ dependencies = [
  "greenlit-expr",
  "greenlit-workflow",
  "indexmap",
+ "rustix",
  "tar",
  "thiserror",
  "tokio",
