@@ -7,6 +7,17 @@ repository.workspace = true
 description = "Private container-only init helper: overlay mounts inside the workflow container. Never a host command."
 publish = false
 
+[lib]
+name = "greenlit_init"
+path = "src/lib.rs"
+
 [[bin]]
 name = "greenlit-init"
 path = "src/main.rs"
+
+[dependencies]
+# The kernel `mount(2)` surface this helper wraps. `libc` links cleanly against
+# musl, keeping the embedded binary static and dependency-free (see the
+# embedding contract in `src/lib.rs`).
+libc = "0.2.187"
+thiserror = "2.0.19"

@@ -7,5 +7,53 @@ repository.workspace = true
 description = "ContainerEngine trait, bollard/Docker backend, base images, and overlay isolation."
 
 [dependencies]
+# The resolved execution plan and the pure GitHub-faithful `run:` step
+# semantics (shell resolution, env layering, command files, log commands,
+# outcome model, job outputs) the executor drives against a `ContainerEngine`.
+# The dataflow is one-directional — workflow → engine(plan) → runtime(execute)
+# — so this edge is acyclic (`greenlit-engine` never depends on this crate).
+greenlit-engine = { path = "../greenlit-engine", version = "0.1.0" }
+# The expression `Context`/`Value`/`RealFs` the executor assembles to finish
+# plan-time-deferred `if:`/`env:`/script values against live runtime contexts.
+greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
+# `Span` for the source-located job-container and deferred-construct rejections.
+greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
+# Order-preserving env/output maps, matching the engine execution semantics'
+# `IndexMap` signatures exactly (env layering, step outputs, job outputs).
+indexmap = "2.14.0"
 thiserror = "2.0.19"
 tracing = "0.1.44"
+# Async runtime. Engine access is I/O-bound orchestration (`greenlit-v0-spec.md`
+# "Tech"); every `ContainerEngine` method is async on tokio.
+tokio = { version = "1.48.0", features = ["rt", "io-util", "time", "macros"] }
+# `#[async_trait]` keeps `ContainerEngine` and `EngineProber` object-safe so the
+# engine can be held behind `dyn` at the port boundary and swapped for a fake in
+# tests; native `async fn` in a public trait is not dyn-compatible.
+async-trait = "0.1.90"
+# Docker Engine API client. `AGENTS.md` mandates the Docker API via bollard with
+# no shelling out to `docker`.
+bollard = "0.21.0"
+# Draining bollard's streaming responses (image pull/build progress, exec output).
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+# `bollard::body_full` takes a `bytes::Bytes`; used to send the base-image build
+# context tar to the daemon. Pinned to bollard's own `bytes` version.
+bytes = "1.12.1"
+# Assembling the in-memory base-image build context (Dockerfile + embedded
+# helper) and parsing the exported overlay upper layer for `--write-back`. Both
+# are USTAR archives; a maintained tar implementation avoids hand-rolling the
+# format and its checksum/whiteout handling.
+tar = "0.4.46"
+
+[dev-dependencies]
+# Drives the async trait surface and detection state machine in tests without a
+# real Docker daemon (the engine prober is injected as a fake).
+tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time"] }
+# The overlay-isolation invariant test (`isolation_overlay.rs`) must exercise the
+# real kernel overlay mount, which needs a privileged container with a tmpfs
+# upper (this environment's container rootfs is itself overlayfs, so an overlay
+# upper is rejected unless it sits on another filesystem — TESTING.md's
+# "privileged job" case). The product `ContainerEngine` deliberately cannot
+# request `privileged`/`tmpfs` (the security model forbids privileged workflow
+# containers), so the test constructs that one container through bollard
+# directly. Already a normal dependency; integration tests only see dev-deps.
+bollard = "0.21.0"

@@ -1,14 +1,33 @@
-//! Greenlit's private, container-only init helper. It mounts the overlayfs
-//! (read-only repo lower layer + container-local upper) that exposes the
-//! merged workspace, then execs the job command. Its bytes are embedded in
-//! `litci` and extracted only into an image build context — it is never
-//! installed as a host command.
+//! The `greenlit-init` binary: a thin shell over the crate library.
 //!
-//! Phase 2 (execution) fills this in. This is the one crate permitted
-//! `unsafe`, confined to a single documented mount-syscall module with
-//! explicit safety invariants; every other crate keeps `#![forbid(unsafe_code)]`.
+//! It parses the container-entrypoint arguments, establishes workspace
+//! isolation, and `exec(2)`s the job command. See the `greenlit_init` crate
+//! docs for the runtime and embedding contracts.
+#![deny(unsafe_code)]
 
-fn main() {
-    eprintln!("greenlit-init: overlay-mount helper not yet implemented");
-    std::process::exit(1);
+use std::process::ExitCode;
+
+use greenlit_init::{Args, run};
+
+fn main() -> ExitCode {
+    let args = match Args::parse(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("greenlit-init: {err}");
+            // Usage error: distinct from a runtime failure so the caller can
+            // tell a malformed invocation from a mount/exec problem.
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(&args) {
+        // `run` returns only on failure; the success path `exec`s away. The
+        // `Ok` payload is uninhabited, so this arm discharges it without a
+        // panic.
+        Ok(never) => match never {},
+        Err(err) => {
+            eprintln!("greenlit-init: {err}");
+            ExitCode::from(1)
+        }
+    }
 }
