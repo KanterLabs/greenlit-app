@@ -34,6 +34,7 @@
 pub mod condition;
 pub mod defer;
 pub mod event;
+pub mod execution;
 pub mod git;
 pub mod graph;
 pub mod lints;
@@ -51,6 +52,7 @@ mod partial_eval;
 pub use condition::{Condition, DeferredExpr, PlannedCond};
 pub use defer::{DeferReason, StatusFn, StepStatusField};
 pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
+pub use execution::{Conclusion, StepExit, StepInvocation, StepResult};
 pub use git::GitError;
 pub use graph::{DependencyCycle, GraphError, JobId};
 pub use lints::{Lint, LintKind};
