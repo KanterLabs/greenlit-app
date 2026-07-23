@@ -1,0 +1,1 @@
+the widget source, checked out read-only into every job's workspace

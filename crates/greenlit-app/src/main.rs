@@ -10,25 +10,30 @@ mod cli;
 mod errors;
 mod plan_cmd;
 mod render;
+mod run_cmd;
+mod setup_cmd;
 mod stats_cmd;
 mod vars;
 mod workflow_discovery;
 
 use std::ffi::OsString;
+use std::process::ExitCode;
 
 use clap::Parser;
 
-fn main() -> std::process::ExitCode {
+fn main() -> ExitCode {
     let cli = match parse_cli() {
         Ok(cli) => cli,
         Err(exit_code) => return exit_code,
     };
     let result = match cli.command {
-        cli::Command::Plan(args) => plan_cmd::run(args),
-        cli::Command::Stats => stats_cmd::run(),
+        cli::Command::Plan(args) => plan_cmd::run(args).map(|()| ExitCode::SUCCESS),
+        cli::Command::Run(args) => run_cmd::run(args),
+        cli::Command::Setup(args) => setup_cmd::run(args),
+        cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
     };
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             // Error reporting itself must not turn a closed stderr pipe into
             // a panic. There is no second output channel to report this
