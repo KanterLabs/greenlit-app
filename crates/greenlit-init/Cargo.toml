@@ -1,0 +1,12 @@
+[package]
+name = "greenlit-init"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Private container-only init helper: overlay mounts inside the workflow container. Never a host command."
+publish = false
+
+[[bin]]
+name = "greenlit-init"
+path = "src/main.rs"

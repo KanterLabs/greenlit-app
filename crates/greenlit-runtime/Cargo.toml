@@ -1,0 +1,11 @@
+[package]
+name = "greenlit-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ContainerEngine trait, bollard/Docker backend, base images, and overlay isolation."
+
+[dependencies]
+thiserror = "2.0.19"
+tracing = "0.1.44"
