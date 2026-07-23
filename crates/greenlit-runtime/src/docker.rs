@@ -374,18 +374,24 @@ mod tests {
 
     #[test]
     fn connect_docker_host_accepts_local_endpoints() {
-        // Constructing a bollard HTTP/unix client is pure local setup — no
-        // network round-trip — so these succeed even without a live daemon.
+        // The invariant under test is the locality rule: none of these may be
+        // classified remote/unsupported. Client construction itself may still
+        // fail with `Connect` where the endpoint does not exist — bollard's
+        // `connect_with_unix` touches the socket path, which is absent inside
+        // an isolated workflow container (by invariant) — and that outcome is
+        // equally acceptable here.
         for host in [
             "tcp://localhost:2375",
             "tcp://127.0.0.1:2375",
             "tcp://[::1]:2375",
             "unix:///var/run/docker.sock",
         ] {
-            assert!(
-                connect_docker_host(host).is_ok(),
-                "expected {host} to be accepted"
-            );
+            match connect_docker_host(host) {
+                Ok(_) | Err(RuntimeError::Connect { .. }) => {}
+                Err(other) => {
+                    panic!("expected {host} to pass the locality rule, got {other:?}")
+                }
+            }
         }
     }
 }
