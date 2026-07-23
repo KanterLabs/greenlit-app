@@ -16,10 +16,12 @@
 //! Greenlit still skips absolute roots outside the provided workspace.
 //!
 //! [`RealFs`] deliberately strengthens the runner script's lexical workspace
-//! check: a held workspace descriptor and component-wise `openat2` resolution
-//! keep every target beneath the original root even during concurrent rename,
-//! so a file link or followed directory link cannot read host files outside it.
-//! The runner at the pinned Phase 1 source revision follows such links after
+//! check: every access re-resolves fresh from one pinned workspace root
+//! descriptor, hop by hop with `openat2`, so a concurrent rename anywhere
+//! along the path breaks that access (`ENOENT`) rather than silently keeping
+//! it beneath the original root's now-relocated content; a file link or
+//! followed directory link cannot read host files outside it either. The
+//! runner at the pinned Phase 1 source revision follows such links after
 //! checking only the link path. Greenlit's product-root security invariant is
 //! authoritative for this boundary.
 //! <https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Misc/expressionFunc/hashFiles/src/hashFiles.ts>
@@ -31,8 +33,9 @@
 //! interrupted; the detached worker retains cooperative checks and stops as
 //! soon as the blocking call returns. Because a worker stuck in an
 //! uninterruptible host syscall can never actually be killed from a library
-//! (only a process supervisor can do that — out of scope here), the number
-//! of simultaneously stranded workers is itself bounded; see the internal
+//! (only a process supervisor can do that — out of scope here), starting a
+//! worker reserves one slot in a fixed live-worker cap up front, so the
+//! number of simultaneously live workers is itself bounded; see the internal
 //! `stranded` module.
 
 mod deadline;
@@ -129,16 +132,18 @@ pub enum HashFilesError {
         /// Maximum retained directory-identity bytes per invocation.
         max_bytes: usize,
     },
-    /// Too many previously timed-out filesystem workers are still stranded
-    /// on an uninterruptible host call. See ARCHITECTURE.md's known-issues
-    /// entry on bounded stranded workers (finding 3 of the hashFiles
-    /// hardening review; upstream pattern: [runner hashFiles timeout issue
-    /// #1840](https://github.com/actions/runner/issues/1840)).
+    /// The fixed cap on simultaneously live `hashFiles` filesystem workers
+    /// is already reserved — by calls still computing normally, by calls
+    /// stuck on an unresponsive host filesystem, or a mix of both; the cap
+    /// bounds live worker threads, not specifically stranded ones (finding 3
+    /// of the hashFiles hardening re-verification). See ARCHITECTURE.md's
+    /// known-issues entry; upstream pattern: [runner hashFiles timeout issue
+    /// #1840](https://github.com/actions/runner/issues/1840).
     #[error(
-        "hashFiles() couldn't start: {max} previous filesystem workers are still stuck on an unresponsive host filesystem; investigate the workspace's (or $HOME's) filesystem for a stall before retrying"
+        "hashFiles() couldn't start: {max} filesystem workers are already running (concurrent hashFiles() calls, or a worker stuck on an unresponsive host filesystem); wait for concurrent evaluations to finish, or investigate the workspace's (or $HOME's) filesystem for a stall, before retrying"
     )]
     StrandedWorkerLimit {
-        /// The fixed cap on simultaneously stranded workers.
+        /// The fixed cap on simultaneously live workers.
         max: usize,
     },
     /// A matched symbolic link's target could not be found. GitHub's
@@ -195,9 +200,10 @@ pub(crate) fn hash_files(
 
     // A worker stuck in an uninterruptible host syscall can never be killed
     // from within this library — only a process supervisor could do that,
-    // out of scope for Phase 1. Bound the damage instead: refuse to start
-    // another worker once too many previous ones are still stranded, rather
-    // than accumulate unbounded stuck threads (finding 3).
+    // out of scope for Phase 1. Bound the damage instead: atomically reserve
+    // one live-worker slot before starting the thread, refusing to start
+    // another once the fixed cap is already reserved, rather than accumulate
+    // unbounded stuck threads (finding 3; see `stranded.rs`).
     let guard = StrandGuard::try_acquire()?;
 
     let worker_patterns = pattern_args.to_vec();
@@ -232,7 +238,10 @@ pub(crate) fn hash_files(
         let wait = match caller_deadline.wait_slice(SUPERVISOR_POLL_INTERVAL) {
             Ok(wait) => wait,
             Err(timeout) => {
-                guard.mark_stranded();
+                // The caller's own `guard` clone drops here (implicitly, on
+                // return); if the worker is still running, its own clone
+                // keeps the reserved slot held until it actually exits (see
+                // `stranded.rs`).
                 return Err(timeout);
             }
         };
@@ -280,6 +289,7 @@ fn hash_files_worker(
             if !path.starts_with(&workspace_root) {
                 return Ok(());
             }
+            let child_sourced = matches!(source, HashSource::Child { .. });
             let mut check_timeout = || deadline.check_io();
             let digest = match source {
                 HashSource::EntryPoint => fs.hash_file_sha256(path, &mut check_timeout),
@@ -298,6 +308,16 @@ fn hash_files_worker(
                 }
                 Err(source) if symlink_sourced => {
                     classify_symlink_hash_error(path, source, deadline)
+                }
+                // Finding 1: a child whose containing directory vanished
+                // (deleted, or renamed away — the rename-escape fix turns
+                // that into `ENOENT` instead of an escape) between being
+                // listed and being read is never a hard failure, the
+                // same tolerance `walk_search_root` already gives its own
+                // vanished-before-traversal search root.
+                Err(source) if child_sourced && source.kind() == std::io::ErrorKind::NotFound => {
+                    deadline.check()?;
+                    Ok(())
                 }
                 Err(source) => Err(deadline.map_io(path, source)),
             }

@@ -1,16 +1,19 @@
 #![cfg(unix)]
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::symlink;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{CWD, Mode, OFlags, mkdirat, openat};
 
-use greenlit_expr::{Context, HashFilesError, HashFilesFs, RealFs, Value, evaluate, parse};
+use greenlit_expr::{
+    Context, DirEntry, EntryKind, HashFilesError, HashFilesFs, OpenDirectory, OpenedDir, RealFs,
+    Value, evaluate, parse,
+};
 
 #[test]
 fn public_hash_files_boundary_enforces_containment_special_nodes_and_bounded_alias_graphs() {
@@ -301,6 +304,152 @@ fn public_hash_files_matched_dangling_symlink_fails_instead_of_matching_empty() 
     let healthy_context = Context::new(Arc::new(RealFs::new(&workspace)));
     let digest = eval_string("hashFiles('healthy.txt')", &healthy_context);
     assert_eq!(digest.len(), 64);
+}
+
+/// A trait-level interposer around [`RealFs`] that renames a chosen held
+/// directory to a sibling *outside* the workspace at the exact call
+/// boundary the hardening re-verification flagged: after the traversal has
+/// already enumerated it, but before it accesses one of its children.
+/// Finding 1 of the hashFiles hardening re-verification: an earlier
+/// revision resolved that child relative to the still-held (now-relocated)
+/// ancestor descriptor, so the child kept resolving even though its true
+/// path was now outside the workspace. `RealFs` itself cannot be asked to
+/// simulate this — it always resolves fresh from its own pinned root — so
+/// this wrapper is the only way to prove the fix from outside: it lets a
+/// real rename land in the narrow window between a real `RealOpenDir`
+/// yielding a directory it already opened and that same traversal
+/// requesting one of its children.
+#[derive(Debug)]
+struct RenameOnAccessFs {
+    inner: RealFs,
+    rename_from: PathBuf,
+    rename_to: PathBuf,
+    renamed: Arc<AtomicBool>,
+}
+
+impl HashFilesFs for RenameOnAccessFs {
+    fn workspace_root(&self) -> &Path {
+        self.inner.workspace_root()
+    }
+
+    fn open_dir(&self, path: &Path) -> io::Result<OpenedDir<'_>> {
+        let opened = self.inner.open_dir(path)?;
+        if path != self.rename_from {
+            return Ok(opened);
+        }
+        Ok(OpenedDir::new(
+            opened.identity.clone(),
+            Box::new(RenameHookDir {
+                inner: opened,
+                rename_from: self.rename_from.clone(),
+                rename_to: self.rename_to.clone(),
+                renamed: Arc::clone(&self.renamed),
+            }),
+        ))
+    }
+
+    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind> {
+        self.inner.entry_kind(path)
+    }
+
+    fn hash_file_sha256(
+        &self,
+        path: &Path,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        self.inner.hash_file_sha256(path, check_timeout)
+    }
+}
+
+struct RenameHookDir<'a> {
+    inner: OpenedDir<'a>,
+    rename_from: PathBuf,
+    rename_to: PathBuf,
+    renamed: Arc<AtomicBool>,
+}
+
+impl<'a> RenameHookDir<'a> {
+    /// Performs the real, on-disk rename exactly once, the first time this
+    /// held directory's caller tries to reach one of its children.
+    fn rename_held_directory_away(&self) {
+        if !self.renamed.swap(true, Ordering::AcqRel) {
+            std::fs::rename(&self.rename_from, &self.rename_to)
+                .expect("rename the held directory to outside the workspace");
+        }
+    }
+}
+
+impl<'a> OpenDirectory<'a> for RenameHookDir<'a> {
+    fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
+        self.inner.next_entry()
+    }
+
+    fn open_child_dir(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+    ) -> io::Result<OpenedDir<'a>> {
+        self.rename_held_directory_away();
+        self.inner.open_child_dir(name, lexical_path, follow)
+    }
+
+    fn hash_child_file(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        self.rename_held_directory_away();
+        self.inner
+            .hash_child_file(name, lexical_path, follow, check_timeout)
+    }
+}
+
+#[test]
+fn public_hash_files_contains_a_held_directory_renamed_outside_the_workspace_mid_traversal() {
+    // Finding 1 (the critical one) of the hashFiles hardening
+    // re-verification: the previous fd-chain design resolved a child
+    // relative to whatever descriptor its parent directory happened to
+    // still be, not relative to a fresh, root-anchored lookup — so once
+    // `workspace/a` was renamed to a directory outside the workspace, its
+    // already-held descriptor kept serving children from that now-outside
+    // location. The fix makes every access a single `openat2` call over the
+    // full path from the one pinned root, so the rename instead surfaces as
+    // `ENOENT` (the entry vanished from the workspace's perspective) —
+    // never outside content.
+    let tree = TempTree::new();
+    let workspace = tree.path().join("workspace");
+    let held_directory = workspace.join("a");
+    std::fs::create_dir_all(&held_directory).expect("create held traversal directory");
+    std::fs::write(held_directory.join("b.txt"), b"must never be hashed")
+        .expect("write held directory's child file");
+    let outside = tree.path().join("outside-a");
+
+    let renamed = Arc::new(AtomicBool::new(false));
+    let fs = RenameOnAccessFs {
+        inner: RealFs::new(&workspace),
+        rename_from: held_directory,
+        rename_to: outside.clone(),
+        renamed: Arc::clone(&renamed),
+    };
+    let context = Context::new(Arc::new(fs));
+    let digest = eval_string("hashFiles('a/*.txt')", &context);
+
+    assert!(
+        renamed.load(Ordering::Acquire),
+        "test setup bug: the interposer never fired, so it proved nothing"
+    );
+    assert!(
+        outside.join("b.txt").exists(),
+        "test setup bug: the held directory was not actually relocated outside the workspace"
+    );
+    assert_eq!(
+        digest, "",
+        "a directory renamed outside the workspace after being held must never contribute a \
+         match — the outside file's content must never be hashed"
+    );
 }
 
 fn eval_string(source: &str, context: &Context) -> String {

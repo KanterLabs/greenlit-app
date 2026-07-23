@@ -82,8 +82,8 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 
 | Phase | File | Status |
 |---|---|---|
-| 1 — Engine core | `PHASE-1-engine-core.md` | in progress |
-| 2 — Execution | `PHASE-2-execution.md` | not started |
+| 1 — Engine core | `PHASE-1-engine-core.md` | completed |
+| 2 — Execution | `PHASE-2-execution.md` | in progress |
 | 3 — Actions | `PHASE-3-actions.md` | not started |
 | 4 — Environment | `PHASE-4-environment.md` | not started |
 | 5 — Speed | `PHASE-5-speed.md` | not started |
@@ -112,7 +112,7 @@ Phase 1 creates `greenlit-app`, `greenlit-workflow`, `greenlit-expr`, `greenlit-
 
 - **Fidelity:** never take a semantic shortcut. When GitHub's behavior is unclear, match GitHub's documented behavior, then its observed behavior; document the source in a code comment. Steps within a job run sequentially and never skip. Each user step executes exactly once unless GitHub itself defines a retry; runtime provisioning never replays it.
 - **Security:** repo is mounted read-only with a throwaway overlay upper layer; the host Docker socket is never mounted into any workflow container; workflow containers cannot reach the host LAN; secret values are masked in all log output. These are not configurable off.
-- **Host filesystem evaluation:** `hashFiles` never reads outside its supplied workspace root or opens special filesystem nodes; directory enumeration state is proportional to traversal depth, the exact canonical-directory alias registry has fixed entry and retained-path-byte ceilings, symbolic-link alias graphs stay bounded, and work ends at the runner-compatible fixed deadline.
+- **Host filesystem evaluation:** `hashFiles` never reads outside its supplied workspace root or opens special filesystem nodes; directory enumeration state is proportional to traversal depth, the exact canonical-directory alias registry has fixed entry and retained-path-byte ceilings, symbolic-link alias graphs stay bounded, and evaluation returns at the runner-compatible fixed deadline, with abandoned workers held within a fixed live-worker bound (see ARCHITECTURE.md known issues).
 - **UX:** every error maps to a state plus the one action that fixes it. No raw stack traces, no "cannot connect to Docker daemon".
 - **Performance budgets** (enforced from Phase 5): < 2s from `litci run` to first step executing; < 30s warm re-run of a typical test workflow.
 - v0 hosts are Linux x86_64. All engine access goes through the `ContainerEngine` trait in `greenlit-runtime` so other platforms and architectures remain ports.

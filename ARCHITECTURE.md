@@ -97,36 +97,53 @@ path before it reaches a host resource:
   passes use bounded/indexed traversal rather than pairwise amplification.
 - The production `hashFiles` filesystem lexically normalizes the supplied
   physical workspace path, rejects root-path symlink components, and pins the
-  directory in one `openat2` lookup, lazily (only on first actual use inside
-  the supervised worker, never at construction). Every later access —
-  entering a literal search root or descending into a child — resolves
-  relative to a held ancestor descriptor kept alive for as long as the
-  traversal is anywhere beneath it, never by re-deriving a lexical path and
-  re-walking it from the root; a directory's `(device, inode)` identity comes
-  from that same held object it enumerates. Concurrent renames therefore
-  cannot substitute a different, unvetted object for an ancestor already
-  inspected, nor pair one alias identity with another directory's entries.
-  A final regular-file or directory open is validated once via `O_PATH` and
-  then reopened through that exact descriptor's own `/proc/self/fd` entry —
-  never a second lookup by name — so no replacement (a stable special node
-  included) can be raced into a readable handle. Regular files stream in
-  64 KiB chunks; native-order directory enumeration retains only the active
-  DFS stack, and that stack's lexical path is one shared buffer pushed on
-  descent and popped on ascent, so retained bytes stay proportional to depth
-  rather than depth squared. Traversal also prunes: a directory is opened
-  only if its path so far could still lead to a pattern match (toolkit's own
-  `match || partialMatch`), so an unrelated or unreadable sibling is never
-  touched. The exact first-alias registry is separately capped at 262,144
-  entries and 32 MiB of retained identity bytes; reaching either cap fails
-  with the single action to narrow patterns. A matched symbolic link whose
-  target cannot be found fails the whole expression, matching GitHub's own
-  hash helper, rather than silently contributing an empty match. One worker
-  owns the complete computation and cooperative checks, while the caller
-  enforces the same runner-compatible 120-second deadline independently;
-  evaluation therefore returns on time even if an uninterruptible host
-  filesystem call leaves that worker detached until the call completes, and
-  the number of workers simultaneously stranded that way is itself bounded
-  (see the known-issues log).
+  root directory in one `openat2` lookup, lazily (only on first actual use
+  inside the supervised worker, never at construction). Every later access —
+  entering a literal search root, descending into a child directory, or
+  hashing a child file — resolves fresh from that one pinned root descriptor,
+  one path component and one `openat2` call per hop, rather than relative to
+  a held intermediate descriptor cached from an earlier access: an ancestor
+  renamed away since it was last inspected breaks the very next hop through
+  it (`ENOENT`, treated the same as any other vanished entry) instead of the
+  stale descriptor silently continuing to serve content that has moved
+  outside the workspace. Splitting each access into single-component hops
+  (rather than one `openat2` call over a joined multi-component path) keeps
+  every syscall argument bounded by a single path component's own length
+  regardless of how deep the access is, which is what lets this stay
+  compatible with the depth-proportional-state guarantee below even past
+  Linux's `PATH_MAX`. A directory's `(device, inode)` identity comes from the
+  object that same walk reaches. A final regular-file or directory open is
+  validated once via `O_PATH` and then reopened through that exact
+  descriptor's own `/proc/self/fd` entry — never a second lookup by name —
+  so no replacement (a stable special node included) can be raced into a
+  readable handle. Regular files stream in 64 KiB chunks; native-order
+  directory enumeration retains only the active DFS stack, and that stack's
+  lexical path is one shared buffer pushed on descent and popped on ascent,
+  so retained bytes stay proportional to depth rather than depth squared.
+  Traversal also prunes: a directory is opened, and an entry whose native
+  enumeration type went unreported (`DT_UNKNOWN`) is resolved, only if its
+  path so far could still lead to a pattern match (toolkit's own
+  `match || partialMatch`), so an unrelated or unreadable sibling — or an
+  irrelevant `DT_UNKNOWN` entry — is never touched. A non-directory result
+  (an entry-point file, a plain child file, or a symlink probe result) is
+  ever yielded only on a *full* pattern match with negative patterns folded,
+  never merely because it sits at a glob's literal search root or partially
+  matches a prefix; a bare literal exclusion (`hashFiles('a.txt', '!a.txt')`)
+  therefore folds to nothing rather than bypassing the negation. The exact
+  first-alias registry is separately capped at 262,144 entries and 32 MiB of
+  retained identity bytes; reaching either cap fails with the single action
+  to narrow patterns. A matched symbolic link whose target cannot be found
+  fails the whole expression, matching GitHub's own hash helper, rather than
+  silently contributing an empty match. One worker owns the complete
+  computation and cooperative checks, while the caller enforces the same
+  runner-compatible 120-second deadline independently; evaluation therefore
+  returns on time even if an uninterruptible host filesystem call leaves
+  that worker detached until the call completes. Starting that worker itself
+  reserves one slot in a fixed live-worker cap — a single atomic
+  compare-and-swap before the thread spawns, released only once the worker
+  actually exits, however late — so the cap bounds concurrently live workers
+  outright rather than only the ones later detected as stuck (see the
+  known-issues log).
 - Human stdout/stderr escapes repository-authored terminal controls and has a
   bounded render buffer. The default metrics path is traversed from a held
   `HOME` directory descriptor with no-follow/nonblocking opens; readers and
@@ -165,21 +182,33 @@ policy actively contains. They are not deferred Greenlit behavior.
   traversal](https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Misc/layoutbin/hashFiles/index.js).
 
 - **A `hashFiles` worker stuck in an uninterruptible host syscall cannot be
-  killed, so simultaneously stranded workers are bounded and die only with
-  the process.** The caller-side supervisor returns on time by detaching a
+  killed, so simultaneously live workers are bounded and die only with the
+  process.** The caller-side supervisor returns on time by detaching a
   worker once its fixed deadline elapses, but detaching does not free
   anything: the thread, its held descriptors, and its filesystem handle all
   persist until the blocking call eventually returns, if it ever does.
   Killing that thread outright is not possible from within this library —
   only a process supervisor could do that, out of scope for the Phase 1
-  engine-core crate. Greenlit instead bounds the damage: once four previous
-  workers are still stranded on an unresponsive filesystem, a new
-  `hashFiles()` call fails fast with the corrective action (investigate the
-  stalled workspace or `$HOME` filesystem) instead of accumulating another
-  likely-stuck worker. This is a security/robustness containment, not
-  parity — the runner's own model kills the whole child helper process on
-  timeout, which this library cannot do to itself. Upstream pattern:
-  [runner hashFiles timeout issue #1840](https://github.com/actions/runner/issues/1840).
+  engine-core crate. Greenlit instead bounds the damage with a real
+  reservation: starting a worker atomically increments a fixed live-worker
+  counter (a single `fetch_update` compare-and-swap) *before* the thread is
+  spawned, and only a worker that has actually exited — whether it finished
+  normally or was detached and is still finishing very late — decrements it.
+  This bounds concurrently live workers outright, not merely the ones later
+  discovered to be stuck (an earlier revision incremented the counter only
+  once the caller detected a stranding, which left an unbounded window at
+  call start where arbitrarily many concurrent calls could all start before
+  any one of them was individually flagged). Once the fixed cap of
+  simultaneously live workers is reserved, a new `hashFiles()` call fails
+  fast with the corrective action (wait for concurrent evaluations to finish,
+  or investigate the stalled workspace or `$HOME` filesystem) instead of
+  starting another thread. The cap is kept small — concurrent `hashFiles()`
+  evaluations are rare during planning — so a burst of them cannot spawn
+  unbounded threads even when every one of them would otherwise complete
+  quickly. This is a security/robustness containment, not parity — the
+  runner's own model kills the whole child helper process on timeout, which
+  this library cannot do to itself. Upstream pattern: [runner hashFiles
+  timeout issue #1840](https://github.com/actions/runner/issues/1840).
 
 - **Contained `hashFiles` traversal does not cross mount points.** Each
   descriptor-relative lookup uses Linux `RESOLVE_BENEATH`,

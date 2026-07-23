@@ -20,6 +20,16 @@ pub enum EntryKind {
     /// A non-regular filesystem node such as a FIFO, socket, or device.
     /// `hashFiles()` never reads or hashes these nodes.
     Other,
+    /// The entry's kind was not reported by directory enumeration itself
+    /// (Linux `DT_UNKNOWN`, e.g. on some FUSE/network filesystems). Finding
+    /// 5 of the hashFiles hardening re-verification: resolving this requires
+    /// an extra filesystem call, so it must happen only once the traversal
+    /// layer has decided the entry's name could still contribute a match —
+    /// never unconditionally during enumeration, which is what let an
+    /// irrelevant sibling be `stat`ed (or stalled on) purely because its
+    /// native type was unreported.
+    /// <https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts>
+    Unknown,
 }
 
 /// One directory entry: a bare file name (not a full path) plus its kind.
@@ -97,6 +107,17 @@ impl<'a> OpenedDir<'a> {
         self.directory
             .hash_child_file(name, lexical_path, follow, check_timeout)
     }
+
+    /// Resolves the real kind of a child whose native enumeration type was
+    /// [`EntryKind::Unknown`]. Callers must only reach for this once they
+    /// have already decided, from `name`/`lexical_path` alone, that the
+    /// entry could still contribute a match (GitHub toolkit's own
+    /// `match || partialMatch` pruning) — see [`OpenedDir::open_child_dir`]'s
+    /// pruning contract, which this mirrors for the one kind that cannot be
+    /// pruned without an extra resolution step.
+    pub fn resolve_unknown_kind(&self, name: &str, lexical_path: &Path) -> io::Result<EntryKind> {
+        self.directory.resolve_unknown_kind(name, lexical_path)
+    }
 }
 
 /// The object backing one [`OpenedDir`]. Implementations are shared with a
@@ -123,6 +144,17 @@ pub trait OpenDirectory<'a> {
         follow: bool,
         check_timeout: &mut dyn FnMut() -> io::Result<()>,
     ) -> io::Result<[u8; 32]>;
+
+    /// See [`OpenedDir::resolve_unknown_kind`]. Implementations whose
+    /// `next_entry` never reports [`EntryKind::Unknown`] can rely on this
+    /// default, which is never called in that case.
+    fn resolve_unknown_kind(&self, name: &str, lexical_path: &Path) -> io::Result<EntryKind> {
+        let _ = name;
+        Err(io::Error::other(format!(
+            "this HashFilesFs implementation does not resolve unknown entry kinds: {}",
+            lexical_path.display()
+        )))
+    }
 }
 
 /// Filesystem access for `hashFiles()`, injected so evaluation never talks
