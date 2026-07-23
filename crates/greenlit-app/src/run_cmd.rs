@@ -28,7 +28,7 @@ use greenlit_runtime::{
 };
 
 use crate::cli::{IsolationArg, RunArgs};
-use crate::{errors, render, vars, workflow_discovery};
+use crate::{errors, render, vars, workflow_discovery, workflow_picker};
 
 /// Run the command, returning the process exit code (a failed workflow run
 /// exits non-zero without an error, since its table is the real output).
@@ -79,6 +79,9 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
     let workflow_path =
         workflow_discovery::resolve_workflow_path(args.workflow.as_deref(), &cwd, &repo_root)
+            .and_then(|resolution| {
+                workflow_picker::resolve_or_pick(resolution, &repo_root, !args.no_input)
+            })
             .map_err(|message| anyhow::anyhow!(message))?;
 
     let workflow = invocation

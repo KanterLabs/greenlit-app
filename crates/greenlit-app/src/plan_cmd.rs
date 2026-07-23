@@ -14,7 +14,7 @@ use greenlit_engine::{PlanOptions, build_synthetic_event, plan, validate_v0_supp
 use greenlit_metrics::{Invocation, MetricsStore};
 
 use crate::cli::PlanArgs;
-use crate::{errors, render, vars, workflow_discovery};
+use crate::{errors, render, vars, workflow_discovery, workflow_picker};
 
 pub(crate) fn run(args: PlanArgs) -> anyhow::Result<()> {
     let invocation = Invocation::start("plan");
@@ -64,6 +64,7 @@ fn execute(args: &PlanArgs, invocation: &Invocation) -> anyhow::Result<()> {
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
     let workflow_path =
         workflow_discovery::resolve_workflow_path(args.workflow.as_deref(), &cwd, &repo_root)
+            .and_then(|resolution| workflow_picker::resolve_or_pick(resolution, &repo_root, true))
             .map_err(|s| anyhow::anyhow!(s))?;
 
     let workflow = invocation

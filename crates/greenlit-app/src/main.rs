@@ -15,6 +15,7 @@ mod setup_cmd;
 mod stats_cmd;
 mod vars;
 mod workflow_discovery;
+mod workflow_picker;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
