@@ -6,9 +6,25 @@ members = [
     "crates/greenlit-expr",
     "crates/greenlit-engine",
     "crates/greenlit-metrics",
+    "crates/greenlit-runtime",
+    "crates/greenlit-init",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ShaneKanterman04/greenlit-app"
+
+# Dedicated profile for building the private `greenlit-init` helper as a small,
+# static, musl-linked binary for embedding into `litci` and extraction into the
+# base-image build context. Used only via
+# `cargo build -p greenlit-init --profile init --target x86_64-unknown-linux-musl`;
+# it does not affect any crate's normal dev/release/test builds. See the
+# embedding contract in `crates/greenlit-init/src/lib.rs`.
+[profile.init]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

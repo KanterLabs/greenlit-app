@@ -18,6 +18,12 @@ greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
 greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
 greenlit-engine = { path = "../greenlit-engine", version = "0.1.0" }
 greenlit-metrics = { path = "../greenlit-metrics", version = "0.1.0" }
+# The container runtime: engine detection, the Docker backend, base images,
+# overlay isolation, and the plan executor `litci run` drives.
+greenlit-runtime = { path = "../greenlit-runtime", version = "0.1.0" }
+# Async runtime for `litci run`/`litci setup`: the executor and engine detection
+# are async; the CLI drives them on a current-thread runtime via `block_on`.
+tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time"] }
 # CLI argument parsing (derive API) -- the one new user-facing-flags
 # dependency this crate adds.
 clap = { version = "4.6.3", features = ["derive"] }

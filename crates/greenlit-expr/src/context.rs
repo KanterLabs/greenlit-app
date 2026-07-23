@@ -51,6 +51,18 @@ pub enum RunStatus {
     Failure,
     /// The run was cancelled.
     Cancelled,
+    /// A needed job's dependency chain contains a job that was *skipped*
+    /// without any ancestor actually failing or being cancelled (for
+    /// example, a `needs:` job whose own `if:` evaluated false). This value
+    /// is only ever produced by needs-chain evaluation for a job-level `if:`
+    /// — a job's own step-rolling status never becomes this, since steps
+    /// only move between `Success`, `Failure`, and `Cancelled`. `success()`,
+    /// `failure()`, and `cancelled()` are all false here: GitHub does not
+    /// treat a job downstream of a merely-skipped dependency as having
+    /// succeeded, matching the observed "skipped propagates, not success"
+    /// behavior status-check functions must reproduce.
+    /// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions>
+    Blocked,
 }
 
 /// Everything an expression evaluation needs: one [`Value`] per context

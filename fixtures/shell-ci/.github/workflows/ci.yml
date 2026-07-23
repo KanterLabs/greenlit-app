@@ -1,0 +1,72 @@
+name: shell-ci
+on: push
+
+env:
+  WORKFLOW_LEVEL: wf
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JOB_LEVEL: job
+    outputs:
+      version: ${{ steps.gen.outputs.version }}
+    steps:
+      - name: env layering
+        env:
+          STEP_LEVEL: step
+        run: |
+          echo "workflow=$WORKFLOW_LEVEL job=$JOB_LEVEL step=$STEP_LEVEL"
+          test "$WORKFLOW_LEVEL" = "wf"
+          test "$JOB_LEVEL" = "job"
+          test "$STEP_LEVEL" = "step"
+      - name: grouped output
+        run: |
+          echo "::group::Compiling"
+          echo "compiling the widget"
+          echo "::endgroup::"
+      - name: generate output
+        id: gen
+        run: |
+          echo "version=1.2.3" >> "$GITHUB_OUTPUT"
+      - name: propagate through GITHUB_ENV
+        run: |
+          echo "BUILD_STAMP=stamped" >> "$GITHUB_ENV"
+      - name: read propagated env
+        run: |
+          echo "stamp is $BUILD_STAMP"
+          test "$BUILD_STAMP" = "stamped"
+      - name: soft failure is tolerated
+        continue-on-error: true
+        run: |
+          echo "this command fails but the job continues"
+          exit 1
+      - name: only on failure
+        if: failure()
+        run: echo "this must be skipped because the job is still successful"
+      - name: cleanup always runs
+        if: always()
+        run: echo "cleanup ran"
+
+  container-job:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: prove we are in the requested image
+        run: |
+          echo "container step running"
+          test -f /etc/os-release
+      - name: writes land in the overlay
+        run: |
+          echo "scratch" > "$GITHUB_WORKSPACE/scratch.txt"
+          test -f "$GITHUB_WORKSPACE/scratch.txt"
+
+  report:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: consume the dependency output
+        run: |
+          echo "built version ${{ needs.build.outputs.version }}"
+          test "${{ needs.build.outputs.version }}" = "1.2.3"

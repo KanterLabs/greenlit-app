@@ -220,8 +220,24 @@ fn public_hash_files_traversal_state_stays_depth_proportional_beyond_path_max() 
         Mode::empty(),
     )
     .expect("open temporary root");
-    for _ in 0..DEPTH {
-        mkdirat(&dir, name.as_str(), Mode::from_raw_mode(0o700)).expect("mkdirat one level deeper");
+    for depth in 0..DEPTH {
+        match mkdirat(&dir, name.as_str(), Mode::from_raw_mode(0o700)) {
+            Ok(()) => {}
+            // overlayfs (a container's rootfs, notably) reconstructs the full
+            // lexical path internally for every directory operation and so
+            // refuses chains beyond PATH_MAX outright — the beyond-PATH_MAX
+            // demonstration is impossible there, not violated. Skip with a
+            // notice, mirroring the daemon-gated tests' convention.
+            Err(rustix::io::Errno::NAMETOOLONG) => {
+                eprintln!(
+                    "public_hash_files_traversal_state_stays_depth_proportional_beyond_path_max: \
+                     filesystem refuses beyond-PATH_MAX directory chains at depth {depth} \
+                     (overlayfs?); skipping the beyond-PATH_MAX demonstration"
+                );
+                return;
+            }
+            Err(error) => panic!("mkdirat one level deeper: {error:?}"),
+        }
         dir = openat(
             &dir,
             name.as_str(),

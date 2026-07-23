@@ -1,0 +1,44 @@
+name: dogfood
+# The repo's own gates run under litci itself (TESTING.md dogfood clause;
+# PHASE-2-execution.md exit criterion 7). Shell-only because Phase 2 cannot
+# execute ci.yml's `uses:` steps; from Phase 3, litci runs ci.yml directly.
+# GitHub never auto-runs this (workflow_dispatch; no checkout step here).
+#   invoke: litci run -W .github/workflows/dogfood.yml -e workflow_dispatch
+# Omitted TESTING.md gates: cargo deny (needs a prebuilt binary), cargo doc
+# and benches (cold-container cost without guard value) — ci.yml runs all.
+on: workflow_dispatch
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep build artifacts off the merged workspace: the host repo's target/
+  # sits in the read-only lower layer; building over it would fight stale
+  # host fingerprints and bloat the overlay upper (or copy-in tree).
+  CARGO_TARGET_DIR: /tmp/dogfood-target
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.96.0 # matches rust-toolchain.toml channel
+    defaults:
+      run:
+        shell: bash # job containers default to sh -e {0}
+    steps:
+      - name: Provision toolchain components
+        run: |
+          rustc --version
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl # greenlit-init sub-build
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        timeout-minutes: 45
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Stub registry consistency
+        run: |
+          command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
+          python3 tools/check-stubs
+      - name: Test
+        timeout-minutes: 45
+        # Daemon-gated tests self-skip: no docker socket in the container, by invariant.
+        run: cargo test --workspace
