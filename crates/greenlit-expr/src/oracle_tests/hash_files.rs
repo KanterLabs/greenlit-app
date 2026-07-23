@@ -40,6 +40,17 @@ fn hash_files_documented_patterns_hashing_and_workspace_boundary() {
         "/workspace/a.txt",
         b"folded out by its own negation".to_vec(),
     )));
+    // The same partial-match rule must hold for a non-directory reached during
+    // traversal, not only at a glob's literal search root. `pkg/cfg` is a
+    // dangling symlink that partially matches `*/cfg/*.yml` (its prefix could
+    // still lead to a match) but is not itself a full match, so it must be
+    // skipped — never followed into a `DanglingSymlink` failure. `keep.txt`
+    // exists only so `pkg` enumerates as a directory during the walk.
+    let partial_match_child_dangling_symlink = Context::new(Arc::new(
+        InMemoryFs::new("/workspace")
+            .with_file("/workspace/pkg/keep.txt", b"keeps pkg a directory".to_vec())
+            .with_symlink("/workspace/pkg/cfg", "/workspace/does-not-exist"),
+    ));
     let rows = [
         (
             "single package-lock pattern",
@@ -101,6 +112,13 @@ fn hash_files_documented_patterns_hashing_and_workspace_boundary() {
             "an exact literal pattern folded out by its own negation matches nothing",
             &negated_exact_match,
             "hashFiles('a.txt', '!a.txt')",
+            "",
+        ),
+        (
+            "a dangling symlink reached during traversal that only partially \
+             matches is skipped, not a DanglingSymlink failure",
+            &partial_match_child_dangling_symlink,
+            "hashFiles('*/cfg/*.yml')",
             "",
         ),
     ];
