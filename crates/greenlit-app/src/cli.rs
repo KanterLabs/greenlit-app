@@ -25,9 +25,77 @@ pub(crate) enum Command {
     /// Print the fully resolved execution plan for a workflow -- no
     /// containers, no network.
     Plan(PlanArgs),
+    /// Run a shell-only workflow end to end in isolated containers.
+    Run(RunArgs),
+    /// Detect, start, or install the container engine (three-state UX).
+    Setup(SetupArgs),
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
     Stats,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct RunArgs {
+    /// Which trigger event to simulate.
+    #[arg(short = 'e', long = "event", value_enum, default_value = "push")]
+    pub(crate) event: EventArg,
+
+    /// Path to the workflow YAML file to run. When omitted, Greenlit looks for
+    /// exactly one `*.yml`/`*.yaml` file under `.github/workflows/`.
+    #[arg(short = 'W', long = "workflow")]
+    pub(crate) workflow: Option<PathBuf>,
+
+    /// Run only this job and its transitive `needs:` dependencies.
+    #[arg(short = 'j', long = "job")]
+    pub(crate) job: Option<String>,
+
+    /// A local variable override, `KEY=VALUE`. Repeatable.
+    #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
+    pub(crate) vars: Vec<(String, String)>,
+
+    /// A `workflow_dispatch` input, `KEY=VALUE`. Repeatable.
+    #[arg(long = "input", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    pub(crate) inputs: Vec<(String, String)>,
+
+    /// A secret value, `KEY=VALUE`. Repeatable. In this phase the value is
+    /// registered for log masking; the `secrets` context lands in Phase 3.
+    #[arg(short = 's', long = "secret", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    pub(crate) secrets: Vec<(String, String)>,
+
+    /// Workspace isolation mechanism.
+    #[arg(long = "isolation", value_enum, default_value = "auto")]
+    pub(crate) isolation: IsolationArg,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct SetupArgs {
+    /// Pre-confirm the single install/start prompt (non-interactive).
+    #[arg(short = 'y', long = "yes")]
+    pub(crate) yes: bool,
+}
+
+/// Which workspace isolation mechanism `litci run` requests of `greenlit-init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum IsolationArg {
+    /// Try overlay, fall back to copy-in (the default).
+    #[value(name = "auto")]
+    Auto,
+    /// Require overlay; fail if it cannot be mounted.
+    #[value(name = "overlay")]
+    Overlay,
+    /// Always copy the checkout in.
+    #[value(name = "copy-in")]
+    CopyIn,
+}
+
+impl From<IsolationArg> for greenlit_runtime::IsolationStrategy {
+    fn from(value: IsolationArg) -> Self {
+        match value {
+            IsolationArg::Auto => greenlit_runtime::IsolationStrategy::Auto,
+            IsolationArg::Overlay => greenlit_runtime::IsolationStrategy::Overlay,
+            IsolationArg::CopyIn => greenlit_runtime::IsolationStrategy::CopyIn,
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]
