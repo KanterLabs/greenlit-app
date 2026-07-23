@@ -26,6 +26,22 @@ pub(crate) struct ResolvedWorkflowPath {
     pub(crate) source_name: String,
 }
 
+/// The outcome of workflow resolution. Discovery that finds several files is
+/// not an error by itself: an interactive caller may prompt the user to pick
+/// one (see `crate::workflow_picker`), while a non-interactive caller reports
+/// the prepared `error` unchanged.
+pub(crate) enum WorkflowResolution {
+    /// Exactly one workflow was named or discovered.
+    Resolved(ResolvedWorkflowPath),
+    /// Several candidates exist under [`WORKFLOWS_DIR`] and none was named.
+    Ambiguous {
+        /// The discovered files, sorted, ready for an interactive picker.
+        candidates: Vec<PathBuf>,
+        /// The non-interactive report (message + `-W` fix action).
+        error: String,
+    },
+}
+
 /// Resolves the workflow file to plan: an explicit relative path is resolved
 /// from `invocation_cwd`; otherwise the sole `*.yml`/`*.yaml` file under
 /// [`WORKFLOWS_DIR`] in `repo_root` is selected. A workflow outside the
@@ -35,7 +51,7 @@ pub(crate) fn resolve_workflow_path(
     explicit: Option<&Path>,
     invocation_cwd: &Path,
     repo_root: &Path,
-) -> Result<ResolvedWorkflowPath, String> {
+) -> Result<WorkflowResolution, String> {
     let selected = if let Some(path) = explicit {
         if path.is_absolute() {
             path.to_path_buf()
@@ -43,12 +59,34 @@ pub(crate) fn resolve_workflow_path(
             invocation_cwd.join(path)
         }
     } else {
-        discover_workflow(repo_root)?
+        match discover_workflow(repo_root)? {
+            Discovered::One(path) => path,
+            Discovered::Several { candidates, error } => {
+                return Ok(WorkflowResolution::Ambiguous { candidates, error });
+            }
+        }
     };
-    normalize_workflow_path(&selected, repo_root)
+    normalize_workflow_path(&selected, repo_root).map(WorkflowResolution::Resolved)
 }
 
-fn discover_workflow(repo_root: &Path) -> Result<PathBuf, String> {
+/// Resolves one picked candidate exactly as an explicit `-W` path would be —
+/// the interactive picker's follow-up to [`WorkflowResolution::Ambiguous`].
+pub(crate) fn resolve_picked(
+    picked: &Path,
+    repo_root: &Path,
+) -> Result<ResolvedWorkflowPath, String> {
+    normalize_workflow_path(picked, repo_root)
+}
+
+enum Discovered {
+    One(PathBuf),
+    Several {
+        candidates: Vec<PathBuf>,
+        error: String,
+    },
+}
+
+fn discover_workflow(repo_root: &Path) -> Result<Discovered, String> {
     let dir = repo_root.join(WORKFLOWS_DIR);
     let (mut candidates, additional_candidates) = discover_candidates(&dir)?;
     candidates.sort();
@@ -57,7 +95,7 @@ fn discover_workflow(repo_root: &Path) -> Result<PathBuf, String> {
             "no workflow file found under {}\n  fix: pass -W <path> to select a workflow file, or add one under {WORKFLOWS_DIR}",
             safe_path(&dir)
         )),
-        1 => Ok(candidates.remove(0)),
+        1 => Ok(Discovered::One(candidates.remove(0))),
         _ => {
             let mut list = candidates
                 .iter()
@@ -67,10 +105,16 @@ fn discover_workflow(repo_root: &Path) -> Result<PathBuf, String> {
             if additional_candidates {
                 list.push_str(", ... (additional candidates omitted)");
             }
-            Err(format!(
+            let error = format!(
                 "multiple workflow files found under {}: {list}\n  fix: pass -W <path> to select one explicitly",
                 safe_path(&dir)
-            ))
+            );
+            // Beyond the reporting cap the list itself is untrustworthy as a
+            // menu; fall back to the explicit `-W` error unconditionally.
+            if additional_candidates {
+                return Err(error);
+            }
+            Ok(Discovered::Several { candidates, error })
         }
     }
 }
