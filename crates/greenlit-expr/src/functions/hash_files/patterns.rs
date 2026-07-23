@@ -10,6 +10,7 @@ use super::{HashFilesError, HashFilesFs};
 enum RootKind {
     Workspace,
     Home,
+    Filesystem,
 }
 
 /// One pattern after rooting and glob compilation.
@@ -17,6 +18,21 @@ pub(super) struct CompiledPattern {
     negated: bool,
     matchers: Vec<globset::GlobMatcher>,
     search_root: Option<PathBuf>,
+    /// The rooted pattern split into path segments, each compiled as its
+    /// own single-component matcher, for prefix ("partial match") pruning.
+    /// See [`could_match_descendant`].
+    segments: Vec<PatternSegment>,
+}
+
+/// One segment of a rooted pattern, for prefix-pruning purposes only (full
+/// matching still goes through `matchers`).
+enum PatternSegment {
+    /// `**`: can absorb any number of remaining path segments, so once
+    /// reached, every deeper candidate is a potential match.
+    DoubleStar,
+    /// Any other segment, compiled on its own (no `/` can appear within a
+    /// single segment, so no `literal_separator` distinction is needed).
+    One(globset::GlobMatcher),
 }
 
 /// Parses and compiles the already string-converted function arguments.
@@ -45,6 +61,7 @@ pub(super) fn compile_patterns(
         let root_path = match root_kind {
             RootKind::Workspace => Some(fs.workspace_root()),
             RootKind::Home => fs.home_dir(),
+            RootKind::Filesystem => Some(Path::new("/")),
         };
         let Some(root_path) = root_path else {
             // A home-rooted pattern cannot match when no home directory is
@@ -60,6 +77,7 @@ pub(super) fn compile_patterns(
             negated,
             matchers: compile_matchers(&rooted.to_string_lossy())?,
             search_root: (!negated).then(|| derive_search_root(root_path, &stripped)),
+            segments: compile_segments(&rooted.to_string_lossy())?,
         });
     }
     Ok(compiled)
@@ -68,10 +86,11 @@ pub(super) fn compile_patterns(
 /// Splits a recognized leading `.`/`./`/`~`/`~/` rooting prefix off `pattern`,
 /// or leaves it untouched (workspace-relative) otherwise.
 ///
-/// The leading-`/` case is a deliberate, documented departure from the
-/// toolkit implementation's literal
-/// behavior (filesystem-absolute) in favor of the *docs'* description
-/// ("root level" of the repo) — see the inline comment on that arm.
+/// A leading `/` remains filesystem-absolute, matching the hosted runner's
+/// observed toolkit behavior. The public docs call `/src/*.js` a root-level
+/// repository pattern, but runner 2.336.0 returned no match for that form
+/// while `src/*.js` matched the workspace file in this observed run:
+/// <https://github.com/ShaneKanterman04/greenlit-app/actions/runs/29880046283>.
 fn strip_root_prefix(pattern: &str) -> (RootKind, String) {
     if pattern == "." {
         (RootKind::Workspace, String::new())
@@ -82,15 +101,11 @@ fn strip_root_prefix(pattern: &str) -> (RootKind, String) {
     } else if let Some(rest) = pattern.strip_prefix("~/") {
         (RootKind::Home, rest.to_string())
     } else if let Some(rest) = pattern.strip_prefix('/') {
-        // GitHub's docs define hashFiles paths relative to GITHUB_WORKSPACE
-        // and use `/src/*.js` for a repository-root match, while current
-        // @actions/glob source treats `/` as filesystem-absolute. GitHub's
-        // public workflow contract is authoritative for user-visible
-        // behavior, and the expression oracle pins this workspace-rooted
-        // interpretation.
-        // https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#hashfiles
+        // `hashFiles` still refuses to traverse or hash outside the provided
+        // workspace: the absolute search root is filtered by the RealFs and
+        // traversal containment boundary after compilation.
         // https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-pattern.ts
-        (RootKind::Workspace, rest.to_string())
+        (RootKind::Filesystem, rest.to_string())
     } else {
         (RootKind::Workspace, pattern.to_string())
     }
@@ -150,6 +165,71 @@ fn compile_one(pattern: &str) -> Result<globset::GlobMatcher, HashFilesError> {
             pattern: pattern.to_string(),
             source,
         })
+}
+
+/// Splits an already-rooted (but not yet brace-escaped) pattern into
+/// per-segment matchers for [`could_match_descendant`]'s prefix pruning.
+fn compile_segments(rooted: &str) -> Result<Vec<PatternSegment>, HashFilesError> {
+    escape_braces(rooted)
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if segment == "**" {
+                Ok(PatternSegment::DoubleStar)
+            } else {
+                compile_one(segment).map(PatternSegment::One)
+            }
+        })
+        .collect()
+}
+
+/// Toolkit-equivalent `match || partialMatch` pruning: is `path` (a
+/// directory reached so far during traversal) still a possible ancestor of
+/// something a positive pattern could match, or is it definitively outside
+/// every pattern's reach? Mirrors `@actions/glob`'s own descend-or-skip
+/// check, which is segment-wise against the pattern rather than a whole-path
+/// glob test:
+/// <https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-globber.ts>
+/// (`partialMatch`) and
+/// <https://github.com/actions/toolkit/blob/main/packages/glob/src/internal-pattern.ts>.
+/// Only non-negated patterns can discover new matches, so only those
+/// contribute; a negated pattern can only remove an already-found file
+/// later, never stop traversal into a directory.
+///
+/// This never prunes a directory that could still lead to a match — where
+/// a pattern segment is `**`, every deeper candidate is treated as
+/// reachable, even patterns with a *later*, non-`**`, segment that would
+/// realistically fail; that a directory more expensive to reach is
+/// occasionally kept anyway is a safe (if pessimistic) approximation, and
+/// only affects performance, never correctness.
+pub(super) fn could_match_descendant(patterns: &[CompiledPattern], path: &Path) -> bool {
+    let path = path.to_string_lossy();
+    let candidate: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    patterns
+        .iter()
+        .filter(|pattern| !pattern.negated)
+        .any(|pattern| segments_could_match(&pattern.segments, &candidate))
+}
+
+fn segments_could_match(pattern: &[PatternSegment], candidate: &[&str]) -> bool {
+    for (pattern_segment, candidate_segment) in pattern.iter().zip(candidate) {
+        match pattern_segment {
+            PatternSegment::DoubleStar => return true,
+            PatternSegment::One(matcher) => {
+                if !matcher.is_match(candidate_segment) {
+                    return false;
+                }
+            }
+        }
+    }
+    // The shorter side (whichever it is) ran out first: `candidate` is
+    // either a still-viable ancestor of `pattern`, or `pattern` was fully
+    // matched and its implicit `/**` suffix (see `compile_matchers`) covers
+    // any remaining depth in `candidate`. Either way, keep it.
+    true
 }
 
 /// Compiles one already-rooted pattern plus, unless it already ends in `**`,

@@ -35,12 +35,35 @@ pub struct StageDuration {
     pub duration_ms: f64,
 }
 
+/// One executed workflow step's duration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StepDuration {
+    /// Stable job-instance identifier.
+    pub job: String,
+    /// Stable step id or display label.
+    pub step: String,
+    /// Wall-clock duration in fractional milliseconds.
+    pub duration_ms: f64,
+}
+
+/// Hit/miss totals for one named local lookup/cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HitMissCounter {
+    /// Counter name, such as `action-fetch` or `toolcache`.
+    pub name: String,
+    /// Successful local hits.
+    pub hits: u64,
+    /// Misses requiring slower work.
+    pub misses: u64,
+}
+
 /// One appended record: the complete stage-timing breakdown of a single
 /// `litci plan` or `litci run` invocation.
 ///
 /// This is the stable, versioned unit written to
 /// `~/.litci/metrics/runs.ndjson`, one per line, newest last. Constructed via
-/// [`crate::Invocation::finish`]; read back via [`crate::MetricsStore::read_all`].
+/// [`crate::Invocation::finish`]; read back via
+/// [`crate::MetricsStore::read_recent`] or [`crate::MetricsStore::read_all`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvocationRecord {
     /// Schema version this record was written under. See [`SCHEMA_VERSION`].
@@ -59,6 +82,10 @@ pub struct InvocationRecord {
     pub total_duration_ms: f64,
     /// Per-stage timings, in the order each stage was opened.
     pub stages: Vec<StageDuration>,
+    /// Per-step timings; empty for `plan` invocations.
+    pub steps: Vec<StepDuration>,
+    /// Named hit/miss counters; empty until a lookup occurs.
+    pub hit_miss: Vec<HitMissCounter>,
 }
 
 #[cfg(test)]
@@ -91,6 +118,8 @@ mod tests {
                     duration_ms: 9.0,
                 },
             ],
+            steps: Vec::new(),
+            hit_miss: Vec::new(),
         };
 
         let json = serde_json::to_string(&record).expect("record must serialize");
@@ -98,7 +127,8 @@ mod tests {
             json,
             "{\"schema_version\":1,\"command\":\"plan\",\"started_at_unix_ms\":1700000000000,\
              \"total_duration_ms\":12.5,\"stages\":[{\"name\":\"parse\",\"duration_ms\":1.0},\
-             {\"name\":\"eval\",\"duration_ms\":2.5},{\"name\":\"plan\",\"duration_ms\":9.0}]}"
+             {\"name\":\"eval\",\"duration_ms\":2.5},{\"name\":\"plan\",\"duration_ms\":9.0}],\
+             \"steps\":[],\"hit_miss\":[]}"
         );
 
         // Round-trips back to an equal value, independent of the pinned

@@ -12,7 +12,9 @@
 //! network calls are made — every subcommand used here is local-only.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+mod base;
+mod process;
 
 /// Everything the synthetic event builder needs from the local git
 /// checkout: enough to populate `github.repository`, `github.ref`,
@@ -40,6 +42,22 @@ pub struct GitContext {
     /// `git config user.name`, falling back to `git config user.email`,
     /// falling back to the literal `"local"` when neither is configured.
     pub actor: String,
+    /// Paths changed by `HEAD`, relative to the repository root. Synthetic
+    /// push trigger path filters use this deterministic local change set.
+    pub changed_paths: Vec<String>,
+    /// Whether [`GitContext::changed_paths`] reached GitHub's 3,000-path
+    /// comparison boundary and further paths were deliberately not retained.
+    pub changed_paths_truncated: bool,
+    /// The local branch used as the synthetic pull request's base branch.
+    pub pull_request_base_branch: String,
+    /// Paths changed between the merge base of
+    /// [`GitContext::pull_request_base_branch`] and `HEAD`, relative to the
+    /// repository root.
+    pub pull_request_changed_paths: Vec<String>,
+    /// Whether [`GitContext::pull_request_changed_paths`] reached GitHub's
+    /// 3,000-path comparison boundary and further paths were deliberately not
+    /// retained.
+    pub pull_request_changed_paths_truncated: bool,
 }
 
 /// A failure collecting local git metadata.
@@ -78,26 +96,102 @@ pub enum GitError {
         /// The underlying I/O error's message.
         message: String,
     },
+    /// A required plumbing command exited unsuccessfully.
+    #[error("required 'git {args}' command failed: {message}")]
+    CommandUnsuccessful {
+        /// The subcommand and arguments that failed.
+        args: String,
+        /// Git's bounded diagnostic or exit status.
+        message: String,
+    },
+    /// A partial/promisor clone lacks an object required for truthful local
+    /// metadata, and Greenlit deliberately refused Git's lazy network fetch.
+    #[error("local repository is missing Git objects required by 'git {args}'")]
+    MissingObjects {
+        /// The read-only plumbing command that needed the object.
+        args: String,
+    },
+    /// A successful plumbing command produced more scalar stdout than can be
+    /// safely interpreted as one metadata value.
+    #[error("Git stdout from 'git {args}' exceeds the {max_bytes}-byte safety limit")]
+    OutputLimit {
+        /// The bounded local plumbing command.
+        args: String,
+        /// Maximum captured stdout bytes.
+        max_bytes: usize,
+    },
+    /// A NUL-delimited changed path exceeded the per-record memory bound.
+    #[error("a changed path from 'git {args}' exceeds the {max_bytes}-byte safety limit")]
+    ChangedPathLimit {
+        /// The bounded local diff command.
+        args: String,
+        /// Maximum bytes accepted for one changed path.
+        max_bytes: usize,
+    },
+    /// A local Git plumbing process did not complete within its fixed
+    /// deadline and was stopped.
+    #[error("'git {args}' exceeded the {seconds}-second local command deadline and was stopped")]
+    CommandTimedOut {
+        /// The bounded local plumbing command.
+        args: String,
+        /// Deadline in seconds.
+        seconds: u64,
+    },
 }
 
-/// Runs `git <args>` rooted at `repo_root`, returning trimmed stdout on
-/// success (exit code 0) or `None` on any non-zero exit (the plumbing
-/// subcommands used here signal "no such ref"/"no remote" this way, which
-/// is a normal, expected outcome — not itself an error).
-fn run_git(repo_root: &Path, args: &[&str]) -> Result<Option<String>, GitError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .map_err(|e| GitError::CommandFailed {
+fn missing_object_diagnostic(stderr: &str) -> bool {
+    let diagnostic = stderr.to_ascii_lowercase();
+    [
+        "could not fetch",
+        "promisor remote",
+        "missing blob",
+        "missing tree",
+        "bad object",
+        "unable to read tree",
+        "invalid object",
+    ]
+    .iter()
+    .any(|needle| diagnostic.contains(needle))
+}
+
+fn failed_command(
+    args: &[&str],
+    stderr: &[u8],
+    stderr_truncated: bool,
+    status: std::process::ExitStatus,
+) -> GitError {
+    let mut diagnostic = String::from_utf8_lossy(stderr).trim().to_string();
+    if stderr_truncated {
+        diagnostic.push_str(" [diagnostic truncated at 65536 bytes]");
+    }
+    if missing_object_diagnostic(&diagnostic) {
+        return GitError::MissingObjects {
             args: args.join(" "),
-            message: e.to_string(),
-        })?;
+        };
+    }
+    GitError::CommandUnsuccessful {
+        args: args.join(" "),
+        message: if diagnostic.is_empty() {
+            status.to_string()
+        } else {
+            diagnostic
+        },
+    }
+}
+
+/// Runs an optional Git query. Non-zero means an absent optional ref/config
+/// unless Git explicitly reports a missing object, which is never absence.
+fn run_git(repo_root: &Path, args: &[&str]) -> Result<Option<String>, GitError> {
+    let output = process::run_text(repo_root, args)?;
     if !output.status.success() {
+        if missing_object_diagnostic(&String::from_utf8_lossy(&output.stderr)) {
+            return Err(GitError::MissingObjects {
+                args: args.join(" "),
+            });
+        }
         return Ok(None);
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = String::from_utf8_lossy(&output.value).trim().to_string();
     if text.is_empty() {
         Ok(None)
     } else {
@@ -132,16 +226,57 @@ pub(crate) fn parse_owner_repo(remote_url: &str) -> Option<(String, String)> {
     Some((owner.to_string(), repo.to_string()))
 }
 
+/// Finds the root of the git worktree containing `path`.
+///
+/// This delegates to `git rev-parse --show-toplevel`, so worktrees and
+/// submodules follow git's own discovery rules.
+pub fn find_repository_root(path: &Path) -> Result<PathBuf, GitError> {
+    let path_display = path.display().to_string();
+    run_git(path, &["rev-parse", "--show-toplevel"])?
+        .map(PathBuf::from)
+        .ok_or(GitError::NotARepository { path: path_display })
+}
+
+/// Returns whether the working-tree file at `repo_relative` has exactly the
+/// blob content recorded for that path in `HEAD`.
+///
+/// A synthetic event can name `HEAD` as `github.workflow_sha` only when the
+/// parsed workflow really came from that commit. Untracked, staged, and
+/// unstaged workflow edits therefore return `false` rather than acquiring a
+/// misleading commit identity.
+pub(crate) fn file_matches_head(repo_root: &Path, repo_relative: &str) -> Result<bool, GitError> {
+    let head_spec = format!("HEAD:{repo_relative}");
+    let head_hash = run_git(repo_root, &["rev-parse", "--verify", &head_spec])?;
+    let working_hash = run_git(repo_root, &["hash-object", "--", repo_relative])?;
+    Ok(head_hash
+        .zip(working_hash)
+        .is_some_and(|(head, working)| head == working))
+}
+
+fn changed_paths(repo_root: &Path, range: &[&str]) -> Result<(Vec<String>, bool), GitError> {
+    let output = process::run_changed_paths(repo_root, range)?;
+    let (paths, truncated) = output.value;
+    if !truncated && !output.status.success() {
+        return Err(failed_command(
+            range,
+            &output.stderr,
+            output.stderr_truncated,
+            output.status,
+        ));
+    }
+    Ok((paths, truncated))
+}
+
 /// Collects [`GitContext`] from the repository containing `repo_root`.
 pub fn collect_git_context(repo_root: &Path) -> Result<GitContext, GitError> {
     let path_display = repo_root.display().to_string();
 
-    let toplevel = run_git(repo_root, &["rev-parse", "--show-toplevel"])?.ok_or_else(|| {
-        GitError::NotARepository {
+    let toplevel = find_repository_root(repo_root).map_err(|error| match error {
+        GitError::NotARepository { .. } => GitError::NotARepository {
             path: path_display.clone(),
-        }
+        },
+        other => other,
     })?;
-    let toplevel = PathBuf::from(toplevel);
 
     let sha = run_git(&toplevel, &["rev-parse", "HEAD"])?.ok_or_else(|| GitError::NoCommits {
         path: path_display.clone(),
@@ -154,6 +289,37 @@ pub fn collect_git_context(repo_root: &Path) -> Result<GitContext, GitError> {
     })?;
 
     let parent_sha = run_git(&toplevel, &["rev-parse", "HEAD~1"])?;
+    let (push_changed_paths, push_changed_paths_truncated) = changed_paths(
+        &toplevel,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "-r",
+            "--root",
+            "HEAD",
+        ],
+    )?;
+    let (pull_request_base_branch, pull_request_merge_base) =
+        base::pull_request_base(&toplevel, &branch)?;
+    // GitHub evaluates pull-request path filters with a three-dot diff from
+    // the merge base to the topic branch's latest commit, unlike a synthetic
+    // push, which describes only `HEAD` here.
+    // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#git-diff-comparisons
+    let pull_request_range = format!("{pull_request_merge_base}...HEAD");
+    let (pull_request_changed_paths, pull_request_changed_paths_truncated) = changed_paths(
+        &toplevel,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            &pull_request_range,
+        ],
+    )?;
 
     let remote_url = run_git(&toplevel, &["config", "--get", "remote.origin.url"])?;
     let (repository, repository_owner) = match remote_url.as_deref().and_then(parse_owner_repo) {
@@ -178,5 +344,10 @@ pub fn collect_git_context(repo_root: &Path) -> Result<GitContext, GitError> {
         sha,
         parent_sha,
         actor,
+        changed_paths: push_changed_paths,
+        changed_paths_truncated: push_changed_paths_truncated,
+        pull_request_base_branch,
+        pull_request_changed_paths,
+        pull_request_changed_paths_truncated,
     })
 }

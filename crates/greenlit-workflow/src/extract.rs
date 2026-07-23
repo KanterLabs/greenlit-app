@@ -1,10 +1,10 @@
 //! Static extraction: every `secrets.*`/`vars.*` reference, every dynamic
-//! use of the `vars` context, every `uses:` reference, and every
-//! `runs-on` value in a parsed workflow — the exact list
-//! `PHASE-1-engine-core.md`'s greenlit-workflow section asks for, needed
-//! before `litci run`/`litci plan` can resolve secrets/variables
-//! (`greenlit-v0-spec.md` "Secrets/vars") or validate runner labels
-//! ("Stable Linux x64 runners").
+//! use of the `vars` context, every statically identifiable
+//! `needs.<job>.outputs.<name>` reference, every `uses:` reference, and
+//! every `runs-on` value in a parsed workflow. The preflight inventory lets
+//! `litci run`/`litci plan` resolve secrets/variables
+//! (`greenlit-v0-spec.md` "Secrets/vars"), validate runner labels, and lint
+//! missing direct-dependency outputs independently of evaluation residue.
 //!
 //! # Extraction strategy
 //!
@@ -23,6 +23,10 @@
 //! *not* mistaken for a literal reference to a secret named `FOO` (the
 //! index is a `Call`, not a `Str`, so it falls through to the dynamic-vars/
 //! opaque-index handling below instead).
+//! `needs` output paths additionally accept context-free-computable bracket
+//! indexes such as `needs[format('{0}', 'build')]`; the real evaluator
+//! computes those indexes, while an index containing a runtime context is
+//! deliberately left unknown rather than guessed.
 //!
 //! This superseded an earlier interim version of this module that did its
 //! own best-effort raw-text token scanning, written before `greenlit-expr`
@@ -40,8 +44,12 @@ use crate::model::step::{Step, StepAction};
 use crate::model::value::{ScalarOrExpr, YamlValue};
 use crate::model::workflow::Workflow;
 use crate::span::{Span, Spanned};
-use greenlit_expr::ast::Expr;
 use std::collections::BTreeMap;
+
+mod walk;
+
+pub use walk::NeedsOutputReference;
+use walk::walk_expr;
 
 /// Everything statically discoverable from a parsed workflow without
 /// evaluating any expression.
@@ -68,10 +76,14 @@ pub struct StaticExtraction {
     pub uses: Vec<Spanned<String>>,
     /// Every `runs-on` value, in document order.
     pub runs_on: Vec<Spanned<String>>,
+    /// Literal or context-free-computable
+    /// `needs.<job>.outputs.<name>` references, in authored order.
+    pub needs_outputs: Vec<NeedsOutputReference>,
 }
 
 /// Scan a parsed workflow for every `secrets.*`/`vars.*` reference, dynamic
-/// `vars` use, `uses:` reference, and `runs-on` value.
+/// `vars` use, statically identifiable `needs` output reference, `uses:`
+/// reference, and `runs-on` value.
 ///
 /// # Errors
 /// Returns [`ParseError::Expression`] if a caller mutated a parsed model to
@@ -79,6 +91,12 @@ pub struct StaticExtraction {
 /// [`crate::parse_workflow`] have already passed the same grammar checks.
 pub fn extract_static(workflow: &Workflow) -> Result<StaticExtraction, ParseError> {
     let mut out = StaticExtraction::default();
+    if let Some(run_name) = &workflow.run_name {
+        // `vars` is available in `run-name` according to GitHub's context
+        // availability table.
+        // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
+        scan_wrapped_text(&run_name.value, &run_name.span, &mut out)?;
+    }
     for (_, v) in &workflow.env {
         scan_scalar_or_expr(v, &mut out)?;
     }
@@ -89,6 +107,7 @@ pub fn extract_static(workflow: &Workflow) -> Result<StaticExtraction, ParseErro
 }
 
 fn scan_job(job: &Job, out: &mut StaticExtraction) -> Result<(), ParseError> {
+    let needs_outputs_start = out.needs_outputs.len();
     if let Some(name) = &job.name {
         // `vars` is explicitly available in `jobs.<job_id>.name`:
         // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
@@ -130,6 +149,13 @@ fn scan_job(job: &Job, out: &mut StaticExtraction) -> Result<(), ParseError> {
     }
     for step in &job.steps {
         scan_step(step, out)?;
+    }
+    // Every expression traversed above belongs to this job. The shared AST
+    // walker records the exact expression span; attach the containing job
+    // once here so nested field scanners do not need a redundant job-id
+    // parameter solely for extraction bookkeeping.
+    for reference in &mut out.needs_outputs[needs_outputs_start..] {
+        reference.referencing_job.clone_from(&job.id.value);
     }
     Ok(())
 }
@@ -297,73 +323,4 @@ fn scan_wrapped_text(
         walk_expr(&expr, span, out);
     }
     Ok(())
-}
-
-fn record(out: &mut StaticExtraction, is_secrets: bool, name: &str, span: &Span) {
-    let map = if is_secrets {
-        &mut out.secrets
-    } else {
-        &mut out.vars
-    };
-    map.entry(name.to_owned()).or_default().push(span.clone());
-}
-
-fn record_dynamic_vars(out: &mut StaticExtraction, span: &Span) {
-    out.has_dynamic_vars_lookup = true;
-    out.dynamic_vars.push(span.clone());
-}
-
-/// Walks a parsed expression tree for `secrets.*`/`vars.*` references —
-/// see this module's doc comment for exactly which AST shape is matched
-/// and why the dot/bracket forms need no separate handling.
-fn walk_expr(expr: &Expr, span: &Span, out: &mut StaticExtraction) {
-    match expr {
-        Expr::Null | Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => {}
-        Expr::NamedValue(root) => {
-            if root.eq_ignore_ascii_case("vars") {
-                record_dynamic_vars(out, span);
-            }
-        }
-        Expr::Not(inner) => walk_expr(inner, span, out),
-        Expr::Wildcard { target } => {
-            if matches!(target.as_ref(), Expr::NamedValue(root) if root.eq_ignore_ascii_case("vars"))
-            {
-                record_dynamic_vars(out, span);
-            } else {
-                walk_expr(target, span, out);
-            }
-        }
-        Expr::Binary { lhs, rhs, .. } => {
-            walk_expr(lhs, span, out);
-            walk_expr(rhs, span, out);
-        }
-        Expr::Call { args, .. } => {
-            for a in args {
-                walk_expr(a, span, out);
-            }
-        }
-        Expr::Index { target, index } => {
-            if let Expr::NamedValue(root) = target.as_ref() {
-                let is_secrets = root.eq_ignore_ascii_case("secrets");
-                let is_vars = root.eq_ignore_ascii_case("vars");
-                if is_secrets || is_vars {
-                    match index.as_ref() {
-                        Expr::Str(name) => record(out, is_secrets, name, span),
-                        _ => {
-                            if is_vars {
-                                record_dynamic_vars(out, span);
-                            }
-                            // A non-literal index (e.g. `secrets[format(...)]`)
-                            // can itself reference `secrets.*`/`vars.*`;
-                            // keep walking it rather than dropping it.
-                            walk_expr(index, span, out);
-                        }
-                    }
-                    return;
-                }
-            }
-            walk_expr(target, span, out);
-            walk_expr(index, span, out);
-        }
-    }
 }

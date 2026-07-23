@@ -10,7 +10,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use greenlit_expr::{Context, RealFs, Value, evaluate, parse};
 use std::hint::black_box;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A representative, moderately complex expression: property/index access
 /// through two contexts, an object filter, a boolean short-circuit, and a
@@ -25,7 +25,7 @@ fn sample_context() -> Context {
         Value::object(vec![("name".into(), Value::String("enhancement".into()))]),
     ]);
     let event = Value::object(vec![("labels".into(), labels)]);
-    Context::new(Rc::new(RealFs::new(std::env::temp_dir())))
+    Context::new(Arc::new(RealFs::new(std::env::temp_dir())))
         .with_github(Value::object(vec![("event".into(), event)]))
         .with_matrix(Value::object(vec![(
             "os".into(),

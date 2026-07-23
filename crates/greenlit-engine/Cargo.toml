@@ -20,20 +20,20 @@ greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
 thiserror = "2.0.19"
 # `ExecutionPlan` and its constituent types derive `Serialize` so
 # `greenlit-app` can produce the stable `litci plan --json` document directly
-# from this crate's types without re-deriving the schema; see the design
-# memo §3.4/§4.4 ("Stable `--json` schema").
+# from this crate's types without re-deriving the stable plan schema.
 serde = { version = "1.0.229", features = ["derive"] }
-# Order-preserving maps: matrix axis/leg keys, env layers, and job outputs
-# all have declaration-order-significant iteration per the design memo
-# ("Use `IndexMap` ... everywhere order matters") and the determinism
-# contract ("identical input file => byte-identical --json (ordered
-# maps...)"). Built with the `serde` feature so it participates directly in
-# the derives above.
-indexmap = { version = "2.14.0", features = ["serde"] }
-
-[dev-dependencies]
-# Used only by this crate's own tests to inspect the shape of serialized
-# plan documents (individual field values, not a literal stable-surface
-# snapshot — that snapshot's one real home is `crates/greenlit-app/tests/`
-# per `TESTING.md`).
+# Streams the stable plan representation into a bounded byte counter while
+# planning, preventing matrix/context amplification before CLI rendering.
 serde_json = "1.0.151"
+# Order-preserving maps: matrix axis/leg keys, env layers, and job outputs
+# all have declaration-order-significant iteration under GitHub's documented
+# matrix ordering and the byte-stable JSON contract. Built with the `serde`
+# feature so it participates directly in the derives above.
+indexmap = { version = "2.14.0", features = ["serde"] }
+# Named evaluation/assembly spans are consumed by greenlit-metrics' local
+# timing layer when the engine is called from `litci`.
+tracing = "0.1.44"
+# GitHub trigger filters use a documented glob grammar whose `?` and `+`
+# quantifiers differ from filesystem glob crates. The event matcher compiles
+# that grammar to anchored regular expressions.
+regex = "1.13.1"

@@ -18,6 +18,14 @@ sha2 = "0.11.0"
 # (`dot:true, nobrace:true, noext:true, nonegate:true`, Linux case-sensitive)
 # rather than globset's own looser defaults — see `functions::hash_files`.
 globset = "0.4.19"
+# Linux descriptor-relative opens keep `hashFiles` pinned to the workspace
+# directory even while an untrusted checkout is concurrently renamed or
+# replaces symlinks. The existing workspace already pins this rustix release.
+rustix = { version = "1.1.4", features = ["fs"] }
+# Newtonsoft accepts unquoted object keys using .NET's Char.IsLetterOrDigit
+# (Unicode General Categories L*/Nd), which Rust's broader `is_alphanumeric`
+# cannot reproduce exactly. The 0.6 line pins Unicode 15.0, matching .NET 8.
+unicode-general-category = "0.6.0"
 
 [dev-dependencies]
 criterion = "0.8.2"

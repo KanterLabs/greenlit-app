@@ -11,14 +11,14 @@
 //! additionally restricts which of these eleven roots are legal in a given
 //! workflow key (the "Context availability" table — e.g. `secrets` is not
 //! legal in `jobs.<id>.if`); this crate treats all eleven roots as always
-//! resolvable and leaves the narrower per-key allow-list to
-//! `greenlit-workflow`, which walks the public
-//! [`crate::ast::Expr`] tree themselves to find referenced root names.
+//! resolvable and leaves narrower per-key allow-lists to the workflow parser
+//! and planner, which can inspect the public [`crate::ast::Expr`] tree with
+//! the authored workflow-key location in hand.
 
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
-use crate::functions::hash_files::HashFilesFs;
+use crate::functions::hash_files::{HashFilesClock, HashFilesFs, SystemHashFilesClock};
 use crate::value::Value;
 
 /// The fixed, case-insensitive set of context root names this crate
@@ -55,7 +55,8 @@ pub enum RunStatus {
 
 /// Everything an expression evaluation needs: one [`Value`] per context
 /// root, the current [`RunStatus`] for the status-check functions, and an
-/// injected [`HashFilesFs`] for `hashFiles()`.
+/// injected [`HashFilesFs`] and acceleration-only [`HashFilesClock`] for
+/// `hashFiles()`.
 ///
 /// Construct with [`Context::new`] (all value roots default to an empty
 /// object, `matrix` defaults to `Null` since not every job has a matrix
@@ -75,18 +76,20 @@ pub struct Context {
     job: Value,
     inputs: Value,
     status: RunStatus,
-    fs: Rc<dyn HashFilesFs>,
+    fs: Arc<dyn HashFilesFs>,
+    hash_files_clock: Arc<dyn HashFilesClock>,
 }
 
 impl Context {
     /// Builds a context with every root defaulted to an empty object
     /// (`matrix` to `Null`, since a job without a matrix strategy has no
     /// matrix context data) and [`RunStatus::Success`], backed by `fs` for
-    /// `hashFiles()`.
-    pub fn new(fs: Rc<dyn HashFilesFs>) -> Self {
+    /// `hashFiles()`. The filesystem is shared with a bounded worker because
+    /// a timed-out host operation may finish after evaluation has returned.
+    pub fn new(fs: Arc<dyn HashFilesFs>) -> Self {
         Context {
             github: Value::object(vec![]),
-            env: Value::object(vec![]),
+            env: Value::case_sensitive_object(vec![]),
             vars: Value::object(vec![]),
             secrets: Value::object(vec![]),
             needs: Value::object(vec![]),
@@ -98,6 +101,7 @@ impl Context {
             inputs: Value::object(vec![]),
             status: RunStatus::default(),
             fs,
+            hash_files_clock: Arc::new(SystemHashFilesClock),
         }
     }
 
@@ -107,9 +111,19 @@ impl Context {
         self
     }
     /// Sets the `env` context root (conventionally an `Object` flat string
-    /// map).
+    /// map). Object keys are normalized to case-sensitive lookup because v0
+    /// runs on Linux and Actions treats environment variable names as case
+    /// sensitive. Nested object values retain their own comparison policy.
     pub fn with_env(mut self, v: Value) -> Self {
-        self.env = v;
+        self.env = match v {
+            Value::Object(object) => Value::case_sensitive_object(
+                object
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.clone()))
+                    .collect(),
+            ),
+            other => other,
+        };
         self
     }
     /// Sets the `vars` context root (conventionally an `Object` flat string
@@ -170,6 +184,19 @@ impl Context {
         self
     }
 
+    /// Supplies a supplemental clock for deterministic `hashFiles()`
+    /// deadline verification.
+    ///
+    /// The evaluator always uses the greater of real monotonic elapsed time
+    /// and this clock's reported elapsed time. This seam can therefore only
+    /// accelerate the non-configurable 120-second deadline; it cannot delay
+    /// or disable it. The clock may be queried concurrently by the caller and
+    /// filesystem worker.
+    pub fn with_hash_files_clock(mut self, clock: Arc<dyn HashFilesClock>) -> Self {
+        self.hash_files_clock = clock;
+        self
+    }
+
     /// The current [`RunStatus`] the status-check functions evaluate
     /// against.
     pub fn status(&self) -> RunStatus {
@@ -181,8 +208,12 @@ impl Context {
         self.fs.workspace_root()
     }
 
-    pub(crate) fn fs(&self) -> &dyn HashFilesFs {
-        self.fs.as_ref()
+    pub(crate) fn fs(&self) -> Arc<dyn HashFilesFs> {
+        Arc::clone(&self.fs)
+    }
+
+    pub(crate) fn hash_files_clock(&self) -> Arc<dyn HashFilesClock> {
+        Arc::clone(&self.hash_files_clock)
     }
 
     /// Resolves a context root name case-insensitively, matching the

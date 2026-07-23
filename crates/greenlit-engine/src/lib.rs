@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 //! `greenlit-engine`: the planner.
 //!
@@ -54,13 +55,14 @@ pub use git::GitError;
 pub use graph::{DependencyCycle, GraphError, JobId};
 pub use lints::{Lint, LintKind};
 pub use matrix::{
-    DEFAULT_MAX_MATRIX_LEGS, LegOrigin, MatrixError, MatrixLeg, MatrixValue, StrategyPlan,
+    DEFAULT_MAX_MATRIX_LEGS, DeferredMatrixExpression, LegOrigin, MatrixError, MatrixKey,
+    MatrixLeg, MatrixPlan, MatrixValue, StrategyControl, StrategyPlan,
 };
 pub use outputs::{JobOutputsPlan, PlannedOutput, PlannedValue};
 pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue};
 pub use plan::{
     ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanError, PlanOptions,
-    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, plan,
+    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, plan, validate_v0_support,
 };
 pub use planned::{Evaluation, Planned};
 pub use runner::{

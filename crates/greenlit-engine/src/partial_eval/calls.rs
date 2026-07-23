@@ -221,9 +221,10 @@ fn evaluate_call(
         name: name.to_string(),
         args,
     };
-    Ok(Folded::Value(greenlit_expr::evaluate(
+    Ok(Folded::Value(greenlit_expr::evaluate_with_options(
         &expression,
         &ctx.static_context(),
+        greenlit_expr::EvaluationOptions::new(greenlit_expr::WORKFLOW_TEMPLATE_MAX_MEMORY_BYTES),
     )?))
 }
 

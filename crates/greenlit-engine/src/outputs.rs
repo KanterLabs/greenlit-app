@@ -2,19 +2,21 @@
 //! inventing values.
 //!
 //! `PHASE-1-engine-core.md` requires outputs to remain runtime-deferred
-//! without invented values. Output *names* are fully static (declared in the workflow
-//! file); output *values* are templates whose interpolations this module
-//! partially evaluates with exactly the same machinery as `if:` conditions
-//! (`crate::partial_eval`). GitHub's `needs` context exposes those values
-//! only after the producing job completes:
+//! without invented values. Output *names* are fully static (declared in
+//! the workflow file); output *values* are templates whose interpolations
+//! this module partially evaluates with exactly the same machinery as `if:`
+//! conditions (`crate::partial_eval`). GitHub's `needs` context exposes
+//! those values only after the producing job completes:
 //! <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context>.
 
+use greenlit_workflow::Span;
 use indexmap::IndexMap;
 use serde::Serialize;
 
 use crate::condition::DeferredExpr;
 use crate::json_shape::EvaluatedJson;
-use crate::partial_eval::{FoldCtx, PartialEvalError, TemplateFold, fold_template};
+use crate::partial_eval::{FoldCtx, LocatedEvalError, TemplateFold, fold_template};
+use crate::plan::{PlanSizeBudget, RetainedFieldError};
 
 /// One job's `outputs:` block, plan-time resolved as far as possible.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -29,6 +31,8 @@ pub struct JobOutputsPlan {
 /// plan-time evaluation result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlannedOutput {
+    /// Location of the authored output value.
+    pub span: Span,
     /// Verbatim authored text (including the `${{ }}` wrapper, unlike a
     /// condition's `source` — an output value keeps whatever literal text
     /// surrounds its placeholders, since it is a template, not a bare
@@ -58,6 +62,7 @@ impl Serialize for PlannedOutput {
     {
         match &self.value {
             PlannedValue::Static(s) => EvaluatedJson {
+                span: self.span.to_string(),
                 source: &self.source,
                 evaluation: "static",
                 value: Some(s),
@@ -66,6 +71,7 @@ impl Serialize for PlannedOutput {
             }
             .serialize(serializer),
             PlannedValue::Deferred(d) => EvaluatedJson::<String> {
+                span: self.span.to_string(),
                 source: &self.source,
                 evaluation: "deferred",
                 value: None,
@@ -80,12 +86,16 @@ impl Serialize for PlannedOutput {
 /// Folds every declared `outputs:` entry's raw template text into a
 /// [`JobOutputsPlan`], preserving declaration order.
 pub(crate) fn plan_outputs(
-    raw_outputs: &[(String, String)],
+    raw_outputs: &[(String, String, Span)],
     ctx: &FoldCtx<'_>,
-) -> Result<JobOutputsPlan, PartialEvalError> {
+    size_budget: &mut PlanSizeBudget,
+) -> Result<JobOutputsPlan, RetainedFieldError> {
     let mut entries = IndexMap::with_capacity(raw_outputs.len());
-    for (name, raw) in raw_outputs {
-        let value = match fold_template(raw, ctx)? {
+    for (name, raw, span) in raw_outputs {
+        let value = match fold_template(raw, ctx).map_err(|source| LocatedEvalError {
+            span: span.clone(),
+            source,
+        })? {
             TemplateFold::Static(v) => {
                 PlannedValue::Static(greenlit_expr::value::to_display_string(&v))
             }
@@ -99,13 +109,13 @@ pub(crate) fn plan_outputs(
                 defers_on: defers_on.into_iter().collect(),
             }),
         };
-        entries.insert(
-            name.clone(),
-            PlannedOutput {
-                source: raw.clone(),
-                value,
-            },
-        );
+        let planned = PlannedOutput {
+            span: span.clone(),
+            source: raw.clone(),
+            value,
+        };
+        size_budget.add(&(name.as_str(), &planned), span)?;
+        entries.insert(name.clone(), planned);
     }
     Ok(JobOutputsPlan { entries })
 }

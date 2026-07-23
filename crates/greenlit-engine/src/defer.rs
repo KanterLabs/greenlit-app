@@ -8,7 +8,11 @@
 //! `steps.<id>.outputs.*`/`.outcome`/`.conclusion`, the four status-check
 //! functions, `hashFiles(...)`, `runner.*`, `job.*`, and `secrets.*` (at
 //! step level; job-level `secrets.*` is a hard `PartialEvalError`
-//! instead, per the docs' job-`if` context-availability rule).
+//! instead, per the docs' job-`if` context-availability rule). Synthetic
+//! event-backed `github.*` properties remain static when locally knowable;
+//! event-specific identities (such as a pull request's merge SHA), runner-,
+//! run-, and API-backed properties defer explicitly rather than becoming
+//! invented empty or placeholder values.
 
 use crate::graph::JobId;
 
@@ -79,13 +83,23 @@ pub enum DeferReason {
     /// A `hashFiles(...)` call — reads the runner workspace, which does not
     /// exist at plan time.
     HashFiles,
-    /// An `env.<name>` reference where `<name>` is not statically resolvable
-    /// from the declared `env:` chain. Runtime workflow commands may still
-    /// set it through `GITHUB_ENV`, so planning must defer it.
+    /// An `env.<name>` reference whose value may be changed or created by a
+    /// preceding executable step through `GITHUB_ENV`, or whose indexed key
+    /// cannot be reduced to one scalar name at planning time.
     DynamicEnv {
         /// The referenced env var name, or `"*"` for a dynamically indexed
-        /// `env[...]` access whose selected name is not a string literal.
+        /// `env[...]` access whose selected name cannot be reduced to a
+        /// single scalar value.
         name: String,
+    },
+    /// A property in the `github` context that is not available from the
+    /// Phase 1 synthetic event, or the context as a whole (`property: None`).
+    /// Runtime-only examples include `github.workspace` and
+    /// `github.action`; API-backed examples include `github.actor_id`.
+    GithubContext {
+        /// The documented property name, or `None` for a whole-context
+        /// reference such as `toJSON(github)`.
+        property: Option<String>,
     },
     /// Any reference into the `runner` context — modeled wholesale as
     /// runtime-only, even for sub-fields that are in
@@ -95,6 +109,12 @@ pub enum DeferReason {
     RunnerContext,
     /// Any reference into the `job` context.
     JobContext,
+    /// A `matrix.*` reference while a prerequisite-produced matrix has not
+    /// yet been expanded into concrete legs.
+    MatrixContext,
+    /// A `strategy.*` reference whose values depend on a matrix that has not
+    /// yet been expanded.
+    StrategyContext,
     /// A `secrets.*` reference outside job-level `if` (where it is instead a
     /// hard plan error — see `crate::partial_eval::PartialEvalError::SecretsForbiddenInJobCondition`).
     SecretsContext,

@@ -9,18 +9,21 @@ use crate::span::{Span, Spanned};
 /// A fully parsed `.github/workflows/*.yml` file.
 ///
 /// Covers everything `PHASE-1-engine-core.md`'s greenlit-workflow section
-/// lists: `on` (all trigger forms), `env`, `defaults`, `permissions`, and
-/// `jobs`. `concurrency` is recognized but not deeply modeled (see
-/// [`UnsupportedConstruct`]); `run-name` and job-level `permissions` are not
-/// modeled at all in v0 (see the crate-level docs' "Known limitations").
+/// lists: `run-name`, `on` (all trigger forms), `env`, `defaults`,
+/// `permissions`, and `jobs`. `concurrency` is recognized but not deeply
+/// modeled (see [`UnsupportedConstruct`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workflow {
     /// The whole-document span.
     pub span: Span,
     /// `name:` — display name. Plain text; GitHub does not evaluate
-    /// expressions in the workflow-level `name` key (unlike `run-name`,
-    /// which this crate does not model — see crate docs).
+    /// expressions in the workflow-level `name` key.
     pub name: Option<Spanned<String>>,
+    /// `run-name:` — workflow-run display name. GitHub evaluates template
+    /// expressions here using only the `github`, `inputs`, and `vars`
+    /// contexts. An omitted value, or one that resolves to only whitespace,
+    /// uses GitHub's event-specific default run name.
+    pub run_name: Option<Spanned<String>>,
     /// `on:` — every trigger, normalized from whichever of the three YAML
     /// forms was used.
     pub on: Vec<Spanned<Trigger>>,
@@ -53,15 +56,12 @@ pub struct RunDefaults {
     pub working_directory: Option<Spanned<ScalarOrExpr>>,
 }
 
-/// `permissions:` at the workflow level (job-level `permissions:` is not
-/// modeled in v0 — see crate docs' "Known limitations").
+/// A workflow- or job-level `permissions:` declaration.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Permissions {
     /// `permissions: read-all` / `permissions: write-all`.
     All(PermissionLevelAll),
-    /// `permissions: {}` is `Scoped(vec![])`; `permissions:` with no value
-    /// is also schema-valid and modeled the same way as an empty scope set
-    /// (GitHub docs: omitting a scope defaults it to `none`).
+    /// `permissions: {}` is `Scoped(vec![])`; omitted scopes are `none`.
     Scoped(Vec<(Spanned<String>, Spanned<PermissionLevel>)>),
 }
 

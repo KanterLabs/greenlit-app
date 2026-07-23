@@ -3,6 +3,9 @@
 
 use greenlit_workflow::{ParseError, parse_workflow};
 
+#[path = "expression_validation/template_synthesis.rs"]
+mod template_synthesis;
+
 const QUOTE_AWARE_EXPRESSION: &str = "${{ format('it''s }} {0}', vars.VALUE) }}";
 const UNCLOSED_EXPRESSION: &str = "${{ vars.VALUE";
 
@@ -17,6 +20,10 @@ fn every_modeled_expression_site_uses_quote_aware_delimiters_and_reports_unclose
     // strings, including doubled-quote escapes:
     // https://github.com/actions/runner/blob/main/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateReader.cs
     let rows = [
+        TemplateRow {
+            name: "run name",
+            source: "run-name: __EXPR__\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        },
         TemplateRow {
             name: "workflow env",
             source: "on: push\nenv:\n  VALUE: __EXPR__\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
@@ -138,10 +145,6 @@ fn every_modeled_expression_site_uses_quote_aware_delimiters_and_reports_unclose
             source: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"__EXPR__\"\n",
         },
         TemplateRow {
-            name: "step shell",
-            source: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: __EXPR__\n        run: echo hi\n",
-        },
-        TemplateRow {
             name: "step with",
             source: "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          path: __EXPR__\n",
         },
@@ -184,6 +187,12 @@ fn context_and_special_function_availability_is_validated_at_each_workflow_key()
     // Rows are transcribed from GitHub's current context-availability table:
     // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability
     let rejected = [
+        PolicyRow {
+            name: "env in run name",
+            source: "run-name: ${{ env.LABEL }}\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+            expected_context: "run-name",
+            expected_message: "context 'env'",
+        },
         PolicyRow {
             name: "needs in workflow env",
             source: "on: push\nenv:\n  VALUE: ${{ needs.build.result }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
@@ -279,6 +288,10 @@ fn context_and_special_function_availability_is_validated_at_each_workflow_key()
 
     let accepted = [
         (
+            "github inputs and vars in run name",
+            "run-name: Deploy ${{ inputs.target }} by ${{ github.actor }} in ${{ vars.REGION }}\non: workflow_dispatch\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
+        ),
+        (
             "secrets in workflow env",
             "on: push\nenv:\n  VALUE: ${{ secrets.VALUE }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
         ),
@@ -356,6 +369,11 @@ fn expressions_are_rejected_at_documented_non_expression_sites() {
             "step id",
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - id: ${{ vars.ID }}\n        run: echo hi\n",
             "jobs.build.steps[0].id",
+        ),
+        (
+            "step shell",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: ${{ vars.SHELL }}\n        run: echo hi\n",
+            "jobs.build.steps[0].shell",
         ),
         (
             "step uses",

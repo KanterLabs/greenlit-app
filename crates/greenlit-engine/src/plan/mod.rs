@@ -5,6 +5,7 @@
 //! `job`, one step in `step`, skip propagation in `skip`, and the stable
 //! public contract/error types in `types` and `error`.
 
+mod budget;
 mod conditions;
 mod contexts;
 mod error;
@@ -16,6 +17,7 @@ mod step;
 mod types;
 
 pub use error::PlanError;
+pub(crate) use error::RetainedFieldError;
 pub use types::{
     ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanOptions,
     RunDefaultsPlan, StaticSkip, StepKind, StepPlan,
@@ -30,9 +32,13 @@ use greenlit_workflow::model::workflow::{
 use crate::event::SyntheticEvent;
 use crate::graph::{JobId, build_graph};
 use crate::lints::Lint;
-use crate::partial_eval::{EnvChain, FoldCtx, StaticRoots, StrategyDeferred};
+use crate::partial_eval::{
+    EnvChain, FoldCtx, NeedsContextSlots, StaticRoots, StepsContextSlots, StrategyDeferred,
+    build_env_chain,
+};
 use crate::pass_through::plan_env_layer;
-use crate::planned::{plan_scalar_string, plan_template_string};
+use crate::planned::{Evaluation, plan_scalar_string, plan_template_string};
+pub(crate) use budget::PlanSizeBudget;
 
 /// Plans `workflow` against `event`, using `options` for local variable
 /// overrides. The single entrypoint `greenlit-app` calls.
@@ -47,17 +53,29 @@ pub fn plan(
         stage = "eval"
     );
     let evaluation_guard = evaluation_span.enter();
-    reject_unsupported_workflow_constructs(workflow)?;
+    validate_v0_support(workflow)?;
+    let static_extraction = greenlit_workflow::extract_static(workflow).map_err(|source| {
+        PlanError::StaticExtraction {
+            source: Box::new(source),
+        }
+    })?;
 
     let null = Value::Null;
+    let empty_context = Value::object(vec![]);
+    let empty_needs_slots = NeedsContextSlots::default();
+    let empty_steps_slots = StepsContextSlots::default();
     let roots = StaticRoots {
         github: &event.github,
+        github_deferred: &event.deferred_github_properties,
         vars: &options.vars,
-        needs: None,
+        needs: &empty_context,
+        needs_slots: &empty_needs_slots,
         matrix: &null,
         matrix_deferred: false,
         strategy: &null,
         strategy_deferred: StrategyDeferred::default(),
+        steps: &empty_context,
+        steps_slots: &empty_steps_slots,
         inputs: &event.inputs,
     };
     let empty_env = EnvChain::empty();
@@ -66,22 +84,77 @@ pub fn plan(
         env: &empty_env,
         secrets_forbidden: false,
     };
-    let env =
-        plan_env_layer(&workflow.env, &workflow_ctx).map_err(|error| PlanError::WorkflowEval {
-            span: error.span,
-            source: Box::new(error.source),
+    let mut size_budget = PlanSizeBudget::new();
+    let run_name = workflow
+        .run_name
+        .as_ref()
+        .map(|run_name| {
+            plan_template_string(&run_name.value, &run_name.span, &workflow_ctx).map_err(|source| {
+                PlanError::WorkflowEval {
+                    span: run_name.span.clone(),
+                    source: Box::new(source),
+                }
+            })
+        })
+        .transpose()?
+        // GitHub falls back to event-specific run information when the
+        // resolved run name contains only whitespace.
+        // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#run-name
+        .filter(|planned| {
+            !matches!(&planned.evaluation, Evaluation::Static(value) if value.trim().is_empty())
+        });
+    if let Some(planned) = &run_name {
+        size_budget.add(planned, &planned.span)?;
+    }
+    let env = plan_env_layer(&workflow.env, &workflow_ctx, &mut size_budget)
+        .map_err(workflow_retained_error)?;
+    // Workflow-level env may use only workflow-invariant roots. Build its
+    // lookup chain once and share it across every job and matrix leg.
+    let workflow_env_chain =
+        build_env_chain(&[workflow.env.as_slice()], roots).map_err(|error| {
+            PlanError::WorkflowEval {
+                span: error.span,
+                source: Box::new(error.source),
+            }
         })?;
-    let defaults = plan_workflow_defaults(workflow, &workflow_ctx)?;
+    let defaults = plan_workflow_defaults(workflow, &workflow_ctx, &mut size_budget)?;
     let permissions = workflow.permissions.as_ref().map(plan_permissions);
+    let permissions_span = workflow
+        .permissions
+        .as_ref()
+        .map_or(&workflow.span, |permissions| &permissions.span);
+    size_budget.add(&permissions, permissions_span)?;
 
     let graph = build_graph(&workflow.jobs)?;
+    let reference_index =
+        references::WorkflowReferenceIndex::new(workflow, &static_extraction.needs_outputs);
 
     let mut lints = Vec::new();
     let mut job_plans: Vec<JobPlan> = Vec::with_capacity(workflow.jobs.len());
-    for job in &workflow.jobs {
-        reject_unsupported_job_constructs(job)?;
+    for (job_index, job) in workflow.jobs.iter().enumerate() {
+        let effective_permissions = job.permissions.as_ref().or(workflow.permissions.as_ref());
         lint_duplicate_needs(job, &mut lints);
-        let job_plan = job::plan_job(workflow, job, event, options, &graph, &mut lints)?;
+        let mut planning_state = job::PlanningState {
+            lints: &mut lints,
+            size_budget: &mut size_budget,
+            workflow_env: &workflow_env_chain,
+            references: &reference_index,
+            job_index,
+        };
+        let mut job_plan =
+            job::plan_job(workflow, job, event, options, &graph, &mut planning_state)?;
+        // GitHub documents job-level permissions as a complete replacement
+        // for the workflow declaration for that job. Within a scoped
+        // declaration, every omitted scope becomes `none`.
+        // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_idpermissions
+        let effective_permissions = effective_permissions.map(plan_permissions);
+        let effective_permissions_span = job
+            .permissions
+            .as_ref()
+            .or(workflow.permissions.as_ref())
+            .map_or(&job.id.span, |permissions| &permissions.span);
+        size_budget.add(&effective_permissions, effective_permissions_span)?;
+        job_plan.permissions = effective_permissions;
         job_plans.push(job_plan);
     }
 
@@ -97,15 +170,28 @@ pub fn plan(
     skip::propagate_static_skip(&graph, &mut job_plans);
     references::lint_matrix_output_collisions(&job_plans, &mut lints);
 
+    for job in &job_plans {
+        size_budget.add(&job.skip, &job.span)?;
+        for leg in &job.legs {
+            size_budget.add(&leg.skip, &job.span)?;
+        }
+    }
+    size_budget.add(&lints, &workflow.span)?;
+
     let topo_order: Vec<JobId> = graph
         .topo_order()
         .iter()
         .map(|idx| graph.id_of(*idx).clone())
         .collect();
+    size_budget.add(&topo_order, &workflow.span)?;
+    let event_name = event.kind.event_name().to_string();
+    size_budget.add(&event_name, &workflow.span)?;
+    size_budget.add_bytes(512, &workflow.span)?;
 
     let execution_plan = ExecutionPlan {
         schema_version: 1,
-        event_name: event.kind.event_name().to_string(),
+        event_name,
+        run_name,
         env,
         defaults,
         permissions,
@@ -118,9 +204,28 @@ pub fn plan(
     Ok(execution_plan)
 }
 
+/// Rejects every parsed construct that Greenlit deliberately excludes from
+/// v0, without requiring an event, local variables, or any other planning
+/// input.
+///
+/// CLI callers invoke this immediately after workflow parsing so a missing
+/// variable or mismatched synthetic event cannot obscure the authored
+/// unsupported construct. [`plan`] invokes it again to keep the library
+/// entrypoint independently safe and complete.
+pub fn validate_v0_support(workflow: &Workflow) -> Result<(), PlanError> {
+    reject_unsupported_workflow_constructs(workflow)?;
+    for job in &workflow.jobs {
+        reject_unsupported_job_constructs(job)?;
+        let effective_permissions = job.permissions.as_ref().or(workflow.permissions.as_ref());
+        reject_oidc_permissions(effective_permissions)?;
+    }
+    Ok(())
+}
+
 fn plan_workflow_defaults(
     workflow: &Workflow,
     ctx: &FoldCtx<'_>,
+    size_budget: &mut PlanSizeBudget,
 ) -> Result<RunDefaultsPlan, PlanError> {
     let run = workflow
         .defaults
@@ -137,6 +242,9 @@ fn plan_workflow_defaults(
             })
         })
         .transpose()?;
+    if let Some(planned) = &shell {
+        size_budget.add(planned, &planned.span)?;
+    }
     let working_directory = run
         .and_then(|run| run.value.working_directory.as_ref())
         .map(|directory| {
@@ -146,10 +254,23 @@ fn plan_workflow_defaults(
             })
         })
         .transpose()?;
+    if let Some(planned) = &working_directory {
+        size_budget.add(planned, &planned.span)?;
+    }
     Ok(RunDefaultsPlan {
         shell,
         working_directory,
     })
+}
+
+fn workflow_retained_error(error: RetainedFieldError) -> PlanError {
+    match error {
+        RetainedFieldError::Evaluation(error) => PlanError::WorkflowEval {
+            span: error.span,
+            source: Box::new(error.source),
+        },
+        RetainedFieldError::Limit(error) => error,
+    }
 }
 
 fn plan_permissions(permissions: &greenlit_workflow::Spanned<Permissions>) -> PermissionsPlan {
@@ -202,6 +323,32 @@ fn reject_unsupported_job_constructs(job: &Job) -> Result<(), PlanError> {
         });
     }
     Ok(())
+}
+
+fn reject_oidc_permissions(
+    permissions: Option<&greenlit_workflow::Spanned<Permissions>>,
+) -> Result<(), PlanError> {
+    let Some(permissions) = permissions else {
+        return Ok(());
+    };
+    let oidc_span = match &permissions.value {
+        // `write-all` grants every available write permission, including
+        // `id-token: write`. Greenlit v0 deliberately has no OIDC provider.
+        // https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#permissions
+        Permissions::All(PermissionLevelAll::WriteAll) => Some(&permissions.span),
+        Permissions::All(PermissionLevelAll::ReadAll) => None,
+        Permissions::Scoped(entries) => entries.iter().find_map(|(scope, level)| {
+            (scope.value == "id-token" && level.value == PermissionLevel::Write)
+                .then_some(&level.span)
+        }),
+    };
+    match oidc_span {
+        Some(span) => Err(PlanError::NotSupportedInV0 {
+            name: "OIDC (`permissions: id-token: write`)",
+            span: span.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 fn lint_duplicate_needs(job: &Job, lints: &mut Vec<Lint>) {

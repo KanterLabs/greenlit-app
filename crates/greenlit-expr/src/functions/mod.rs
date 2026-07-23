@@ -9,10 +9,10 @@
 //! Arities are independent of evaluated data, which is why `lookup_arity`
 //! is consulted by the *parser* (a wrong-arity call is a
 //! [`crate::error::ParseError`], not an [`crate::error::EvalError`]). The
-//! public Expressions reference is authoritative for `format`: it requires
-//! a format string plus at least one replacement and specifies no maximum
-//! number of replacements.
-//! <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#format>
+//! runner's function registry is authoritative for `format`: it accepts
+//! one to 255 total arguments (the format string plus up to 254 replacement
+//! values).
+//! <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/ExpressionConstants.cs>
 
 pub(crate) mod affixes;
 pub(crate) mod contains;
@@ -40,7 +40,7 @@ pub(crate) fn lookup_arity(name: &str) -> Option<Arity> {
         "contains" => a(2, 2, "2"),
         "startswith" => a(2, 2, "2"),
         "endswith" => a(2, 2, "2"),
-        "format" => a(2, usize::MAX, "2 or more"),
+        "format" => a(1, 255, "1-255"),
         "join" => a(1, 2, "1-2"),
         "tojson" => a(1, 1, "1"),
         "fromjson" => a(1, 1, "1"),

@@ -1,90 +1,165 @@
-//! Assembles one [`StepPlan`].
+//! Assembles one [`StepPlan`] with every context-sensitive field explicitly
+//! static or runtime-deferred.
 
-use greenlit_expr::value::to_display_string;
-use greenlit_workflow::model::job::Job;
 use greenlit_workflow::model::step::{Step, StepAction};
 use greenlit_workflow::model::value::ScalarOrExpr;
-use greenlit_workflow::model::workflow::Workflow;
 
 use crate::condition::plan_condition;
-use crate::convert::scalar_to_value;
 use crate::graph::JobId;
-use crate::partial_eval::{
-    FoldCtx, PartialEvalError, StaticRoots, TemplateFold, build_env_chain, fold_template,
+use crate::partial_eval::{EnvChain, FoldCtx, StaticRoots, extend_env_chain};
+use crate::pass_through::plan_env_layer;
+use crate::planned::{
+    Planned, plan_scalar_bool, plan_scalar_number, plan_scalar_string, plan_template_string,
 };
-use crate::pass_through::env_layer_to_map;
 
-use super::job::{eval_err, expr_calls_status};
-use super::{PlanError, StepKind, StepPlan};
+use super::conditions::expr_calls_status;
+use super::error::{eval_err, located_eval_err, retained_field_err};
+use super::{PlanError, PlanSizeBudget, StepKind, StepPlan};
 
 pub(crate) fn plan_step(
-    workflow: &Workflow,
-    job: &Job,
     step: &Step,
     steps_roots: &StaticRoots<'_>,
+    job_env: &EnvChain,
     job_id: &JobId,
+    prior_step_can_mutate_env: bool,
+    size_budget: &mut PlanSizeBudget,
 ) -> Result<StepPlan, PlanError> {
-    let step_id = step.id.as_ref().map(|s| s.value.clone());
+    let step_id = step.id.as_ref().map(|id| id.value.clone());
+    if let (Some(id), Some(planned_id)) = (&step.id, &step_id) {
+        size_budget.add(planned_id, &id.span)?;
+    }
+    let mut outer_env = job_env.clone();
+    if prior_step_can_mutate_env {
+        outer_env = outer_env.after_executable_step();
+    }
+    let step_layer_ctx = FoldCtx {
+        roots: *steps_roots,
+        env: &outer_env,
+        secrets_forbidden: false,
+    };
+    let env = plan_env_layer(&step.env, &step_layer_ctx, size_budget)
+        .map_err(|error| retained_field_err(job_id, step_id.as_deref(), error))?;
 
-    let step_env_layers: [&[(
-        greenlit_workflow::Spanned<String>,
-        greenlit_workflow::Spanned<ScalarOrExpr>,
-    )]; 3] = [&workflow.env, &job.env, &step.env];
-    let step_env_chain = build_env_chain(&step_env_layers, *steps_roots)
-        .map_err(|source| eval_err(job_id, step_id.as_deref(), source))?;
+    let step_env = extend_env_chain(&outer_env, &step.env, *steps_roots, true)
+        .map_err(|error| located_eval_err(job_id, step_id.as_deref(), error))?;
     let step_ctx = FoldCtx {
         roots: *steps_roots,
-        env: &step_env_chain,
+        env: &step_env,
         secrets_forbidden: false,
     };
 
-    let condition = match &step.if_condition {
-        None => None,
-        Some(raw) => Some(
-            plan_condition(&raw.value, &step_ctx)
-                .map_err(|source| eval_err(job_id, step_id.as_deref(), source))?,
-        ),
-    };
-    let implicit_status_gate = match &step.if_condition {
-        None => true,
-        Some(raw) => !expr_calls_status(&raw.value),
-    };
+    let condition = step
+        .if_condition
+        .as_ref()
+        .map(|raw| {
+            plan_condition(&raw.value, &raw.span, &step_ctx)
+                .map_err(|source| eval_err(job_id, step_id.as_deref(), raw.span.clone(), source))
+        })
+        .transpose()?;
+    if let (Some(raw), Some(planned)) = (&step.if_condition, &condition) {
+        size_budget.add(planned, &raw.span)?;
+    }
+    let implicit_status_gate = step
+        .if_condition
+        .as_ref()
+        .is_none_or(|raw| !expr_calls_status(&raw.value));
 
-    let name = match &step.name {
-        None => None,
-        Some(n) => Some(
-            resolve_display_name(&n.value, &step_ctx)
-                .map_err(|source| eval_err(job_id, step_id.as_deref(), source))?,
-        ),
-    };
+    let name = step
+        .name
+        .as_ref()
+        .map(|name| {
+            plan_scalar_string(name, &step_ctx)
+                .map_err(|source| eval_err(job_id, step_id.as_deref(), name.span.clone(), source))
+        })
+        .transpose()?;
+    if let (Some(raw), Some(planned)) = (&step.name, &name) {
+        size_budget.add(planned, &raw.span)?;
+    }
+    let working_directory = plan_optional_scalar_string(
+        step.working_directory.as_ref(),
+        &step_ctx,
+        job_id,
+        step_id.as_deref(),
+    )?;
+    if let (Some(raw), Some(planned)) = (&step.working_directory, &working_directory) {
+        size_budget.add(planned, &raw.span)?;
+    }
+    let continue_on_error = step
+        .continue_on_error
+        .as_ref()
+        .map(|value| {
+            plan_scalar_bool(value, &step_ctx)
+                .map_err(|source| eval_err(job_id, step_id.as_deref(), value.span.clone(), source))
+        })
+        .transpose()?;
+    if let (Some(raw), Some(planned)) = (&step.continue_on_error, &continue_on_error) {
+        size_budget.add(planned, &raw.span)?;
+    }
+    let timeout_minutes = step
+        .timeout_minutes
+        .as_ref()
+        .map(|value| {
+            plan_scalar_number(value, &step_ctx)
+                .map_err(|source| eval_err(job_id, step_id.as_deref(), value.span.clone(), source))
+        })
+        .transpose()?;
+    if let (Some(raw), Some(planned)) = (&step.timeout_minutes, &timeout_minutes) {
+        size_budget.add(planned, &raw.span)?;
+    }
 
     let kind = match &step.action {
-        StepAction::Run { script, shell } => StepKind::Run {
-            script: script.value.clone(),
-            shell: shell.as_ref().map(|s| s.value.clone()),
-        },
-        StepAction::Uses { reference, with } => StepKind::Uses {
-            reference: reference.value.clone(),
-            with: env_layer_to_map(with),
-        },
+        StepAction::Run { script, shell } => {
+            let script_plan = plan_template_string(&script.value, &script.span, &step_ctx)
+                .map_err(|source| {
+                    eval_err(job_id, step_id.as_deref(), script.span.clone(), source)
+                })?;
+            size_budget.add(&script_plan, &script.span)?;
+            let shell_plan = shell.as_ref().map(|shell| {
+                Planned::static_value(shell.span.clone(), shell.value.clone(), shell.value.clone())
+            });
+            if let (Some(raw), Some(planned)) = (shell, &shell_plan) {
+                size_budget.add(planned, &raw.span)?;
+            }
+            StepKind::Run {
+                script: Box::new(script_plan),
+                shell: shell_plan,
+            }
+        }
+        StepAction::Uses { reference, with } => {
+            size_budget.add(&reference.value, &reference.span)?;
+            StepKind::Uses {
+                reference: reference.value.clone(),
+                with: plan_env_layer(with, &step_ctx, size_budget)
+                    .map_err(|error| retained_field_err(job_id, step_id.as_deref(), error))?,
+            }
+        }
     };
+
+    size_budget.add_bytes(192, &step.span)?;
 
     Ok(StepPlan {
         id: step_id,
         name,
-        env: env_layer_to_map(&step.env),
+        env,
+        working_directory,
+        continue_on_error,
+        timeout_minutes,
         condition,
         implicit_status_gate,
         kind,
     })
 }
 
-fn resolve_display_name(v: &ScalarOrExpr, ctx: &FoldCtx<'_>) -> Result<String, PartialEvalError> {
-    match v {
-        ScalarOrExpr::Literal(s) => Ok(to_display_string(&scalar_to_value(s))),
-        ScalarOrExpr::Expression(text) => match fold_template(text, ctx)? {
-            TemplateFold::Static(v) => Ok(to_display_string(&v)),
-            TemplateFold::Deferred { residual_text, .. } => Ok(residual_text),
-        },
-    }
+fn plan_optional_scalar_string(
+    value: Option<&greenlit_workflow::Spanned<ScalarOrExpr>>,
+    ctx: &FoldCtx<'_>,
+    job_id: &JobId,
+    step_id: Option<&str>,
+) -> Result<Option<crate::planned::Planned<String>>, PlanError> {
+    value
+        .map(|value| {
+            plan_scalar_string(value, ctx)
+                .map_err(|source| eval_err(job_id, step_id, value.span.clone(), source))
+        })
+        .transpose()
 }

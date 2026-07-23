@@ -2,8 +2,8 @@
 //! deterministic topological/"wave" order used for both rendering and (in
 //! later phases) scheduling.
 //!
-//! Source: design memo §2 ("The `needs` graph: types, cycle detection,
-//! topological order"), itself transcribing the docs' `needs` semantics —
+//! `PHASE-1-engine-core.md` requires DAG construction and named-cycle
+//! rejection. GitHub documents the underlying `needs` semantics —
 //! "a string or array of strings" naming "jobs that must complete
 //! successfully before this job will run"; "if a job fails or is skipped,
 //! all jobs that need it are skipped unless the jobs use a conditional
@@ -11,13 +11,17 @@
 //! [Using jobs in a workflow](https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/using-jobs-in-a-workflow)).
 //! Jobs without `needs` run in parallel; for a matrix job, `needs` is
 //! job-granular (every leg of the needed job must complete before any leg
-//! of the dependent starts) — this graph stays at job granularity, matching
-//! the design memo's explicit instruction: "Keep the plan graph at job
-//! granularity; leg fan-out happens inside a job node."
+//! of the dependent starts) — this graph stays at job granularity, while
+//! matrix leg fan-out remains inside each job plan.
 
 use std::collections::HashMap;
 
+use greenlit_workflow::Span;
 use greenlit_workflow::model::job::Job;
+
+mod error;
+
+pub use error::{DependencyCycle, GraphError};
 
 /// A job's identifier — the `jobs:` mapping key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
@@ -39,164 +43,62 @@ impl From<&str> for JobId {
 /// `Copy` handle used everywhere internally instead of cloning [`JobId`]
 /// strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JobIdx(pub u32);
+pub(crate) struct JobIdx(pub(crate) u32);
 
 /// The `needs` graph, built once per plan.
 ///
 /// `JobIdx` values are dense indices into declaration order (the order jobs
-/// appear in the workflow file) — design memo §2.2: "this order is the
-/// deterministic tie-break for everything downstream."
+/// appear in the workflow file), used as the deterministic tie-break for
+/// stable plan output.
 #[derive(Debug, Clone)]
-pub struct JobGraph {
+pub(crate) struct JobGraph {
     ids: Vec<JobId>,
     by_id: HashMap<JobId, JobIdx>,
-    /// `deps[j]` = the jobs `j` needs (edge `j -> dep`), deduplicated,
-    /// preserving the `needs:` list's declaration order.
-    deps: Vec<Vec<JobIdx>>,
-    /// Reverse adjacency: `dependents[j]` = jobs that need `j`.
-    dependents: Vec<Vec<JobIdx>>,
     /// The unique topological order that is lexicographically smallest by
-    /// declaration index (design memo §2.3 step 3) — only populated when
+    /// declaration index — only populated when
     /// the graph is acyclic.
     topo_order: Vec<JobIdx>,
     /// `wave[j] = 0` if `deps[j]` is empty, else `1 + max(wave[d])` over
-    /// `d` in `deps[j]` — longest-path depth (design memo §2.3 step 4).
+    /// `d` in `deps[j]` — longest-path depth.
     wave: Vec<u32>,
 }
 
-/// Everything that can go wrong building a [`JobGraph`] from a workflow's
-/// `jobs:` list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GraphError {
-    /// A job's `needs:` entry names a job id that isn't defined anywhere in
-    /// the workflow.
-    UnknownNeed {
-        /// The job whose `needs:` list has the bad reference.
-        job: JobId,
-        /// The unknown job id it referenced.
-        needs: JobId,
-    },
-    /// One or more dependency cycles were found — every disjoint cycle is
-    /// reported at once (design memo §2.3 step 1: "better UX than
-    /// fix-one-rerun-find-next"). Each [`DependencyCycle`]'s own `Display`
-    /// renders the full `a -> b -> c -> a` walk, and this error's own
-    /// `Display` joins every disjoint named cycle into one diagnostic.
-    Cycles(Vec<DependencyCycle>),
-}
-
-impl std::fmt::Display for GraphError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            GraphError::UnknownNeed { job, needs } => {
-                write!(f, "job '{job}' needs unknown job '{needs}'")
-            }
-            GraphError::Cycles(cycles) => {
-                for (index, cycle) in cycles.iter().enumerate() {
-                    if index > 0 {
-                        write!(f, "; ")?;
-                    }
-                    write!(f, "{cycle}")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-impl std::error::Error for GraphError {}
-
-/// One dependency cycle: a closed walk in the "needs" direction
-/// (`members[i]` needs `members[(i + 1) % len]`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DependencyCycle {
-    /// The cycle's members, in canonical walk order starting at the
-    /// lexicographically smallest [`JobId`] — a self-dependency is a
-    /// 1-cycle (`members = [j]`).
-    pub members: Vec<JobId>,
-}
-
-impl std::fmt::Display for DependencyCycle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "dependency cycle: ")?;
-        for (i, m) in self.members.iter().enumerate() {
-            if i > 0 {
-                write!(f, " -> ")?;
-            }
-            write!(f, "{m}")?;
-        }
-        if let Some(first) = self.members.first() {
-            write!(f, " -> {first}")?;
-        }
-        Ok(())
-    }
-}
-
 impl JobGraph {
-    /// The jobs in declaration order.
-    #[must_use]
-    pub fn job_ids(&self) -> &[JobId] {
-        &self.ids
-    }
-
     /// Looks up the dense index for a job id.
     #[must_use]
-    pub fn idx_of(&self, id: &JobId) -> Option<JobIdx> {
+    pub(crate) fn idx_of(&self, id: &JobId) -> Option<JobIdx> {
         self.by_id.get(id).copied()
     }
 
     /// The job id a dense index refers to.
     #[must_use]
-    pub fn id_of(&self, idx: JobIdx) -> &JobId {
+    pub(crate) fn id_of(&self, idx: JobIdx) -> &JobId {
         &self.ids[idx.0 as usize]
     }
 
-    /// The jobs `idx` needs (edges `idx -> dep`), in `needs:` declaration
-    /// order, deduplicated.
-    #[must_use]
-    pub fn deps_of(&self, idx: JobIdx) -> &[JobIdx] {
-        &self.deps[idx.0 as usize]
-    }
-
-    /// The jobs that need `idx`.
-    #[must_use]
-    pub fn dependents_of(&self, idx: JobIdx) -> &[JobIdx] {
-        &self.dependents[idx.0 as usize]
-    }
-
-    /// The deterministic topological order (design memo §2.3 step 3):
+    /// The deterministic topological order:
     /// Kahn's algorithm with a min-heap keyed by declaration index, giving
     /// the unique topo order that is lexicographically smallest by
     /// declaration order.
     #[must_use]
-    pub fn topo_order(&self) -> &[JobIdx] {
+    pub(crate) fn topo_order(&self) -> &[JobIdx] {
         &self.topo_order
     }
 
     /// `wave(j)`: `0` if `j` has no dependencies, else `1 + max` of its
     /// dependencies' waves — how the human tree shows parallelism.
     #[must_use]
-    pub fn wave(&self, idx: JobIdx) -> u32 {
+    pub(crate) fn wave(&self, idx: JobIdx) -> u32 {
         self.wave[idx.0 as usize]
-    }
-
-    /// How many jobs are in the graph.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.ids.len()
-    }
-
-    /// Whether the graph has no jobs at all.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
     }
 }
 
 /// Builds the `needs` graph from a workflow's jobs, validating every
-/// `needs:` reference and rejecting any dependency cycle (design memo §2.1
-/// "Validation errors").
-pub fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
+/// `needs:` reference and rejecting any dependency cycle as required by
+/// `PHASE-1-engine-core.md`.
+pub(crate) fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
     let ids: Vec<JobId> = jobs.iter().map(|j| JobId(j.id.value.clone())).collect();
+    let spans: Vec<Span> = jobs.iter().map(|job| job.id.span.clone()).collect();
     let by_id: HashMap<JobId, JobIdx> = ids
         .iter()
         .enumerate()
@@ -211,12 +113,13 @@ pub fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
             let need_id = JobId(need.value.clone());
             let Some(&idx) = by_id.get(&need_id) else {
                 return Err(GraphError::UnknownNeed {
+                    span: need.span.clone(),
                     job: JobId(job.id.value.clone()),
                     needs: need_id,
                 });
             };
-            // Duplicate entries in one `needs:` list are a lint concern
-            // (design memo §2.1), deduplicated here at the graph-edge
+            // Duplicate entries in one `needs:` list are a lint concern,
+            // deduplicated here at the graph-edge
             // level; the lint itself is emitted by `crate::plan` while it
             // still has the raw job model in hand (it can see the actual
             // duplicated span there, which this graph representation no
@@ -235,7 +138,7 @@ pub fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
         }
     }
 
-    let cycles = find_cycles(&ids, &deps);
+    let cycles = find_cycles(&ids, &spans, &deps);
     if !cycles.is_empty() {
         return Err(GraphError::Cycles(cycles));
     }
@@ -246,14 +149,12 @@ pub fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
     Ok(JobGraph {
         ids,
         by_id,
-        deps,
-        dependents,
         topo_order,
         wave,
     })
 }
 
-/// Iterative Tarjan's SCC (design memo §2.3 step 1), returning one
+/// Iterative Tarjan's SCC, returning one
 /// [`DependencyCycle`] per strongly-connected component of size >= 2, plus
 /// every single node with a self-edge — "avoid recursion so a pathological
 /// 10k-job file cannot overflow the stack."
@@ -264,7 +165,7 @@ pub fn build_graph(jobs: &[Job]) -> Result<JobGraph, GraphError> {
 /// node's adjacency list, and popping a fully-scanned frame is a return —
 /// at which point its final `lowlink` is folded into the (now top-of-stack)
 /// caller's, exactly as a `return`-then-`min()` would.
-fn find_cycles(ids: &[JobId], deps: &[Vec<JobIdx>]) -> Vec<DependencyCycle> {
+fn find_cycles(ids: &[JobId], spans: &[Span], deps: &[Vec<JobIdx>]) -> Vec<DependencyCycle> {
     let n = ids.len();
     let mut visited: Vec<bool> = vec![false; n];
     let mut index: Vec<u32> = vec![0; n];
@@ -331,7 +232,7 @@ fn find_cycles(ids: &[JobId], deps: &[Vec<JobIdx>]) -> Vec<DependencyCycle> {
         if !is_cycle {
             continue;
         }
-        if let Some(cycle) = build_cycle_display(ids, deps, scc) {
+        if let Some(cycle) = build_cycle_display(ids, spans, deps, scc) {
             cycles.push(cycle);
         }
     }
@@ -341,14 +242,15 @@ fn find_cycles(ids: &[JobId], deps: &[Vec<JobIdx>]) -> Vec<DependencyCycle> {
     cycles
 }
 
-/// Reconstructs one concrete witness loop for an SCC's member set (design
-/// memo §2.3 step 2). An iterative depth-first search starts at the
+/// Reconstructs one concrete witness loop for an SCC's member set. An
+/// iterative depth-first search starts at the
 /// lexicographically smallest member and finds a simple path back to that
 /// start. Every adjacent pair therefore comes directly from `deps`; a
 /// tempting greedy walk is incorrect because it can enter a smaller
 /// sub-cycle that does not contain the canonical start.
 fn build_cycle_display(
     ids: &[JobId],
+    spans: &[Span],
     deps: &[Vec<JobIdx>],
     scc: &[usize],
 ) -> Option<DependencyCycle> {
@@ -356,17 +258,26 @@ fn build_cycle_display(
     let member_set: std::collections::HashSet<usize> = scc.iter().copied().collect();
     let start = *scc.iter().min_by_key(|&&node| &ids[node]).unwrap_or(&first);
 
-    let mut path = vec![start];
-    let mut cursors = vec![0usize];
-    let mut on_path = std::collections::HashSet::from([start]);
-
-    while let Some(&current) = path.last() {
-        let mut neighbors: Vec<usize> = deps[current]
+    // Cache and sort each SCC member's adjacency once. Rebuilding the same
+    // neighbor vector on every DFS cursor advance made a dense cyclic SCC
+    // repeat allocation, filtering, and sorting once per outgoing edge.
+    let mut scc_neighbors = std::collections::HashMap::with_capacity(scc.len());
+    for &node in scc {
+        let mut neighbors: Vec<usize> = deps[node]
             .iter()
             .map(|dependency| dependency.0 as usize)
             .filter(|dependency| member_set.contains(dependency))
             .collect();
         neighbors.sort_by(|left, right| ids[*left].cmp(&ids[*right]));
+        scc_neighbors.insert(node, neighbors);
+    }
+
+    let mut path = vec![start];
+    let mut cursors = vec![0usize];
+    let mut on_path = std::collections::HashSet::from([start]);
+
+    while let Some(&current) = path.last() {
+        let neighbors = scc_neighbors.get(&current)?;
 
         let cursor = cursors.last_mut()?;
         if *cursor >= neighbors.len() {
@@ -380,6 +291,7 @@ fn build_cycle_display(
         *cursor += 1;
         if next == start {
             return Some(DependencyCycle {
+                span: spans[start].clone(),
                 members: path.into_iter().map(|index| ids[index].clone()).collect(),
             });
         }
@@ -391,8 +303,8 @@ fn build_cycle_display(
     None
 }
 
-/// Kahn's algorithm with a min-heap keyed by declaration index (design memo
-/// §2.3 step 3), producing the unique topo order that is lexicographically
+/// Kahn's algorithm with a min-heap keyed by declaration index, producing
+/// the unique topo order that is lexicographically
 /// smallest by declaration order. Only called once [`find_cycles`] has
 /// confirmed the graph is acyclic, so it always fully drains.
 fn kahn_topo_order(deps: &[Vec<JobIdx>], dependents: &[Vec<JobIdx>]) -> Vec<JobIdx> {
@@ -423,7 +335,7 @@ fn kahn_topo_order(deps: &[Vec<JobIdx>], dependents: &[Vec<JobIdx>]) -> Vec<JobI
 }
 
 /// `wave(j) = 0` if `deps[j]` is empty, else `1 + max(wave(d))` — one pass
-/// over the topo order (design memo §2.3 step 4).
+/// over the topo order.
 fn compute_waves(topo_order: &[JobIdx], deps: &[Vec<JobIdx>]) -> Vec<u32> {
     let mut wave = vec![0u32; deps.len()];
     for &idx in topo_order {

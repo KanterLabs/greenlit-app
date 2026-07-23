@@ -2,18 +2,18 @@
 
 use crate::model::step::Step;
 use crate::model::value::{ScalarOrExpr, UnsupportedConstruct, YamlValue};
-use crate::model::workflow::Defaults;
+use crate::model::workflow::{Defaults, Permissions};
 use crate::span::{Span, Spanned};
 
 /// One entry of `jobs:`, in file order.
 ///
-/// Covers `runs-on`, `needs`, `if`, `outputs`, `env`, `defaults`,
+/// Covers `runs-on`, `needs`, `if`, `outputs`, `env`, `defaults`, `permissions`,
 /// `strategy.matrix` (`include`/`exclude`/`fail-fast`/`max-parallel`),
 /// `services`, `container`, and `steps`, per `PHASE-1-engine-core.md`.
 /// `name` is additionally modeled (see crate docs' "Known deviations" —
 /// omitting a basic display-name string would make nearly every
-/// realistically-named job fail to parse). Job-level `permissions:` is not
-/// modeled (same docs section). A job defined as a reusable-workflow call
+/// realistically-named job fail to parse). A job defined as a
+/// reusable-workflow call
 /// (`jobs.<id>.uses:` instead of `steps:`) is recognized via
 /// [`Job::reusable_call`] rather than deeply parsed — reusable workflows
 /// are out of v0 scope.
@@ -40,6 +40,9 @@ pub struct Job {
     pub env: Vec<(Spanned<String>, Spanned<ScalarOrExpr>)>,
     /// `defaults:` at the job level.
     pub defaults: Option<Spanned<Defaults>>,
+    /// `permissions:` at the job level. When present, this declaration
+    /// replaces the workflow-level declaration for this job.
+    pub permissions: Option<Spanned<Permissions>>,
     /// `strategy:`.
     pub strategy: Option<Spanned<Strategy>>,
     /// `services:`, in file order.

@@ -17,4 +17,7 @@ mod trigger;
 mod util;
 mod workflow;
 
-pub use workflow::{parse_workflow, parse_workflow_file};
+pub use workflow::{
+    MAX_WORKFLOW_SOURCE_CHARACTERS, parse_workflow, parse_workflow_file,
+    parse_workflow_file_with_name,
+};

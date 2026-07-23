@@ -12,7 +12,7 @@ use greenlit_workflow::model::value::{ScalarOrExpr, YamlValue};
 use crate::lints::Lint;
 use crate::partial_eval::{FoldCtx, TemplateFold, fold_template};
 
-use super::algorithm::run_algorithm;
+use super::algorithm::{checked_product_cardinality, run_algorithm};
 use super::{MatrixError, MatrixLeg, MatrixValue, ResolvedEntry, value_kind_name};
 
 pub(super) fn expand_matrix_source(
@@ -25,6 +25,65 @@ pub(super) fn expand_matrix_source(
         MatrixSource::Inline(matrix) => expand_inline_matrix(matrix, span, ctx, cap),
         MatrixSource::Expression(text) => expand_expression_matrix(text, ctx, cap),
     }
+}
+
+/// Validates every matrix fragment whose value is already known even when
+/// another fragment keeps the matrix as a whole runtime-deferred. Deferral
+/// is not permission to postpone an error Greenlit can prove now.
+pub(super) fn validate_static_fragments(
+    source: &MatrixSource,
+    source_span: &Span,
+    ctx: &FoldCtx<'_>,
+    cap: usize,
+) -> Result<(), MatrixError> {
+    let MatrixSource::Inline(matrix) = source else {
+        return Ok(());
+    };
+    let mut minimum_axis_cardinalities = Vec::with_capacity(matrix.axes.len());
+    for (name, values) in &matrix.axes {
+        let mut minimum_cardinality = 0_usize;
+        for value in values {
+            let known_values = match &value.value {
+                YamlValue::Scalar(ScalarOrExpr::Expression(raw)) => {
+                    match fold_template(raw, ctx).map_err(|source| MatrixError::PartialEval {
+                        span: value.span.clone(),
+                        source,
+                    })? {
+                        TemplateFold::Static(greenlit_expr::Value::Array(items)) => {
+                            items.items().len()
+                        }
+                        TemplateFold::Deferred { .. } => 0,
+                        TemplateFold::Static(actual) => {
+                            return Err(MatrixError::ExpressionFieldNotArray {
+                                field: name.value.clone(),
+                                actual: value_kind_name(&actual),
+                                span: value.span.clone(),
+                            });
+                        }
+                    }
+                }
+                // A literal, sequence, or mapping is one matrix value even
+                // if data nested inside it remains deferred. Only a
+                // top-level expression yielding an array is spliced.
+                _ => 1,
+            };
+            minimum_cardinality =
+                minimum_cardinality
+                    .checked_add(known_values)
+                    .ok_or_else(|| MatrixError::CardinalityOverflow {
+                        cap,
+                        span: source_span.clone(),
+                    })?;
+        }
+        minimum_axis_cardinalities.push(minimum_cardinality);
+    }
+    checked_product_cardinality(&minimum_axis_cardinalities, cap, source_span)?;
+    if let Some(entry) = matrix.exclude.iter().find(|entry| entry.value.is_empty()) {
+        return Err(MatrixError::EmptyExcludeEntry {
+            span: entry.span.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn expand_inline_matrix(
@@ -184,19 +243,20 @@ fn expr_value_to_matrix_value(v: &greenlit_expr::Value) -> MatrixValue {
         greenlit_expr::Value::Null => MatrixValue::Null,
         greenlit_expr::Value::Bool(b) => MatrixValue::Bool(*b),
         greenlit_expr::Value::Number(n) => MatrixValue::Number(*n),
-        greenlit_expr::Value::String(s) => MatrixValue::String(s.clone()),
+        greenlit_expr::Value::String(s) => MatrixValue::String(s.clone().into()),
         greenlit_expr::Value::Array(items) => MatrixValue::Sequence(
             items
                 .items()
                 .iter()
                 .map(expr_value_to_matrix_value)
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
         ),
-        greenlit_expr::Value::Object(obj) => MatrixValue::Mapping(
+        greenlit_expr::Value::Object(obj) => MatrixValue::Mapping(std::sync::Arc::new(
             obj.iter()
                 .map(|(k, v)| (k.to_string(), expr_value_to_matrix_value(v)))
                 .collect(),
-        ),
+        )),
     }
 }
 
@@ -232,14 +292,14 @@ fn convert_yaml_value(
         YamlValue::Sequence(items) => {
             let converted: Result<Vec<_>, _> =
                 items.iter().map(|i| convert_yaml_value(i, ctx)).collect();
-            Ok(MatrixValue::Sequence(converted?))
+            Ok(MatrixValue::Sequence(converted?.into()))
         }
         YamlValue::Mapping(entries) => {
             let mut m = IndexMap::new();
             for (k, val) in entries {
                 m.insert(k.value.clone(), convert_yaml_value(val, ctx)?);
             }
-            Ok(MatrixValue::Mapping(m))
+            Ok(MatrixValue::Mapping(std::sync::Arc::new(m)))
         }
     }
 }
@@ -250,6 +310,6 @@ fn scalar_to_matrix_value(s: &greenlit_workflow::model::value::YamlScalar) -> Ma
         YamlScalar::Null => MatrixValue::Null,
         YamlScalar::Bool(b) => MatrixValue::Bool(*b),
         YamlScalar::Number(n) => MatrixValue::Number(*n),
-        YamlScalar::String(s) => MatrixValue::String(s.clone()),
+        YamlScalar::String(s) => MatrixValue::String(s.clone().into()),
     }
 }

@@ -17,7 +17,7 @@ use super::{Value, to_number};
 /// comparison, including non-ASCII casing:
 /// <https://learn.microsoft.com/en-us/dotnet/api/system.stringcomparer.ordinalignorecase>.
 pub fn ordinal_ignore_case_eq(a: &str, b: &str) -> bool {
-    ordinal_uppercase(a) == ordinal_uppercase(b)
+    ordinal_ignore_case_key(a) == ordinal_ignore_case_key(b)
 }
 
 /// Applies the one-scalar uppercase mapping used by .NET's ordinal comparer.
@@ -43,9 +43,14 @@ fn ordinal_upper(character: char) -> char {
     }
 }
 
-/// Produces the invariant, one-scalar uppercase representation shared by all
-/// OrdinalIgnoreCase operations in this crate.
-fn ordinal_uppercase(s: &str) -> String {
+/// Produces the invariant, one-scalar uppercase representation used by
+/// .NET's ordinal-ignore-case dictionaries and comparisons.
+///
+/// Callers that need a hash-map key with the same equality policy as the
+/// Actions runner can store this canonical form instead of falling back to
+/// repeated linear comparisons.
+#[must_use]
+pub fn ordinal_ignore_case_key(s: &str) -> String {
     s.chars().map(ordinal_upper).collect()
 }
 
@@ -53,21 +58,21 @@ fn ordinal_uppercase(s: &str) -> String {
 /// `IndexOf(..., StringComparison.OrdinalIgnoreCase)` implementation:
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/Contains.cs>.
 pub fn ordinal_ignore_case_contains(haystack: &str, needle: &str) -> bool {
-    ordinal_uppercase(haystack).contains(&ordinal_uppercase(needle))
+    ordinal_ignore_case_key(haystack).contains(&ordinal_ignore_case_key(needle))
 }
 
 /// Case-insensitive prefix test, matching the runner's
 /// `StringComparison.OrdinalIgnoreCase` implementation:
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/StartsWith.cs>.
 pub fn ordinal_ignore_case_starts_with(s: &str, prefix: &str) -> bool {
-    ordinal_uppercase(s).starts_with(&ordinal_uppercase(prefix))
+    ordinal_ignore_case_key(s).starts_with(&ordinal_ignore_case_key(prefix))
 }
 
 /// Case-insensitive suffix test, matching the runner's
 /// `StringComparison.OrdinalIgnoreCase` implementation:
 /// <https://github.com/actions/runner/blob/main/src/Sdk/DTExpressions2/Expressions2/Sdk/Functions/EndsWith.cs>.
 pub fn ordinal_ignore_case_ends_with(s: &str, suffix: &str) -> bool {
-    ordinal_uppercase(s).ends_with(&ordinal_uppercase(suffix))
+    ordinal_ignore_case_key(s).ends_with(&ordinal_ignore_case_key(suffix))
 }
 
 /// Ordinal (UTF-16 code-unit) comparison after invariant uppercase mapping.
@@ -83,7 +88,7 @@ pub fn ordinal_ignore_case_ends_with(s: &str, suffix: &str) -> bool {
 /// <https://github.com/dotnet/runtime/blob/main/src/libraries/System.Private.CoreLib/src/System/Globalization/Ordinal.cs>.
 pub fn ordinal_ignore_case_cmp(a: &str, b: &str) -> Ordering {
     let to_utf16 = |s: &str| -> Vec<u16> { s.encode_utf16().collect() };
-    to_utf16(&ordinal_uppercase(a)).cmp(&to_utf16(&ordinal_uppercase(b)))
+    to_utf16(&ordinal_ignore_case_key(a)).cmp(&to_utf16(&ordinal_ignore_case_key(b)))
 }
 
 // ---------------------------------------------------------------------

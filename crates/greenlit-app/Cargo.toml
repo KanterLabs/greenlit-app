@@ -28,11 +28,10 @@ anyhow = "1.0.103"
 # `serde::Serialize` (see `greenlit-engine`), so this crate only needs the
 # writer, not `serde` itself.
 serde_json = "1.0.151"
-# Reads `.litci/vars` as flat KEY=VALUE pairs (`from_path_iter`) without
-# mutating the actual process environment, so this crate can tell "supplied
-# by `.litci/vars`" apart from "supplied by the process environment" per
-# `PHASE-1-engine-core.md`'s local variable resolution order.
-dotenvy = "0.15.7"
+# Opens `.litci/vars` relative to an already-open repository directory with
+# no-follow semantics. This prevents a repository-authored symlink from
+# redirecting local-variable reads into host files.
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 # Integration tests (`crates/greenlit-app/tests/`) spawn the compiled

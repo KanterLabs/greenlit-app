@@ -11,6 +11,7 @@ use greenlit_expr::Expr;
 /// <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#context-availability>.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ExpressionPolicy {
+    RunName,
     WorkflowEnv,
     JobIf,
     JobStrategy,
@@ -25,6 +26,7 @@ pub(crate) enum ExpressionPolicy {
     StepIf,
 }
 
+const RUN_NAME: &[&str] = &["github", "inputs", "vars"];
 const WORKFLOW_ENV: &[&str] = &["github", "secrets", "inputs", "vars"];
 const JOB_IF: &[&str] = &["github", "needs", "vars", "inputs"];
 const JOB_STRATEGY: &[&str] = &["github", "needs", "vars", "inputs"];
@@ -57,6 +59,7 @@ const STEP_IF: &[&str] = &[
 impl ExpressionPolicy {
     fn contexts(self) -> &'static [&'static str] {
         match self {
+            Self::RunName => RUN_NAME,
             Self::WorkflowEnv => WORKFLOW_ENV,
             Self::JobIf => JOB_IF,
             Self::JobStrategy => JOB_STRATEGY,
@@ -178,17 +181,65 @@ pub(crate) fn parse_template(
 ) -> Result<Vec<Expr>, ParseError> {
     let mut expressions = Vec::new();
     let mut rest = text;
+    let mut segment_count = 0usize;
+    let mut format_pattern = String::new();
+    let mut format_arguments = String::new();
     while let Some(start) = rest.find("${{") {
+        if start > 0 {
+            append_runner_format_literal(&mut format_pattern, &rest[..start]);
+            segment_count += 1;
+        }
         let after_open = &rest[start + 3..];
         let end = find_closing_delimiter(after_open).ok_or_else(|| ParseError::Expression {
             span: span.clone(),
             context: context.to_owned(),
             message: "`${{` is not closed by a quote-aware `}}` delimiter".to_owned(),
         })?;
-        expressions.push(parse_body(after_open[..end].trim(), span, context)?);
+        let body = after_open[..end].trim();
+        expressions.push(parse_body(body, span, context)?);
+        let argument_index = expressions.len() - 1;
+        format_pattern.push('{');
+        format_pattern.push_str(&argument_index.to_string());
+        format_pattern.push('}');
+        format_arguments.push_str(", ");
+        format_arguments.push_str(body);
+        segment_count += 1;
         rest = &after_open[end + 2..];
     }
+    if !rest.is_empty() {
+        append_runner_format_literal(&mut format_pattern, rest);
+        segment_count += 1;
+    }
+
+    // TemplateReader represents every scalar with multiple literal/expression
+    // segments as one synthetic `format('<pattern>', <expression>...)` call.
+    // The older object-templating path constructs the token here and parses it
+    // when the token is evaluated; the pinned WorkflowParser copy validates
+    // the same synthetic expression immediately. In both paths this parse is
+    // authoritative for the 255-total-argument, 21,000-UTF-16-unit, and
+    // expression-depth limits, so validate exactly that source rather than
+    // imposing a Greenlit-only placeholder count.
+    // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/DTObjectTemplating/ObjectTemplating/TemplateReader.cs#L503-L619
+    // https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Sdk/WorkflowParser/ObjectTemplating/TemplateReader.cs#L505-L627
+    if segment_count > 1 {
+        let runner_expression = format!("format('{format_pattern}'{format_arguments})");
+        parse_body(&runner_expression, span, context)?;
+    }
     Ok(expressions)
+}
+
+/// Apply the runner's exact literal transformation before embedding a scalar
+/// segment in the synthetic `format()` string: single quotes are doubled,
+/// then braces are doubled for the formatter.
+fn append_runner_format_literal(output: &mut String, literal: &str) {
+    for character in literal.chars() {
+        match character {
+            '\'' => output.push_str("''"),
+            '{' => output.push_str("{{"),
+            '}' => output.push_str("}}"),
+            _ => output.push(character),
+        }
+    }
 }
 
 /// Parse one already-delimited expression body and attach its workflow span.

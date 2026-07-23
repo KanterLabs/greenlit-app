@@ -1,8 +1,14 @@
 //! The injectable filesystem boundary and its production implementation.
 
+mod real;
+
+use std::io;
 use std::path::{Path, PathBuf};
 
-/// The kind of a directory entry returned by [`HashFilesFs::read_dir`].
+pub use self::real::RealFs;
+
+/// The kind of a directory entry returned while enumerating an
+/// [`OpenedDir`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     /// A regular file.
@@ -11,6 +17,9 @@ pub enum EntryKind {
     Dir,
     /// A symbolic link (to a file or directory — not yet resolved).
     Symlink,
+    /// A non-regular filesystem node such as a FIFO, socket, or device.
+    /// `hashFiles()` never reads or hashes these nodes.
+    Other,
 }
 
 /// One directory entry: a bare file name (not a full path) plus its kind.
@@ -22,112 +31,134 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
+/// A directory opened as a capability rather than a reusable path.
+///
+/// Every child of an [`OpenedDir`] must be reached through
+/// [`OpenedDir::open_child_dir`] or [`OpenedDir::hash_child_file`] — never
+/// by re-deriving a lexical path and reopening it against the workspace
+/// root. [`RealFs`] resolves a child through the exact kernel object this
+/// directory names, so a concurrent rename of an ancestor cannot
+/// substitute a different, unvetted directory or file for later access.
+/// See `ARCHITECTURE.md`'s "Phase 1 trust and resource boundaries".
+pub struct OpenedDir<'a> {
+    /// Stable identity used by the bounded symbolic-link alias registry.
+    pub identity: PathBuf,
+    directory: Box<dyn OpenDirectory<'a> + 'a>,
+}
+
+impl<'a> OpenedDir<'a> {
+    /// Wraps `directory` as one capability, identified by `identity`.
+    #[must_use]
+    pub fn new(identity: PathBuf, directory: Box<dyn OpenDirectory<'a> + 'a>) -> Self {
+        Self {
+            identity,
+            directory,
+        }
+    }
+
+    /// Pulls the next direct child (bare name + kind) in native
+    /// enumeration order.
+    pub fn next_entry(&mut self) -> io::Result<Option<DirEntry>> {
+        self.directory.next_entry()
+    }
+
+    /// Opens the child directory named `name` (one bare path component —
+    /// implementations reject a name containing a path separator) relative
+    /// to this held directory. `lexical_path` is `name`'s full lexical
+    /// position and is used only for error messages, never for access.
+    /// `follow` controls whether a symlink child is followed to its target;
+    /// a symlink or plain entry that does not resolve to a directory
+    /// returns `ErrorKind::NotADirectory` so the caller can retry it as a
+    /// file. Passing `follow: false` for an entry whose listed kind was
+    /// already a plain directory additionally rejects it if a concurrent
+    /// rename replaced it with a symlink in the meantime, regardless of the
+    /// caller's `--follow-symbolic-links` mode.
+    pub fn open_child_dir(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+    ) -> io::Result<OpenedDir<'a>> {
+        self.directory.open_child_dir(name, lexical_path, follow)
+    }
+
+    /// Computes the SHA-256 digest of the regular file named `name`,
+    /// relative to this held directory, following a final symlink when
+    /// `follow` is true. `lexical_path` is used only for error messages.
+    /// `check_timeout` is polled the same way as the top-level deadline
+    /// checks.
+    pub fn hash_child_file(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]> {
+        self.directory
+            .hash_child_file(name, lexical_path, follow, check_timeout)
+    }
+}
+
+/// The object backing one [`OpenedDir`]. Implementations are shared with a
+/// bounded filesystem worker; an instance is created and consumed entirely
+/// on that one worker, so this trait carries no thread-safety bound.
+pub trait OpenDirectory<'a> {
+    /// Pulls the next direct child (bare name + kind) in native
+    /// enumeration order.
+    fn next_entry(&mut self) -> io::Result<Option<DirEntry>>;
+
+    /// See [`OpenedDir::open_child_dir`].
+    fn open_child_dir(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+    ) -> io::Result<OpenedDir<'a>>;
+
+    /// See [`OpenedDir::hash_child_file`].
+    fn hash_child_file(
+        &self,
+        name: &str,
+        lexical_path: &Path,
+        follow: bool,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]>;
+}
+
 /// Filesystem access for `hashFiles()`, injected so evaluation never talks
-/// to `std::fs` directly — the real implementation is [`RealFs`]; tests
-/// substitute an in-memory fake.
-pub trait HashFilesFs: std::fmt::Debug {
+/// to host filesystem APIs directly — the real implementation is [`RealFs`];
+/// tests substitute an in-memory fake. Implementations are shared with a
+/// bounded filesystem worker and must therefore be thread-safe at this
+/// top level; an opened directory is created and consumed entirely on that
+/// one worker (see [`OpenDirectory`]).
+pub trait HashFilesFs: std::fmt::Debug + Send + Sync {
     /// The directory `hashFiles` patterns are rooted against by default
-    /// (GitHub's `GITHUB_WORKSPACE`).
+    /// (GitHub's `GITHUB_WORKSPACE` equivalent).
     fn workspace_root(&self) -> &Path;
     /// The directory a leading `~`/`~/…` pattern roots against. `None` if
-    /// unavailable, in which case such a pattern contributes zero matches
-    /// rather than erroring (real runners always have a home directory; this
-    /// is a defensive default for environments that don't).
+    /// unavailable, in which case such a pattern contributes zero matches.
     fn home_dir(&self) -> Option<&Path> {
         None
     }
-    /// Lists `path`'s direct children (bare names + kind), not recursive.
-    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>>;
-    /// Reads a regular file's full contents.
-    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>>;
-    /// Returns the kind of `path` without following a final symbolic link.
-    ///
-    /// The default preserves compatibility for injected implementations
-    /// that predate this method. Implementations with metadata access should
-    /// override it so symlinks can be distinguished precisely.
-    fn entry_kind(&self, path: &Path) -> std::io::Result<EntryKind> {
-        match self.read_dir(path) {
-            Ok(_) => Ok(EntryKind::Dir),
-            Err(dir_error) => match self.read_file(path) {
-                Ok(_) => Ok(EntryKind::File),
-                Err(_) => Err(dir_error),
-            },
-        }
-    }
-    /// Resolves symbolic links for directory-cycle detection.
-    ///
-    /// The identity default is suitable for virtual filesystems with no
-    /// symlinks. Real filesystems should override it with canonicalization.
-    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
-
-/// The production [`HashFilesFs`], backed directly by `std::fs`, rooted at a
-/// given workspace directory.
-#[derive(Debug)]
-pub struct RealFs {
-    root: PathBuf,
-    home: Option<PathBuf>,
-}
-
-impl RealFs {
-    /// Builds a real filesystem rooted at `root` (GitHub's `GITHUB_WORKSPACE`
-    /// equivalent). Reads `$HOME` once at construction for `~`-rooted
-    /// patterns.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        RealFs {
-            root: root.into(),
-            home: std::env::var_os("HOME").map(PathBuf::from),
-        }
-    }
-}
-
-impl HashFilesFs for RealFs {
-    fn workspace_root(&self) -> &Path {
-        &self.root
-    }
-
-    fn home_dir(&self) -> Option<&Path> {
-        self.home.as_deref()
-    }
-
-    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<DirEntry>> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let kind = if file_type.is_symlink() {
-                EntryKind::Symlink
-            } else if file_type.is_dir() {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
-            };
-            entries.push(DirEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                kind,
-            });
-        }
-        Ok(entries)
-    }
-
-    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        std::fs::read(path)
-    }
-
-    fn entry_kind(&self, path: &Path) -> std::io::Result<EntryKind> {
-        let file_type = std::fs::symlink_metadata(path)?.file_type();
-        if file_type.is_symlink() {
-            Ok(EntryKind::Symlink)
-        } else if file_type.is_dir() {
-            Ok(EntryKind::Dir)
-        } else {
-            Ok(EntryKind::File)
-        }
-    }
-
-    fn canonicalize(&self, path: &Path) -> std::io::Result<PathBuf> {
-        std::fs::canonicalize(path)
-    }
+    /// Opens one search-root ENTRY POINT — the workspace root, `$HOME`, or a
+    /// literal search root derived from a pattern's non-glob prefix — by its
+    /// full lexical path. Called once per entry point; every subsequent
+    /// child access must go through the returned [`OpenedDir`] instead of
+    /// calling this again with a longer path, so a rename of an ancestor
+    /// after it was already inspected cannot substitute an unvetted
+    /// directory for later traversal.
+    fn open_dir(&self, path: &Path) -> io::Result<OpenedDir<'_>>;
+    /// Returns the kind of one entry point without following a final
+    /// symbolic link. Never used for a child of an already-open directory
+    /// (its kind comes from that directory's own entry stream).
+    fn entry_kind(&self, path: &Path) -> io::Result<EntryKind>;
+    /// Computes the SHA-256 digest of one entry point that is itself a
+    /// regular file (a literal search root with no wildcard segment).
+    /// Implementations must call `check_timeout` around blocking work and
+    /// between bounded read chunks.
+    fn hash_file_sha256(
+        &self,
+        path: &Path,
+        check_timeout: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<[u8; 32]>;
 }
