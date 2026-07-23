@@ -220,6 +220,22 @@ policy actively contains. They are not deferred Greenlit behavior.
   to upgrade to Linux 5.6 or newer. Ordinary relative links and absolute links
   whose spelling is beneath the canonical workspace remain supported.
 
+- **A matched entry that vanishes between enumeration and access is treated by
+  its kind, not uniformly.** A committed *symbolic link* whose target cannot be
+  resolved fails the whole expression (`DanglingSymlink`), matching GitHub's
+  pinned hash helper, whose `statSync`/`readFile` of the followed target errors
+  out. A *non-symlink* object (a plain matched file, or an ancestor directory)
+  that is enumerated but then returns `ENOENT` on the next access is instead
+  skipped silently, exactly like the search root's own vanished-before-traversal
+  case. The asymmetry is deliberate: the rename-escape containment re-resolves
+  every access from the pinned root, so an ancestor renamed away — by an
+  attacker probing the boundary or by ordinary concurrent build churn — surfaces
+  as `ENOENT`; hard-failing on that would turn the containment mechanism itself
+  into a reliable "abort this workflow" oracle. The one case GitHub's contract
+  meaningfully covers, a stably-committed dangling symlink, is already the hard
+  failure; a transient vanish is racy on GitHub's own hosted runner too and is
+  not a fidelity target. Reference: [pinned hashFiles helper](https://github.com/actions/runner/blob/f898ef14a51cf42409469bc248492c325ad8a874/src/Misc/expressionFunc/hashFiles/src/hashFiles.ts).
+
 - **The `hashFiles` workspace root must be a physical path.** Root
   establishment deliberately uses one `openat2` lookup with
   `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`; any symbolic-link

@@ -373,20 +373,33 @@ fn drive<'fs>(
                         return Err(deadline.map_io(path, source));
                     }
                     Err(_) => {
-                        let parent = &stack
-                            .last()
-                            .ok_or_else(|| io::Error::other("hashFiles traversal stack is empty"))
-                            .map_err(|source| deadline.map_io(path, source))?
-                            .opened;
-                        visit_file(
-                            path,
-                            HashSource::Child {
-                                parent,
-                                name: &entry.name,
-                                follow: true,
-                            },
-                            true,
-                        )?;
+                        // The probe failed to open the entry as a directory, so
+                        // it resolves to a non-directory (a file-like or dangling
+                        // symlink). GitHub's toolkit yields a non-directory only on
+                        // a *full* pattern match and folds negative patterns before
+                        // yielding; a path that merely `could_match_descendant`
+                        // (partial-prefix) must not be hashed — nor may a dangling
+                        // such symlink raise `DanglingSymlink`. Gate on `is_included`
+                        // exactly as the `EntryKind::File` arm does. Ref:
+                        // actions/toolkit internal-globber.ts / internal-pattern-helper.ts.
+                        if is_included(compiled, path) {
+                            let parent = &stack
+                                .last()
+                                .ok_or_else(|| {
+                                    io::Error::other("hashFiles traversal stack is empty")
+                                })
+                                .map_err(|source| deadline.map_io(path, source))?
+                                .opened;
+                            visit_file(
+                                path,
+                                HashSource::Child {
+                                    parent,
+                                    name: &entry.name,
+                                    follow: true,
+                                },
+                                true,
+                            )?;
+                        }
                         path.pop();
                     }
                 }
