@@ -338,3 +338,25 @@ policy actively contains. They are not deferred Greenlit behavior.
   `deny.toml`'s `bans.skip`, mirroring the existing `syn@2.0.119` exception's
   granularity — a version bump on either side requires deliberately updating
   the pinned skip entry, not a silent pass.
+
+- **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
+  it out of the ordinary secrets chain.** GitHub secret and configuration
+  variable names share one documented rule: "must not start with the
+  `GITHUB_` prefix"
+  (<https://docs.github.com/en/actions/reference/security/secrets>,
+  <https://docs.github.com/en/actions/reference/workflows-and-actions/variables#naming-conventions-for-configuration-variables>).
+  A real repository can therefore never hold a user-created secret literally
+  named `GITHUB_TOKEN` — it is always the platform-populated token instead.
+  `crate::secrets::validate_name` (`crate::gh_names::validate_configuration_name`)
+  already rejects that exact name for the same reason it rejects any other
+  `GITHUB_`-prefixed one, so `crate::secrets`'s ordinary chain excludes
+  `GITHUB_TOKEN` from its candidate set outright rather than letting it reach
+  (and fail) that validator; `crate::auth::resolve_github_token` is its own,
+  separate resolution path (local override, if any, else the stored auth
+  token, else the empty string — never a hard failure, since GitHub itself
+  always provides a working token and a workflow that merely references it
+  should not be blocked from an unauthenticated local run). `github.token`
+  gets the identical treatment via a small, additive
+  `greenlit_workflow::extract::StaticExtraction::references_github_token`
+  flag (`extract::walk`), since — unlike `secrets.GITHUB_TOKEN` — no existing
+  Phase 1 extraction tracked a bare `github.*` field access at all.

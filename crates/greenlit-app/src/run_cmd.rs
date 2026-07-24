@@ -28,7 +28,7 @@ use greenlit_runtime::{
 };
 
 use crate::cli::{IsolationArg, RunArgs};
-use crate::{errors, render, vars, workflow_discovery, workflow_picker};
+use crate::{auth, errors, render, secrets, vars, workflow_discovery, workflow_picker};
 
 /// Run the command, returning the process exit code (a failed workflow run
 /// exits non-zero without an error, since its table is the real output).
@@ -96,20 +96,86 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
 
     let extraction = greenlit_workflow::extract_static(&workflow)
         .map_err(|error| errors::parse_error(&error))?;
+
+    // Local git metadata is collected once, up front: the remote `vars`
+    // lookup needs the repository owner/name before planning even starts,
+    // and every later use (`build_runner_env`) reuses this same value
+    // instead of re-collecting it.
+    let git = collect_git_context(&repo_root)
+        .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
+    let repo_leaf = git
+        .repository
+        .rsplit('/')
+        .next()
+        .unwrap_or(&git.repository)
+        .to_string();
+
     let dotenv_vars =
         vars::read_dotenv_vars(&repo_root).map_err(|message| anyhow::anyhow!(message))?;
-    let vars_value = vars::resolve_vars(
+    let vars_outcome = vars::resolve_vars_with_remote(
         &extraction,
         &args.vars,
         dotenv_vars.as_deref().unwrap_or_default(),
         dotenv_vars.is_some(),
+        &git.repository_owner,
+        &repo_leaf,
+    );
+    let vars_value = errors::vars_outcome(vars_outcome)?;
+
+    // Secrets are collected next, before engine detection and well before
+    // any container starts (`PHASE-3-actions.md` Secrets: "before any
+    // container starts, prompt for every referenced-but-unresolved
+    // secret"). `GITHUB_TOKEN` is deliberately excluded from the ordinary
+    // chain and resolved separately just below.
+    let dotenv_secrets =
+        secrets::read_dotenv_secrets(&repo_root).map_err(|message| anyhow::anyhow!(message))?;
+    let secrets_outcome = secrets::resolve_secrets(
+        &extraction,
+        &args.secrets,
+        dotenv_secrets.as_deref().unwrap_or_default(),
+        &repo_root,
+        args.no_input,
     )
-    .map_err(|failure| errors::vars_resolution(&failure, false))?;
+    .map_err(|failure| errors::secrets_error(&failure))?;
+
+    let references_token = extraction.references_github_token
+        || extraction.secrets.contains_key(secrets::GITHUB_TOKEN_NAME);
+    let token_local_override = secrets::local_override_for(
+        secrets::GITHUB_TOKEN_NAME,
+        &args.secrets,
+        dotenv_secrets.as_deref().unwrap_or_default(),
+    );
+    let (github_token, token_notice) = if references_token {
+        auth::resolve_github_token(token_local_override)
+    } else {
+        (String::new(), None)
+    };
+    if let Some(notice) = &token_notice {
+        eprintln!("{notice}");
+    }
+
+    let mut all_secrets = secrets_outcome.resolved.clone();
+    if references_token && !github_token.is_empty() {
+        all_secrets.push((secrets::GITHUB_TOKEN_NAME.to_string(), github_token.clone()));
+    }
+    let secrets_value = Value::object(
+        all_secrets
+            .iter()
+            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
+            .collect(),
+    );
 
     let event_kind: greenlit_engine::EventKind = args.event.into();
     let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
-    let event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
+    let mut event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
         .map_err(|error| errors::event_error(&error))?;
+    if references_token {
+        // Baked in *before* planning: plan-time partial evaluation folds
+        // `github.*` field access against this concrete object, so a later
+        // `RunConfig.github` patch would be too late for any statically
+        // foldable `${{ github.token }}` use.
+        event.github = auth::inject_github_token(event.github, &github_token);
+    }
     let plan_options = PlanOptions {
         vars: vars_value.clone(),
         max_matrix_legs: DEFAULT_MAX_MATRIX_LEGS,
@@ -126,19 +192,26 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // potentially long workspace copy.
     reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
 
-    let git = collect_git_context(&repo_root)
-        .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
+    if references_token && !github_token.is_empty() {
+        let effective_permissions: Vec<Option<&greenlit_engine::PermissionsPlan>> = execution_plan
+            .jobs
+            .iter()
+            .map(|job| {
+                job.permissions
+                    .as_ref()
+                    .or(execution_plan.permissions.as_ref())
+            })
+            .collect();
+        if let Some(notice) = auth::token_permission_notice(&effective_permissions) {
+            eprintln!("{notice}");
+        }
+    }
+
     let workflow_name = workflow
         .name
         .as_ref()
         .map(|name| name.value.clone())
         .unwrap_or_else(|| workflow_path.source_name.clone());
-    let repo_leaf = git
-        .repository
-        .rsplit('/')
-        .next()
-        .unwrap_or(&git.repository)
-        .to_string();
     let workspace = format!("/home/runner/work/{repo_leaf}/{repo_leaf}");
 
     let config = RunConfig {
@@ -149,12 +222,12 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         github: event.github.clone(),
         vars: vars_value,
         inputs: event.inputs.clone(),
-        secrets: Value::object(vec![]),
-        initial_masks: args
-            .secrets
-            .iter()
-            .map(|(_, value)| value.clone())
-            .collect(),
+        secrets: secrets_value,
+        // Every secret this run actually resolved — from any source in the
+        // chain, not only `-s` — is masked before any step runs
+        // (`PHASE-3-actions.md` Secrets: "Every resolved secret value
+        // registers with the Phase 2 masker before any step runs").
+        initial_masks: all_secrets.iter().map(|(_, value)| value.clone()).collect(),
         volume_namespace: run_volume_namespace(),
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),

@@ -72,9 +72,13 @@ pub(crate) struct RunArgs {
     #[arg(long = "input", value_name = "KEY=VALUE", value_parser = parse_key_val)]
     pub(crate) inputs: Vec<(String, String)>,
 
-    /// A secret value, `KEY=VALUE`. Repeatable. In this phase the value is
-    /// registered for log masking; the `secrets` context lands in Phase 3.
-    #[arg(short = 's', long = "secret", value_name = "KEY=VALUE", value_parser = parse_key_val)]
+    /// A secret value override, `KEY=VALUE`. Repeatable; the highest
+    /// priority source in the `secrets.*` resolution chain (CLI override,
+    /// then same-named process environment variable, then
+    /// `.litci/secrets`, then an interactive prompt for anything still
+    /// unresolved). Every resolved value is registered for log masking
+    /// before any step runs.
+    #[arg(short = 's', long = "secret", value_name = "KEY=VALUE", value_parser = parse_secret)]
     pub(crate) secrets: Vec<(String, String)>,
 
     /// Workspace isolation mechanism.
@@ -200,3 +204,23 @@ fn parse_var(raw: &str) -> Result<(String, String), String> {
     Ok((key, value))
 }
 
+/// Parses and validates one secret override. `GITHUB_TOKEN` is deliberately
+/// accepted here even though it starts with the reserved `GITHUB_` prefix
+/// (which every other name is rejected for) — it is the one name
+/// `crate::secrets`' ordinary chain excludes entirely in favor of
+/// `crate::auth::resolve_github_token`, and a local `-s GITHUB_TOKEN=...`
+/// override is that resolution's own highest-priority source
+/// (`crate::run_cmd`), not a name a repository could ever store as a real
+/// secret.
+fn parse_secret(raw: &str) -> Result<(String, String), String> {
+    let (key, value) = parse_key_val(raw)?;
+    if key.eq_ignore_ascii_case(crate::secrets::GITHUB_TOKEN_NAME) {
+        return Ok((key, value));
+    }
+    crate::secrets::validate_name(&key).map_err(|reason| {
+        format!(
+            "invalid -s/--secret name '{key}': {reason}\n  fix: rename it to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_"
+        )
+    })?;
+    Ok((key, value))
+}

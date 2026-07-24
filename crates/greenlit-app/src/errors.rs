@@ -11,6 +11,7 @@ use greenlit_expr::Value;
 use greenlit_metrics::MetricsError;
 use greenlit_workflow::ParseError;
 
+use crate::secrets::{SecretResolutionError, SecretsError};
 use crate::vars::{VarResolutionError, VarsOutcome};
 
 fn safe_text(text: &str) -> String {
@@ -208,6 +209,59 @@ pub(crate) fn vars_outcome(outcome: VarsOutcome) -> anyhow::Result<Value> {
         VarsOutcome::LocalError(failure) => Err(vars_resolution(&failure, false)),
         VarsOutcome::AuthRequired(failure) => Err(vars_resolution(&failure, true)),
         VarsOutcome::RemoteError(message) => Err(anyhow::anyhow!(safe_text(&message))),
+    }
+}
+
+/// Renders a [`SecretResolutionError`] (invalid/oversized/ambiguous/
+/// non-Unicode local values, or every referenced-but-unresolved name when
+/// prompting could not run — `--no-input` or no interactive terminal).
+pub(crate) fn secrets_resolution(failure: &SecretResolutionError) -> anyhow::Error {
+    let mut message = String::new();
+    for invalid in &failure.invalid {
+        let span = safe_text(&invalid.first_use.to_string());
+        let name = safe_text(&invalid.name);
+        message.push_str(&format!(
+            "{span}: 'secrets.{name}' is not a valid GitHub secret name: {}\n  fix: rename the reference to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_\n",
+            invalid.reason
+        ));
+    }
+    for oversized in &failure.oversized {
+        let name = safe_text(&oversized.name);
+        message.push_str(&format!(
+            "secret 'secrets.{name}' has a {}-byte value, exceeding GitHub's 48 KiB per-secret limit\n  fix: shorten the value supplied through -s, the process environment, or .litci/secrets\n",
+            oversized.bytes
+        ));
+    }
+    for ambiguous in &failure.ambiguous_process {
+        let name = safe_text(&ambiguous.name);
+        let spellings = safe_text(&ambiguous.spellings.join(", "));
+        message.push_str(&format!(
+            "process environment defines case-insensitive secret 'secrets.{name}' more than once ({spellings})\n  fix: remove the duplicate case variants, or pass -s {name}=<value> to choose explicitly\n"
+        ));
+    }
+    for non_unicode in &failure.non_unicode_process {
+        let spelling = safe_text(&non_unicode.spelling);
+        let name = safe_text(&non_unicode.name);
+        message.push_str(&format!(
+            "process environment variable '{spelling}' for 'secrets.{name}' is not valid UTF-8\n  fix: remove it, or pass -s {name}=<value> with a UTF-8 value\n"
+        ));
+    }
+    if !failure.missing.is_empty() {
+        let names: Vec<String> = failure.missing.iter().map(|m| safe_text(&m.name)).collect();
+        message.push_str(&format!(
+            "the following referenced secret(s) are not set and could not be prompted for (non-interactive): {}\n  fix: pass -s NAME=<value> for each, set it in the process environment, add it to .litci/secrets, or rerun interactively to be prompted\n",
+            names.join(", ")
+        ));
+    }
+    anyhow::anyhow!(message.trim_end().to_string())
+}
+
+/// Renders a [`SecretsError`] end to end (both its resolution-failure and
+/// prompt-I/O-failure shapes).
+pub(crate) fn secrets_error(error: &SecretsError) -> anyhow::Error {
+    match error {
+        SecretsError::Resolution(failure) => secrets_resolution(failure),
+        SecretsError::Prompt(message) => anyhow::anyhow!(safe_text(message)),
     }
 }
 
