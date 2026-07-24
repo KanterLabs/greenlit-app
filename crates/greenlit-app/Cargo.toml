@@ -18,6 +18,11 @@ greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
 greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
 greenlit-engine = { path = "../greenlit-engine", version = "0.1.0" }
 greenlit-metrics = { path = "../greenlit-metrics", version = "0.1.0" }
+# `uses:` resolution/fetch: constructs the real `GitHubApiResolver`/
+# `GitLsRemoteResolver` (picked by whether `auth::current_token()` returns a
+# token) and `FallbackFetcher`/`ActionStore` this crate hands the executor
+# through `RunConfig::actions` (`PHASE-3-actions.md` "Action execution").
+greenlit-actions = { path = "../greenlit-actions", version = "0.1.0" }
 # The container runtime: engine detection, the Docker backend, base images,
 # overlay isolation, and the plan executor `litci run` drives.
 greenlit-runtime = { path = "../greenlit-runtime", version = "0.1.0" }

@@ -214,6 +214,16 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         .unwrap_or_else(|| workflow_path.source_name.clone());
     let workspace = format!("/home/runner/work/{repo_leaf}/{repo_leaf}");
 
+    // Action resolution reuses whatever token `litci auth` already stored
+    // (`PHASE-3-actions.md` "Action execution": "pick `GitHubApiResolver`
+    // (token) when Some, else `GitLsRemoteResolver`") — independent of
+    // whether *this workflow* references `secrets.GITHUB_TOKEN`/
+    // `github.token` (host-side action fetching is not workflow-token
+    // injection).
+    let action_token = auth::current_token().ok().flatten();
+    let actions_config =
+        build_action_runtime_config(action_token).map_err(|message| anyhow::anyhow!(message))?;
+
     let config = RunConfig {
         repo_host_path: repo_root.clone(),
         workspace: workspace.clone(),
@@ -231,6 +241,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         volume_namespace: run_volume_namespace(),
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),
+        actions: actions_config,
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -263,6 +274,29 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         for step in &job.steps {
             invocation.record_step_duration(job.id.clone(), step.label.clone(), step.duration);
         }
+    }
+
+    // Action-store and Node-runtime-cache hit/miss counts, for the
+    // end-of-run stage breakdown (`AGENTS.md` Metrics: "instrument spans
+    // ... hit/miss counters"; `PHASE-3-actions.md`: "surface the store
+    // hit/miss counts into the run's end-of-run breakdown"). Reuses the
+    // existing `hit_miss` record field/`record_lookup` API from Phase 1 —
+    // no metrics-schema change, so no deliberate snapshot update is needed
+    // (`TESTING.md`: the metrics record schema is a declared-stable
+    // snapshot surface).
+    let action_counts = config.actions.store.counts();
+    for _ in 0..action_counts.hits {
+        invocation.record_lookup("action-fetch", true);
+    }
+    for _ in 0..action_counts.misses {
+        invocation.record_lookup("action-fetch", false);
+    }
+    let node_runtime_counts = config.actions.node_runtime_store.counts();
+    for _ in 0..node_runtime_counts.hits {
+        invocation.record_lookup("action-runtime-fetch", true);
+    }
+    for _ in 0..node_runtime_counts.misses {
+        invocation.record_lookup("action-runtime-fetch", false);
     }
 
     render_run_table(&report, &mut out).map_err(|error| {
@@ -375,6 +409,68 @@ async fn connect_engine() -> anyhow::Result<DockerEngine> {
             Err(anyhow::anyhow!("{}\n  fix: {}", fix.message, fix.action))
         }
     }
+}
+
+/// Builds the real (network-capable) action-resolution/fetch/runtime
+/// configuration `litci run` hands the executor.
+///
+/// Picks [`greenlit_actions::resolve::GitHubApiResolver`] when a token is
+/// available, [`greenlit_actions::resolve::GitLsRemoteResolver`] otherwise
+/// (`PHASE-3-actions.md` "Action execution"), and the standard tarball-
+/// then-git-clone [`greenlit_actions::store::FallbackFetcher`] composition
+/// its own module docs recommend.
+///
+/// # Errors
+/// Returns a message (with a fix, per `AGENTS.md`'s UX invariant) if the
+/// user home directory cannot be determined.
+fn build_action_runtime_config(
+    token: Option<String>,
+) -> Result<greenlit_runtime::ActionRuntimeConfig, String> {
+    use greenlit_actions::resolve::{GitHubApiResolver, GitLsRemoteResolver, RefResolver};
+    use greenlit_actions::store::{
+        ActionFetcher, ActionStore, FallbackFetcher, GitCloneFetcher, TarballFetcher,
+    };
+    use greenlit_runtime::HttpRuntimeBundleFetcher;
+    use greenlit_runtime::executor::actions::node_runtime::{PinnedNodeBundleSpecs, RuntimeStore};
+    use std::sync::Arc;
+
+    let store = ActionStore::open_default().map_err(|error| {
+        format!("could not open the local action store: {error}\n  fix: ensure $HOME is set and writable")
+    })?;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        "could not determine the user home directory (HOME is not set)\n  fix: set HOME, then retry"
+            .to_string()
+    })?;
+    let node_runtime_store = RuntimeStore::at(RuntimeStore::default_path_under(
+        std::path::Path::new(&home),
+    ));
+
+    let (resolver, fetcher): (Arc<dyn RefResolver>, Arc<dyn ActionFetcher>) = match &token {
+        Some(t) => (
+            Arc::new(GitHubApiResolver::new(t.clone())),
+            Arc::new(FallbackFetcher::new(
+                TarballFetcher::with_token(t.clone()),
+                GitCloneFetcher::new(),
+            )),
+        ),
+        None => (
+            Arc::new(GitLsRemoteResolver::new()),
+            Arc::new(FallbackFetcher::new(
+                TarballFetcher::new(),
+                GitCloneFetcher::new(),
+            )),
+        ),
+    };
+
+    Ok(greenlit_runtime::ActionRuntimeConfig {
+        resolver,
+        store,
+        fetcher,
+        node_runtime_fetcher: Arc::new(HttpRuntimeBundleFetcher::new()),
+        node_runtime_specs: Arc::new(PinnedNodeBundleSpecs),
+        node_runtime_store,
+        github_token: token,
+    })
 }
 
 /// Build the runner/`github` environment template from local git metadata.
