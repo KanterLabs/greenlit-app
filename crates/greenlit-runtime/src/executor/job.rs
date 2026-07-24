@@ -30,6 +30,7 @@ use crate::executor::context::{
 use crate::executor::instance::JobInstance;
 use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
+use crate::executor::services;
 use crate::executor::step::{
     JobRuntime, StepLoopState, execute_step, run_post_steps, run_pre_steps,
 };
@@ -85,6 +86,19 @@ pub(crate) async fn run_instance(
     let mut runner_env = shared.config.runner_env.clone();
     runner_env.job = job_id.0.clone();
     runner_env.workspace = shared.config.workspace.clone();
+
+    // The job's own bridge: the shim binds on its gateway and, from the next
+    // task group, services attach to it. Created before the container so the
+    // container can be attached at creation time, and torn down after it --
+    // a network with an attached container cannot be removed.
+    let network_name = format!(
+        "greenlit-run-{}-{}",
+        shared.config.volume_namespace, job_id.0
+    );
+    let job_network =
+        services::create(shared.engine, &network_name, shared.config.store.as_ref()).await?;
+    runner_env.actions_service = job_network.actions_service().cloned();
+
     let mut base_env = runner_env.clone().into_map();
     let runner_ctx = runner_context(&runner_env);
 
@@ -167,11 +181,14 @@ pub(crate) async fn run_instance(
 
     let container = boot_container(
         shared,
-        &image_tag,
-        in_container,
-        &additions,
-        &extra_binds,
-        action_plan.needs_docker_sibling,
+        &BootRequest {
+            image: &image_tag,
+            in_container,
+            additions: &additions,
+            extra_binds: &extra_binds,
+            needs_docker_sibling: action_plan.needs_docker_sibling,
+            network: job_network.name(),
+        },
         progress,
     )
     .await?;
@@ -242,6 +259,9 @@ pub(crate) async fn run_instance(
             let _ = shared.engine.remove_volume(&volume).await;
         }
     }
+    // After the container: a network still holding an attachment cannot be
+    // removed, and the shim must outlive every step that might call it.
+    job_network.teardown(shared.engine).await;
 
     let (step_reports, outputs, result) = outcome?;
     Ok(JobReport {
@@ -669,15 +689,37 @@ async fn seed_container_path(
 /// itself needs no change: its copy-in populate step fills whatever is
 /// already bind-mounted at the workspace path, oblivious to whether that is
 /// container-local storage or a named volume.
+/// Everything that shapes the job container, gathered so the boot call keeps
+/// one argument per *concern* rather than one per field.
+struct BootRequest<'a> {
+    /// The resolved image reference.
+    image: &'a str,
+    /// Whether this is a user-declared `container:` rather than a Greenlit
+    /// runner image — the flag that gates every convergence behavior.
+    in_container: bool,
+    /// Job-container `env:`/`volumes:`/credentials, already validated.
+    additions: &'a ContainerAdditions,
+    /// Read-only binds the job's `uses:` steps need.
+    extra_binds: &'a [BindMount],
+    /// Whether a Docker action forces the shared-workspace volume.
+    needs_docker_sibling: bool,
+    /// The job's own bridge network.
+    network: &'a str,
+}
+
 async fn boot_container(
     shared: &Shared<'_>,
-    image: &str,
-    in_container: bool,
-    additions: &ContainerAdditions,
-    extra_binds: &[BindMount],
-    needs_docker_sibling: bool,
+    request: &BootRequest<'_>,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ExecError> {
+    let BootRequest {
+        image,
+        in_container,
+        additions,
+        extra_binds,
+        needs_docker_sibling,
+        network,
+    } = *request;
     let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
     let idle = vec![
         "sh".to_string(),
@@ -718,6 +760,25 @@ async fn boot_container(
     spec.binds.extend(additions.volume_binds.iter().cloned());
     spec.binds.extend(extra_binds.iter().cloned());
     spec.env = additions.env.clone();
+    spec.network = Some(network.to_string());
+    // The persistent toolcache: a writable Greenlit-owned host directory, so a
+    // `setup-*` action finds what a previous run installed instead of
+    // downloading it again (`PHASE-4-environment.md`: "mount
+    // `~/.litci/toolcache` at `RUNNER_TOOL_CACHE`"). A failure to create it
+    // means no toolcache this run, not a failed run.
+    if let Some(store) = shared.config.store.as_ref() {
+        match services::toolcache_bind(
+            &store.toolcache_root,
+            &shared.config.runner_env.runner_tool_cache,
+        ) {
+            Ok(bind) => spec.binds.push(bind),
+            Err(error) => tracing::debug!(
+                target: "greenlit_runtime::services",
+                %error,
+                "could not prepare the toolcache; running without it"
+            ),
+        }
+    }
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 
     let engine = shared.engine;

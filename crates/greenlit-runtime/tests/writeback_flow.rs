@@ -15,7 +15,7 @@ use tar::{Builder, EntryType, Header};
 
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
-    ExecOutputSink, ExecSpec, HealthState, ImageSummary, RegistryAuth,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use greenlit_runtime::error::RuntimeError;
 use greenlit_runtime::progress::ProgressSink;
@@ -84,6 +84,12 @@ impl ContainerEngine for DiffEngine {
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
+    }
+
+    async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
+        Ok(NetworkInfo {
+            gateway: Some("10.0.0.1".to_string()),
+        })
     }
     // Write-back never inspects health, touches volumes, or manages images;
     // these exist so the fake still implements the whole port.

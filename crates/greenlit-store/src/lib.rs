@@ -32,6 +32,6 @@ mod layout;
 pub mod server;
 
 pub use artifacts::{Artifact, ArtifactStore};
-pub use cache::{CacheStore, Restored};
+pub use cache::{CacheCounts, CacheStore, Restored};
 pub use error::StoreError;
 pub use server::{Bound, Shim, ShimState, bind};

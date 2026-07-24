@@ -72,8 +72,18 @@ struct Plan {
 }
 
 impl Plan {
+    /// Whether there is nothing this clean could remove.
+    ///
+    /// An image listing that *failed* counts as empty: nothing is known to be
+    /// removable, so announcing a removal would be misleading. The reason is
+    /// still surfaced, so a user who expected images gone learns why they are
+    /// not.
     fn is_empty(&self) -> bool {
-        self.directories.is_empty() && self.images.as_ref().is_ok_and(Vec::is_empty)
+        self.directories.is_empty()
+            && self
+                .images
+                .as_ref()
+                .map_or(true, |images| images.is_empty())
     }
 
     fn total_bytes(&self) -> u64 {
@@ -103,6 +113,9 @@ pub(crate) fn run(args: CleanArgs) -> anyhow::Result<ExitCode> {
 
     if plan.is_empty() {
         println!("Nothing to clean — no Greenlit caches or images are present.");
+        if let Err(reason) = &plan.images {
+            println!("Images could not be listed: {reason}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 

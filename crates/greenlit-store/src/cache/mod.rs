@@ -30,6 +30,8 @@ pub mod key;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -64,10 +66,37 @@ pub struct Restored {
     pub exact: bool,
 }
 
+/// A running tally of lookups, for the end-of-run breakdown
+/// `PHASE-4-environment.md` asks for ("Instrument cache-shim hit/miss").
+///
+/// Every clone of a [`CacheStore`] shares one tally, which is what lets the
+/// host process read counts accumulated by the shim's own task: the shim
+/// serves on a `tokio::spawn`ed task that does not inherit the scoped tracing
+/// subscriber `greenlit-metrics` installs, so a span opened inside a handler
+/// would never be recorded. Counters are subscriber-independent and work
+/// regardless of which task touched the store.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheCounts {
+    /// Lookups that restored an entry.
+    pub hits: u64,
+    /// Lookups that found nothing.
+    pub misses: u64,
+    /// Bytes committed into the store by save operations.
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Default)]
+struct Counters {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    bytes_written: AtomicU64,
+}
+
 /// The local cache store rooted at a directory.
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     root: PathBuf,
+    counters: Arc<Counters>,
 }
 
 impl CacheStore {
@@ -83,7 +112,20 @@ impl CacheStore {
     /// Opens a store backed by an explicit root directory.
     #[must_use]
     pub fn at(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            counters: Arc::new(Counters::default()),
+        }
+    }
+
+    /// The lookup tally across this store and every clone of it.
+    #[must_use]
+    pub fn counts(&self) -> CacheCounts {
+        CacheCounts {
+            hits: self.counters.hits.load(Ordering::Relaxed),
+            misses: self.counters.misses.load(Ordering::Relaxed),
+            bytes_written: self.counters.bytes_written.load(Ordering::Relaxed),
+        }
     }
 
     /// Opens the real per-user store, resolving `HOME`.
@@ -134,8 +176,10 @@ impl CacheStore {
             .collect();
 
         let Some(selected) = key::select(keys, version, candidates.iter()) else {
+            self.counters.misses.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
+        self.counters.hits.fetch_add(1, Ordering::Relaxed);
 
         // `select` returns the winning *key*; map it back to the id whose
         // metadata produced that candidate. Keys are unique per version, and
@@ -213,6 +257,9 @@ impl CacheStore {
             return Err(StoreError::UnknownReservation { id });
         }
 
+        self.counters
+            .bytes_written
+            .fetch_add(size, Ordering::Relaxed);
         let mut meta = read_meta(&from)?;
         meta.size = size;
         meta.created_unix = now_unix();

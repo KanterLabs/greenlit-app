@@ -5,10 +5,28 @@
 //! everything this removes is derived and cheap to rebuild, while credentials
 //! and the user's own run history are not. Deleting either of those would be
 //! a silent, unrecoverable loss, so both are asserted explicitly.
+//!
+//! Every case points `DOCKER_HOST` at a transport detection rejects. `clean`
+//! removes *images* as well as directories, and a test that reached the
+//! developer's real daemon would delete their real Greenlit images as a side
+//! effect — which is exactly what happened before this was added, and which
+//! also made the cases race each other. Pointing at a dead socket keeps the
+//! filesystem behavior under test and exercises the documented degradation
+//! path (caches still reclaimed, images reported as skipped) at the same
+//! time.
 
 pub mod support;
 
 use support::Sandbox;
+
+/// A `DOCKER_HOST` transport detection *rejects outright*, so no test ever
+/// reaches a daemon.
+///
+/// An unreachable socket path is not enough: detection falls through to the
+/// real Docker socket when `DOCKER_HOST` simply fails to answer, which would
+/// put the developer's own images in range of a `clean --yes`. A rejected
+/// transport short-circuits before any probe.
+const NO_DAEMON: (&str, &str) = ("DOCKER_HOST", "ssh://greenlit-tests-never-connect");
 
 /// Seeds every derived store plus the two things a clean must never remove.
 fn seed_litci_home(sandbox: &Sandbox) {
@@ -31,7 +49,7 @@ fn clean_removes_every_derived_store() {
     let sandbox = Sandbox::new();
     seed_litci_home(&sandbox);
 
-    let output = sandbox.run(&["clean", "--yes"]);
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
     assert!(
         output.status.success(),
         "clean failed: {}",
@@ -58,7 +76,7 @@ fn clean_never_touches_credentials_or_run_history() {
     let sandbox = Sandbox::new();
     seed_litci_home(&sandbox);
 
-    let output = sandbox.run(&["clean", "--yes"]);
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
     assert!(output.status.success());
 
     let home = sandbox.home();
@@ -81,7 +99,7 @@ fn clean_reports_what_it_will_remove_before_removing_it() {
     let sandbox = Sandbox::new();
     seed_litci_home(&sandbox);
 
-    let output = sandbox.run(&["clean", "--yes"]);
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
     let stdout = support::stdout_text(&output);
 
     assert!(
@@ -104,7 +122,7 @@ fn declining_the_prompt_removes_nothing() {
     seed_litci_home(&sandbox);
 
     // No `--yes`, and stdin answers "n".
-    let output = sandbox.run_with_stdin(&["clean"], &[], "n\n");
+    let output = sandbox.run_with_stdin(&["clean"], &[NO_DAEMON], "n\n");
     assert!(output.status.success(), "declining is not a failure");
     assert!(
         support::stdout_text(&output).contains("No changes made."),
@@ -120,10 +138,29 @@ fn declining_the_prompt_removes_nothing() {
 fn an_empty_store_is_not_an_error() {
     let sandbox = Sandbox::new();
 
-    let output = sandbox.run(&["clean", "--yes"]);
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
     assert!(output.status.success());
     assert!(
         support::stdout_text(&output).contains("Nothing to clean"),
         "a fresh machine says so rather than reporting an empty removal"
+    );
+}
+
+#[test]
+fn an_unreachable_daemon_still_reclaims_the_caches() {
+    let sandbox = Sandbox::new();
+    seed_litci_home(&sandbox);
+
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
+    assert!(output.status.success(), "an absent daemon is not a failure");
+
+    let stdout = support::stdout_text(&output);
+    assert!(
+        stdout.contains("images could not be listed"),
+        "the user is told which half was skipped and why: {stdout}"
+    );
+    assert!(
+        !sandbox.home().join(".litci/cache").exists(),
+        "the on-disk half is reclaimed regardless of the daemon"
     );
 }
