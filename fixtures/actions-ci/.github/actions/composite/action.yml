@@ -1,0 +1,21 @@
+name: greenlit composite fixture
+description: >
+  Local composite action exercised by fixtures/actions-ci
+  (PHASE-3-actions.md exit criterion 1). Proves nested input scoping,
+  nested expression evaluation, and composite output mapping.
+inputs:
+  greeting:
+    description: Greeting text to echo back, suffixed.
+    default: hello
+outputs:
+  greeting:
+    description: The input greeting, suffixed by the composite's own step.
+    value: ${{ steps.echo.outputs.greeting }}
+runs:
+  using: composite
+  steps:
+    - id: echo
+      shell: bash
+      run: |
+        echo "composite got: ${{ inputs.greeting }}"
+        echo "greeting=${{ inputs.greeting }}-composite" >> "$GITHUB_OUTPUT"

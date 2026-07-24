@@ -8,6 +8,7 @@ members = [
     "crates/greenlit-metrics",
     "crates/greenlit-runtime",
     "crates/greenlit-init",
+    "crates/greenlit-actions",
 ]
 
 [workspace.package]

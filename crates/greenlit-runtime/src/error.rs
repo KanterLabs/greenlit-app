@@ -103,6 +103,8 @@ pub enum Operation {
     RemoveContainer,
     /// Exporting a filesystem subtree from a container as a tar archive.
     ExportPath,
+    /// Streaming a container's own stdout/stderr log.
+    ContainerLogs,
     /// Creating an exec instance.
     CreateExec,
     /// Starting an exec instance / draining its output.
@@ -127,6 +129,7 @@ impl fmt::Display for Operation {
             Operation::StopContainer => "stop container",
             Operation::RemoveContainer => "remove container",
             Operation::ExportPath => "export path",
+            Operation::ContainerLogs => "stream container logs",
             Operation::CreateExec => "create exec",
             Operation::StartExec => "start exec",
             Operation::InspectExec => "inspect exec",

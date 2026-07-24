@@ -1,0 +1,13 @@
+name: greenlit docker fixture
+description: >
+  Local Docker action exercised by fixtures/actions-ci
+  (PHASE-3-actions.md exit criterion 1). Proves Docker-action execution as
+  an isolated sibling container sharing the job's live workspace, never a
+  host Docker socket.
+inputs:
+  message:
+    description: Message text to record into the shared workspace.
+    default: hi
+runs:
+  using: docker
+  image: Dockerfile

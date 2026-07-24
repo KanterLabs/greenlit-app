@@ -17,6 +17,7 @@
 //! (`greenlit_metrics::timed_stage`) the day it is built, so `greenlit-metrics`
 //! captures the stage breakdown without a dependency edge back onto this crate.
 
+pub mod actions;
 mod cmdfiles;
 pub mod container;
 mod context;
@@ -99,6 +100,9 @@ pub struct RunConfig {
     pub write_back: bool,
     /// Cadence and deadlines for the workspace-readiness poll.
     pub readiness: ReadinessConfig,
+    /// Action resolution/fetch/runtime configuration for `uses:` steps
+    /// (`PHASE-3-actions.md` "Action execution").
+    pub actions: actions::ActionRuntimeConfig,
 }
 
 /// A failure during execution. Detection-time engine conditions never travel
@@ -136,6 +140,11 @@ pub enum ExecError {
     /// A plan-time-deferred expression could not be finished at runtime.
     #[error("could not finish evaluating an expression at runtime: {0}")]
     Eval(#[source] EvalError),
+    /// A manifest-sourced `${{ }}` expression (composite step `if`/`run`/
+    /// `env`/`with`, `runs.pre-if`/`post-if`, Docker `args`/`env`) failed to
+    /// parse or evaluate (`crate::executor::actions::template`).
+    #[error("could not evaluate an action expression: {0}")]
+    TemplateEval(String),
     /// A step's `shell:` could not be resolved.
     #[error("step '{label}': {source}")]
     Shell {
@@ -156,15 +165,71 @@ pub enum ExecError {
         #[source]
         source: greenlit_engine::execution::resolve::TimeoutMinutesError,
     },
-    /// A `uses:` step was reached — action execution lands in Phase 3.
-    #[error(
-        "{span}: `uses: {reference}` is an action step, which `litci run` executes starting in Phase 3\n  fix: for now run a shell-only workflow, or use `litci plan` to inspect this one"
-    )]
-    UsesUnsupported {
-        /// The action reference.
+    /// A `uses:` value did not match one of GitHub's four documented forms
+    /// (`owner/repo@ref`, `owner/repo/subdir@ref`, `./local/path`,
+    /// `docker://image`). The one shape `crate::executor::preflight` still
+    /// rejects before any engine work — everything parseable proceeds to
+    /// resolution.
+    #[error("{span}: `uses: {reference}` {source}")]
+    ActionRefInvalid {
+        /// The action reference, verbatim.
         reference: String,
         /// Where the `uses:` value was authored.
         span: Span,
+        /// The parse failure.
+        #[source]
+        source: greenlit_actions::UsesRefError,
+    },
+    /// Resolving a `uses:` ref (tag/branch/SHA) to a commit SHA failed.
+    ///
+    /// Boxed: `greenlit_actions::resolve::ResolveError` is large enough that
+    /// clippy's `result_large_err` flags every `Result<_, ExecError>` return
+    /// in this module otherwise (the same reasoning applies to
+    /// [`Self::ActionFetch`]/[`Self::ActionManifest`] below).
+    #[error("{span}: could not resolve `uses: {reference}`: {source}")]
+    ActionResolve {
+        /// The action reference, verbatim.
+        reference: String,
+        /// Where the `uses:` value was authored.
+        span: Span,
+        /// The underlying resolution failure.
+        #[source]
+        source: Box<greenlit_actions::resolve::ResolveError>,
+    },
+    /// Fetching a resolved action's source into the action store failed.
+    #[error("{span}: could not fetch `uses: {reference}`: {source}")]
+    ActionFetch {
+        /// The action reference, verbatim.
+        reference: String,
+        /// Where the `uses:` value was authored.
+        span: Span,
+        /// The underlying store/fetch failure.
+        #[source]
+        source: Box<greenlit_actions::store::StoreError>,
+    },
+    /// Parsing a resolved action's `action.yml`/`action.yaml` failed.
+    #[error("{span}: could not read the manifest for `uses: {reference}`: {source}")]
+    ActionManifest {
+        /// The action reference, verbatim.
+        reference: String,
+        /// Where the `uses:` value was authored.
+        span: Span,
+        /// The underlying manifest parse failure.
+        #[source]
+        source: Box<greenlit_actions::manifest::ManifestError>,
+    },
+    /// A checkout of a repository other than the current one was requested
+    /// with no token available (`PHASE-3-actions.md` "actions/checkout":
+    /// "Checkout of a different repository performs a real clone and
+    /// requires a token").
+    #[error(
+        "{span}: checking out '{repository}' requires a GitHub token, and none is configured\n  fix: run `litci auth` (or `litci auth --pat`/`--gh`), or supply `with: token: <value>` on this step"
+    )]
+    CheckoutRequiresAuth {
+        /// Where the `uses:` value was authored.
+        span: Span,
+        /// The repository that was requested.
+        repository: String,
     },
     /// A matrix that only materializes from runtime dependency outputs was
     /// reached. Expanding it requires mid-run data v0's sequential executor
@@ -199,6 +264,15 @@ impl ExecError {
     /// Wrap a runtime expression-evaluation failure.
     pub(crate) fn eval(source: EvalError) -> Self {
         ExecError::Eval(source)
+    }
+
+    /// Wrap a manifest-sourced template parse/evaluation failure
+    /// (`crate::executor::actions::template::TemplateError`) — kept as a
+    /// `String` (like [`ExecError::CommandFile`]) rather than the typed
+    /// error itself, since the typed error lives in a `pub(crate)` module
+    /// and this enum is public.
+    pub(crate) fn template_eval(source: impl std::fmt::Display) -> Self {
+        ExecError::TemplateEval(source.to_string())
     }
 }
 

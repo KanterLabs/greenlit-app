@@ -7,7 +7,7 @@ use super::HEADER;
 #[test]
 fn static_extraction_reports_the_complete_preflight_inventory() {
     let source = format!(
-        "{HEADER}run-name: Deploy ${{{{ vars.RUN_LABEL }}}}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - token: ${{{{ vars.MATRIX_VALUE }}}}\n    container:\n      image: node:20\n      credentials:\n        password: ${{{{ secrets.REGISTRY_PASSWORD }}}}\n    services:\n      db:\n        image: postgres\n        credentials:\n          password: ${{{{ secrets.DB_PASS }}}}\n    env:\n      TOKEN: ${{{{ secrets.API_TOKEN }}}}\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          region: ${{{{ vars.REGION }}}}\n      - run: echo ${{{{ secrets['DB_PASSWORD'] }}}} ${{{{ vars['DEPLOY_ENV'] }}}} ${{{{ vars[matrix.key] }}}}\n  package:\n    needs: build\n    runs-on: [self-hosted, linux]\n    steps:\n      - uses: actions/setup-node@v4\n      - run: echo ${{{{ needs.build.outputs.literal }}}} ${{{{ needs[format('{{0}}', 'build')].outputs[format('{{0}}', 'computed')] }}}} ${{{{ needs[github.event_name].outputs.dynamic }}}}\n"
+        "{HEADER}run-name: Deploy ${{{{ vars.RUN_LABEL }}}}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - token: ${{{{ vars.MATRIX_VALUE }}}}\n    container:\n      image: node:20\n      credentials:\n        password: ${{{{ secrets.REGISTRY_PASSWORD }}}}\n    services:\n      db:\n        image: postgres\n        credentials:\n          password: ${{{{ secrets.DB_PASS }}}}\n    env:\n      TOKEN: ${{{{ secrets.API_TOKEN }}}}\n      GH_TOKEN: ${{{{ github.token }}}}\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          region: ${{{{ vars.REGION }}}}\n      - run: echo ${{{{ secrets['DB_PASSWORD'] }}}} ${{{{ vars['DEPLOY_ENV'] }}}} ${{{{ vars[matrix.key] }}}}\n  package:\n    needs: build\n    runs-on: [self-hosted, linux]\n    steps:\n      - uses: actions/setup-node@v4\n      - run: echo ${{{{ needs.build.outputs.literal }}}} ${{{{ needs[format('{{0}}', 'build')].outputs[format('{{0}}', 'computed')] }}}} ${{{{ needs[github.event_name].outputs.dynamic }}}}\n"
     );
     let workflow = parse_workflow("inventory.yml", &source).expect("parses");
     let extraction = extract_static(&workflow).expect("valid expressions extract");
@@ -24,6 +24,7 @@ fn static_extraction_reports_the_complete_preflight_inventory() {
     );
     assert!(extraction.has_dynamic_vars_lookup);
     assert_eq!(extraction.dynamic_vars.len(), 1);
+    assert!(extraction.references_github_token);
 
     let uses: Vec<&str> = extraction
         .uses
@@ -72,4 +73,5 @@ fn static_extraction_reports_the_complete_preflight_inventory() {
     let workflow = parse_workflow("literal-only.yml", &literal_only).expect("parses");
     let extraction = extract_static(&workflow).expect("valid expressions extract");
     assert!(!extraction.has_dynamic_vars_lookup);
+    assert!(!extraction.references_github_token);
 }

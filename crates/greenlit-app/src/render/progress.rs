@@ -170,6 +170,13 @@ impl<W: Write + Send> ProgressSink for ProgressRenderer<W> {
                 }
                 _ => {}
             },
+            ProgressEvent::ActionRuntimeEnsureStarted => {
+                self.show_transient("action-runtime-ensure: preparing pinned Node runtime", true);
+            }
+            ProgressEvent::ActionRuntimeEnsureFinished => {
+                self.phase_line("action-runtime-ensure: pinned Node runtime ready");
+                self.clear_transient();
+            }
             _ => {}
         }
     }
@@ -325,6 +332,19 @@ mod tests {
             !output.contains('\u{1b}'),
             "escape byte must not reach the terminal: {output:?}"
         );
+    }
+
+    #[test]
+    fn action_runtime_ensure_prints_a_phase_line_off_a_tty() {
+        let output = drive(
+            false,
+            vec![
+                ProgressEvent::ActionRuntimeEnsureStarted,
+                ProgressEvent::ActionRuntimeEnsureFinished,
+            ],
+        );
+        assert!(output.contains("action-runtime-ensure: pinned Node runtime ready\n"));
+        assert!(!output.contains('\r'));
     }
 
     #[test]

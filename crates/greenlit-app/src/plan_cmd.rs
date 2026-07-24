@@ -80,22 +80,38 @@ fn execute(args: &PlanArgs, invocation: &Invocation) -> anyhow::Result<()> {
     let (plan_options, event) = (|| -> anyhow::Result<_> {
         let extraction = greenlit_workflow::extract_static(&workflow)
             .map_err(|error| errors::parse_error(&error))?;
-        let dotenv_vars = vars::read_dotenv_vars(&repo_root).map_err(|s| anyhow::anyhow!(s))?;
-        let vars_value = vars::resolve_vars(
-            &extraction,
-            &args.vars,
-            dotenv_vars.as_deref().unwrap_or_default(),
-            dotenv_vars.is_some(),
-        )
-        .map_err(|failure| errors::vars_resolution(&failure))?;
-        let plan_options = PlanOptions {
-            vars: vars_value,
-            max_matrix_legs: greenlit_engine::DEFAULT_MAX_MATRIX_LEGS,
-        };
+        // `litci plan` resolves `vars` through the same remote-augmented
+        // chain `litci run` does (`PHASE-3-actions.md`: "keep plan and run
+        // behavior consistent") but never touches secrets/`GITHUB_TOKEN` —
+        // "plan never prompts for secrets", and `plan()` has no secrets
+        // input at all, so nothing here could leak one into
+        // `litci plan --json` even by mistake.
         let event_kind: greenlit_engine::EventKind = args.event.into();
         let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
         let event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
             .map_err(|e| errors::event_error(&e))?;
+        let dotenv_vars = vars::read_dotenv_vars(&repo_root).map_err(|s| anyhow::anyhow!(s))?;
+        let git = greenlit_engine::git::collect_git_context(&repo_root)
+            .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
+        let repo_leaf = git
+            .repository
+            .rsplit('/')
+            .next()
+            .unwrap_or(&git.repository)
+            .to_string();
+        let vars_outcome = vars::resolve_vars_with_remote(
+            &extraction,
+            &args.vars,
+            dotenv_vars.as_deref().unwrap_or_default(),
+            dotenv_vars.is_some(),
+            &git.repository_owner,
+            &repo_leaf,
+        );
+        let vars_value = errors::vars_outcome(vars_outcome)?;
+        let plan_options = PlanOptions {
+            vars: vars_value,
+            max_matrix_legs: greenlit_engine::DEFAULT_MAX_MATRIX_LEGS,
+        };
         Ok((plan_options, event))
     })()?;
 

@@ -1,0 +1,72 @@
+name: actions-ci
+on: push
+
+env:
+  WORKFLOW_LEVEL: wf
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Local variable reference (`--var LOCAL_MODE=ci` in the smoke test):
+    # gates the job exactly like `fixtures/matrix-needs.yml` already does,
+    # proving the local `--var` leg of the `vars.*` chain.
+    if: vars.LOCAL_MODE == 'ci'
+    env:
+      # Remote variable reference: not supplied locally, so it must come
+      # from the authenticated GitHub configuration-variable lookup
+      # (mocked in the smoke test via `LITCI_TEST_GITHUB_API_BASE_URL`).
+      REMOTE_GREETING: ${{ vars.REMOTE_GREETING }}
+      # Secret references: one via `-s`, one via the process environment --
+      # both legs of the local secrets chain the smoke test exercises.
+      CLI_SECRET: ${{ secrets.CLI_SECRET }}
+      ENV_SECRET: ${{ secrets.ENV_SECRET }}
+    steps:
+      # actions/checkout: self-satisfied from the already-isolated
+      # workspace -- no network for the local repo (`ARCHITECTURE.md`
+      # "actions/checkout of the workflow's own repository").
+      - name: checkout
+        id: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # A real marketplace setup-* action, pinned by full commit SHA so
+      # resolution needs no ref lookup (`greenlit_actions::resolve::resolve_ref`
+      # short-circuits a full-SHA ref with zero network). `cache:` is left
+      # unset so setup-node's own post step (`dist/cache-save/index.js`)
+      # takes its documented early-return path without calling the
+      # actions/cache service at all -- Phase 4 scope stays untouched.
+      - name: setup node
+        id: setup
+        uses: actions/setup-node@8f152de45cc393bb48ce5d89d36b731f54556e65
+        with:
+          node-version: '20.11.1'
+
+      # A tiny in-fixture composite action: local paths bypass the action
+      # store by design, and this exercises nested input scoping, nested
+      # expression evaluation, and composite output mapping.
+      - name: run composite
+        id: composite
+        uses: ./.github/actions/composite
+        with:
+          greeting: hello-from-workflow
+
+      # A tiny in-fixture Docker action: runs as a sibling container
+      # sharing the job's live workspace (never a host socket).
+      - name: run docker action
+        id: docker
+        uses: ./.github/actions/docker-action
+        with:
+          message: hi-from-docker
+
+      - name: verify everything
+        run: |
+          set -e
+          node --version | grep -q '^v20\.'
+          test "$REMOTE_GREETING" = "greenlit-remote"
+          test "$CLI_SECRET" = "cli-secret-value"
+          test "$ENV_SECRET" = "env-secret-value"
+          test "${{ steps.checkout.outputs.ref }}" = "refs/heads/main"
+          test -n "${{ steps.checkout.outputs.commit }}"
+          test -n "${{ steps.setup.outputs.node-version }}"
+          test "${{ steps.composite.outputs.greeting }}" = "hello-from-workflow-composite"
+          test "$(cat "$GITHUB_WORKSPACE/docker-action.log")" = "hi-from-docker"
+          echo "all checks passed"
