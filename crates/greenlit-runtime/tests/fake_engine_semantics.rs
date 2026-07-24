@@ -23,7 +23,7 @@ use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
 use greenlit_runtime::error::RuntimeError;
-use greenlit_runtime::progress::{ProgressNull, ProgressSink};
+use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink};
 use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
 
 /// A fake engine that keeps an in-memory file map and interprets a directive
@@ -33,6 +33,9 @@ use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
 struct ScriptedEngine {
     files: Mutex<HashMap<String, String>>,
     counter: AtomicUsize,
+    /// When set, `image_exists` reports absence so the executor drives the
+    /// build path (and its progress events).
+    image_absent: bool,
 }
 
 impl ScriptedEngine {
@@ -123,13 +126,21 @@ impl ContainerEngine for ScriptedEngine {
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
-        Ok(true)
+        Ok(!self.image_absent)
     }
     async fn build_image(
         &self,
-        _spec: &BuildSpec,
-        _progress: &mut (dyn ProgressSink + Send),
+        spec: &BuildSpec,
+        progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
+        // Mirror the real engine's contract: engines report their own
+        // build progress.
+        progress.on_progress(ProgressEvent::BuildStarted {
+            tag: spec.tag.clone(),
+        });
+        progress.on_progress(ProgressEvent::BuildFinished {
+            tag: spec.tag.clone(),
+        });
         Ok(())
     }
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {
@@ -393,5 +404,90 @@ async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
     assert!(
         rendered.contains("fake-ci.yml:"),
         "the exec-time guard keeps the authored span: {rendered}"
+    );
+}
+
+/// A sink that records event discriminants in arrival order.
+#[derive(Default)]
+struct RecordingSink {
+    events: Vec<String>,
+}
+
+impl ProgressSink for RecordingSink {
+    fn on_progress(&mut self, event: ProgressEvent) {
+        let name = match event {
+            ProgressEvent::PullStarted { .. } => "pull-started",
+            ProgressEvent::PullProgress { .. } => "pull-progress",
+            ProgressEvent::PullFinished { .. } => "pull-finished",
+            ProgressEvent::BuildStarted { .. } => "build-started",
+            ProgressEvent::BuildLine { .. } => "build-line",
+            ProgressEvent::BuildFinished { .. } => "build-finished",
+            ProgressEvent::BootStarted => "boot-started",
+            ProgressEvent::BootFinished => "boot-finished",
+            ProgressEvent::Workspace(_) => "workspace",
+            _ => "other",
+        };
+        self.events.push(name.to_string());
+    }
+}
+
+const SINGLE_JOB_WORKFLOW: &str = r#"
+on: push
+jobs:
+  only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          ECHO hi
+"#;
+
+#[tokio::test]
+async fn preparation_progress_events_arrive_in_phase_order() {
+    let workflow =
+        greenlit_workflow::parse_workflow("fake-ci.yml", SINGLE_JOB_WORKFLOW).expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+
+    let engine = ScriptedEngine {
+        image_absent: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
+    };
+
+    let mut log: Vec<u8> = Vec::new();
+    let mut recording = RecordingSink::default();
+    run_plan(&engine, &execution_plan, &config, &mut log, &mut recording)
+        .await
+        .expect("run completes");
+
+    assert_eq!(
+        recording.events,
+        vec![
+            "build-started",
+            "build-finished",
+            "boot-started",
+            "boot-finished"
+        ],
+        "preparation phases report in order: image ensure, then boot"
     );
 }
