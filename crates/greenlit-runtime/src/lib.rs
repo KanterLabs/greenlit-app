@@ -43,12 +43,12 @@ pub use detect::{Endpoint, EngineFix, EngineProber, EngineState, SystemProber, d
 pub use docker::DockerEngine;
 pub use engine::{
     BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
-    ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageSummary, PortBinding, RegistryAuth,
-    SinkNull,
+    ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageSummary, NetworkInfo, PortBinding,
+    RegistryAuth, SinkNull,
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{
-    ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport,
+    ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport, StoreConfig,
     actions::ActionRuntimeConfig, actions::node_runtime::HttpRuntimeBundleFetcher,
     container::ContainerRejection, reject_uses_steps, run_plan,
 };

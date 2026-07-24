@@ -27,6 +27,7 @@ mod logsink;
 mod preflight;
 mod readiness;
 mod report;
+mod services;
 mod step;
 
 use std::collections::HashMap;
@@ -57,6 +58,7 @@ pub use container::{
 pub use preflight::reject_uses_steps;
 pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
+pub use services::{JobNetwork, StoreConfig};
 
 /// Everything the executor needs beyond the plan and the engine.
 pub struct RunConfig {
@@ -103,6 +105,9 @@ pub struct RunConfig {
     /// Action resolution/fetch/runtime configuration for `uses:` steps
     /// (`PHASE-3-actions.md` "Action execution").
     pub actions: actions::ActionRuntimeConfig,
+    /// Where the local cache, artifact, and toolcache stores live, when this
+    /// run serves them. `None` runs with no cache service at all.
+    pub store: Option<StoreConfig>,
 }
 
 /// A failure during execution. Detection-time engine conditions never travel

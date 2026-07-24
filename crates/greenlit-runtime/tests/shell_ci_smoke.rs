@@ -72,6 +72,7 @@ fn runner_env(workspace: &str) -> RunnerEnv {
         runner_name: "greenlit".to_string(),
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
+        actions_service: None,
     }
 }
 
@@ -108,6 +109,7 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
+        store: None,
     };
 
     let mut log: Vec<u8> = Vec::new();

@@ -252,3 +252,17 @@ pub struct ImageSummary {
     /// On-disk size in bytes, as the engine reports it.
     pub size_bytes: u64,
 }
+
+/// What Greenlit needs to know about a network it created.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkInfo {
+    /// The bridge's own IPv4 address on the host, which is the address a
+    /// container attached to it reaches the host at.
+    ///
+    /// `PHASE-4-environment.md` ("Network policy"): "Bind only on the
+    /// Greenlit bridge gateway". The shim binds here rather than on every
+    /// host interface, so nothing outside the run can reach it, and the
+    /// container addresses it here rather than at a loopback it does not
+    /// share.
+    pub gateway: Option<String>,
+}

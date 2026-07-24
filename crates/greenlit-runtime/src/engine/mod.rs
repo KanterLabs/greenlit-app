@@ -21,7 +21,7 @@ use crate::progress::ProgressSink;
 
 pub use spec::{
     BindMount, BuildSpec, CommitSpec, ContainerSpec, ContainerState, ExecOutput, ExecSpec,
-    HealthCheck, HealthState, ImageSummary, PortBinding, RegistryAuth,
+    HealthCheck, HealthState, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
 };
 
 /// Receives an exec's stdout/stderr as the daemon streams it.
@@ -286,6 +286,13 @@ pub trait ContainerEngine: Send + Sync {
     ///
     /// Returns [`RuntimeError::Api`] if creation fails.
     async fn create_network(&self, name: &str) -> Result<String, RuntimeError>;
+
+    /// The gateway address of a network Greenlit created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if the inspection fails.
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError>;
 
     /// Remove a network by name or id.
     ///

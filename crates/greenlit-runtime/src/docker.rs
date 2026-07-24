@@ -30,7 +30,7 @@ use futures_util::StreamExt;
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
-    ExecOutputSink, ExecSpec, HealthState, ImageSummary, RegistryAuth,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -610,6 +610,28 @@ impl ContainerEngine for DockerEngine {
             .await
             .map_err(|e| RuntimeError::api(Operation::CreateNetwork, e))?;
         Ok(response.id)
+    }
+
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError> {
+        let network = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|e| RuntimeError::api(Operation::InspectNetwork, e))?;
+        // A bridge can carry both an IPv4 and an IPv6 config; Greenlit binds
+        // v4 only, matching the v0 host support statement.
+        let gateway = network
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .and_then(|configs| {
+                configs
+                    .into_iter()
+                    .find_map(|config| config.gateway.filter(|value| !value.contains(':')))
+            });
+        Ok(NetworkInfo { gateway })
     }
 
     async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {

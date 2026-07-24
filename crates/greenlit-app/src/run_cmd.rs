@@ -224,6 +224,12 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let actions_config =
         build_action_runtime_config(action_token).map_err(|message| anyhow::anyhow!(message))?;
 
+    // The local stores this run serves. A machine whose `HOME` cannot be
+    // resolved simply runs without them -- `actions/cache` then behaves as it
+    // does on a runner with no cache service, which is an honest miss rather
+    // than a broken run.
+    let store_config = build_store_config();
+
     let config = RunConfig {
         repo_host_path: repo_root.clone(),
         workspace: workspace.clone(),
@@ -242,6 +248,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: actions_config,
+        store: store_config.clone(),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -284,6 +291,19 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // no metrics-schema change, so no deliberate snapshot update is needed
     // (`TESTING.md`: the metrics record schema is a declared-stable
     // snapshot surface).
+    if let Some(store) = config.store.as_ref() {
+        // Drained from the store rather than read off a tracing span: the
+        // shim serves on a spawned task, which does not inherit the scoped
+        // subscriber the timing layer installs, so a span opened inside a
+        // handler would silently never be recorded.
+        let cache_counts = store.cache.counts();
+        for _ in 0..cache_counts.hits {
+            invocation.record_lookup("cache", true);
+        }
+        for _ in 0..cache_counts.misses {
+            invocation.record_lookup("cache", false);
+        }
+    }
     let action_counts = config.actions.store.counts();
     for _ in 0..action_counts.hits {
         invocation.record_lookup("action-fetch", true);
@@ -473,6 +493,51 @@ fn build_action_runtime_config(
     })
 }
 
+/// Opens the local cache, artifact, and toolcache stores for this run.
+///
+/// A machine whose `HOME` cannot be resolved runs without them, and
+/// `actions/cache` then behaves as it does on a runner with no cache service
+/// — an honest miss rather than a broken run.
+///
+/// The runtime token is per-run and never leaves the machine: it exists so a
+/// container other than this run's cannot read this run's cache through the
+/// shim, which is reachable from the job network.
+fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    if !home.is_absolute() {
+        return None;
+    }
+    let runtime_token = runtime_token()?;
+    Some(greenlit_runtime::StoreConfig {
+        cache: greenlit_store::CacheStore::at(greenlit_store::CacheStore::default_path_under(
+            &home,
+        )),
+        artifacts: greenlit_store::ArtifactStore::at(
+            greenlit_store::ArtifactStore::default_path_under(&home),
+        ),
+        toolcache_root: home.join(".litci").join("toolcache"),
+        runtime_token,
+    })
+}
+
+/// A per-run bearer token for the shim.
+///
+/// This is the only thing standing between one container on the job bridge
+/// and another run's cache, so it is drawn from the kernel CSPRNG rather than
+/// derived from the pid and clock the way `run_volume_namespace` is — a
+/// volume name only has to be unique, but a token has to be unguessable. If
+/// `/dev/urandom` cannot be read the run proceeds with no shim at all rather
+/// than with a predictable token: an honest cache miss beats a guessable
+/// credential.
+fn runtime_token() -> Option<String> {
+    use std::io::Read;
+    let mut bytes = [0_u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// Build the runner/`github` environment template from local git metadata.
 fn build_runner_env(
     git: &greenlit_engine::git::GitContext,
@@ -498,6 +563,7 @@ fn build_runner_env(
         runner_name: "greenlit".to_string(),
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
+        actions_service: None,
     }
 }
 
