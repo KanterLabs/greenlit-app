@@ -52,8 +52,39 @@ tar = "0.4.46"
 # rather than hand-rolling raw libc FFI, which would need `unsafe` in a crate
 # that forbids it.
 rustix = { version = "1.1.4", features = ["fs"] }
+# `uses:` resolution/fetch/manifest types this crate's executor drives to turn
+# a resolved action into a ready-to-mount source tree
+# (`crates/greenlit-runtime/src/executor/actions`). The dataflow stays
+# one-directional (`greenlit-actions` never depends back on this crate).
+greenlit-actions = { path = "../greenlit-actions", version = "0.1.0" }
+# Downloads the pinned `actions/runner` Node runtime bundles
+# (`executor::actions::node_runtime`) — the same blocking HTTP client,
+# version, and rustls backend `greenlit-actions` already pins for its own
+# real network calls (tarball download, GitHub API), for the identical
+# "single static host binary rules out a system-OpenSSL `native-tls` link"
+# reasoning; driven via `spawn_blocking` per `AGENTS.md` "no blocking calls
+# on the async runtime".
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+# Decompresses the `.tar.gz` framing the pinned Node runtime bundles ship in,
+# ahead of unpacking with `tar` (already a dependency above). Same pure-Rust
+# `miniz_oxide`-backed crate and version `greenlit-actions` already pins for
+# its own tarball fetcher, for the same "no system zlib/C-compiler
+# dependency" reasoning.
+flate2 = "1.1.9"
+# Verifies each downloaded Node runtime bundle against its pinned checksum
+# before it is ever extracted or mounted into a job container — a genuine
+# integrity check on untrusted network content, unlike `image::context`'s
+# FNV cache key. Already a transitive dependency (`greenlit-expr`'s
+# `hashFiles` digest use) at this exact version; declared directly here too
+# since this crate calls it itself.
+sha2 = "0.11.0"
 
 [dev-dependencies]
+# Isolated temp directories for the action-store/node-runtime-cache unit
+# tests in `crates/greenlit-runtime/src/executor/actions`. Same version
+# already used elsewhere in the workspace (`greenlit-actions`,
+# `greenlit-app`).
+tempfile = "3.27.0"
 # Drives the async trait surface and detection state machine in tests without a
 # real Docker daemon (the engine prober is injected as a fake).
 tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time"] }
