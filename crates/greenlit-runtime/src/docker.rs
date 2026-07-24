@@ -13,20 +13,24 @@ use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, CreateImageInfo, HostConfig, NetworkCreateRequest,
+    ContainerConfig, ContainerCreateBody, CreateImageInfo, EndpointSettings, HealthConfig,
+    HealthStatusEnum, HostConfig, NetworkCreateRequest, NetworkingConfig,
+    PortBinding as BollardPortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CommitContainerOptionsBuilder, CreateContainerOptionsBuilder,
-    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, InspectContainerOptions,
+    ListImagesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RemoveImageOptions, RemoveVolumeOptions, StopContainerOptionsBuilder,
+    WaitContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, RegistryAuth,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -289,18 +293,73 @@ impl ContainerEngine for DockerEngine {
                 format!("{}:{}{mode}", bind.host_path, bind.container_path)
             })
             .collect();
-        let host_config = (spec.network.is_some() || !binds.is_empty()).then(|| HostConfig {
+        // Published ports are expressed twice: `exposed_ports` on the config
+        // declares them, `port_bindings` on the host config says where they
+        // land. Greenlit always sets `host_ip`, so a service is reachable from
+        // the job and from nowhere else on the host.
+        let mut exposed_ports: Vec<String> = Vec::new();
+        let mut port_bindings: HashMap<String, Option<Vec<BollardPortBinding>>> = HashMap::new();
+        for port in &spec.ports {
+            let key = format!("{}/{}", port.container_port, port.protocol);
+            if !exposed_ports.contains(&key) {
+                exposed_ports.push(key.clone());
+            }
+            port_bindings
+                .entry(key)
+                .or_insert_with(|| Some(Vec::new()))
+                .get_or_insert_with(Vec::new)
+                .push(BollardPortBinding {
+                    host_ip: port.host_ip.clone(),
+                    host_port: port.host_port.map(|value| value.to_string()),
+                });
+        }
+
+        let needs_host_config = spec.network.is_some()
+            || !binds.is_empty()
+            || !spec.cap_add.is_empty()
+            || !port_bindings.is_empty();
+        let host_config = needs_host_config.then(|| HostConfig {
             network_mode: spec.network.clone(),
             binds: (!binds.is_empty()).then_some(binds),
+            cap_add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
+            port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
             ..Default::default()
         });
+
+        // A network alias only applies to a *named* network, not to the
+        // `container:<id>` namespace-sharing mode the netguard sidecar uses,
+        // where the endpoint config has no meaning.
+        let networking_config = match (&spec.network, spec.network_aliases.is_empty()) {
+            (Some(network), false) if !network.starts_with("container:") => {
+                let endpoint = EndpointSettings {
+                    aliases: Some(spec.network_aliases.clone()),
+                    ..Default::default()
+                };
+                Some(NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(network.clone(), endpoint)])),
+                })
+            }
+            _ => None,
+        };
+
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
+            hostname: spec.hostname.clone(),
             entrypoint: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
             cmd: (!spec.cmd.is_empty()).then(|| spec.cmd.clone()),
             env: (!env.is_empty()).then_some(env),
             working_dir: spec.working_dir.clone(),
             labels: (!labels.is_empty()).then_some(labels),
+            exposed_ports: (!exposed_ports.is_empty()).then_some(exposed_ports),
+            healthcheck: spec.healthcheck.as_ref().map(|health| HealthConfig {
+                test: (!health.test.is_empty()).then(|| health.test.clone()),
+                interval: health.interval_nanos,
+                timeout: health.timeout_nanos,
+                retries: health.retries,
+                start_period: health.start_period_nanos,
+                ..Default::default()
+            }),
+            networking_config,
             host_config,
             ..Default::default()
         };
@@ -321,6 +380,94 @@ impl ContainerEngine for DockerEngine {
             .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
             .await
             .map_err(|e| RuntimeError::api(Operation::StartContainer, e))
+    }
+
+    async fn inspect_container(&self, id: &str) -> Result<ContainerState, RuntimeError> {
+        let response = self
+            .docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| RuntimeError::api(Operation::InspectContainer, e))?;
+        let state = response.state;
+        // A container with no configured probe reports `None`/`Empty` rather
+        // than a status, which the health gate must read as "nothing to wait
+        // for" -- not as "not healthy yet".
+        let health = state
+            .as_ref()
+            .and_then(|state| state.health.as_ref())
+            .and_then(|health| health.status)
+            .map_or(HealthState::None, |status| match status {
+                HealthStatusEnum::HEALTHY => HealthState::Healthy,
+                HealthStatusEnum::UNHEALTHY => HealthState::Unhealthy,
+                HealthStatusEnum::STARTING => HealthState::Starting,
+                HealthStatusEnum::NONE | HealthStatusEnum::EMPTY => HealthState::None,
+            });
+        Ok(ContainerState {
+            running: state.as_ref().and_then(|state| state.running) == Some(true),
+            exit_code: state.as_ref().and_then(|state| state.exit_code),
+            health,
+        })
+    }
+
+    async fn create_volume(&self, name: &str) -> Result<(), RuntimeError> {
+        self.docker
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.to_string()),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| RuntimeError::api(Operation::CreateVolume, e))
+    }
+
+    async fn remove_volume(&self, name: &str) -> Result<(), RuntimeError> {
+        match self
+            .docker
+            .remove_volume(name, None::<RemoveVolumeOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            // A volume that is already gone is the state the caller wanted.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(RuntimeError::api(Operation::RemoveVolume, e)),
+        }
+    }
+
+    async fn list_images(&self, label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        let options = ListImagesOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec![label])]))
+            .build();
+        let images = self
+            .docker
+            .list_images(Some(options))
+            .await
+            .map_err(|e| RuntimeError::api(Operation::ListImages, e))?;
+        Ok(images
+            .into_iter()
+            .map(|image| ImageSummary {
+                id: image.id,
+                tags: image.repo_tags,
+                size_bytes: u64::try_from(image.size).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn remove_image(&self, image: &str) -> Result<(), RuntimeError> {
+        match self
+            .docker
+            .remove_image(image, None::<RemoveImageOptions>, None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Already gone, same as `remove_volume`.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(RuntimeError::api(Operation::RemoveImage, e)),
+        }
     }
 
     async fn stop_container(&self, id: &str) -> Result<(), RuntimeError> {

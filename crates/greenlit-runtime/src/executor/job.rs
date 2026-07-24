@@ -230,6 +230,17 @@ pub(crate) async fn run_instance(
     // error.
     if !shared.config.write_back {
         let _ = shared.engine.remove_container(&container).await;
+        // The Docker-sibling workspace volume outlives the container that
+        // bound it, so removing the container is not enough. Before
+        // `remove_volume` existed on the port these accumulated on the host
+        // until an operator ran `docker volume prune` -- the module doc in
+        // `actions::docker_action` already described a per-job removal that
+        // no code performed. Removal must follow the container, because a
+        // volume still in use cannot be removed.
+        if let Some(source) = docker_workspace_volume {
+            let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
+            let _ = shared.engine.remove_volume(&volume).await;
+        }
     }
 
     let (step_reports, outputs, result) = outcome?;

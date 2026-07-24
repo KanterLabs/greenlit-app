@@ -42,8 +42,9 @@ pub mod writeback;
 pub use detect::{Endpoint, EngineFix, EngineProber, EngineState, SystemProber, detect};
 pub use docker::DockerEngine;
 pub use engine::{
-    BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink,
-    ExecSpec, RegistryAuth, SinkNull,
+    BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageSummary, PortBinding, RegistryAuth,
+    SinkNull,
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{
