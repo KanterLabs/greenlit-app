@@ -23,6 +23,7 @@ mod context;
 mod instance;
 mod job;
 mod logsink;
+mod preflight;
 mod report;
 mod step;
 
@@ -50,6 +51,7 @@ use crate::isolation::IsolationStrategy;
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
+pub use preflight::reject_uses_steps;
 pub use report::{JobReport, RunReport, StepReport};
 
 /// Everything the executor needs beyond the plan and the engine.
@@ -151,11 +153,13 @@ pub enum ExecError {
     },
     /// A `uses:` step was reached — action execution lands in Phase 3.
     #[error(
-        "`uses: {reference}` is an action step, which `litci run` executes starting in Phase 3\n  fix: for now run a shell-only workflow, or use `litci plan` to inspect this one"
+        "{span}: `uses: {reference}` is an action step, which `litci run` executes starting in Phase 3\n  fix: for now run a shell-only workflow, or use `litci plan` to inspect this one"
     )]
     UsesUnsupported {
         /// The action reference.
         reference: String,
+        /// Where the `uses:` value was authored.
+        span: Span,
     },
     /// A matrix that only materializes from runtime dependency outputs was
     /// reached. Expanding it requires mid-run data v0's sequential executor

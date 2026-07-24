@@ -206,6 +206,11 @@ pub enum StepKind {
         /// The action reference, verbatim (never an expression in valid
         /// GitHub syntax).
         reference: String,
+        /// Where the `uses:` value was authored. Not serialized: `litci plan
+        /// --json` is a declared-stable surface, and its consumers key off
+        /// `reference`, not source position.
+        #[serde(skip)]
+        span: Span,
         /// `with:` inputs with authored source and evaluation state.
         with: IndexMap<String, EnvValue>,
     },

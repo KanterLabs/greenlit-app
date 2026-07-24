@@ -23,8 +23,8 @@ use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
     ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, IsolationStrategy, RunConfig,
-    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, run_plan, run_write_back,
-    validate_host, validate_request,
+    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, reject_uses_steps, run_plan,
+    run_write_back, validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -121,6 +121,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         Some(job) => prune_to_job(&execution_plan, job)?,
         None => execution_plan,
     };
+    // Fail before any engine work: a `uses:` step that is certain to execute
+    // would otherwise surface only after image ensure, container boot, and a
+    // potentially long workspace copy.
+    reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let git = collect_git_context(&repo_root)
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;

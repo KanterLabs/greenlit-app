@@ -308,3 +308,69 @@ async fn dag_propagation_rollup_gating_and_masking() {
     assert_eq!(c.result, Conclusion::Skipped);
     assert!(!log.contains("c ran"), "the skipped job's step never ran");
 }
+
+/// The one `uses:` shape preflight deliberately leaves to runtime: a step
+/// behind a deferred condition. When the condition resolves true, the
+/// exec-time guard still rejects it with the authored span.
+const DEFERRED_USES_WORKFLOW: &str = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: first
+        run: |
+          ECHO ok
+      - if: steps.first.outcome == 'success'
+        uses: actions/checkout@v4
+"#;
+
+#[tokio::test]
+async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
+    let workflow =
+        greenlit_workflow::parse_workflow("fake-ci.yml", DEFERRED_USES_WORKFLOW).expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    // The plan itself must retain the deferred `uses:` step: preflight
+    // rejection of this shape would break workflows whose condition
+    // legally resolves false at runtime.
+    greenlit_runtime::reject_uses_steps(&execution_plan)
+        .expect("a deferred-condition uses: step passes preflight");
+
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
+    };
+
+    let mut log: Vec<u8> = Vec::new();
+    let error = run_plan(&engine, &execution_plan, &config, &mut log)
+        .await
+        .expect_err("the runtime-true uses: step must fail the run");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("`uses: actions/checkout@v4` is an action step"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("fake-ci.yml:"),
+        "the exec-time guard keeps the authored span: {rendered}"
+    );
+}
