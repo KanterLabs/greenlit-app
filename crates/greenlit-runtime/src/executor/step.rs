@@ -193,9 +193,12 @@ pub(crate) async fn execute_step(
 
     let (script_planned, step_shell_planned) = match &step.kind {
         StepKind::Run { script, shell } => (script.as_ref(), shell.as_ref()),
-        StepKind::Uses { reference, .. } => {
+        StepKind::Uses {
+            reference, span, ..
+        } => {
             return Err(ExecError::UsesUnsupported {
                 reference: reference.clone(),
+                span: span.clone(),
             });
         }
     };

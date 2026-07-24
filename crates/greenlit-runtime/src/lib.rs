@@ -36,6 +36,7 @@ pub mod executor;
 pub mod image;
 pub mod isolation;
 pub mod platform;
+pub mod progress;
 pub mod writeback;
 
 pub use detect::{Endpoint, EngineFix, EngineProber, EngineState, SystemProber, detect};
@@ -46,11 +47,13 @@ pub use engine::{
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{
-    ExecError, JobReport, RunConfig, RunReport, StepReport, container::ContainerRejection, run_plan,
+    ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport,
+    container::ContainerRejection, reject_uses_steps, run_plan,
 };
 pub use image::{BaseImagePlan, ImageError, ensure_base_image, init_binary, plan_base_image};
 pub use isolation::{IsolationStrategy, isolation_container_spec};
 pub use platform::{UbuntuRelease, UnsupportedHost, resolve_base_image, validate_host};
+pub use progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
 pub use writeback::{
     Change, ChangeKind, Confirm, InteractiveConfirm, NoInputConflict, OverlayDiff, WriteBackError,
     WriteBackOutcome, run_write_back, validate_request,

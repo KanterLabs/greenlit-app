@@ -37,7 +37,7 @@ use bollard::query_parameters::CreateContainerOptionsBuilder;
 use greenlit_runtime::detect::Endpoint;
 use greenlit_runtime::engine::{ContainerEngine, ExecSpec};
 use greenlit_runtime::isolation::{CONTAINER_LOWER, CONTAINER_UPPER_BASE};
-use greenlit_runtime::{DockerEngine, UbuntuRelease, ensure_base_image};
+use greenlit_runtime::{DockerEngine, ProgressNull, UbuntuRelease, ensure_base_image};
 
 use dockerkit::{
     CollectSink, engine_if_reachable, notice_no_daemon, seed_repo, tree_fingerprint, unique_suffix,
@@ -55,7 +55,7 @@ async fn overlay_isolation_protects_the_host() {
         return;
     };
 
-    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404)
+    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
         .expect("base image");
 

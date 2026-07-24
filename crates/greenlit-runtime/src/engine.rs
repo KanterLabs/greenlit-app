@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 
 use crate::error::RuntimeError;
+use crate::progress::ProgressSink;
 
 /// A container image build request.
 ///
@@ -145,12 +146,17 @@ impl ExecOutputSink for SinkNull {
 /// the `docker` binary (`AGENTS.md`).
 #[async_trait]
 pub trait ContainerEngine: Send + Sync {
-    /// Pull an image by `name:tag` reference so it is present locally.
+    /// Pull an image by `name:tag` reference so it is present locally,
+    /// reporting layer progress to `progress` as the daemon streams it.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::Api`] if the daemon rejects or fails the pull.
-    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError>;
+    async fn pull_image(
+        &self,
+        image: &str,
+        progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError>;
 
     /// Whether an image with the given `name:tag` reference already exists
     /// locally.
@@ -166,12 +172,17 @@ pub trait ContainerEngine: Send + Sync {
     /// simple "image not found" is reported as `Ok(false)`, not an error.
     async fn image_exists(&self, image: &str) -> Result<bool, RuntimeError>;
 
-    /// Build an image from a context tar, tagging it `spec.tag`.
+    /// Build an image from a context tar, tagging it `spec.tag`, reporting
+    /// daemon build-output lines to `progress`.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::Api`] if the build fails.
-    async fn build_image(&self, spec: &BuildSpec) -> Result<(), RuntimeError>;
+    async fn build_image(
+        &self,
+        spec: &BuildSpec,
+        progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError>;
 
     /// Commit a container into a new image, returning the new image id.
     ///

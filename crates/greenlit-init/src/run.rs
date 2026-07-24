@@ -9,6 +9,7 @@ use std::process::Command;
 
 use crate::cli::{Args, StrategyPref};
 use crate::error::InitError;
+use crate::status::StatusWriter;
 use crate::strategy::{self, FALLBACK_MARKER, Isolation};
 use crate::{copy_in, mount};
 
@@ -26,17 +27,33 @@ use crate::{copy_in, mount};
 /// overlay option encoding, a required-but-failed or unexpectedly-failed mount,
 /// the copy-in fallback, or the final `exec`.
 pub fn run(args: &Args) -> Result<Infallible, InitError> {
-    prepare_isolation(args)?;
-    exec_command(args)
+    let status = StatusWriter::new();
+    // The host cannot read this process's stderr, so on any failure the
+    // status file carries the real error for the host to surface.
+    if let Err(error) = prepare_isolation(args, &status) {
+        status.failed(&error.to_string());
+        return Err(error);
+    }
+    let error = match exec_command(args) {
+        Ok(never) => match never {},
+        Err(error) => error,
+    };
+    status.failed(&error.to_string());
+    Err(error)
 }
 
-/// Set up the workspace via overlay or copy-in, honoring `args.strategy`.
-fn prepare_isolation(args: &Args) -> Result<(), InitError> {
+/// Set up the workspace via overlay or copy-in, honoring `args.strategy`,
+/// reporting phases and copy progress through `status`. Ends with the
+/// `done` snapshot; the ready marker (touched by the idle command after the
+/// exec) remains the host's terminal readiness signal.
+fn prepare_isolation(args: &Args, status: &StatusWriter) -> Result<(), InitError> {
+    status.start();
     create_dir(&args.workspace)?;
 
     match args.strategy {
         StrategyPref::CopyIn => {
-            copy_in::populate(&args.lower, &args.workspace)?;
+            populate_with_status(args, status, None)?;
+            status.done("copy-in", None);
             Ok(())
         }
         StrategyPref::Auto | StrategyPref::Overlay => {
@@ -44,6 +61,7 @@ fn prepare_isolation(args: &Args) -> Result<(), InitError> {
             let (upper, work) = prepare_overlay_dirs(&args.upper)?;
             let options = strategy::overlay_options(&args.lower, &upper, &work)?;
 
+            status.overlay();
             let mount_errno = match mount::mount_overlay(&args.workspace, &options) {
                 Ok(()) => None,
                 // A failed mount always carries an OS errno; `-1` is an
@@ -53,22 +71,39 @@ fn prepare_isolation(args: &Args) -> Result<(), InitError> {
             };
 
             match strategy::decide_after_overlay_attempt(require_overlay, mount_errno)? {
-                Isolation::Overlay => Ok(()),
+                Isolation::Overlay => {
+                    status.done("overlay", None);
+                    Ok(())
+                }
                 Isolation::CopyIn { fell_back } => {
-                    if fell_back {
-                        let reason =
-                            mount_errno.map_or_else(|| "unknown".to_string(), strategy::errno_name);
+                    let reason = fell_back.then(|| {
+                        mount_errno.map_or_else(|| "unknown".to_string(), strategy::errno_name)
+                    });
+                    if let Some(reason) = &reason {
                         eprintln!(
                             "{FALLBACK_MARKER} strategy=copy-in reason={reason}: unprivileged \
                              overlayfs unavailable, copying the checkout into the workspace"
                         );
                     }
-                    copy_in::populate(&args.lower, &args.workspace)?;
+                    populate_with_status(args, status, reason.as_deref())?;
+                    status.done("copy-in", reason.as_deref());
                     Ok(())
                 }
             }
         }
     }
+}
+
+/// Run the checkout copy, streaming file/byte counts into the status file.
+fn populate_with_status(
+    args: &Args,
+    status: &StatusWriter,
+    fell_back: Option<&str>,
+) -> Result<(), InitError> {
+    status.copy(0, 0, fell_back);
+    copy_in::populate(&args.lower, &args.workspace, &mut |files, bytes| {
+        status.copy(files, bytes, fell_back);
+    })
 }
 
 /// Create the overlay `upper/` and `work/` directories under `base`.

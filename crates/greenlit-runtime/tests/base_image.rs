@@ -9,7 +9,7 @@
 mod dockerkit;
 
 use greenlit_runtime::engine::{ContainerEngine, ContainerSpec, ExecSpec};
-use greenlit_runtime::{UbuntuRelease, ensure_base_image};
+use greenlit_runtime::{ProgressNull, UbuntuRelease, ensure_base_image};
 
 use dockerkit::{CollectSink, engine_if_reachable, notice_no_daemon, unique_suffix};
 
@@ -21,7 +21,7 @@ async fn base_image_builds_reuses_and_carries_the_toolset() {
     };
 
     // First use builds it; the tag carries the resolved label.
-    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404)
+    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
         .expect("base image builds");
     assert!(
@@ -35,7 +35,7 @@ async fn base_image_builds_reuses_and_carries_the_toolset() {
 
     // Content-addressed: a second ensure returns the same tag and does not
     // depend on a rebuild.
-    let again = ensure_base_image(&engine, UbuntuRelease::Noble2404)
+    let again = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
         .expect("reuse");
     assert_eq!(tag, again, "identical inputs converge on one tag");

@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerConfig, ContainerCreateBody, HostConfig, NetworkCreateRequest};
+use bollard::models::{
+    ContainerConfig, ContainerCreateBody, CreateImageInfo, HostConfig, NetworkCreateRequest,
+};
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CommitContainerOptionsBuilder, CreateContainerOptionsBuilder,
     CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, RemoveContainerOptionsBuilder,
@@ -26,6 +28,7 @@ use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
 use crate::error::{Operation, RuntimeError};
+use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Connection timeout for the Docker API client, in seconds — matches bollard's
 /// own default so behaviour is unsurprising.
@@ -137,18 +140,72 @@ fn split_reference(image: &str) -> (&str, &str) {
     }
 }
 
+/// Folds one pull-stream item into the per-layer byte tally and returns the
+/// cumulative totals: bytes received across all layers, and the total across
+/// all layers once every known layer has reported one.
+///
+/// A layer whose `status` reports completion ("Pull complete", "Already
+/// exists") pins its `current` to its `total` — the daemon stops sending
+/// byte counts for finished layers.
+fn fold_pull_progress(
+    layers: &mut HashMap<String, (u64, Option<u64>)>,
+    info: &CreateImageInfo,
+) -> (u64, Option<u64>) {
+    if let Some(id) = &info.id {
+        let entry = layers.entry(id.clone()).or_insert((0, None));
+        if let Some(detail) = &info.progress_detail {
+            if let Some(current) = detail.current {
+                entry.0 = u64::try_from(current).unwrap_or(0);
+            }
+            if let Some(total) = detail.total {
+                entry.1 = Some(u64::try_from(total).unwrap_or(0));
+            }
+        }
+        let complete = matches!(
+            info.status.as_deref(),
+            Some("Pull complete" | "Already exists" | "Download complete")
+        );
+        if complete && let Some(total) = entry.1 {
+            entry.0 = total;
+        }
+    }
+    let current: u64 = layers.values().map(|(current, _)| current).sum();
+    let total = layers
+        .values()
+        .map(|(_, total)| *total)
+        .collect::<Option<Vec<u64>>>()
+        .map(|totals| totals.iter().sum());
+    (current, total)
+}
+
 #[async_trait]
 impl ContainerEngine for DockerEngine {
-    async fn pull_image(&self, image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        image: &str,
+        progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         let (name, tag) = split_reference(image);
         let options = CreateImageOptionsBuilder::new()
             .from_image(name)
             .tag(tag)
             .build();
+        progress.on_progress(ProgressEvent::PullStarted {
+            image: image.to_string(),
+        });
+        let mut layers: HashMap<String, (u64, Option<u64>)> = HashMap::new();
         let mut stream = self.docker.create_image(Some(options), None, None);
         while let Some(item) = stream.next().await {
-            item.map_err(|e| RuntimeError::api(Operation::PullImage, e))?;
+            let info = item.map_err(|e| RuntimeError::api(Operation::PullImage, e))?;
+            let (current_bytes, total_bytes) = fold_pull_progress(&mut layers, &info);
+            progress.on_progress(ProgressEvent::PullProgress {
+                current_bytes,
+                total_bytes,
+            });
         }
+        progress.on_progress(ProgressEvent::PullFinished {
+            image: image.to_string(),
+        });
         Ok(())
     }
 
@@ -164,7 +221,11 @@ impl ContainerEngine for DockerEngine {
         }
     }
 
-    async fn build_image(&self, spec: &BuildSpec) -> Result<(), RuntimeError> {
+    async fn build_image(
+        &self,
+        spec: &BuildSpec,
+        progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         let build_args: HashMap<String, String> = spec.build_args.iter().cloned().collect();
         let options = BuildImageOptionsBuilder::new()
             .dockerfile(&spec.dockerfile)
@@ -173,10 +234,23 @@ impl ContainerEngine for DockerEngine {
             .rm(true)
             .build();
         let body = bollard::body_full(Bytes::from(spec.context_tar.clone()));
+        progress.on_progress(ProgressEvent::BuildStarted {
+            tag: spec.tag.clone(),
+        });
         let mut stream = self.docker.build_image(options, None, Some(body));
         while let Some(item) = stream.next().await {
-            item.map_err(|e| RuntimeError::api(Operation::BuildImage, e))?;
+            let info = item.map_err(|e| RuntimeError::api(Operation::BuildImage, e))?;
+            if let Some(text) = &info.stream {
+                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    progress.on_progress(ProgressEvent::BuildLine {
+                        line: line.to_string(),
+                    });
+                }
+            }
         }
+        progress.on_progress(ProgressEvent::BuildFinished {
+            tag: spec.tag.clone(),
+        });
         Ok(())
     }
 
@@ -393,5 +467,87 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn layer_info(
+        id: &str,
+        status: &str,
+        current: Option<i64>,
+        total: Option<i64>,
+    ) -> CreateImageInfo {
+        CreateImageInfo {
+            id: Some(id.to_string()),
+            status: Some(status.to_string()),
+            progress_detail: Some(bollard::models::ProgressDetail { current, total }),
+            ..CreateImageInfo::default()
+        }
+    }
+
+    #[test]
+    fn pull_progress_sums_bytes_across_layers() {
+        let mut layers = HashMap::new();
+        fold_pull_progress(
+            &mut layers,
+            &layer_info("aa", "Downloading", Some(10), Some(100)),
+        );
+        let (current, total) = fold_pull_progress(
+            &mut layers,
+            &layer_info("bb", "Downloading", Some(5), Some(50)),
+        );
+        assert_eq!(current, 15);
+        assert_eq!(total, Some(150));
+    }
+
+    #[test]
+    fn pull_progress_total_is_unknown_until_every_layer_reports_one() {
+        let mut layers = HashMap::new();
+        fold_pull_progress(
+            &mut layers,
+            &layer_info("aa", "Downloading", Some(10), Some(100)),
+        );
+        // A layer announced with no byte counts yet.
+        let (current, total) = fold_pull_progress(
+            &mut layers,
+            &CreateImageInfo {
+                id: Some("bb".to_string()),
+                status: Some("Pulling fs layer".to_string()),
+                ..CreateImageInfo::default()
+            },
+        );
+        assert_eq!(current, 10);
+        assert_eq!(total, None, "an unknown layer total makes the sum unknown");
+    }
+
+    #[test]
+    fn a_completed_layer_counts_its_full_size() {
+        let mut layers = HashMap::new();
+        fold_pull_progress(
+            &mut layers,
+            &layer_info("aa", "Downloading", Some(10), Some(100)),
+        );
+        // The daemon stops sending byte counts once a layer finishes; the
+        // completion status pins the layer to its total.
+        let (current, total) =
+            fold_pull_progress(&mut layers, &layer_info("aa", "Pull complete", None, None));
+        assert_eq!(current, 100);
+        assert_eq!(total, Some(100));
+    }
+
+    #[test]
+    fn an_untracked_info_line_leaves_the_tally_unchanged() {
+        let mut layers = HashMap::new();
+        fold_pull_progress(
+            &mut layers,
+            &layer_info("aa", "Downloading", Some(10), Some(100)),
+        );
+        // Pull-level status lines carry no layer id.
+        let (current, total) = fold_pull_progress(
+            &mut layers,
+            &CreateImageInfo {
+                status: Some("Digest: sha256:...".to_string()),
+                ..CreateImageInfo::default()
+            },
+        );
+        assert_eq!((current, total), (10, Some(100)));
     }
 }

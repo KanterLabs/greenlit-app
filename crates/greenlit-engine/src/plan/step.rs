@@ -129,6 +129,7 @@ pub(crate) fn plan_step(
             size_budget.add(&reference.value, &reference.span)?;
             StepKind::Uses {
                 reference: reference.value.clone(),
+                span: reference.span.clone(),
                 with: plan_env_layer(with, &step_ctx, size_budget)
                     .map_err(|error| retained_field_err(job_id, step_id.as_deref(), error))?,
             }

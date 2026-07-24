@@ -77,6 +77,7 @@ mod copy_in;
 mod error;
 mod mount;
 mod run;
+mod status;
 mod strategy;
 
 pub use cli::{Args, CliError, StrategyPref};
