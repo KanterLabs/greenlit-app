@@ -31,6 +31,8 @@ pub(crate) struct JobInstance<'a> {
     pub runner: RunnerImage,
     /// `container:`, if this job runs in a job container.
     pub container: Option<&'a ContainerPlan>,
+    /// `services:`, keyed by service id, in file order.
+    pub services: &'a IndexMap<String, ContainerPlan>,
     /// The job/leg `if:`, if authored.
     pub condition: Option<&'a Condition>,
     /// Whether the implicit `success()` gate applies to the job condition.
@@ -106,6 +108,7 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
             needs: &job.needs,
             runner,
             container: job.container.as_ref(),
+            services: &job.services,
             condition: job.condition.as_ref(),
             implicit_status_gate: job.implicit_status_gate,
             skip: job.skip.as_ref(),
@@ -129,6 +132,7 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
             needs: &job.needs,
             runner,
             container: leg.container.as_ref(),
+            services: &leg.services,
             condition: leg.condition.as_ref(),
             implicit_status_gate: job.implicit_status_gate,
             skip: leg.skip.as_ref(),

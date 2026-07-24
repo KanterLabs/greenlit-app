@@ -168,6 +168,35 @@ pub(crate) async fn run_instance(
     let mut extra_binds = action_plan.binds.clone();
     extra_binds.extend(node_binds);
 
+    // Services start before the job container, exactly as GitHub starts them
+    // before the job: a first step that connects to `postgres:5432` must find
+    // it already listening, not race it.
+    //
+    // Both halves unwind the network on failure. The executor has no
+    // `Drop`-based cleanup registry, so anything created before the container
+    // has to be released on every path out — a rejected service definition
+    // leaked an empty network until this was folded into one place.
+    let services_started =
+        match resolve_services(shared, masker, &runner_ctx, instance, &base_env, needs) {
+            Ok(resolved) => {
+                match services::start(shared.engine, job_network.name(), &resolved, progress).await
+                {
+                    Ok(started) => started,
+                    Err(failure) => {
+                        // Some may already be running; stop them before removing
+                        // the network they are attached to.
+                        services::stop(shared.engine, &failure.started).await;
+                        job_network.teardown(shared.engine).await;
+                        return Err(failure.cause);
+                    }
+                }
+            }
+            Err(error) => {
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        };
+
     let (image_tag, in_container, bash_available, additions) = resolve_image(
         shared,
         masker,
@@ -259,8 +288,9 @@ pub(crate) async fn run_instance(
             let _ = shared.engine.remove_volume(&volume).await;
         }
     }
-    // After the container: a network still holding an attachment cannot be
-    // removed, and the shim must outlive every step that might call it.
+    // After the container, before the network: services hold attachments too,
+    // and a network with any attachment cannot be removed.
+    services::stop(shared.engine, &services_started).await;
     job_network.teardown(shared.engine).await;
 
     let (step_reports, outputs, result) = outcome?;
@@ -851,4 +881,62 @@ fn skipped_report(job_id: &JobId, display: String, started: Instant) -> JobRepor
         duration: started.elapsed(),
         container_id: None,
     }
+}
+
+/// Resolves every `services:` entry against the job's contexts and validates
+/// it exactly as a job container is validated.
+///
+/// A service is as untrusted as a job container: it goes through the same
+/// option and volume gates, so `--privileged` on a service is refused for the
+/// same reason it is refused on `container:`. Credentials are masked before
+/// validation so a pull failure cannot echo them.
+fn resolve_services(
+    shared: &Shared<'_>,
+    masker: &mut Masker,
+    runner_ctx: &Value,
+    instance: &JobInstance<'_>,
+    base_env: &IndexMap<String, String>,
+    needs: &[NeedRecord],
+) -> Result<Vec<(String, services::ResolvedService)>, ExecError> {
+    if instance.services.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx = env_ctx(
+        shared.roots,
+        runner_ctx,
+        &instance.matrix,
+        base_env,
+        needs,
+        needs_status(needs),
+    );
+
+    let mut resolved = Vec::new();
+    for (id, plan) in instance.services {
+        let request = resolve_container(plan, &ctx)?;
+        if let Some(credentials) = &request.credentials {
+            masker.add(&credentials.password);
+        }
+        let additions = validate_container(
+            &request,
+            &shared.config.workspace,
+            &shared.config.volume_namespace,
+        )
+        .map_err(|rejection| ExecError::Infrastructure {
+            message: format!("service `{id}`: {rejection}"),
+            fix: "correct the service definition in the workflow".to_string(),
+        })?;
+
+        resolved.push((
+            id.clone(),
+            services::ResolvedService {
+                image: request.image.clone(),
+                env: additions.env,
+                ports: additions.ports,
+                volume_binds: additions.volume_binds,
+                healthcheck: additions.healthcheck,
+                registry_auth: additions.registry_auth,
+            },
+        ));
+    }
+    Ok(resolved)
 }
