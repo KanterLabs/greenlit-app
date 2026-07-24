@@ -25,12 +25,15 @@
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use greenlit_engine::execution::env::ActionsService;
 use greenlit_store::{ArtifactStore, CacheStore, ShimState};
 
-use crate::engine::ContainerEngine;
+use crate::engine::{ContainerEngine, ContainerSpec, HealthState};
 use crate::error::RuntimeError;
+use crate::executor::ExecError;
+use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Where the local stores live, and whether to serve them at all.
 ///
@@ -166,6 +169,192 @@ pub async fn create(
             runtime_token: store.runtime_token.clone(),
         }),
     })
+}
+
+/// How long a service has to report healthy before the job gives up.
+///
+/// GitHub's runner waits on a service's own probe with no separate deadline
+/// of its own; Greenlit adds one so a mis-authored `--health-cmd` fails with
+/// a message naming the service instead of hanging the run forever.
+const HEALTH_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often the health gate polls.
+const HEALTH_POLL: Duration = Duration::from_millis(500);
+
+/// A service that failed to start, plus the ones already running.
+///
+/// The caller needs both: the cause to report, and the started set to stop
+/// before it can remove the network they are attached to.
+pub struct ServiceStartFailure {
+    /// Why the start failed.
+    pub cause: ExecError,
+    /// Services that started before the failure.
+    pub started: Vec<StartedService>,
+}
+
+/// One started service container.
+pub struct StartedService {
+    /// The service id, which is also its hostname on the job network.
+    pub id: String,
+    /// The container id, for teardown.
+    pub container: String,
+}
+
+/// Starts `services` on `network`, waiting for each to report healthy.
+///
+/// Each service is reachable from the job at its service id
+/// (`PHASE-4-environment.md`: "hostname = service key"), which is what a
+/// workflow's `postgres:5432` connection string relies on.
+///
+/// # Errors
+/// Returns [`ServiceStartFailure`] if a service cannot be pulled, created, or
+/// started, or if its health probe does not pass within [`HEALTH_DEADLINE`].
+/// A service that never becomes healthy fails the job rather than letting the
+/// first step discover it by timing out on a connection.
+///
+/// The failure carries the services that *did* start, because the caller has
+/// to stop them before it can remove the network they are attached to.
+pub async fn start(
+    engine: &dyn ContainerEngine,
+    network: &str,
+    services: &[(String, ResolvedService)],
+    progress: &mut (dyn ProgressSink + Send),
+) -> Result<Vec<StartedService>, ServiceStartFailure> {
+    let mut started = Vec::new();
+    for (id, service) in services {
+        progress.on_progress(ProgressEvent::ServiceStarting {
+            service: id.clone(),
+        });
+
+        macro_rules! bail {
+            ($result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(cause) => {
+                        return Err(ServiceStartFailure {
+                            cause: cause.into(),
+                            started,
+                        });
+                    }
+                }
+            };
+        }
+
+        if !bail!(engine.image_exists(&service.image).await) {
+            bail!(
+                engine
+                    .pull_image(&service.image, service.registry_auth.as_ref(), progress)
+                    .await
+            );
+        }
+
+        let spec = ContainerSpec {
+            image: service.image.clone(),
+            env: service.env.clone(),
+            network: Some(network.to_string()),
+            // The service id is the name the job connects to.
+            network_aliases: vec![id.clone()],
+            hostname: Some(id.clone()),
+            ports: service.ports.clone(),
+            healthcheck: service.healthcheck.clone(),
+            binds: service.volume_binds.clone(),
+            labels: vec![
+                ("greenlit.managed".to_string(), "1".to_string()),
+                ("greenlit.service".to_string(), id.clone()),
+            ],
+            ..ContainerSpec::default()
+        };
+
+        let container = bail!(engine.create_container(&spec).await);
+        started.push(StartedService {
+            id: id.clone(),
+            container: container.clone(),
+        });
+        bail!(engine.start_container(&container).await);
+        bail!(wait_healthy(engine, &container, id).await);
+        progress.on_progress(ProgressEvent::ServiceReady {
+            service: id.clone(),
+        });
+    }
+    Ok(started)
+}
+
+/// Polls until the service reports healthy, or fails with a message naming it.
+///
+/// A service with no configured probe is ready as soon as its container is
+/// running — the same rule the runner applies, and the reason
+/// [`crate::engine::HealthState::None`] is distinct from `Starting`.
+async fn wait_healthy(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    id: &str,
+) -> Result<(), ExecError> {
+    let deadline = Instant::now() + HEALTH_DEADLINE;
+    loop {
+        let state = engine.inspect_container(container).await?;
+        match state.health {
+            HealthState::None if state.running => return Ok(()),
+            HealthState::Healthy => return Ok(()),
+            HealthState::Unhealthy => {
+                return Err(ExecError::Infrastructure {
+                    message: format!("service `{id}` reported unhealthy"),
+                    fix: format!(
+                        "check the service image and its `--health-cmd`; run `docker logs` against the `greenlit.service={id}` container to see why the probe failed"
+                    ),
+                });
+            }
+            _ if !state.running => {
+                return Err(ExecError::Infrastructure {
+                    message: format!("service `{id}` exited before becoming ready"),
+                    fix: "check the service image's own configuration — a service that exits immediately usually needs `env:` it was not given".to_string(),
+                });
+            }
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(ExecError::Infrastructure {
+                message: format!(
+                    "service `{id}` did not become healthy within {}s",
+                    HEALTH_DEADLINE.as_secs()
+                ),
+                fix: "raise `--health-start-period`/`--health-retries`, or check that the probe command is right for the image".to_string(),
+            });
+        }
+        tokio::time::sleep(HEALTH_POLL).await;
+    }
+}
+
+/// Removes every started service container, best effort.
+pub async fn stop(engine: &dyn ContainerEngine, services: &[StartedService]) {
+    for service in services {
+        // A leaked service container is not a run failure and must never mask
+        // the job's real result, so a removal failure is recorded rather than
+        // propagated.
+        if engine.remove_container(&service.container).await.is_err() {
+            tracing::debug!(
+                target: "greenlit_runtime::services",
+                service = service.id,
+                "could not remove the service container"
+            );
+        }
+    }
+}
+
+/// A service resolved and validated, ready to start.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedService {
+    /// The image reference.
+    pub image: String,
+    /// Resolved `env:`.
+    pub env: Vec<(String, String)>,
+    /// Ports to publish.
+    pub ports: Vec<crate::engine::PortBinding>,
+    /// Named-volume binds.
+    pub volume_binds: Vec<crate::engine::BindMount>,
+    /// The probe from `--health-*`, if any.
+    pub healthcheck: Option<crate::engine::HealthCheck>,
+    /// Private-registry credentials, if authored.
+    pub registry_auth: Option<crate::engine::RegistryAuth>,
 }
 
 /// The host bind that makes `RUNNER_TOOL_CACHE` persist across runs.
