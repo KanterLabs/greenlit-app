@@ -563,6 +563,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "greenlit-actions"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "greenlit-app"
 version = "0.1.0"
 dependencies = [
