@@ -494,3 +494,86 @@ policy actively contains. They are not deferred Greenlit behavior.
   `greenlit_workflow::extract::StaticExtraction::references_github_token`
   flag (`extract::walk`), since — unlike `secrets.GITHUB_TOKEN` — no existing
   Phase 1 extraction tracked a bare `github.*` field access at all.
+
+- **Every step's layered environment needs an explicit, tracked `PATH` from
+  job start — ordinary Docker `exec` inheritance alone stops being enough
+  the moment any step writes to `GITHUB_PATH`.** Before this wave, no
+  environment layer (`greenlit_engine::execution::env::RunnerEnv::into_map`,
+  the job/workflow `env:` layers, `GITHUB_ENV` accumulation) ever carried an
+  explicit `PATH` key at all — the container's own image-configured default
+  reached every step only through ordinary Docker `exec` environment
+  inheritance, invisible to Greenlit's own `IndexMap`-based layering. That
+  works for a job's *first* step, but `apply_path_additions`
+  (`greenlit_engine::execution::env`) documents its contract as *prepending*
+  onto whatever `PATH` the layered map already carries — and the instant one step
+  calls `core.addPath()` (`actions/setup-node` and most `setup-*` actions
+  do), every *later* step's `exec` starts carrying an explicit
+  `PATH=<additions>` entry, which Docker's exec-env merge applies key-for-key
+  over the container's live environment, silently dropping `/usr/bin` and
+  friends for the rest of the job — a real defect this wave found (and
+  fixed) building `fixtures/actions-ci`, invisible until then because no
+  earlier test ran a real `setup-*` action followed by another real step
+  against a live daemon. GitHub's own runner never has this gap: its
+  `ExecutionContext` seeds one explicit, always-current `PATH` value from the
+  runner process's own environment at job start
+  (`src/Runner.Worker/FileCommandManager.cs`'s `AddPathFileCommand` only ever
+  prepends onto it — `actions/runner` v2.336.0, pinned release, see the
+  Node-runtime entry above). `crate::executor::job::seed_container_path`
+  reproduces that: one `sh -c 'printf %s "$PATH"'` exec against the freshly
+  booted (and ready) job container, seeded into `base_env` before the step
+  loop starts — container-agnostic, so it works identically for the
+  convergent base image and an arbitrary user-specified
+  `jobs.<id>.container`. `crates/greenlit-runtime/tests/actions_composite.rs`
+  pins the regression (a `run:` step's own `GITHUB_PATH` addition must not
+  break a later composite step's access to system binaries).
+
+- **A composite step's own environment must be the same job-wide
+  base/workflow/job layers an ordinary top-level step sees, not just its own
+  `GITHUB_ENV` accumulation.** `crate::executor::actions::composite`'s own
+  module docs already state the intended rule ("env: accumulation is
+  job-wide, not composite-scoped"), but before this wave the implementation
+  only threaded the job's *accumulated* `GITHUB_ENV` writes into a nested
+  step's environment (and its `${{ env.* }}` context) — literal
+  workflow-level and job-level `env:` blocks, and the `base_env` fix above,
+  were never visible inside a composite's nested steps at all. Fixed by
+  threading `base_env`/`workflow_env`/`job_env` through `CompositeEnv`
+  (mirroring `crate::executor::step::layered_env` exactly) rather than
+  seeding nested execution from an empty map. A second, unrelated bug in the
+  same code path — a nested step's shell was resolved against
+  `{cmdfiles_dir}/script`, one directory short of where
+  `CommandFilePaths::new` actually places it
+  (`{cmdfiles_dir}/step-<n>/script`) — meant *every* composite `run:` step
+  failed outright ("no such file") before this wave, regardless of the env
+  gap; no prior test had ever executed a composite action's nested `run:`
+  step against a real daemon. Both are pinned directly by
+  `crates/greenlit-runtime/tests/actions_composite.rs`.
+
+- **A Docker action's sibling container does not receive the
+  `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
+  command-file protocol every other step kind gets.** GitHub's real runner
+  exposes these uniformly to *any* step, including a Docker container
+  action: `Runner.Worker/FileCommandManager.cs`'s `InitializeFiles` runs
+  once per step regardless of handler type, writing each file's
+  (container-translated) path into the step's `github` context before
+  dispatch (`actions/runner` v2.336.0, pinned release). This
+  implementation's `crate::executor::actions::docker_action::execute` passes
+  `INPUT_<NAME>` env vars (via the same `nodejs::input_env` every action kind
+  uses) but never creates or mounts the four command files, so a
+  marketplace Docker action that writes to `$GITHUB_OUTPUT`/`$GITHUB_ENV`
+  either silently loses that write or (if it does not tolerate an unset
+  variable) fails outright. `PHASE-3-actions.md`'s own "Action execution"
+  bullet for Docker actions ("pass args/entrypoint/env per spec; run as a
+  sibling container") does not name the workflow-command protocol the way
+  its JavaScript-action bullet explicitly does ("Env protocol: `INPUT_<NAME>`,
+  workflow command files, `STATE_` save-state..."), so this is treated as a
+  scoped, documented gap rather than an in-scope defect this wave fixed
+  silently — `fixtures/actions-ci`'s own Docker action deliberately proves
+  its execution through the shared workspace (a log file under
+  `$GITHUB_WORKSPACE`) instead, the same way
+  `crates/greenlit-runtime/tests/actions_docker.rs` already does. Closing
+  this gap would need the command files to live inside the job's shared
+  workspace volume (already the mechanism a Docker-sibling job uses for its
+  workspace — see the entry above) rather than the job container's own
+  ordinary, sibling-invisible temp storage, so a fix can reuse
+  `crate::executor::cmdfiles` unchanged once that plumbing exists; left for
+  a later wave.
