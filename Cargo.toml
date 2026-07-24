@@ -9,6 +9,7 @@ members = [
     "crates/greenlit-runtime",
     "crates/greenlit-init",
     "crates/greenlit-actions",
+    "crates/greenlit-store",
 ]
 
 [workspace.package]

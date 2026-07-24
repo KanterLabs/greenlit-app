@@ -1,0 +1,28 @@
+[package]
+name = "greenlit-store"
+description = "Local cache, artifact, and toolcache stores behind the workflow-facing shim server."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Typed errors for every fallible path, per `AGENTS.md` "Errors: thiserror
+# in library crates". Same pinned version as every other library crate here.
+thiserror = "2.0.19"
+# Entry metadata (`meta.json`) and the shim server's request/response bodies
+# are the exact JSON shapes `@actions/cache` sends and expects; `serde`/
+# `serde_json` are the workspace's already-chosen (de)serialization crates,
+# pinned to the versions `greenlit-actions` and `greenlit-metrics` use.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# Stage spans (`cache-lookup`/`cache-save`/`artifact-upload`) follow the same
+# `tracing::info_span!(target = "greenlit_metrics::timed_stage", ...)`
+# convention `greenlit-runtime`'s executor and `greenlit-actions` already
+# use, so `greenlit-metrics`' `Invocation` timing layer captures them without
+# this crate depending on `greenlit-metrics` itself.
+tracing = "0.1.44"
+
+[dev-dependencies]
+# Every store test runs against an isolated temp root rather than the real
+# `~/.litci/`, matching `greenlit-actions`' store tests.
+tempfile = "3.27.0"
