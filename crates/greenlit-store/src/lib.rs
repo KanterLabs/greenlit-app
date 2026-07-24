@@ -16,6 +16,7 @@
 //! # Crate boundary
 //!
 //! * [`cache`] — the `actions/cache` backing store and its selection rule.
+//! * [`server`] — the workflow-facing HTTP shim those actions talk to.
 //!
 //! Every store resolves its root the same way (`~/.litci/<name>`, overridable
 //! by constructing with an explicit path in tests), mirroring
@@ -25,6 +26,8 @@
 
 pub mod cache;
 pub mod error;
+pub mod server;
 
 pub use cache::{CacheStore, Restored};
 pub use error::StoreError;
+pub use server::{Bound, Shim, ShimState, bind};
