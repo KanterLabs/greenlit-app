@@ -265,4 +265,12 @@ pub struct NetworkInfo {
     /// container addresses it here rather than at a loopback it does not
     /// share.
     pub gateway: Option<String>,
+    /// The bridge's IPv4 subnet in CIDR form.
+    ///
+    /// The network policy needs it to tell "another container in this run"
+    /// (a service the job is entitled to reach) apart from "some other
+    /// RFC1918 address on the developer's LAN" (which it is not) — both look
+    /// like private addresses, so the subnet is the only thing that
+    /// distinguishes them.
+    pub subnet: Option<String>,
 }

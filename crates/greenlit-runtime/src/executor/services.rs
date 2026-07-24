@@ -68,6 +68,8 @@ pub struct JobNetwork {
     shim: Option<greenlit_store::Shim>,
     /// The `ACTIONS_*` values the job's environment needs.
     service: Option<ActionsService>,
+    /// What the network policy needs to know about this bridge.
+    policy: crate::executor::netguard::Policy,
 }
 
 impl JobNetwork {
@@ -81,6 +83,12 @@ impl JobNetwork {
     #[must_use]
     pub fn actions_service(&self) -> Option<&ActionsService> {
         self.service.as_ref()
+    }
+
+    /// The network policy to apply inside every container on this bridge.
+    #[must_use]
+    pub fn policy(&self) -> &crate::executor::netguard::Policy {
+        &self.policy
     }
 
     /// Stops the shim and removes the network.
@@ -113,11 +121,18 @@ pub async fn create(
     engine.create_network(name).await?;
     let info = engine.inspect_network(name).await?;
 
+    let base_policy = crate::executor::netguard::Policy {
+        gateway: info.gateway.clone(),
+        subnet: info.subnet.clone(),
+        shim_port: None,
+    };
+
     let Some(store) = store else {
         return Ok(JobNetwork {
             name: name.to_string(),
             shim: None,
             service: None,
+            policy: base_policy,
         });
     };
 
@@ -133,6 +148,7 @@ pub async fn create(
             name: name.to_string(),
             shim: None,
             service: None,
+            policy: base_policy,
         });
     };
 
@@ -146,12 +162,14 @@ pub async fn create(
             name: name.to_string(),
             shim: None,
             service: None,
+            policy: base_policy,
         });
     };
 
     // The base URL has to carry the port the kernel just chose, and the
     // client concatenates onto it, so the trailing slash is load-bearing.
-    let base = format!("http://{}:{}/", gateway, bound.address().port());
+    let port = bound.address().port();
+    let base = format!("http://{gateway}:{port}/");
     let state = ShimState::new(
         store.cache.clone(),
         store.artifacts.clone(),
@@ -163,6 +181,10 @@ pub async fn create(
     Ok(JobNetwork {
         name: name.to_string(),
         shim: Some(shim),
+        policy: crate::executor::netguard::Policy {
+            shim_port: Some(port),
+            ..base_policy
+        },
         service: Some(ActionsService {
             cache_url: base.clone(),
             results_url: base,
@@ -217,6 +239,7 @@ pub struct StartedService {
 pub async fn start(
     engine: &dyn ContainerEngine,
     network: &str,
+    policy: &crate::executor::netguard::Policy,
     services: &[(String, ResolvedService)],
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<Vec<StartedService>, ServiceStartFailure> {
@@ -271,6 +294,9 @@ pub async fn start(
             container: container.clone(),
         });
         bail!(engine.start_container(&container).await);
+        // A service is untrusted code too, and it is on the same bridge as
+        // the job -- so it is contained by the same policy.
+        bail!(crate::executor::netguard::apply(engine, &container, policy, progress).await);
         bail!(wait_healthy(engine, &container, id).await);
         progress.on_progress(ProgressEvent::ServiceReady {
             service: id.clone(),
