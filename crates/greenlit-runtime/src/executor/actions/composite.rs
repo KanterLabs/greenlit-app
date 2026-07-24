@@ -88,6 +88,18 @@ pub(crate) struct CompositeEnv<'a> {
     pub cmdfiles_base: &'a str,
     pub workspace: &'a str,
     pub node_mounts: &'a NodeRuntimeMounts,
+    /// The job's runner/base defaults (`crate::executor::step::layered_env`'s
+    /// `base` layer — includes the container's own live `PATH`, seeded by
+    /// `crate::executor::job::seed_container_path`). A nested step is
+    /// otherwise part of the *same* job-wide environment an ordinary
+    /// top-level step sees (module docs: "env: accumulation is job-wide, not
+    /// composite-scoped") — that applies to this static layer too, not only
+    /// to `GITHUB_ENV` accumulation.
+    pub base_env: &'a IndexMap<String, String>,
+    /// The job's resolved workflow-level `env:`.
+    pub workflow_env: &'a IndexMap<String, String>,
+    /// The job's resolved job-level `env:`.
+    pub job_env: &'a IndexMap<String, String>,
 }
 
 /// Mutable, cross-call state a composite's execution (and any nested
@@ -265,6 +277,13 @@ async fn run_nested_step(
     let shell_resolved =
         template::resolve_template(shell_raw, ctx).map_err(ExecError::template_eval)?;
     let cmdfiles_dir = nested_cmdfiles_dir(env.cmdfiles_base, state_key);
+    // `paths.script` (not a hand-reconstructed `{cmdfiles_dir}/script`) is
+    // where `cmdfiles::prepare` below actually materializes the script:
+    // `CommandFilePaths::new` nests everything one `step-<index>` directory
+    // deeper than `cmdfiles_dir` itself. Resolving the shell against the
+    // wrong path here previously pointed the exec at a file that was never
+    // written, failing every composite `run:` step with "no such file".
+    let paths = CommandFilePaths::new(&cmdfiles_dir, 0);
     let shell = greenlit_engine::execution::shell::resolve_shell(
         greenlit_engine::execution::shell::ShellSelection {
             step_shell: Some(&shell_resolved),
@@ -272,7 +291,7 @@ async fn run_nested_step(
             in_container: false,
             bash_available: true,
         },
-        &format!("{cmdfiles_dir}/script"),
+        &paths.script,
     )
     .map_err(|source| ExecError::Shell {
         label: "composite step".to_string(),
@@ -286,17 +305,15 @@ async fn run_nested_step(
             template::resolve_template(value, ctx).map_err(ExecError::template_eval)?,
         );
     }
-    let empty = IndexMap::new();
     let mut full_env = layer_step_env(EnvLayers {
-        base: &empty,
-        workflow: &empty,
-        job: state.job_accumulated,
-        accumulated: &empty,
+        base: env.base_env,
+        workflow: env.workflow_env,
+        job: env.job_env,
+        accumulated: state.job_accumulated,
         step: &step_env,
     });
     apply_path_additions(&mut full_env, state.job_path_additions);
 
-    let paths = CommandFilePaths::new(&cmdfiles_dir, 0);
     cmdfiles::prepare(env.engine, env.container, &paths, &script)
         .await
         .map_err(|source| ExecError::CommandFile(state.masker.apply(&source.to_string())))?;
@@ -484,6 +501,18 @@ fn build_composite_context(
     inputs_value: &Value,
     composite_records: &[StepRecord],
 ) -> Context {
+    // The `env` context is job-wide (module docs: "env: accumulation is
+    // job-wide, not composite-scoped"), so a nested step's `${{ env.* }}`
+    // sees the same base/workflow/job layers plus `GITHUB_ENV` accumulation
+    // an ordinary top-level step's context would — not only the
+    // accumulation, matching `crate::executor::step::layered_env`.
+    let full_env = layer_step_env(EnvLayers {
+        base: env.base_env,
+        workflow: env.workflow_env,
+        job: env.job_env,
+        accumulated: state.job_accumulated,
+        step: &IndexMap::new(),
+    });
     Context::new(Arc::clone(&env.roots.fs))
         .with_github(env.roots.github.clone())
         .with_vars(env.roots.vars.clone())
@@ -493,7 +522,7 @@ fn build_composite_context(
         .with_secrets(Value::object(vec![]))
         .with_runner(env.runner_ctx.clone())
         .with_matrix(env.matrix.clone())
-        .with_env(env_value(state.job_accumulated))
+        .with_env(env_value(&full_env))
         .with_steps(build_steps_context(composite_records))
         .with_needs(greenlit_engine::execution::build_needs_context(env.needs))
         .with_status(env.status)

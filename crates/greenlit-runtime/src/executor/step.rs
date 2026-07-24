@@ -703,6 +703,9 @@ async fn execute_uses_step(
                 cmdfiles_base: job.cmdfiles_base,
                 workspace: job.workspace,
                 node_mounts: job.node_mounts,
+                base_env: job.base_env,
+                workflow_env: job.workflow_env,
+                job_env: job.job_env,
             };
             let mut composite_state = composite::CompositeState {
                 masker: io.masker,

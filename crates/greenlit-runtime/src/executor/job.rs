@@ -16,7 +16,7 @@ use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
-use crate::engine::BindMount;
+use crate::engine::{BindMount, ContainerEngine, ExecSpec};
 use crate::executor::actions::node_runtime;
 use crate::executor::actions::nodejs::NodeRuntimeMounts;
 use crate::executor::actions::resolve::{JobActionPlan, resolve_job_actions};
@@ -25,7 +25,7 @@ use crate::executor::container::{
     validate_container,
 };
 use crate::executor::context::{
-    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::instance::JobInstance;
 use crate::executor::readiness::{self, READY_MARKER};
@@ -85,7 +85,7 @@ pub(crate) async fn run_instance(
     let mut runner_env = shared.config.runner_env.clone();
     runner_env.job = job_id.0.clone();
     runner_env.workspace = shared.config.workspace.clone();
-    let base_env = runner_env.clone().into_map();
+    let mut base_env = runner_env.clone().into_map();
     let runner_ctx = runner_context(&runner_env);
 
     let needs_run_status = needs_status(needs);
@@ -191,30 +191,33 @@ pub(crate) async fn run_instance(
         .needs_docker_sibling
         .then_some(DOCKER_SIBLING_WORKSPACE_VOLUME);
     let outcome = match ready {
-        Ok(()) => {
-            run_job_body(
-                shared,
-                masker,
-                instance,
-                RunnerLayers {
-                    runner_ctx: &runner_ctx,
-                    base_env: &base_env,
-                    workflow_env: &job_env.workflow_env,
-                    job_env: &job_env.job_env,
-                    default_shell: job_env.default_shell.as_deref(),
-                    default_wd: job_env.default_wd.as_deref(),
-                    in_container,
-                    bash_available,
-                    action_plan: &action_plan,
-                    node_mounts: &node_mounts,
-                    docker_workspace_volume,
-                },
-                (&container, &runner_env),
-                needs,
-                out,
-            )
-            .await
-        }
+        Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
+            Ok(()) => {
+                run_job_body(
+                    shared,
+                    masker,
+                    instance,
+                    RunnerLayers {
+                        runner_ctx: &runner_ctx,
+                        base_env: &base_env,
+                        workflow_env: &job_env.workflow_env,
+                        job_env: &job_env.job_env,
+                        default_shell: job_env.default_shell.as_deref(),
+                        default_wd: job_env.default_wd.as_deref(),
+                        in_container,
+                        bash_available,
+                        action_plan: &action_plan,
+                        node_mounts: &node_mounts,
+                        docker_workspace_volume,
+                    },
+                    (&container, &runner_env),
+                    needs,
+                    out,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
 
@@ -584,6 +587,65 @@ fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedCont
         ports,
         options,
     })
+}
+
+/// Queries the freshly booted (and now ready) job container's own default
+/// `PATH` — inherited from the image, before any step or `GITHUB_PATH`
+/// mutation — and seeds it into `base_env`.
+///
+/// Every later step's environment is built by
+/// [`greenlit_engine::execution::env::layer_step_env`] plus
+/// [`apply_path_additions`], and that function's documented contract is to
+/// *prepend* `GITHUB_PATH` additions onto whatever `PATH` the layered map
+/// already carries — never to invent one. Before this seed, no layer ever
+/// carried an explicit `PATH` key at all (`base_env` is built from
+/// [`RunnerEnv::into_map`], which has no `PATH` field), so the container's
+/// real `PATH` was reaching every step only through ordinary Docker `exec`
+/// environment inheritance, never through Greenlit's own layering. That
+/// works for the *first* step of a job, but the instant one step calls
+/// `core.addPath()` (`setup-node` and most `setup-*` actions do), the caller
+/// starts passing an explicit `PATH=<additions>` entry into every later
+/// `exec`, which *overrides* the container's inherited default outright
+/// (Docker merges an exec's explicit env over the container's live
+/// environment key-for-key) — silently dropping `/usr/bin` and friends from
+/// every subsequent step. GitHub's real runner never has this gap: its
+/// `ExecutionContext` tracks one explicit, always-current `PATH` value from
+/// the job's own start (seeded from the runner process's own environment),
+/// which `core.addPath` only ever prepends onto. Querying the booted
+/// container's own `PATH` once, up front, and seeding it into `base_env`
+/// gives Greenlit's layering that same explicit, always-current baseline —
+/// container-agnostic, so it works identically for the convergent base image
+/// and an arbitrary user-specified `jobs.<id>.container`.
+///
+/// # Errors
+///
+/// Returns an [`ExecError`] if the query exec itself could not be dispatched
+/// (an infrastructure failure, not a step failure) — a non-zero exit or
+/// empty output is treated as "no baseline available" rather than a hard
+/// failure, leaving `base_env` without `PATH` (the pre-fix behavior).
+async fn seed_container_path(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    base_env: &mut IndexMap<String, String>,
+) -> Result<(), ExecError> {
+    let spec = ExecSpec {
+        cmd: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$PATH\"".to_string(),
+        ],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code == 0 {
+        let path = sink.text();
+        if !path.is_empty() {
+            base_env.insert("PATH".to_string(), path);
+        }
+    }
+    Ok(())
 }
 
 /// Create and start the isolated job container, returning its id.
