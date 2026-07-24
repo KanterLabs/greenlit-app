@@ -21,3 +21,7 @@ path = "src/main.rs"
 # embedding contract in `src/lib.rs`).
 libc = "0.2.187"
 thiserror = "2.0.19"
+
+[dev-dependencies]
+# Status-file and copy-progress tests write into isolated temp directories.
+tempfile = "3.27.0"
