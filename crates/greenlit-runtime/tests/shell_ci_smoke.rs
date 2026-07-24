@@ -18,7 +18,7 @@ use greenlit_engine::{
     Conclusion, EventKind, PlanOptions, SyntheticEvent, plan, validate_v0_support,
 };
 use greenlit_expr::Value;
-use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
+use greenlit_runtime::{IsolationStrategy, ProgressNull, RunConfig, run_plan};
 
 use dockerkit::{engine_if_reachable, notice_no_daemon};
 
@@ -106,12 +106,19 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         initial_masks: Vec::new(),
         volume_namespace: "shell-ci-smoke".to_string(),
         write_back: false,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
-    let report = run_plan(&engine, &execution_plan, &config, &mut log)
-        .await
-        .expect("run completes");
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
     let log = String::from_utf8_lossy(&log);
 
     assert_eq!(

@@ -22,8 +22,23 @@ use greenlit_expr::Value;
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
-use greenlit_runtime::error::RuntimeError;
-use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
+use greenlit_runtime::error::{Operation, RuntimeError};
+use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
+use greenlit_runtime::{IsolationStrategy, ReadinessConfig, RunConfig, run_plan};
+
+/// How the fake engine answers the executor's readiness probe.
+#[derive(Default)]
+enum ReadinessScript {
+    /// The marker exists on the first poll (the pre-existing behavior).
+    #[default]
+    ImmediatelyReady,
+    /// Serve each status text once, then report ready alongside the last.
+    StatusSequenceThenReady(Vec<&'static str>),
+    /// Serve the same status text forever — drives the inactivity timeout.
+    StatusFrozen(&'static str),
+    /// The probe exec itself fails — drives the missing-`sh` classification.
+    ProbeExecErrors,
+}
 
 /// A fake engine that keeps an in-memory file map and interprets a directive
 /// language in the stored step scripts: `OUT k=v` (→ GITHUB_OUTPUT), `ENV k=v`
@@ -32,6 +47,13 @@ use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
 struct ScriptedEngine {
     files: Mutex<HashMap<String, String>>,
     counter: AtomicUsize,
+    /// When set, `image_exists` reports absence so the executor drives the
+    /// build path (and its progress events).
+    image_absent: bool,
+    /// Scripted readiness-probe behavior.
+    readiness: ReadinessScript,
+    /// How many readiness polls have been answered.
+    polls: AtomicUsize,
 }
 
 impl ScriptedEngine {
@@ -114,13 +136,29 @@ impl ScriptedEngine {
 
 #[async_trait]
 impl ContainerEngine for ScriptedEngine {
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
-        Ok(true)
+        Ok(!self.image_absent)
     }
-    async fn build_image(&self, _spec: &BuildSpec) -> Result<(), RuntimeError> {
+    async fn build_image(
+        &self,
+        spec: &BuildSpec,
+        progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
+        // Mirror the real engine's contract: engines report their own
+        // build progress.
+        progress.on_progress(ProgressEvent::BuildStarted {
+            tag: spec.tag.clone(),
+        });
+        progress.on_progress(ProgressEvent::BuildFinished {
+            tag: spec.tag.clone(),
+        });
         Ok(())
     }
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {
@@ -148,8 +186,34 @@ impl ContainerEngine for ScriptedEngine {
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError> {
         let cmd = &spec.cmd;
-        // Readiness poll.
+        // Readiness poll: the probe prints GREENLIT_READY when the marker
+        // exists, then the status file's contents.
         if cmd.len() == 3 && cmd[0] == "sh" && cmd[2].contains("/greenlit/ready") {
+            let poll = self.polls.fetch_add(1, Ordering::Relaxed);
+            match &self.readiness {
+                ReadinessScript::ImmediatelyReady => {
+                    sink.on_stdout(b"GREENLIT_READY\n");
+                }
+                ReadinessScript::StatusSequenceThenReady(sequence) => {
+                    if let Some(status) = sequence.get(poll) {
+                        sink.on_stdout(status.as_bytes());
+                    } else {
+                        let last = sequence.last().copied().unwrap_or("");
+                        sink.on_stdout(format!("GREENLIT_READY\n{last}").as_bytes());
+                    }
+                }
+                ReadinessScript::StatusFrozen(status) => {
+                    sink.on_stdout(status.as_bytes());
+                }
+                ReadinessScript::ProbeExecErrors => {
+                    return Err(RuntimeError::Api {
+                        operation: Operation::StartExec,
+                        source: bollard::errors::Error::IOError {
+                            err: std::io::Error::other("no sh in this image"),
+                        },
+                    });
+                }
+            }
             return Ok(ExecOutput { exit_code: 0 });
         }
         // Command-file preparation + script write.
@@ -264,12 +328,19 @@ async fn dag_propagation_rollup_gating_and_masking() {
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
         write_back: false,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
-    let report = run_plan(&engine, &execution_plan, &config, &mut log)
-        .await
-        .expect("run completes");
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
     let log = String::from_utf8(log).unwrap();
 
     assert_eq!(
@@ -307,4 +378,310 @@ async fn dag_propagation_rollup_gating_and_masking() {
     let c = report.jobs.iter().find(|j| j.id == "c").unwrap();
     assert_eq!(c.result, Conclusion::Skipped);
     assert!(!log.contains("c ran"), "the skipped job's step never ran");
+}
+
+/// The one `uses:` shape preflight deliberately leaves to runtime: a step
+/// behind a deferred condition. When the condition resolves true, the
+/// exec-time guard still rejects it with the authored span.
+const DEFERRED_USES_WORKFLOW: &str = r#"
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: first
+        run: |
+          ECHO ok
+      - if: steps.first.outcome == 'success'
+        uses: actions/checkout@v4
+"#;
+
+#[tokio::test]
+async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
+    let workflow =
+        greenlit_workflow::parse_workflow("fake-ci.yml", DEFERRED_USES_WORKFLOW).expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    // The plan itself must retain the deferred `uses:` step: preflight
+    // rejection of this shape would break workflows whose condition
+    // legally resolves false at runtime.
+    greenlit_runtime::reject_uses_steps(&execution_plan)
+        .expect("a deferred-condition uses: step passes preflight");
+
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
+    };
+
+    let mut log: Vec<u8> = Vec::new();
+    let error = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect_err("the runtime-true uses: step must fail the run");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("`uses: actions/checkout@v4` is an action step"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("fake-ci.yml:"),
+        "the exec-time guard keeps the authored span: {rendered}"
+    );
+}
+
+/// A sink that records event discriminants in arrival order.
+#[derive(Default)]
+struct RecordingSink {
+    events: Vec<String>,
+}
+
+impl ProgressSink for RecordingSink {
+    fn on_progress(&mut self, event: ProgressEvent) {
+        let name = match event {
+            ProgressEvent::PullStarted { .. } => "pull-started",
+            ProgressEvent::PullProgress { .. } => "pull-progress",
+            ProgressEvent::PullFinished { .. } => "pull-finished",
+            ProgressEvent::BuildStarted { .. } => "build-started",
+            ProgressEvent::BuildLine { .. } => "build-line",
+            ProgressEvent::BuildFinished { .. } => "build-finished",
+            ProgressEvent::BootStarted => "boot-started",
+            ProgressEvent::BootFinished => "boot-finished",
+            ProgressEvent::Workspace(WorkspaceProgress::FellBack { .. }) => "workspace-fellback",
+            ProgressEvent::Workspace(WorkspaceProgress::Copying { .. }) => "workspace-copying",
+            ProgressEvent::Workspace(WorkspaceProgress::Ready { .. }) => "workspace-ready",
+            ProgressEvent::Workspace(_) => "workspace",
+            _ => "other",
+        };
+        self.events.push(name.to_string());
+    }
+}
+
+const SINGLE_JOB_WORKFLOW: &str = r#"
+on: push
+jobs:
+  only:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          ECHO hi
+"#;
+
+#[tokio::test]
+async fn preparation_progress_events_arrive_in_phase_order() {
+    let workflow =
+        greenlit_workflow::parse_workflow("fake-ci.yml", SINGLE_JOB_WORKFLOW).expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+
+    let engine = ScriptedEngine {
+        image_absent: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
+    };
+
+    let mut log: Vec<u8> = Vec::new();
+    let mut recording = RecordingSink::default();
+    run_plan(&engine, &execution_plan, &config, &mut log, &mut recording)
+        .await
+        .expect("run completes");
+
+    assert_eq!(
+        recording.events,
+        vec![
+            "build-started",
+            "build-finished",
+            "boot-started",
+            "boot-finished",
+            "workspace-ready"
+        ],
+        "preparation phases report in order: image ensure, boot, workspace"
+    );
+}
+
+/// Deadlines small enough that timeout scenarios resolve in tens of
+/// milliseconds instead of the production seconds.
+fn tiny_readiness() -> ReadinessConfig {
+    ReadinessConfig {
+        poll_interval: std::time::Duration::from_millis(5),
+        first_signal_timeout: std::time::Duration::from_millis(80),
+        inactivity_timeout: std::time::Duration::from_millis(80),
+    }
+}
+
+/// Run [`SINGLE_JOB_WORKFLOW`] against `engine`, returning the run result
+/// and the recorded progress-event names.
+async fn run_single_job(
+    engine: ScriptedEngine,
+) -> (
+    Result<greenlit_runtime::RunReport, greenlit_runtime::ExecError>,
+    Vec<String>,
+) {
+    let workflow =
+        greenlit_workflow::parse_workflow("fake-ci.yml", SINGLE_JOB_WORKFLOW).expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "fake-engine-semantics".to_string(),
+        write_back: false,
+        readiness: tiny_readiness(),
+    };
+    let mut log: Vec<u8> = Vec::new();
+    let mut recording = RecordingSink::default();
+    let result = run_plan(&engine, &execution_plan, &config, &mut log, &mut recording).await;
+    (result, recording.events)
+}
+
+#[tokio::test]
+async fn a_progressing_copy_reports_fallback_once_then_ticks_then_ready() {
+    let engine = ScriptedEngine {
+        readiness: ReadinessScript::StatusSequenceThenReady(vec![
+            "v=1 phase=copy strategy=copy-in fell_back=1 reason=EPERM files=100 bytes=1000",
+            "v=1 phase=copy strategy=copy-in fell_back=1 reason=EPERM files=200 bytes=2000",
+        ]),
+        ..ScriptedEngine::default()
+    };
+    let (result, events) = run_single_job(engine).await;
+    result.expect("a progressing copy completes green");
+    let workspace: Vec<&str> = events
+        .iter()
+        .map(String::as_str)
+        .filter(|name| name.starts_with("workspace"))
+        .collect();
+    assert_eq!(
+        workspace,
+        vec![
+            "workspace-fellback",
+            "workspace-copying",
+            "workspace-copying",
+            "workspace-ready"
+        ],
+        "the fallback reports once, each copy tick reports, then ready"
+    );
+}
+
+#[tokio::test]
+async fn a_frozen_copy_reports_its_counts_and_the_clean_clone_fix() {
+    let engine = ScriptedEngine {
+        readiness: ReadinessScript::StatusFrozen(
+            "v=1 phase=copy strategy=copy-in files=9000 bytes=123456",
+        ),
+        ..ScriptedEngine::default()
+    };
+    let (result, _) = run_single_job(engine).await;
+    let error = result.expect_err("a frozen copy must fail").to_string();
+    assert!(error.contains("9000 files"), "{error}");
+    assert!(error.contains("clean clone"), "{error}");
+    assert!(
+        !error.contains("`sh` and `tail`"),
+        "the stall never blames the image's shell: {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_init_failure_surfaces_its_own_detail() {
+    let engine = ScriptedEngine {
+        readiness: ReadinessScript::StatusFrozen(
+            "v=1 phase=failed\ncould not copy /greenlit/lower/x: permission denied",
+        ),
+        ..ScriptedEngine::default()
+    };
+    let (result, _) = run_single_job(engine).await;
+    let error = result
+        .expect_err("phase=failed must fail the run")
+        .to_string();
+    assert!(
+        error.contains("could not copy /greenlit/lower/x: permission denied"),
+        "init's own message surfaces: {error}"
+    );
+}
+
+#[tokio::test]
+async fn a_container_that_never_reports_names_the_init_helper() {
+    let engine = ScriptedEngine {
+        readiness: ReadinessScript::StatusFrozen(""),
+        ..ScriptedEngine::default()
+    };
+    let (result, _) = run_single_job(engine).await;
+    let error = result.expect_err("silence must time out").to_string();
+    assert!(error.contains("never reported isolation status"), "{error}");
+    assert!(error.contains("greenlit-init"), "{error}");
+}
+
+#[tokio::test]
+async fn an_unprobeable_container_gets_the_sh_fix() {
+    let engine = ScriptedEngine {
+        readiness: ReadinessScript::ProbeExecErrors,
+        ..ScriptedEngine::default()
+    };
+    let (result, _) = run_single_job(engine).await;
+    let error = result
+        .expect_err("an unprobeable container fails")
+        .to_string();
+    assert!(
+        error.contains("could not probe the job container"),
+        "{error}"
+    );
+    assert!(error.contains("POSIX `sh`"), "{error}");
 }

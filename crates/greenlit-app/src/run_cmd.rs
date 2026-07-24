@@ -23,8 +23,8 @@ use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
     ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, IsolationStrategy, RunConfig,
-    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, run_plan, run_write_back,
-    validate_host, validate_request,
+    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, reject_uses_steps, run_plan,
+    run_write_back, validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -121,6 +121,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         Some(job) => prune_to_job(&execution_plan, job)?,
         None => execution_plan,
     };
+    // Fail before any engine work: a `uses:` step that is certain to execute
+    // would otherwise surface only after image ensure, container boot, and a
+    // potentially long workspace copy.
+    reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
 
     let git = collect_git_context(&repo_root)
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
@@ -153,6 +157,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             .collect(),
         volume_namespace: run_volume_namespace(),
         write_back: args.write_back,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -167,10 +172,18 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
 
     // `Stdout` (not a lock guard) is `Send`, which the executor's streaming sink
-    // requires; each write still locks internally.
+    // requires; each write still locks internally. Phase progress renders on
+    // stderr so this stream stays the machine-parseable run log.
     let mut out = io::stdout();
+    let mut progress = render::progress::renderer_for_stderr();
     let report = runtime
-        .block_on(run_plan(&engine, &execution_plan, &config, &mut out))
+        .block_on(run_plan(
+            &engine,
+            &execution_plan,
+            &config,
+            &mut out,
+            &mut progress,
+        ))
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     for job in &report.jobs {

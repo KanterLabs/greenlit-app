@@ -16,6 +16,7 @@ mod context;
 use crate::engine::{BuildSpec, ContainerEngine};
 use crate::error::RuntimeError;
 use crate::platform::UbuntuRelease;
+use crate::progress::ProgressSink;
 
 /// The base-image repository (`greenlit/*` namespace, `AGENTS.md`).
 pub const IMAGE_REPO: &str = "greenlit/base";
@@ -111,12 +112,13 @@ fn plan_with_helper(
 pub async fn ensure_base_image(
     engine: &dyn ContainerEngine,
     release: UbuntuRelease,
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ImageError> {
     let plan = plan_base_image(release)?;
     if engine.image_exists(&plan.tag).await? {
         return Ok(plan.tag);
     }
-    engine.build_image(&plan.build_spec).await?;
+    engine.build_image(&plan.build_spec, progress).await?;
     Ok(plan.tag)
 }
 

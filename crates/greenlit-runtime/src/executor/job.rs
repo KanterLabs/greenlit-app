@@ -16,23 +16,23 @@ use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
-use crate::engine::{BindMount, ContainerEngine, ExecSpec};
+use crate::engine::BindMount;
 use crate::executor::container::{ContainerAdditions, ResolvedContainer, validate_container};
 use crate::executor::context::{
-    CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::instance::JobInstance;
+use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::step::{JobRuntime, StepLoopState, execute_step};
 use crate::executor::{ExecError, Shared, stage_span};
 use crate::image::{INIT_IN_IMAGE_PATH, ensure_base_image, init_binary};
 use crate::isolation::isolation_container_spec;
 use crate::platform::UbuntuRelease;
+use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
-/// Readiness marker `greenlit-init` touches once isolation is established.
-const READY_MARKER: &str = "/greenlit/ready";
 
 /// The resolved per-job env layers and defaults threaded into the step loop.
 struct RunnerLayers<'a> {
@@ -59,6 +59,7 @@ pub(crate) async fn run_instance(
     job_id: &JobId,
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<JobReport, ExecError> {
     let started = Instant::now();
 
@@ -99,30 +100,54 @@ pub(crate) async fn run_instance(
         needs_run_status,
     )?;
 
-    let (image_tag, in_container, bash_available, additions) =
-        resolve_image(shared, &runner_ctx, instance, &base_env, needs).await?;
-
-    let container = boot_container(shared, &image_tag, in_container, &additions).await?;
-
-    let outcome = run_job_body(
+    let (image_tag, in_container, bash_available, additions) = resolve_image(
         shared,
         masker,
+        &runner_ctx,
         instance,
-        RunnerLayers {
-            runner_ctx: &runner_ctx,
-            base_env: &base_env,
-            workflow_env: &job_env.workflow_env,
-            job_env: &job_env.job_env,
-            default_shell: job_env.default_shell.as_deref(),
-            default_wd: job_env.default_wd.as_deref(),
-            in_container,
-            bash_available,
-        },
-        &container,
+        &base_env,
         needs,
-        out,
+        progress,
     )
+    .await?;
+
+    let container = boot_container(shared, &image_tag, in_container, &additions, progress).await?;
+
+    // Readiness runs against the freshly booted container, before the step
+    // loop; its error still flows through the teardown below rather than
+    // returning early and leaking the container.
+    let ready = readiness::wait_for_ready(
+        shared.engine,
+        &container,
+        &shared.config.readiness,
+        progress,
+    )
+    .instrument(stage_span("overlay-setup"))
     .await;
+    let outcome = match ready {
+        Ok(()) => {
+            run_job_body(
+                shared,
+                masker,
+                instance,
+                RunnerLayers {
+                    runner_ctx: &runner_ctx,
+                    base_env: &base_env,
+                    workflow_env: &job_env.workflow_env,
+                    job_env: &job_env.job_env,
+                    default_shell: job_env.default_shell.as_deref(),
+                    default_wd: job_env.default_wd.as_deref(),
+                    in_container,
+                    bash_available,
+                },
+                &container,
+                needs,
+                out,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
 
     // `--write-back` needs the container (and its overlay upper) reachable
     // after the run to export the diff (`PHASE-2-execution.md` "Overlay
@@ -147,7 +172,7 @@ pub(crate) async fn run_instance(
     })
 }
 
-/// Run a booted job's steps and finalize its outputs.
+/// Run a ready job's steps and finalize its outputs.
 async fn run_job_body(
     shared: &Shared<'_>,
     masker: &mut Masker,
@@ -157,8 +182,6 @@ async fn run_job_body(
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
 ) -> Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError> {
-    wait_for_ready(shared.engine, container).await?;
-
     let job_rt = JobRuntime {
         engine: shared.engine,
         container,
@@ -315,10 +338,12 @@ fn resolve_env_and_defaults(
 /// Returns `(image_tag, in_container, bash_available, additions)`.
 async fn resolve_image(
     shared: &Shared<'_>,
+    masker: &Masker,
     runner_ctx: &Value,
     instance: &JobInstance<'_>,
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<(String, bool, bool, ContainerAdditions), ExecError> {
     match instance.container {
         Some(container_plan) => {
@@ -337,10 +362,20 @@ async fn resolve_image(
                 &shared.config.volume_namespace,
             )?;
             // Pull only when absent, so a present image (and an offline host)
-            // still runs, and re-runs skip the registry round-trip.
+            // still runs, and re-runs skip the registry round-trip. The image
+            // reference is expression-resolved, so it is masked before it can
+            // reach a progress display.
+            let masked_image = masker.apply(&resolved.image);
             let ensure = async {
                 if !shared.engine.image_exists(&resolved.image).await? {
-                    shared.engine.pull_image(&resolved.image).await?;
+                    let mut masked = MaskedPullSink {
+                        inner: progress,
+                        masked_image,
+                    };
+                    shared
+                        .engine
+                        .pull_image(&resolved.image, &mut masked)
+                        .await?;
                 }
                 Ok::<_, ExecError>(())
             };
@@ -354,11 +389,33 @@ async fn resolve_image(
                 RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
                 RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
             };
-            let tag = ensure_base_image(shared.engine, release)
+            let tag = ensure_base_image(shared.engine, release, progress)
                 .instrument(stage_span("image-ensure"))
                 .await?;
             Ok((tag, false, true, ContainerAdditions::default()))
         }
+    }
+}
+
+/// Replaces the image reference in pull events with its masked form before
+/// forwarding — the reference can interpolate `::add-mask::`ed values.
+struct MaskedPullSink<'a> {
+    inner: &'a mut (dyn ProgressSink + Send),
+    masked_image: String,
+}
+
+impl ProgressSink for MaskedPullSink<'_> {
+    fn on_progress(&mut self, event: ProgressEvent) {
+        let event = match event {
+            ProgressEvent::PullStarted { .. } => ProgressEvent::PullStarted {
+                image: self.masked_image.clone(),
+            },
+            ProgressEvent::PullFinished { .. } => ProgressEvent::PullFinished {
+                image: self.masked_image.clone(),
+            },
+            other => other,
+        };
+        self.inner.on_progress(event);
     }
 }
 
@@ -418,6 +475,7 @@ async fn boot_container(
     image: &str,
     in_container: bool,
     additions: &ContainerAdditions,
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ExecError> {
     let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
     let idle = vec![
@@ -446,38 +504,15 @@ async fn boot_container(
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 
     let engine = shared.engine;
+    progress.on_progress(ProgressEvent::BootStarted);
     let boot = async {
         let id = engine.create_container(&spec).await?;
         engine.start_container(&id).await?;
         Ok::<_, ExecError>(id)
     };
-    boot.instrument(stage_span("container-boot")).await
-}
-
-/// Poll until `greenlit-init` signals isolation is established (the overlay or
-/// copy-in workspace is live), timing the wait as the `overlay-setup` stage.
-async fn wait_for_ready(engine: &dyn ContainerEngine, container: &str) -> Result<(), ExecError> {
-    let program = format!(
-        "i=0; until [ -e {READY_MARKER} ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 1; sleep 0.05; done"
-    );
-    let spec = ExecSpec {
-        cmd: vec!["sh".to_string(), "-c".to_string(), program],
-        env: Vec::new(),
-        working_dir: None,
-    };
-    let mut sink = CaptureSink::default();
-    let output = engine
-        .exec(container, &spec, &mut sink)
-        .instrument(stage_span("overlay-setup"))
-        .await?;
-    if output.exit_code != 0 {
-        return Err(ExecError::Infrastructure {
-            message: "the job container never became ready (isolation setup did not complete)"
-                .to_string(),
-            fix: "ensure the runner image provides a POSIX `sh` and `tail`".to_string(),
-        });
-    }
-    Ok(())
+    let id = boot.instrument(stage_span("container-boot")).await?;
+    progress.on_progress(ProgressEvent::BootFinished);
+    Ok(id)
 }
 
 /// Write the embedded `greenlit-init` bytes to a host temp file (mode 0755) so

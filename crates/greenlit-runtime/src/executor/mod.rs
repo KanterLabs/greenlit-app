@@ -23,6 +23,8 @@ mod context;
 mod instance;
 mod job;
 mod logsink;
+mod preflight;
+mod readiness;
 mod report;
 mod step;
 
@@ -46,10 +48,13 @@ use crate::executor::container::ContainerRejection;
 use crate::executor::context::ContextRoots;
 use crate::image::ImageError;
 use crate::isolation::IsolationStrategy;
+use crate::progress::ProgressSink;
 
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
+pub use preflight::reject_uses_steps;
+pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
 
 /// Everything the executor needs beyond the plan and the engine.
@@ -92,6 +97,8 @@ pub struct RunConfig {
     /// exported after the whole run finishes (`JobReport::container_id`);
     /// the caller is responsible for removing it once write-back has run.
     pub write_back: bool,
+    /// Cadence and deadlines for the workspace-readiness poll.
+    pub readiness: ReadinessConfig,
 }
 
 /// A failure during execution. Detection-time engine conditions never travel
@@ -151,11 +158,13 @@ pub enum ExecError {
     },
     /// A `uses:` step was reached — action execution lands in Phase 3.
     #[error(
-        "`uses: {reference}` is an action step, which `litci run` executes starting in Phase 3\n  fix: for now run a shell-only workflow, or use `litci plan` to inspect this one"
+        "{span}: `uses: {reference}` is an action step, which `litci run` executes starting in Phase 3\n  fix: for now run a shell-only workflow, or use `litci plan` to inspect this one"
     )]
     UsesUnsupported {
         /// The action reference.
         reference: String,
+        /// Where the `uses:` value was authored.
+        span: Span,
     },
     /// A matrix that only materializes from runtime dependency outputs was
     /// reached. Expanding it requires mid-run data v0's sequential executor
@@ -242,6 +251,7 @@ pub async fn run_plan(
     plan: &ExecutionPlan,
     config: &RunConfig,
     out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<RunReport, ExecError> {
     let mut masker = Masker::new();
     for value in &config.initial_masks {
@@ -271,8 +281,16 @@ pub async fn run_plan(
         let mut instance_results: Vec<(Conclusion, IndexMap<String, String>)> = Vec::new();
         for instance in &group.instances {
             let needs = needs_records(instance.needs, &completed);
-            let report =
-                job::run_instance(&shared, &mut masker, instance, &group.id, &needs, out).await?;
+            let report = job::run_instance(
+                &shared,
+                &mut masker,
+                instance,
+                &group.id,
+                &needs,
+                out,
+                progress,
+            )
+            .await?;
             instance_results.push((report.result, report.outputs.clone()));
             job_reports.push(report);
         }

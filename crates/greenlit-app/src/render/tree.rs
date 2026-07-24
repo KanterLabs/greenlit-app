@@ -259,7 +259,9 @@ fn render_step(step: &StepPlan, out: &mut impl Write, indent: &str) -> std::io::
                 None => writeln!(out, "{indent}  shell: (default)")?,
             }
         }
-        StepKind::Uses { reference, with } => {
+        StepKind::Uses {
+            reference, with, ..
+        } => {
             writeln!(out, "{indent}  kind: uses")?;
             writeln!(out, "{indent}  reference: static({reference:?})")?;
             render_env("with", with, out, &format!("{indent}  "))?;
