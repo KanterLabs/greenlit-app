@@ -23,7 +23,9 @@ These names are final for v0. There is no legacy command or data-path compatibil
 1. `AGENTS.md` — this file: working rules, stub discipline, quality bar, metrics rules, status tables.
 2. `greenlit-v0-spec.md` — the product: principles, scope, security model, CLI, phase summaries.
 3. `TESTING.md` — the four test classes, the banned list, the internal CI pipeline.
-4. `PHASE-1-engine-core.md` → `PHASE-6-parity-launch.md` — implementation briefs. Exactly one is active at a time.
+4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-6-parity-launch.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time.
+
+`README.md` is the repository's public front door, not a governance document: it describes what ships, and the documents above remain authoritative when they disagree.
 
 Precedence on conflict: phase file over spec for implementation detail; spec over phase file for product behavior; TESTING.md is absolute for anything test-related. Every conflict found gets flagged in the phase summary.
 
@@ -48,7 +50,7 @@ Agents must request these from the owner at the listed point and stop rather tha
 
 ## First actions
 
-1. Initialize Git; commit these nine documents, a MIT `LICENSE`, and a `.gitignore` (Rust defaults + `.litci/`) at the repo root.
+1. Initialize Git; commit these nine documents (this file, the spec, `TESTING.md`, and the six phase briefs under `docs/`), a MIT `LICENSE`, and a `.gitignore` (Rust defaults + `.litci/`) at the repo root.
 2. Mark Phase 1 "in progress". As its first setup work, create the root Cargo workspace and only the Phase 1 crates, pin the toolchain, commit `Cargo.lock`, and stand up the internal CI pipeline from TESTING.md. CI must be green before product behavior is implemented.
 3. Begin the Phase 1 engine-core tasks.
 
@@ -82,12 +84,12 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 
 | Phase | File | Status |
 |---|---|---|
-| 1 — Engine core | `PHASE-1-engine-core.md` | completed |
-| 2 — Execution | `PHASE-2-execution.md` | completed |
-| 3 — Actions | `PHASE-3-actions.md` | completed |
-| 4 — Environment | `PHASE-4-environment.md` | not started |
-| 5 — Speed | `PHASE-5-speed.md` | not started |
-| 6 — Parity & launch | `PHASE-6-parity-launch.md` | not started |
+| 1 — Engine core | `docs/PHASE-1-engine-core.md` | completed |
+| 2 — Execution | `docs/PHASE-2-execution.md` | completed |
+| 3 — Actions | `docs/PHASE-3-actions.md` | completed |
+| 4 — Environment | `docs/PHASE-4-environment.md` | not started |
+| 5 — Speed | `docs/PHASE-5-speed.md` | not started |
+| 6 — Parity & launch | `docs/PHASE-6-parity-launch.md` | not started |
 
 ## Target workspace layout
 
