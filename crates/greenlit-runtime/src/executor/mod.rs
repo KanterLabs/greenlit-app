@@ -25,6 +25,7 @@ mod health;
 mod instance;
 mod job;
 mod logsink;
+mod netguard;
 mod preflight;
 mod readiness;
 mod report;

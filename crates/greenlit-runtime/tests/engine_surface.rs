@@ -112,6 +112,7 @@ impl ContainerEngine for FakeEngine {
     async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
         Ok(NetworkInfo {
             gateway: Some("10.0.0.1".to_string()),
+            subnet: Some("10.0.0.0/16".to_string()),
         })
     }
 

@@ -28,6 +28,7 @@ use crate::executor::context::{
     CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::instance::JobInstance;
+use crate::executor::netguard;
 use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
@@ -179,7 +180,14 @@ pub(crate) async fn run_instance(
     let services_started =
         match resolve_services(shared, masker, &runner_ctx, instance, &base_env, needs) {
             Ok(resolved) => {
-                match services::start(shared.engine, job_network.name(), &resolved, progress).await
+                match services::start(
+                    shared.engine,
+                    job_network.name(),
+                    job_network.policy(),
+                    &resolved,
+                    progress,
+                )
+                .await
                 {
                     Ok(started) => started,
                     Err(failure) => {
@@ -221,6 +229,18 @@ pub(crate) async fn run_instance(
         progress,
     )
     .await?;
+
+    // The network policy goes on before readiness, and therefore before any
+    // workflow code runs: a container that has executed even one step under
+    // an unrestricted network has already had its chance to reach the LAN.
+    if let Err(error) =
+        netguard::apply(shared.engine, &container, job_network.policy(), progress).await
+    {
+        let _ = shared.engine.remove_container(&container).await;
+        services::stop(shared.engine, &services_started).await;
+        job_network.teardown(shared.engine).await;
+        return Err(error.into());
+    }
 
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than

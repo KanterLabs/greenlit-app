@@ -623,15 +623,17 @@ impl ContainerEngine for DockerEngine {
             .map_err(|e| RuntimeError::api(Operation::InspectNetwork, e))?;
         // A bridge can carry both an IPv4 and an IPv6 config; Greenlit binds
         // v4 only, matching the v0 host support statement.
-        let gateway = network
+        let configs = network
             .ipam
             .and_then(|ipam| ipam.config)
-            .and_then(|configs| {
-                configs
-                    .into_iter()
-                    .find_map(|config| config.gateway.filter(|value| !value.contains(':')))
-            });
-        Ok(NetworkInfo { gateway })
+            .unwrap_or_default();
+        let ipv4 = configs
+            .into_iter()
+            .find(|config| config.gateway.as_ref().is_some_and(|g| !g.contains(':')));
+        Ok(NetworkInfo {
+            gateway: ipv4.as_ref().and_then(|config| config.gateway.clone()),
+            subnet: ipv4.and_then(|config| config.subnet),
+        })
     }
 
     async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {
