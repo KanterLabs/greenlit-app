@@ -10,9 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// `litci` -- run your GitHub Actions workflows locally, fast, with results
-/// you can trust (`greenlit-v0-spec.md`). This Phase 1 build implements only
-/// `plan` and `stats`; `run`/`auth`/`setup`/`clean` are later-phase commands
-/// (`PHASE-1-engine-core.md` "Out of scope (do not build)").
+/// you can trust (`greenlit-v0-spec.md`). `clean` remains unimplemented.
 #[derive(Debug, Parser)]
 #[command(name = "litci", version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -29,9 +27,26 @@ pub(crate) enum Command {
     Run(RunArgs),
     /// Detect, start, or install the container engine (three-state UX).
     Setup(SetupArgs),
+    /// Authenticate for GitHub configuration-variable lookup and action
+    /// resolution: GitHub App device flow by default, or `--pat`/`--gh`.
+    Auth(AuthArgs),
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
     Stats,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct AuthArgs {
+    /// Paste a fine-grained personal access token instead of using the
+    /// device flow.
+    #[arg(long = "pat", conflicts_with = "gh")]
+    pub(crate) pat: bool,
+
+    /// Use `gh auth token` (the GitHub CLI's already-authenticated token)
+    /// instead of the device flow. Prints a broad-scope warning: a
+    /// `gh`-issued token typically carries more than read-only access.
+    #[arg(long = "gh", conflicts_with = "pat")]
+    pub(crate) gh: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -184,3 +199,4 @@ fn parse_var(raw: &str) -> Result<(String, String), String> {
     })?;
     Ok((key, value))
 }
+

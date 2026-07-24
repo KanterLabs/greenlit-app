@@ -273,24 +273,59 @@ policy actively contains. They are not deferred Greenlit behavior.
   tracking includes [tokio-rs/tracing#3582](https://github.com/tokio-rs/tracing/issues/3582)
   and [clap-rs/clap#4824](https://github.com/clap-rs/clap/issues/4824).
 
-- **Phase 3's first outbound HTTPS client pulls in the Rust TLS ecosystem's
+- **Phase 3's first outbound HTTPS clients pull in the Rust TLS ecosystem's
   own license/version footprint.** `greenlit-actions` (`resolve::GitHubApiResolver`,
-  `store::TarballFetcher`) is the first crate in this workspace to make a
+  `store::TarballFetcher`) was the first crate in this workspace to make a
   real HTTPS request (to `api.github.com`), via `ureq`'s `rustls` backend —
   chosen over `native-tls` specifically because `native-tls` links system
   OpenSSL, which would turn the shipped `litci` binary from a single static
   executable into one with a host OpenSSL runtime dependency, contradicting
   `greenlit-v0-spec.md` "Tech": "One distributable static host binary."
-  `rustls`'s dependency chain (`ring`, `rustls-webpki`, `ring`'s own
-  `untrusted`, and `ring`'s `subtle`) is ISC- or BSD-3-Clause-licensed, and
-  its bundled Mozilla root CA list (`webpki-roots`) ships under
-  CDLA-Permissive-2.0 — all still standard OSI-approved/permissive terms,
-  just outside this workspace's original MIT/Apache-2.0/Unicode-3.0
-  allowlist, which predates any crate needing outbound TLS. `deny.toml`'s
-  `[licenses] allow` list was extended to admit exactly these three, with
-  the reasoning recorded inline there. There is no rustls crypto provider
-  or comparably minimal pure-Rust HTTPS client available that avoids this
-  footprint.
+  `greenlit-app` reuses the identical `ureq`/`rustls` choice for the same
+  reason: `litci auth`'s device-flow/refresh client
+  (`auth::device_flow::DeviceFlowClient`, `auth::refresh`) talks to
+  `github.com`, and the authenticated configuration-variables lookup
+  (`vars::remote::VariablesClient`) talks to `api.github.com`. Both crates
+  resolve to the one pinned `ureq` version, so this remains a single
+  dependency-tree footprint, not a duplicate. `rustls`'s dependency chain
+  (`ring`, `rustls-webpki`, `ring`'s own `untrusted`, and `ring`'s `subtle`)
+  is ISC- or BSD-3-Clause-licensed, and its bundled Mozilla root CA list
+  (`webpki-roots`) ships under CDLA-Permissive-2.0 — all still standard
+  OSI-approved/permissive terms, just outside this workspace's original
+  MIT/Apache-2.0/Unicode-3.0 allowlist, which predates any crate needing
+  outbound TLS. `deny.toml`'s `[licenses] allow` list was extended to admit
+  exactly these three, with the reasoning recorded inline there. There is no
+  rustls crypto provider or comparably minimal pure-Rust HTTPS client
+  available that avoids this footprint.
+
+- **`litci auth`'s token store chose the Linux kernel keyring over the
+  cross-platform `keyring` crate, trading persistence guarantees for a
+  smaller, daemon-free dependency.** `auth::token_store` uses
+  [`linux-keyutils`](https://docs.rs/linux-keyutils) directly against the
+  kernel's per-UID *persistent* keyring (`keyrings(7)`,
+  `KEYCTL_GET_PERSISTENT`) rather than the `keyring` crate, whose only
+  daemon-free Linux backend is that same `linux-keyutils` crate behind a
+  non-default feature — its *default* Linux backend is a D-Bus Secret
+  Service client (`zbus`), pulling a full async D-Bus stack and requiring a
+  running `gnome-keyring`/`kwalletd` session, commonly absent on headless
+  dev boxes, containers, and CI runners `litci auth` must not depend on. The
+  trade-off this creates: the kernel keyring is in-memory, not disk-resident
+  (a host reboot clears it, same as any session credential cache) and the
+  kernel expires it automatically after
+  `/proc/sys/kernel/keys/persistent_keyring_expiry` seconds of disuse. Both
+  cases surface as ordinary "not authenticated" (`auth::current_token`
+  returning `None`), which every caller already handles by pointing at
+  `litci auth` again — no special-case recovery path exists or is needed.
+  The documented `0600` file fallback under `~/.litci/auth.json` (with a
+  printed warning) covers the same "kernel keyring unavailable" case a
+  cross-platform crate's D-Bus backend failure would otherwise leave
+  unhandled. Compiled-binary integration tests force this same file-only
+  path via the internal `LITCI_TEST_NO_KEYRING` variable (`tests/support`'s
+  harness sets it for every sandboxed invocation) rather than exercising the
+  real kernel keyring, which is scoped to the test-runner process's UID and
+  so is not sandboxable the way a temporary `$HOME` is; the keyring code
+  path itself is instead covered by a unit test scoped to the thread-private
+  keyring identifier, which never touches persistent kernel state.
 
 - **`ring`'s own transitive pins duplicate two already-present crates at
   older versions.** `ring` (via `rustls`, via `ureq`) depends on

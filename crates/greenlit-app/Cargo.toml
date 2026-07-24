@@ -40,8 +40,44 @@ serde_json = "1.0.151"
 rustix = { version = "1.1.4", features = ["fs"] }
 # The interactive workflow picker shown when `.github/workflows/` holds
 # several files and no `-W` was passed. Prompt rendering goes to stderr, so
-# stdout stays machine-parseable; non-TTY invocations never prompt.
+# stdout stays machine-parseable; non-TTY invocations never prompt. Also
+# used for `litci auth --pat`'s no-echo secret entry and the secrets
+# resolution chain's interactive prompt (`PHASE-3-actions.md` Secrets/Auth).
 dialoguer = "0.12.0"
+# `litci auth`'s device-flow/refresh HTTP client and the authenticated
+# GitHub configuration-variables REST lookup. Same crate, version, and
+# rustls backend `greenlit-actions` already pins (`resolve::GitHubApiResolver`,
+# `store::TarballFetcher`) for the identical reason (a single static host
+# binary rules out `native-tls`'s system OpenSSL link) — see
+# `ARCHITECTURE.md` "Known issues log". Unlike that crate's async callers,
+# every use here runs before `litci`'s async runtime is even built (`plan`
+# has none; `run` builds one only for container execution), so this crate
+# calls `ureq` directly/blocking rather than through `spawn_blocking`.
+ureq = { version = "3.3.0", default-features = false, features = [
+    "rustls",
+    "json",
+] }
+# (De)serializes the stored-token payload (`auth::token_store`) for both the
+# keyring and 0600-file backends. Version pinned alongside the workspace's
+# existing `serde` use.
+serde = { version = "1.0.229", features = ["derive"] }
+# The kernel keyring backend for `litci auth`'s token storage
+# (`auth::token_store`): a safe wrapper around the Linux `keyctl(2)` family
+# of syscalls, chosen over the cross-platform `keyring` crate. v0 is
+# Linux-only (`greenlit-v0-spec.md` "Tech"), so a cross-platform credential
+# abstraction buys nothing; `keyring` 4.x's own Linux backends are either
+# this same `linux-keyutils` crate (opt-in, not a default feature) or a
+# D-Bus Secret Service client (`zbus`, a default feature that pulls a full
+# async D-Bus stack and requires a running `gnome-keyring`/`kwalletd`
+# session daemon — commonly absent on headless dev boxes, containers, and
+# CI runners, which `litci auth` must not depend on). Depending on
+# `linux-keyutils` directly keeps the dependency footprint to it plus
+# `libc`/`bitflags` (both already elsewhere in the tree at the same
+# versions) with no daemon requirement. See `ARCHITECTURE.md` "Known issues
+# log" for the persistence caveat (kernel keyrings are in-memory; a reboot
+# clears them, same as any session credential cache) and the documented
+# 0600-file fallback this crate's absence/failure falls back to.
+linux-keyutils = "0.2.5"
 
 [dev-dependencies]
 # Integration tests (`crates/greenlit-app/tests/`) spawn the compiled
@@ -49,3 +85,10 @@ dialoguer = "0.12.0"
 # the real developer machine's `~/.litci`. Same version already used by
 # `greenlit-metrics`'s own tests.
 tempfile = "3.27.0"
+# `greenlit_engine::PermissionsPlan::Scoped` holds its scopes in an
+# `IndexMap`; the token-permission-notice unit tests construct one directly.
+# Same pinned version the workspace already uses (`greenlit-engine`,
+# `greenlit-actions`) — a dev-only dependency since production code never
+# builds a `PermissionsPlan` itself (it only reads the one the planner
+# already produced).
+indexmap = "2.14.0"

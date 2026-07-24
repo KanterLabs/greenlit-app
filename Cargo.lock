@@ -674,10 +674,14 @@ dependencies = [
  "greenlit-metrics",
  "greenlit-runtime",
  "greenlit-workflow",
+ "indexmap",
+ "linux-keyutils",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -1067,6 +1071,16 @@ name = "libc"
 version = "0.2.187"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7743783ea728ef5c31194c6590797eed286449b4a4e87d626d8a51f0a94e732"
+
+[[package]]
+name = "linux-keyutils"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
+dependencies = [
+ "bitflags",
+ "libc",
+]
 
 [[package]]
 name = "linux-raw-sys"

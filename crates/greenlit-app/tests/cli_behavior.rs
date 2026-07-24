@@ -2,6 +2,8 @@
 
 pub mod support;
 
+#[path = "cli_behavior/auth.rs"]
+mod auth;
 #[path = "cli_behavior/common.rs"]
 mod common;
 #[path = "cli_behavior/discovery.rs"]
