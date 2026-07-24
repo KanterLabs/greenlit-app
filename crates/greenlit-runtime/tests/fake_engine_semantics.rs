@@ -21,6 +21,7 @@ use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
+    RegistryAuth,
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
@@ -139,6 +140,7 @@ impl ContainerEngine for ScriptedEngine {
     async fn pull_image(
         &self,
         _image: &str,
+        _auth: Option<&RegistryAuth>,
         _progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
         Ok(())

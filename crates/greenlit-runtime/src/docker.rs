@@ -26,6 +26,7 @@ use futures_util::StreamExt;
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
+    RegistryAuth,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -183,6 +184,7 @@ impl ContainerEngine for DockerEngine {
     async fn pull_image(
         &self,
         image: &str,
+        auth: Option<&RegistryAuth>,
         progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
         let (name, tag) = split_reference(image);
@@ -193,8 +195,13 @@ impl ContainerEngine for DockerEngine {
         progress.on_progress(ProgressEvent::PullStarted {
             image: image.to_string(),
         });
+        let credentials = auth.map(|auth| bollard::auth::DockerCredentials {
+            username: Some(auth.username.clone()),
+            password: Some(auth.password.clone()),
+            ..Default::default()
+        });
         let mut layers: HashMap<String, (u64, Option<u64>)> = HashMap::new();
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut stream = self.docker.create_image(Some(options), None, credentials);
         while let Some(item) = stream.next().await {
             let info = item.map_err(|e| RuntimeError::api(Operation::PullImage, e))?;
             let (current_bytes, total_bytes) = fold_pull_progress(&mut layers, &info);

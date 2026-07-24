@@ -17,7 +17,9 @@ use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::BindMount;
-use crate::executor::container::{ContainerAdditions, ResolvedContainer, validate_container};
+use crate::executor::container::{
+    ContainerAdditions, ResolvedContainer, ResolvedCredentials, validate_container,
+};
 use crate::executor::context::{
     ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
@@ -338,7 +340,7 @@ fn resolve_env_and_defaults(
 /// Returns `(image_tag, in_container, bash_available, additions)`.
 async fn resolve_image(
     shared: &Shared<'_>,
-    masker: &Masker,
+    masker: &mut Masker,
     runner_ctx: &Value,
     instance: &JobInstance<'_>,
     base_env: &IndexMap<String, String>,
@@ -356,6 +358,15 @@ async fn resolve_image(
                 RunStatus::Success,
             );
             let resolved = resolve_container(container_plan, &ctx)?;
+            // A resolved registry password/username may not already be a
+            // registered secret (e.g. a literal in `credentials:`, however
+            // inadvisable) — mask both before anything derived from them
+            // (the pull's progress events, a later error) can reach output,
+            // matching "never log them" (`PHASE-3-actions.md`).
+            if let Some(credentials) = &resolved.credentials {
+                masker.add(&credentials.username);
+                masker.add(&credentials.password);
+            }
             let additions = validate_container(
                 &resolved,
                 &shared.config.workspace,
@@ -374,7 +385,11 @@ async fn resolve_image(
                     };
                     shared
                         .engine
-                        .pull_image(&resolved.image, &mut masked)
+                        .pull_image(
+                            &resolved.image,
+                            additions.registry_auth.as_ref(),
+                            &mut masked,
+                        )
                         .await?;
                 }
                 Ok::<_, ExecError>(())
@@ -450,18 +465,23 @@ fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedCont
         )),
         None => None,
     };
-    let credentials_span = plan.credentials.as_ref().and_then(|creds| {
-        creds
-            .password
-            .as_ref()
-            .or(creds.username.as_ref())
-            .map(|value| value.span.clone())
-    });
+    let credentials = match &plan.credentials {
+        Some(creds) => Some(ResolvedCredentials {
+            username: match &creds.username {
+                Some(value) => resolve_string(value, ctx).map_err(ExecError::eval)?,
+                None => String::new(),
+            },
+            password: match &creds.password {
+                Some(value) => resolve_string(value, ctx).map_err(ExecError::eval)?,
+                None => String::new(),
+            },
+        }),
+        None => None,
+    };
     Ok(ResolvedContainer {
         image,
         image_span: plan.image.span.clone(),
-        has_credentials: plan.credentials.is_some(),
-        credentials_span,
+        credentials,
         env,
         volumes,
         ports,

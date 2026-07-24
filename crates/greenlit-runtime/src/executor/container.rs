@@ -6,15 +6,20 @@
 //! runs steps in the requested image with `env`, `ports`, named/anonymous
 //! `volumes`, and *safe* `options`, and must "reject host bind mounts,
 //! privileged mode, host networking, host PID/IPC namespaces, and other
-//! containment-breaking options with a source-spanned fix. Private-registry
-//! credentials are completed with auth in Phase 3." The security model is not
-//! configurable off (`greenlit-v0-spec.md` "Security model"), so these
-//! rejections are hard failures, never warnings.
+//! containment-breaking options with a source-spanned fix." Private-registry
+//! `credentials:` are resolved host-side against the `secrets` context
+//! (`PHASE-3-actions.md` "Job-container private-registry credentials") and
+//! handed to the engine's [`crate::engine::ContainerEngine::pull_image`] as a
+//! [`crate::engine::RegistryAuth`] — never logged, never placed on the
+//! container itself (a pulled image needs credentials only for the pull, not
+//! for anything the running container does). The security model is not
+//! configurable off (`greenlit-v0-spec.md` "Security model"), so every other
+//! rejection here is a hard failure, never a warning.
 
 use greenlit_workflow::Span;
 use thiserror::Error;
 
-use crate::engine::BindMount;
+use crate::engine::{BindMount, RegistryAuth};
 
 /// A resolved (all `${{ }}` finished) job-container request, with each value's
 /// authored span retained for precise rejection messages.
@@ -24,10 +29,8 @@ pub struct ResolvedContainer {
     pub image: String,
     /// Where `image:` was authored.
     pub image_span: Span,
-    /// Whether the job authored `credentials:` (Phase 3 completes auth).
-    pub has_credentials: bool,
-    /// Where `credentials:` was authored, if present.
-    pub credentials_span: Option<Span>,
+    /// `credentials:`, resolved to a username/password pair, if authored.
+    pub credentials: Option<ResolvedCredentials>,
     /// Resolved `env:` entries.
     pub env: Vec<(String, String)>,
     /// Resolved `volumes:` specs (`source:dest` or a bare `dest`).
@@ -38,19 +41,22 @@ pub struct ResolvedContainer {
     pub options: Option<(String, Span)>,
 }
 
+/// `credentials:`, resolved: a username/password pair ready to hand the
+/// engine as a [`RegistryAuth`] for the image pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCredentials {
+    /// `credentials.username:`, resolved.
+    pub username: String,
+    /// `credentials.password:`, resolved. Never logged; the caller masks it
+    /// with the running step masker before any of this reaches a log line.
+    pub password: String,
+}
+
 /// A containment-breaking or not-yet-supported job-container request. Every
 /// variant carries the authored span and, in its message, the one action that
 /// resolves it (`AGENTS.md` UX invariant).
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ContainerRejection {
-    /// `credentials:` was supplied before Phase 3's auth landed.
-    #[error(
-        "{span}: private-registry `credentials:` are not available until Phase 3\n  fix: remove `credentials:` for now, or pre-pull the image and reference it by digest"
-    )]
-    Credentials {
-        /// Where `credentials:` was authored.
-        span: Span,
-    },
     /// `--privileged` (or `--privileged=true`) was requested.
     #[error(
         "{span}: `--privileged` is refused — a privileged container defeats Greenlit's isolation\n  fix: remove `--privileged` from the job container `options:`"
@@ -150,6 +156,9 @@ pub struct ContainerAdditions {
     pub volume_binds: Vec<BindMount>,
     /// Resolved container env to add.
     pub env: Vec<(String, String)>,
+    /// Resolved `credentials:`, ready to pass the engine's
+    /// `pull_image` as a [`RegistryAuth`], if the job authored any.
+    pub registry_auth: Option<RegistryAuth>,
 }
 
 /// Validate a resolved job-container request, returning the safe additions or
@@ -163,23 +172,16 @@ pub struct ContainerAdditions {
 ///
 /// # Errors
 ///
-/// Returns a [`ContainerRejection`] for `credentials:`, any privileged / host
-/// namespace / host bind request, a host-path volume source, a volume
-/// destination colliding with the workspace or `/greenlit` control paths, an
-/// escalation flag, or an unsupported option.
+/// Returns a [`ContainerRejection`] for any privileged / host namespace /
+/// host bind request, a host-path volume source, a volume destination
+/// colliding with the workspace or `/greenlit` control paths, an escalation
+/// flag, or an unsupported option. `credentials:` is never rejected — it is
+/// resolved into [`ContainerAdditions::registry_auth`] instead.
 pub fn validate_container(
     container: &ResolvedContainer,
     workspace: &str,
     volume_namespace: &str,
 ) -> Result<ContainerAdditions, ContainerRejection> {
-    if container.has_credentials {
-        return Err(ContainerRejection::Credentials {
-            span: container
-                .credentials_span
-                .clone()
-                .unwrap_or_else(|| container.image_span.clone()),
-        });
-    }
     if let Some((options, span)) = &container.options {
         validate_options(options, span)?;
     }
@@ -195,6 +197,13 @@ pub fn validate_container(
     Ok(ContainerAdditions {
         volume_binds,
         env: container.env.clone(),
+        registry_auth: container
+            .credentials
+            .as_ref()
+            .map(|credentials| RegistryAuth {
+                username: credentials.username.clone(),
+                password: credentials.password.clone(),
+            }),
     })
 }
 
@@ -405,8 +414,7 @@ mod tests {
         ResolvedContainer {
             image: "node:20".to_string(),
             image_span: span(),
-            has_credentials: false,
-            credentials_span: None,
+            credentials: None,
             env: vec![("A".to_string(), "b".to_string())],
             volumes: Vec::new(),
             ports: Vec::new(),
@@ -415,13 +423,26 @@ mod tests {
     }
 
     #[test]
-    fn credentials_are_rejected_with_a_phase_3_fix() {
+    fn credentials_resolve_into_registry_auth_without_being_rejected() {
         let mut c = base();
-        c.has_credentials = true;
-        c.credentials_span = Some(span());
-        let err = validate(&c).unwrap_err();
-        assert!(matches!(err, ContainerRejection::Credentials { .. }));
-        assert!(err.to_string().contains("Phase 3"));
+        c.credentials = Some(ResolvedCredentials {
+            username: "user".to_string(),
+            password: "hunter2".to_string(),
+        });
+        let additions = validate(&c).expect("credentials: is supported");
+        assert_eq!(
+            additions.registry_auth,
+            Some(RegistryAuth {
+                username: "user".to_string(),
+                password: "hunter2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn no_credentials_authored_resolves_to_no_registry_auth() {
+        let additions = validate(&base()).expect("no credentials: ok");
+        assert_eq!(additions.registry_auth, None);
     }
 
     #[test]
