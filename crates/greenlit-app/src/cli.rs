@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// `litci` -- run your GitHub Actions workflows locally, fast, with results
-/// you can trust (`greenlit-v0-spec.md`). `clean` remains unimplemented.
+/// you can trust (`greenlit-v0-spec.md`).
 #[derive(Debug, Parser)]
 #[command(name = "litci", version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -33,6 +33,16 @@ pub(crate) enum Command {
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
     Stats,
+    /// Remove Greenlit's derived caches and built images. Credentials and run
+    /// history are never touched.
+    Clean(CleanArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct CleanArgs {
+    /// Pre-confirm the removal prompt (non-interactive).
+    #[arg(short = 'y', long = "yes")]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, clap::Args)]

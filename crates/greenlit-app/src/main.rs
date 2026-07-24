@@ -2,11 +2,12 @@
 
 //! `litci` -- the Greenlit CLI binary (`greenlit-v0-spec.md`).
 //!
-//! `plan`/`stats` landed in Phase 1, `run`/`setup` in Phase 2, and `auth` in
-//! Phase 3 (`PHASE-3-actions.md` Auth); `clean` remains unimplemented.
+//! `plan`/`stats` landed in Phase 1, `run`/`setup` in Phase 2, `auth` in
+//! Phase 3 (`PHASE-3-actions.md` Auth), and `clean` in Phase 4.
 
 mod auth;
 mod auth_cmd;
+mod clean_cmd;
 mod cli;
 mod dotenv_format;
 mod errors;
@@ -37,6 +38,7 @@ fn main() -> ExitCode {
         cli::Command::Setup(args) => setup_cmd::run(args),
         cli::Command::Auth(args) => auth_cmd::run(args),
         cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
+        cli::Command::Clean(args) => clean_cmd::run(args),
     };
     match result {
         Ok(code) => code,
