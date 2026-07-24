@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use tar::{Builder, EntryType, Header};
 
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, RegistryAuth,
 };
 use greenlit_runtime::error::RuntimeError;
 use greenlit_runtime::progress::ProgressSink;
@@ -83,6 +83,27 @@ impl ContainerEngine for DiffEngine {
         Ok(String::new())
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    // Write-back never inspects health, touches volumes, or manages images;
+    // these exist so the fake still implements the whole port.
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: HealthState::None,
+        })
+    }
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 }

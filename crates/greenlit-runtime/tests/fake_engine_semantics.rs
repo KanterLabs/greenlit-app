@@ -20,8 +20,8 @@ use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, RegistryAuth,
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
@@ -256,6 +256,25 @@ impl ContainerEngine for ScriptedEngine {
         Ok("net".to_string())
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: HealthState::None,
+        })
+    }
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 }
