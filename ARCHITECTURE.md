@@ -339,6 +339,140 @@ policy actively contains. They are not deferred Greenlit behavior.
   granularity — a version bump on either side requires deliberately updating
   the pinned skip entry, not a silent pass.
 
+- **`uses:` execution is pinned against one `actions/runner` release,
+  independent of Phase 4's runner-image manifest.** Node-action execution
+  (node20/node24), composite-action nesting, Docker actions, and the pre/post
+  step protocol are all implemented by directly reading the pinned
+  `actions/runner` **v2.336.0** source
+  (<https://github.com/actions/runner/releases/tag/v2.336.0>) rather than
+  reverse-engineering behavior from observed hosted-runner output, per
+  `PHASE-3-actions.md`'s explicit "do not depend on Phase 4's runner-image
+  manifest for these" instruction. The four pinned Node runtime bundles
+  (`crate::executor::actions::node_runtime`, `greenlit-runtime`) come from
+  that release's own `src/Misc/externals.sh` packaging script, which declares
+  `NODE20_VERSION=20.20.2`/`NODE24_VERSION=24.18.0` and fetches a standard
+  (glibc) `linux-x64` tarball from `nodejs.org/dist` plus an Alpine (musl)
+  tarball from the separate `actions/alpine_nodejs` release for each version.
+  The standard tarballs' checksums come from nodejs.org's own published
+  `SHASUMS256.txt` for each version; the Alpine tarballs are release assets
+  nodejs.org does not publish a checksum for at all, so their `sha256` was
+  computed directly from the downloaded release asset during implementation
+  (the asset was fetched, hashed, and discarded — not taken from any
+  third-party republication). All four are re-verified against their live
+  sources as part of this work:
+
+  | version | variant | url | sha256 |
+  |---|---|---|---|
+  | node20 | standard | `https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.gz` | `19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b` |
+  | node20 | alpine | `https://github.com/actions/alpine_nodejs/releases/download/v20.20.2/node-v20.20.2-alpine-x64.tar.gz` | `f21a2253025a5d1a14332a0b1ed48871689c5ca9aa37a6141428944b75de7d91` |
+  | node24 | standard | `https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.gz` | `783130984963db7ba9cbd01089eaf2c2efb055c7c1693c943174b967b3050cb8` |
+  | node24 | alpine | `https://github.com/actions/alpine_nodejs/releases/download/v24.18.0/node-v24.18.0-alpine-x64.tar.gz` | `0103dd81376d57dcc2bcb39a13cfd6db19ab82f6c2c83a166e44d775f736d0d9` |
+
+  A job container's libc is not known until it is booted, so `RuntimeStore`
+  fetches and caches *both* variants a job needs (content-addressed under
+  `~/.litci/node-runtimes/<node20\|node24>/<standard\|alpine>/<sha256>/`) and
+  a per-job in-container probe (`cat /etc/*release | grep ^ID`, checked for
+  `alpine`) selects which bind-mount to expose as the executable path at exec
+  time — never both mounted live at once, and never a guess made from the
+  requested image name, which is not a reliable libc signal. Pre/post-step
+  ordering (pre in file order before a job's first step, post in *reverse*
+  push order at job end regardless of failure) and the `pre-if`/`post-if`
+  default-to-`always()` rule are taken from the same pinned release's
+  `JobExtension.cs`/`ExecutionContext.cs`/`StepsRunner.cs` (`PostJobSteps` is
+  literally a `Stack<IStep>`, which is why this crate's own `PostChain` is
+  push/reverse-drain) and `ActionManifestManager.cs`. Libc-family detection
+  as the variant-selection signal follows the same release's `StepHost.cs`.
+  Composite-action nesting depth is capped at 10, matching
+  `docs/adrs/1144-composite-actions.md`.
+
+- **A Docker action's sibling container shares the job's *live* workspace
+  through a run-scoped named volume, not a bind mount of the job container's
+  own view.** The job container's workspace is not necessarily a host
+  directory at all — under overlay isolation it is a private overlay upper
+  layer inside that one container, invisible to any sibling. Docker actions
+  must nonetheless run as a sibling container (never sharing the host Docker
+  socket with the job container, and never running inside it), per
+  `PHASE-3-actions.md`. The resolution: a job plan that contains any Docker
+  `uses:` step forces that job onto `IsolationStrategy::CopyIn` (rather than
+  overlay) and binds one namespaced, run-scoped named Docker volume
+  (`crate::executor::container::namespaced_volume_name`, the same
+  namespacing already used for other job volumes) at the workspace path in
+  *both* the job container and every Docker-action sibling for that job. A
+  copy-in job's workspace is, by construction, whatever is bind-mounted at
+  that path — so pointing that mount at a shared named volume instead of a
+  bind mount costs nothing beyond what copy-in isolation already does, and
+  requires no change to `greenlit-init`. Writes made by a `run:` step and by
+  a Docker-action sibling are therefore mutually visible for the remainder of
+  the job, proven end-to-end by
+  `crates/greenlit-runtime/tests/actions_docker.rs` against the real Docker
+  daemon (a `run:` step writes a file, a Docker action reads and appends to
+  it, and a later `run:` step reads back both halves). The tradeoff: a job
+  with a Docker action cannot use overlay isolation even if it would
+  otherwise qualify, and the run-scoped volume this creates is not cleaned up
+  automatically — `ContainerEngine` has no `remove_volume` operation yet, so
+  these volumes accumulate on the host until an operator prunes them
+  (`docker volume prune`); tracked here rather than silently left
+  undocumented, since automatic cleanup is a reasonable near-term follow-up
+  but was out of this task's scope.
+
+- **`actions/checkout` of the workflow's own repository is satisfied from the
+  already-materialized isolated workspace, with no network access; checking
+  out a *different* repository always performs a real, authenticated
+  clone.** `crate::executor::actions::checkout` special-cases exactly the
+  self-checkout shape (`with.repository` absent, or equal to the synthetic
+  event's own `owner/repo`) by treating the workspace already prepared by
+  `greenlit-init` as the checkout result outright and reading `ref`/`commit`
+  outputs from the already-known `RunnerEnv`, rather than re-cloning content
+  litci already isolated onto disk for the job. Checking out any other
+  repository is a real `git clone` executed inside the job container, using
+  a short-lived `http.https://github.com/.extraheader` basic-auth header
+  (the token is never embedded in the remote URL, so it cannot leak through
+  a logged `git remote -v` or similar) built from `litci auth`'s stored
+  token; with no token available, this fails immediately with the same
+  `litci auth` fix-it message used elsewhere, rather than silently attempting
+  an anonymous clone. `checkout`'s post step (credential cleanup, removing
+  the injected `extraheader` config) still appears in the post chain for
+  *both* shapes — a documented no-op for the self-checkout case, since there
+  is no injected credential to remove there, kept honest rather than
+  omitted, so the post-step *ordering* contract (exit criterion: checkout's
+  post step still runs even when a later step fails) holds identically
+  regardless of which shape triggered it.
+
+- **A composite action's nested `pre` steps run immediately before that
+  action's own nested main steps, not hoisted to the job's front alongside
+  ordinary top-level `pre` steps.** The pinned runner hoists every *top-level*
+  step's `pre` action to the front of the job and its `post` action to a
+  job-end stack, but a composite action's own nested steps are, at that
+  level, a single unit (the composite's containing `uses:` step is itself
+  what gets hoisted/stacked as one participant). This implementation
+  deliberately simplifies one layer further: a nested step's `pre` runs in
+  place, immediately before that same nested step's main action, rather than
+  additionally hoisting it to the outer job's front. This is a documented
+  fidelity gap, not an oversight — real-world composite actions rarely rely
+  on nested pre-step hoisting timing, and getting it exactly right would
+  require threading hoisted nested pre steps back out through the same
+  `JobActionPlan` pre-pass that already handles top-level steps, which was
+  not attempted this wave. Nested `post` steps are *not* similarly
+  simplified: they still push onto the job's shared, reverse-drained
+  `PostChain` and so run at job end in the correct overall LIFO position
+  alongside every other step's post action. A Docker action referenced from
+  inside a composite action's nested steps is rejected outright with a clear
+  error rather than attempted, since a nested Docker sibling would need the
+  same shared-workspace volume design as a top-level one but composed inside
+  an already-scoped composite context — deferred rather than guessed at.
+
+- **A manifest's declared input `default:` value is used as a literal
+  string, not evaluated as a `${{ }}` expression.** `actions/checkout`'s own
+  manifest and the marketplace actions this implementation was validated
+  against only use literal default values (`default: true`, `default: '1'`),
+  so this is not a fidelity gap for any action exercised here — but the
+  pinned runner's `ActionManifestManager.cs` does generically evaluate a
+  default value as an expression before substitution, which a marketplace
+  action relying on a non-literal, expression-valued `default:` would
+  observe differently under this implementation (the raw text would be
+  passed through, rather than evaluated). Recorded here as a known,
+  narrow fidelity gap rather than left silent.
+
 - **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
   it out of the ordinary secrets chain.** GitHub secret and configuration
   variable names share one documented rule: "must not start with the
