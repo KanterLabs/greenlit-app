@@ -16,6 +16,7 @@
 //! # Crate boundary
 //!
 //! * [`cache`] — the `actions/cache` backing store and its selection rule.
+//! * [`artifacts`] — the upload/download-artifact backing store.
 //! * [`server`] — the workflow-facing HTTP shim those actions talk to.
 //!
 //! Every store resolves its root the same way (`~/.litci/<name>`, overridable
@@ -24,10 +25,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod artifacts;
 pub mod cache;
 pub mod error;
+mod layout;
 pub mod server;
 
+pub use artifacts::{Artifact, ArtifactStore};
 pub use cache::{CacheStore, Restored};
 pub use error::StoreError;
 pub use server::{Bound, Shim, ShimState, bind};

@@ -3,12 +3,14 @@
 
 use axum::http::{HeaderMap, StatusCode, header};
 
+use crate::artifacts::ArtifactStore;
 use crate::cache::CacheStore;
 
 /// Everything the shim's handlers need, shared behind an `Arc`.
 #[derive(Debug)]
 pub struct ShimState {
     cache: CacheStore,
+    artifacts: ArtifactStore,
     token: String,
     base_url: String,
 }
@@ -19,12 +21,19 @@ impl ShimState {
     /// `base_url` is how the *job container* addresses this shim (the
     /// Greenlit bridge gateway plus the bound port), not how the host does:
     /// it is echoed back to the client as the `archiveLocation` a cache hit
-    /// is downloaded from, so it must resolve from inside the container.
-    /// `token` is the run's `ACTIONS_RUNTIME_TOKEN`.
+    /// is downloaded from and as the `signedUploadUrl` an artifact is written
+    /// to, so it must resolve from inside the container. `token` is the run's
+    /// `ACTIONS_RUNTIME_TOKEN`.
     #[must_use]
-    pub fn new(cache: CacheStore, token: impl Into<String>, base_url: impl Into<String>) -> Self {
+    pub fn new(
+        cache: CacheStore,
+        artifacts: ArtifactStore,
+        token: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             cache,
+            artifacts,
             token: token.into(),
             base_url: base_url.into(),
         }
@@ -36,11 +45,32 @@ impl ShimState {
         &self.cache
     }
 
-    /// The URL a client downloads committed entry `id` from.
+    /// The artifact store this shim serves.
+    #[must_use]
+    pub fn artifacts(&self) -> &ArtifactStore {
+        &self.artifacts
+    }
+
+    /// The id of the artifact currently being uploaded under `name`.
+    #[must_use]
+    pub fn pending_artifact(&self, scope: &str, name: &str) -> Option<i64> {
+        self.artifacts.pending(scope, name)
+    }
+
+    /// The URL a client downloads committed cache entry `id` from.
     #[must_use]
     pub fn blob_url(&self, id: i64) -> String {
         format!(
             "{}_apis/artifactcache/blobs/{id}",
+            with_trailing_slash(&self.base_url)
+        )
+    }
+
+    /// The URL an artifact's bytes are written to and read from.
+    #[must_use]
+    pub fn artifact_blob_url(&self, id: i64) -> String {
+        format!(
+            "{}_apis/artifacts/blobs/{id}",
             with_trailing_slash(&self.base_url)
         )
     }
@@ -100,12 +130,14 @@ fn with_trailing_slash(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ShimState, with_trailing_slash};
+    use crate::artifacts::ArtifactStore;
     use crate::cache::CacheStore;
     use axum::http::{HeaderMap, HeaderValue, header};
 
     fn state() -> ShimState {
         ShimState::new(
             CacheStore::at("/tmp/unused"),
+            ArtifactStore::at("/tmp/unused-artifacts"),
             "secret",
             "http://10.0.0.1:8080",
         )
