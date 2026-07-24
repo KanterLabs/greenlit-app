@@ -173,8 +173,15 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // `Stdout` (not a lock guard) is `Send`, which the executor's streaming sink
     // requires; each write still locks internally.
     let mut out = io::stdout();
+    let mut progress = greenlit_runtime::ProgressNull;
     let report = runtime
-        .block_on(run_plan(&engine, &execution_plan, &config, &mut out))
+        .block_on(run_plan(
+            &engine,
+            &execution_plan,
+            &config,
+            &mut out,
+            &mut progress,
+        ))
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     for job in &report.jobs {

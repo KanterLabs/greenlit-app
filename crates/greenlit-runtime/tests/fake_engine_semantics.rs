@@ -23,6 +23,7 @@ use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
 use greenlit_runtime::error::RuntimeError;
+use greenlit_runtime::progress::{ProgressNull, ProgressSink};
 use greenlit_runtime::{IsolationStrategy, RunConfig, run_plan};
 
 /// A fake engine that keeps an in-memory file map and interprets a directive
@@ -114,13 +115,21 @@ impl ScriptedEngine {
 
 #[async_trait]
 impl ContainerEngine for ScriptedEngine {
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
         Ok(true)
     }
-    async fn build_image(&self, _spec: &BuildSpec) -> Result<(), RuntimeError> {
+    async fn build_image(
+        &self,
+        _spec: &BuildSpec,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {
@@ -267,9 +276,15 @@ async fn dag_propagation_rollup_gating_and_masking() {
     };
 
     let mut log: Vec<u8> = Vec::new();
-    let report = run_plan(&engine, &execution_plan, &config, &mut log)
-        .await
-        .expect("run completes");
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
     let log = String::from_utf8(log).unwrap();
 
     assert_eq!(
@@ -361,9 +376,15 @@ async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
     };
 
     let mut log: Vec<u8> = Vec::new();
-    let error = run_plan(&engine, &execution_plan, &config, &mut log)
-        .await
-        .expect_err("the runtime-true uses: step must fail the run");
+    let error = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect_err("the runtime-true uses: step must fail the run");
     let rendered = error.to_string();
     assert!(
         rendered.contains("`uses: actions/checkout@v4` is an action step"),

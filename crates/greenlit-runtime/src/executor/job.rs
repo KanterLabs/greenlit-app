@@ -28,6 +28,7 @@ use crate::executor::{ExecError, Shared, stage_span};
 use crate::image::{INIT_IN_IMAGE_PATH, ensure_base_image, init_binary};
 use crate::isolation::isolation_container_spec;
 use crate::platform::UbuntuRelease;
+use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
@@ -59,6 +60,7 @@ pub(crate) async fn run_instance(
     job_id: &JobId,
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<JobReport, ExecError> {
     let started = Instant::now();
 
@@ -99,10 +101,18 @@ pub(crate) async fn run_instance(
         needs_run_status,
     )?;
 
-    let (image_tag, in_container, bash_available, additions) =
-        resolve_image(shared, &runner_ctx, instance, &base_env, needs).await?;
+    let (image_tag, in_container, bash_available, additions) = resolve_image(
+        shared,
+        masker,
+        &runner_ctx,
+        instance,
+        &base_env,
+        needs,
+        progress,
+    )
+    .await?;
 
-    let container = boot_container(shared, &image_tag, in_container, &additions).await?;
+    let container = boot_container(shared, &image_tag, in_container, &additions, progress).await?;
 
     let outcome = run_job_body(
         shared,
@@ -315,10 +325,12 @@ fn resolve_env_and_defaults(
 /// Returns `(image_tag, in_container, bash_available, additions)`.
 async fn resolve_image(
     shared: &Shared<'_>,
+    masker: &Masker,
     runner_ctx: &Value,
     instance: &JobInstance<'_>,
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<(String, bool, bool, ContainerAdditions), ExecError> {
     match instance.container {
         Some(container_plan) => {
@@ -337,10 +349,20 @@ async fn resolve_image(
                 &shared.config.volume_namespace,
             )?;
             // Pull only when absent, so a present image (and an offline host)
-            // still runs, and re-runs skip the registry round-trip.
+            // still runs, and re-runs skip the registry round-trip. The image
+            // reference is expression-resolved, so it is masked before it can
+            // reach a progress display.
+            let masked_image = masker.apply(&resolved.image);
             let ensure = async {
                 if !shared.engine.image_exists(&resolved.image).await? {
-                    shared.engine.pull_image(&resolved.image).await?;
+                    let mut masked = MaskedPullSink {
+                        inner: progress,
+                        masked_image,
+                    };
+                    shared
+                        .engine
+                        .pull_image(&resolved.image, &mut masked)
+                        .await?;
                 }
                 Ok::<_, ExecError>(())
             };
@@ -354,11 +376,33 @@ async fn resolve_image(
                 RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
                 RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
             };
-            let tag = ensure_base_image(shared.engine, release)
+            let tag = ensure_base_image(shared.engine, release, progress)
                 .instrument(stage_span("image-ensure"))
                 .await?;
             Ok((tag, false, true, ContainerAdditions::default()))
         }
+    }
+}
+
+/// Replaces the image reference in pull events with its masked form before
+/// forwarding — the reference can interpolate `::add-mask::`ed values.
+struct MaskedPullSink<'a> {
+    inner: &'a mut (dyn ProgressSink + Send),
+    masked_image: String,
+}
+
+impl ProgressSink for MaskedPullSink<'_> {
+    fn on_progress(&mut self, event: ProgressEvent) {
+        let event = match event {
+            ProgressEvent::PullStarted { .. } => ProgressEvent::PullStarted {
+                image: self.masked_image.clone(),
+            },
+            ProgressEvent::PullFinished { .. } => ProgressEvent::PullFinished {
+                image: self.masked_image.clone(),
+            },
+            other => other,
+        };
+        self.inner.on_progress(event);
     }
 }
 
@@ -418,6 +462,7 @@ async fn boot_container(
     image: &str,
     in_container: bool,
     additions: &ContainerAdditions,
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ExecError> {
     let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
     let idle = vec![
@@ -446,12 +491,15 @@ async fn boot_container(
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 
     let engine = shared.engine;
+    progress.on_progress(ProgressEvent::BootStarted);
     let boot = async {
         let id = engine.create_container(&spec).await?;
         engine.start_container(&id).await?;
         Ok::<_, ExecError>(id)
     };
-    boot.instrument(stage_span("container-boot")).await
+    let id = boot.instrument(stage_span("container-boot")).await?;
+    progress.on_progress(ProgressEvent::BootFinished);
+    Ok(id)
 }
 
 /// Poll until `greenlit-init` signals isolation is established (the overlay or

@@ -47,6 +47,7 @@ use crate::executor::container::ContainerRejection;
 use crate::executor::context::ContextRoots;
 use crate::image::ImageError;
 use crate::isolation::IsolationStrategy;
+use crate::progress::ProgressSink;
 
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
@@ -246,6 +247,7 @@ pub async fn run_plan(
     plan: &ExecutionPlan,
     config: &RunConfig,
     out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
 ) -> Result<RunReport, ExecError> {
     let mut masker = Masker::new();
     for value in &config.initial_masks {
@@ -275,8 +277,16 @@ pub async fn run_plan(
         let mut instance_results: Vec<(Conclusion, IndexMap<String, String>)> = Vec::new();
         for instance in &group.instances {
             let needs = needs_records(instance.needs, &completed);
-            let report =
-                job::run_instance(&shared, &mut masker, instance, &group.id, &needs, out).await?;
+            let report = job::run_instance(
+                &shared,
+                &mut masker,
+                instance,
+                &group.id,
+                &needs,
+                out,
+                progress,
+            )
+            .await?;
             instance_results.push((report.result, report.outputs.clone()));
             job_reports.push(report);
         }

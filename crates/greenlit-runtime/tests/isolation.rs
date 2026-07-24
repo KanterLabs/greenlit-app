@@ -18,6 +18,7 @@ mod dockerkit;
 
 use greenlit_runtime::engine::{BindMount, ContainerEngine, ContainerSpec, ExecSpec};
 use greenlit_runtime::isolation::CONTAINER_LOWER;
+use greenlit_runtime::progress::ProgressNull;
 use greenlit_runtime::{UbuntuRelease, ensure_base_image};
 
 use dockerkit::{
@@ -39,7 +40,7 @@ async fn overlay_isolation_protects_the_host_across_strategies() {
         return;
     };
 
-    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404)
+    let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
         .expect("base image");
 

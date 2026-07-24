@@ -17,6 +17,7 @@ use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
 use greenlit_runtime::error::RuntimeError;
+use greenlit_runtime::progress::ProgressSink;
 use greenlit_runtime::writeback::{Change, ChangeKind, Confirm, WriteBackOutcome, run_write_back};
 
 /// A fake engine whose `export_path` replays a fixed overlay-upper tar.
@@ -26,13 +27,21 @@ struct DiffEngine {
 
 #[async_trait]
 impl ContainerEngine for DiffEngine {
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
         Ok(true)
     }
-    async fn build_image(&self, _spec: &BuildSpec) -> Result<(), RuntimeError> {
+    async fn build_image(
+        &self,
+        _spec: &BuildSpec,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {

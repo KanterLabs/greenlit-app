@@ -14,6 +14,7 @@ use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
 };
 use greenlit_runtime::error::RuntimeError;
+use greenlit_runtime::progress::ProgressSink;
 
 /// One framed output chunk the fake exec replays.
 enum Chunk {
@@ -30,7 +31,11 @@ struct FakeEngine {
 
 #[async_trait]
 impl ContainerEngine for FakeEngine {
-    async fn pull_image(&self, _image: &str) -> Result<(), RuntimeError> {
+    async fn pull_image(
+        &self,
+        _image: &str,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
@@ -38,7 +43,11 @@ impl ContainerEngine for FakeEngine {
         Ok(false)
     }
 
-    async fn build_image(&self, _spec: &BuildSpec) -> Result<(), RuntimeError> {
+    async fn build_image(
+        &self,
+        _spec: &BuildSpec,
+        _progress: &mut (dyn ProgressSink + Send),
+    ) -> Result<(), RuntimeError> {
         Ok(())
     }
 
