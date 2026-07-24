@@ -59,6 +59,14 @@ pub enum ProgressEvent {
     BootFinished,
     /// Workspace isolation progress inside the container.
     Workspace(WorkspaceProgress),
+    /// A job's pinned Node action runtime bundle(s) are being ensured
+    /// (checked against the local cache, downloaded and checksum-verified
+    /// on a miss) — the `action-runtime-ensure` stage
+    /// (`crate::executor::actions::node_runtime`).
+    ActionRuntimeEnsureStarted,
+    /// The action runtime ensure finished; every Node action in the job can
+    /// now run.
+    ActionRuntimeEnsureFinished,
 }
 
 /// Progress of the in-container workspace isolation (`overlay-setup` stage).

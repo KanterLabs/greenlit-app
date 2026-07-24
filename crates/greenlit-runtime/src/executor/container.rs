@@ -384,7 +384,7 @@ fn is_ancestor(ancestor: &str, other: &str) -> bool {
 
 /// Namespaces a `volumes:` named-volume source so it can only ever resolve to
 /// a volume created by (and scoped to) this one `litci run` invocation.
-fn namespaced_volume_name(volume_namespace: &str, source: &str) -> String {
+pub(crate) fn namespaced_volume_name(volume_namespace: &str, source: &str) -> String {
     format!("greenlit-run-{volume_namespace}-{source}")
 }
 
