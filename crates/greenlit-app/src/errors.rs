@@ -7,10 +7,11 @@
 //! so the same phrasing is used regardless of which pipeline stage failed.
 
 use greenlit_engine::{EventError, GitError, GraphError, PlanError};
+use greenlit_expr::Value;
 use greenlit_metrics::MetricsError;
 use greenlit_workflow::ParseError;
 
-use crate::vars::VarResolutionError;
+use crate::vars::{VarResolutionError, VarsOutcome};
 
 fn safe_text(text: &str) -> String {
     crate::render::terminal::inline_escape(text)
@@ -130,7 +131,14 @@ pub(crate) fn event_error(e: &EventError) -> anyhow::Error {
     anyhow::anyhow!("{}\n  fix: {fix}", safe_error(e))
 }
 
-pub(crate) fn vars_resolution(failure: &VarResolutionError) -> anyhow::Error {
+/// Renders a variable-resolution failure. `suggest_auth` adds `litci auth`
+/// as the fix for every still-unresolved literal name/dynamic lookup
+/// (`PHASE-3-actions.md` Variables: "stop before engine detection with
+/// `litci auth` as the single fix action") — set only for
+/// [`crate::vars::VarsOutcome::AuthRequired`], never for a hard local error
+/// (invalid/oversized/ambiguous/non-Unicode), which no amount of
+/// authentication could fix.
+pub(crate) fn vars_resolution(failure: &VarResolutionError, suggest_auth: bool) -> anyhow::Error {
     let mut message = String::new();
     for invalid in &failure.invalid {
         let span = safe_text(&invalid.first_use.to_string());
@@ -166,18 +174,41 @@ pub(crate) fn vars_resolution(failure: &VarResolutionError) -> anyhow::Error {
     for m in &failure.missing {
         let span = safe_text(&m.first_use.to_string());
         let name = safe_text(&m.name);
+        let auth_fix = if suggest_auth {
+            " or run `litci auth` to look it up from GitHub"
+        } else {
+            ""
+        };
         message.push_str(&format!(
-            "{}: variable 'vars.{}' is not set\n  fix: pass --var {}=<value>, set ${} in the environment, or add {}=<value> to .litci/vars\n",
-            span, name, name, name, name
+            "{span}: variable 'vars.{name}' is not set\n  fix: pass --var {name}=<value>, set ${name} in the environment, or add {name}=<value> to .litci/vars{auth_fix}\n"
         ));
     }
     if let Some(span) = &failure.dynamic_lookup {
         let span = safe_text(&span.to_string());
+        let auth_fix = if suggest_auth {
+            ", or run `litci auth` to fetch the complete repository/organization map from GitHub"
+        } else {
+            ""
+        };
         message.push_str(&format!(
-            "{span}: dynamic `vars[...]` lookup requires a complete local variable map\n  fix: pass at least one --var KEY=VALUE, or create .litci/vars (an empty file declares an empty map)\n"
+            "{span}: dynamic `vars[...]` lookup requires a complete local variable map\n  fix: pass at least one --var KEY=VALUE, or create .litci/vars (an empty file declares an empty map){auth_fix}\n"
         ));
     }
     anyhow::anyhow!(message.trim_end().to_string())
+}
+
+/// Resolves a [`VarsOutcome`] into the `vars` context `Value` or the one
+/// `anyhow::Error` to report — the single call site both `crate::plan_cmd`
+/// and `crate::run_cmd` share so the local/auth-required/remote-error
+/// renderings stay identical between the two commands
+/// (`PHASE-3-actions.md`: "keep plan and run behavior consistent").
+pub(crate) fn vars_outcome(outcome: VarsOutcome) -> anyhow::Result<Value> {
+    match outcome {
+        VarsOutcome::Resolved(value) => Ok(value),
+        VarsOutcome::LocalError(failure) => Err(vars_resolution(&failure, false)),
+        VarsOutcome::AuthRequired(failure) => Err(vars_resolution(&failure, true)),
+        VarsOutcome::RemoteError(message) => Err(anyhow::anyhow!(safe_text(&message))),
+    }
 }
 
 pub(crate) fn metrics_error(error: &MetricsError) -> anyhow::Error {

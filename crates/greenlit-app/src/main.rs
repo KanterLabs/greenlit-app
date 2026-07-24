@@ -8,7 +8,9 @@
 mod auth;
 mod auth_cmd;
 mod cli;
+mod dotenv_format;
 mod errors;
+mod gh_names;
 mod plan_cmd;
 mod render;
 mod run_cmd;

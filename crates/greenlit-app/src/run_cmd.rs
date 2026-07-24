@@ -104,7 +104,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         dotenv_vars.as_deref().unwrap_or_default(),
         dotenv_vars.is_some(),
     )
-    .map_err(|failure| errors::vars_resolution(&failure))?;
+    .map_err(|failure| errors::vars_resolution(&failure, false))?;
 
     let event_kind: greenlit_engine::EventKind = args.event.into();
     let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();

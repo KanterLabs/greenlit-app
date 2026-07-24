@@ -72,6 +72,13 @@ pub struct StaticExtraction {
     /// (`vars.*` / `vars[*]`), or the whole map (`toJSON(vars)`). Multiple
     /// lookups in one scalar intentionally contribute duplicate spans.
     pub dynamic_vars: Vec<Span>,
+    /// Whether a literal `github.token` reference (dot or bracket form)
+    /// appears anywhere. `PHASE-3-actions.md` Auth: "Inject `GITHUB_TOKEN`/
+    /// `github.token` only into workflows that reference them" — this is the
+    /// `github.token` half of that detection (a literal `secrets.GITHUB_TOKEN`
+    /// reference is already covered by [`StaticExtraction::secrets`], since
+    /// `GITHUB_TOKEN` is an ordinary secret name to this extractor).
+    pub references_github_token: bool,
     /// Every `uses:` reference, in document order.
     pub uses: Vec<Spanned<String>>,
     /// Every `runs-on` value, in document order.
