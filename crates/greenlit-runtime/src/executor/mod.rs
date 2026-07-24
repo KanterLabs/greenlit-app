@@ -24,6 +24,7 @@ mod instance;
 mod job;
 mod logsink;
 mod preflight;
+mod readiness;
 mod report;
 mod step;
 
@@ -53,6 +54,7 @@ pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
 pub use preflight::reject_uses_steps;
+pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
 
 /// Everything the executor needs beyond the plan and the engine.
@@ -95,6 +97,8 @@ pub struct RunConfig {
     /// exported after the whole run finishes (`JobReport::container_id`);
     /// the caller is responsible for removing it once write-back has run.
     pub write_back: bool,
+    /// Cadence and deadlines for the workspace-readiness poll.
+    pub readiness: ReadinessConfig,
 }
 
 /// A failure during execution. Detection-time engine conditions never travel

@@ -16,12 +16,13 @@ use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
-use crate::engine::{BindMount, ContainerEngine, ExecSpec};
+use crate::engine::BindMount;
 use crate::executor::container::{ContainerAdditions, ResolvedContainer, validate_container};
 use crate::executor::context::{
-    CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::instance::JobInstance;
+use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::step::{JobRuntime, StepLoopState, execute_step};
 use crate::executor::{ExecError, Shared, stage_span};
@@ -32,8 +33,6 @@ use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
-/// Readiness marker `greenlit-init` touches once isolation is established.
-const READY_MARKER: &str = "/greenlit/ready";
 
 /// The resolved per-job env layers and defaults threaded into the step loop.
 struct RunnerLayers<'a> {
@@ -114,25 +113,41 @@ pub(crate) async fn run_instance(
 
     let container = boot_container(shared, &image_tag, in_container, &additions, progress).await?;
 
-    let outcome = run_job_body(
-        shared,
-        masker,
-        instance,
-        RunnerLayers {
-            runner_ctx: &runner_ctx,
-            base_env: &base_env,
-            workflow_env: &job_env.workflow_env,
-            job_env: &job_env.job_env,
-            default_shell: job_env.default_shell.as_deref(),
-            default_wd: job_env.default_wd.as_deref(),
-            in_container,
-            bash_available,
-        },
+    // Readiness runs against the freshly booted container, before the step
+    // loop; its error still flows through the teardown below rather than
+    // returning early and leaking the container.
+    let ready = readiness::wait_for_ready(
+        shared.engine,
         &container,
-        needs,
-        out,
+        &shared.config.readiness,
+        progress,
     )
+    .instrument(stage_span("overlay-setup"))
     .await;
+    let outcome = match ready {
+        Ok(()) => {
+            run_job_body(
+                shared,
+                masker,
+                instance,
+                RunnerLayers {
+                    runner_ctx: &runner_ctx,
+                    base_env: &base_env,
+                    workflow_env: &job_env.workflow_env,
+                    job_env: &job_env.job_env,
+                    default_shell: job_env.default_shell.as_deref(),
+                    default_wd: job_env.default_wd.as_deref(),
+                    in_container,
+                    bash_available,
+                },
+                &container,
+                needs,
+                out,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
 
     // `--write-back` needs the container (and its overlay upper) reachable
     // after the run to export the diff (`PHASE-2-execution.md` "Overlay
@@ -157,7 +172,7 @@ pub(crate) async fn run_instance(
     })
 }
 
-/// Run a booted job's steps and finalize its outputs.
+/// Run a ready job's steps and finalize its outputs.
 async fn run_job_body(
     shared: &Shared<'_>,
     masker: &mut Masker,
@@ -167,8 +182,6 @@ async fn run_job_body(
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
 ) -> Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError> {
-    wait_for_ready(shared.engine, container).await?;
-
     let job_rt = JobRuntime {
         engine: shared.engine,
         container,
@@ -500,32 +513,6 @@ async fn boot_container(
     let id = boot.instrument(stage_span("container-boot")).await?;
     progress.on_progress(ProgressEvent::BootFinished);
     Ok(id)
-}
-
-/// Poll until `greenlit-init` signals isolation is established (the overlay or
-/// copy-in workspace is live), timing the wait as the `overlay-setup` stage.
-async fn wait_for_ready(engine: &dyn ContainerEngine, container: &str) -> Result<(), ExecError> {
-    let program = format!(
-        "i=0; until [ -e {READY_MARKER} ]; do i=$((i+1)); [ $i -gt 1200 ] && exit 1; sleep 0.05; done"
-    );
-    let spec = ExecSpec {
-        cmd: vec!["sh".to_string(), "-c".to_string(), program],
-        env: Vec::new(),
-        working_dir: None,
-    };
-    let mut sink = CaptureSink::default();
-    let output = engine
-        .exec(container, &spec, &mut sink)
-        .instrument(stage_span("overlay-setup"))
-        .await?;
-    if output.exit_code != 0 {
-        return Err(ExecError::Infrastructure {
-            message: "the job container never became ready (isolation setup did not complete)"
-                .to_string(),
-            fix: "ensure the runner image provides a POSIX `sh` and `tail`".to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// Write the embedded `greenlit-init` bytes to a host temp file (mode 0755) so

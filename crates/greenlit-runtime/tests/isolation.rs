@@ -89,6 +89,7 @@ struct Checks {
     copyin_exit: i64,
     auto_logged_fallback: bool,
     auto_removed: bool,
+    status_records_fallback: bool,
     overlay_required_failed: bool,
     overlay_required_did_not_run: bool,
     ro_bind_rejected_write: bool,
@@ -110,6 +111,10 @@ impl Checks {
             "auto strategy logged the copy-in fallback"
         );
         assert!(self.auto_removed, "auto fallback still ran the step");
+        assert!(
+            self.status_records_fallback,
+            "/greenlit/status records the copy-in fallback for the host poll"
+        );
 
         // overlay required: fails loudly, and the job command never runs.
         assert!(
@@ -154,6 +159,20 @@ async fn run_all_checks(
     )
     .await?;
 
+    // The status protocol: after the auto fallback, /greenlit/status carries
+    // the machine-readable outcome the host's readiness poll consumes.
+    let mut status = CollectSink::default();
+    let status_spec = ExecSpec {
+        cmd: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "cat /greenlit/status".to_string(),
+        ],
+        ..ExecSpec::default()
+    };
+    engine.exec(id, &status_spec, &mut status).await?;
+    let status_out = status.out();
+
     // overlay required: must fail before the command runs.
     let overlay = init_exec(engine, id, "overlay", "echo SHOULD_NOT_RUN").await?;
 
@@ -176,6 +195,9 @@ async fn run_all_checks(
         copyin_exit: copyin.2,
         auto_logged_fallback: auto.1.contains(FALLBACK_MARKER),
         auto_removed: auto.0.contains("REMOVED"),
+        status_records_fallback: status_out.contains("v=1 phase=done strategy=copy-in")
+            && status_out.contains("fell_back=1")
+            && status_out.contains("reason="),
         overlay_required_failed: overlay.2 != 0,
         overlay_required_did_not_run: !overlay.0.contains("SHOULD_NOT_RUN"),
         ro_bind_rejected_write: ro_out.contains("Read-only file system")

@@ -157,6 +157,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             .collect(),
         volume_namespace: run_volume_namespace(),
         write_back: args.write_back,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
     };
 
     let runtime = tokio::runtime::Builder::new_current_thread()

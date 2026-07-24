@@ -47,8 +47,8 @@ pub use engine::{
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{
-    ExecError, JobReport, RunConfig, RunReport, StepReport, container::ContainerRejection,
-    reject_uses_steps, run_plan,
+    ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport,
+    container::ContainerRejection, reject_uses_steps, run_plan,
 };
 pub use image::{BaseImagePlan, ImageError, ensure_base_image, init_binary, plan_base_image};
 pub use isolation::{IsolationStrategy, isolation_container_spec};
