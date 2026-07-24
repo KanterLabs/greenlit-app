@@ -23,6 +23,7 @@
 //! Binding a fixed port instead would collide between two concurrent
 //! `litci run` invocations on the same machine.
 
+mod artifact_api;
 mod cache_api;
 mod state;
 
@@ -66,7 +67,8 @@ impl Bound {
     /// Starts serving `state` on this listener.
     #[must_use]
     pub fn serve(self, state: ShimState) -> Shim {
-        let router = cache_api::routes(Router::new()).with_state(Arc::new(state));
+        let router =
+            artifact_api::routes(cache_api::routes(Router::new())).with_state(Arc::new(state));
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let address = self.address;
 

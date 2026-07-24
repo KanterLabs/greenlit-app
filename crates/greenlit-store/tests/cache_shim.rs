@@ -36,7 +36,12 @@ async fn start() -> Fixture {
         .await
         .expect("bind the shim");
     let base = format!("http://127.0.0.1:{}/", bound.address().port());
-    let state = ShimState::new(CacheStore::at(root.path()), TOKEN, base.clone());
+    let state = ShimState::new(
+        CacheStore::at(root.path()),
+        greenlit_store::ArtifactStore::at(root.path().join("artifacts")),
+        TOKEN,
+        base.clone(),
+    );
     let shim = bound.serve(state);
 
     Fixture {

@@ -16,9 +16,9 @@
 //!
 //! `<id>` is the integer `cacheId` the client receives from a reservation and
 //! sends back on every upload chunk and on commit, so no key text ever
-//! becomes a path component. Ids are allocated by *creating* the reservation
-//! directory: `create_dir` fails if the name exists, so two concurrent
-//! reservations cannot be handed the same id even across processes.
+//! becomes a path component. Ids come from [`crate::layout`], which allocates
+//! them by creating the directory so two concurrent reservations cannot be
+//! handed the same one even across processes.
 //!
 //! A committed entry is one that finished its `POST .../caches/<id>` commit.
 //! An interrupted upload leaves a `reservations/<id>/` directory that no
@@ -172,8 +172,8 @@ impl CacheStore {
         }
 
         let reservations = self.reservations_dir();
-        create_dir_all(&reservations)?;
-        let id = allocate_id(&reservations, &self.entries_dir())?;
+        crate::layout::create_dir_all(&reservations)?;
+        let id = crate::layout::allocate_id(&reservations, &self.entries_dir())?;
 
         let meta = EntryMeta {
             key: key.to_string(),
@@ -219,7 +219,7 @@ impl CacheStore {
         write_meta(&from, &meta)?;
 
         let entries = self.entries_dir();
-        create_dir_all(&entries)?;
+        crate::layout::create_dir_all(&entries)?;
         let to = entries.join(id.to_string());
         // A rename is atomic within one filesystem, so an entry becomes
         // visible whole or not at all -- there is no window where `lookup`
@@ -280,60 +280,10 @@ impl CacheStore {
     }
 }
 
-/// Allocates the lowest unused id by creating its reservation directory.
-///
-/// `create_dir` fails when the directory already exists, which makes the
-/// create itself the lock: two processes racing for the same id cannot both
-/// succeed, and the loser simply tries the next one.
-fn allocate_id(reservations: &Path, entries: &Path) -> Result<i64, StoreError> {
-    let mut next = highest_id(reservations).max(highest_id(entries)) + 1;
-    loop {
-        let candidate = reservations.join(next.to_string());
-        match fs::create_dir(&candidate) {
-            Ok(()) => return Ok(next),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-                next += 1;
-            }
-            Err(source) => {
-                return Err(StoreError::Io {
-                    operation: "create the cache reservation directory",
-                    path: candidate,
-                    source,
-                });
-            }
-        }
-    }
-}
-
-/// The highest numeric directory name under `dir`, or `0` when there is none.
-fn highest_id(dir: &Path) -> i64 {
-    let Ok(read) = fs::read_dir(dir) else {
-        return 0;
-    };
-    read.flatten()
-        .filter_map(|entry| {
-            entry
-                .path()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse::<i64>().ok())
-        })
-        .max()
-        .unwrap_or(0)
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
-}
-
-fn create_dir_all(path: &Path) -> Result<(), StoreError> {
-    fs::create_dir_all(path).map_err(|source| StoreError::Io {
-        operation: "create the store directory",
-        path: path.to_path_buf(),
-        source,
-    })
 }
 
 fn write_meta(dir: &Path, meta: &EntryMeta) -> Result<(), StoreError> {
