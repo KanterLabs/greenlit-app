@@ -21,6 +21,7 @@ use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
+    RegistryAuth,
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
@@ -139,6 +140,7 @@ impl ContainerEngine for ScriptedEngine {
     async fn pull_image(
         &self,
         _image: &str,
+        _auth: Option<&RegistryAuth>,
         _progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
         Ok(())
@@ -240,6 +242,13 @@ impl ContainerEngine for ScriptedEngine {
         };
         Ok(ExecOutput { exit_code: exit })
     }
+    async fn run_container(
+        &self,
+        _id: &str,
+        _sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError> {
+        Ok(ExecOutput { exit_code: 0 })
+    }
     async fn export_path(&self, _container: &str, _path: &str) -> Result<Vec<u8>, RuntimeError> {
         Ok(Vec::new())
     }
@@ -329,6 +338,7 @@ async fn dag_propagation_rollup_gating_and_masking() {
         volume_namespace: "fake-engine-semantics".to_string(),
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
+        actions: test_action_config(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -380,26 +390,29 @@ async fn dag_propagation_rollup_gating_and_masking() {
     assert!(!log.contains("c ran"), "the skipped job's step never ran");
 }
 
-/// The one `uses:` shape preflight deliberately leaves to runtime: a step
-/// behind a deferred condition. When the condition resolves true, the
-/// exec-time guard still rejects it with the authored span.
-const DEFERRED_USES_WORKFLOW: &str = r#"
+/// `PHASE-3-actions.md` exit criterion 3: "checkout's post step runs even
+/// when a later step fails." `actions/checkout` is self-satisfied (no
+/// network, matching the current repository — `RunnerEnv::default()`'s
+/// empty `repository` and this step's own absent `with.repository` are
+/// equal, so this is the self-checkout path) and its post step is a
+/// documented no-op, but it must still be *registered and drained*: the
+/// job's step-loop failure must not skip the post phase.
+const CHECKOUT_THEN_FAILING_STEP_WORKFLOW: &str = r#"
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - id: first
-        run: |
-          ECHO ok
-      - if: steps.first.outcome == 'success'
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: |
+          EXIT 1
 "#;
 
 #[tokio::test]
-async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
+async fn checkouts_post_step_runs_even_when_a_later_step_fails() {
     let workflow =
-        greenlit_workflow::parse_workflow("fake-ci.yml", DEFERRED_USES_WORKFLOW).expect("parse");
+        greenlit_workflow::parse_workflow("fake-ci.yml", CHECKOUT_THEN_FAILING_STEP_WORKFLOW)
+            .expect("parse");
     let event = SyntheticEvent {
         kind: EventKind::Push,
         github: Value::object(vec![(
@@ -410,11 +423,8 @@ async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
         deferred_github_properties: std::collections::BTreeSet::new(),
     };
     let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
-    // The plan itself must retain the deferred `uses:` step: preflight
-    // rejection of this shape would break workflows whose condition
-    // legally resolves false at runtime.
     greenlit_runtime::reject_uses_steps(&execution_plan)
-        .expect("a deferred-condition uses: step passes preflight");
+        .expect("a well-formed uses: step passes preflight");
 
     let engine = ScriptedEngine::default();
     let config = RunConfig {
@@ -430,10 +440,11 @@ async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
         volume_namespace: "fake-engine-semantics".to_string(),
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
+        actions: test_action_config(),
     };
 
     let mut log: Vec<u8> = Vec::new();
-    let error = run_plan(
+    let report = run_plan(
         &engine,
         &execution_plan,
         &config,
@@ -441,15 +452,30 @@ async fn a_deferred_condition_uses_step_fails_at_exec_time_with_its_span() {
         &mut ProgressNull,
     )
     .await
-    .expect_err("the runtime-true uses: step must fail the run");
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("`uses: actions/checkout@v4` is an action step"),
-        "{rendered}"
+    .expect("the run completes (a failed step is a recorded result, not an error)");
+
+    let job = &report.jobs[0];
+    assert_eq!(
+        job.result,
+        Conclusion::Failure,
+        "the later step's failure fails the job: {job:?}"
     );
+    let post_step = job
+        .steps
+        .iter()
+        .find(|step| step.label == "Post actions/checkout@v4")
+        .unwrap_or_else(|| panic!("checkout's post step must appear in the report: {job:?}"));
     assert!(
-        rendered.contains("fake-ci.yml:"),
-        "the exec-time guard keeps the authored span: {rendered}"
+        post_step.ran,
+        "checkout's post step must run despite the job's failure: {job:?}"
+    );
+    assert_eq!(post_step.conclusion, Conclusion::Success);
+    // Post steps drain after every main step, regardless of outcome — the
+    // post entry is therefore last in the report's step order.
+    assert_eq!(
+        job.steps.last().map(|step| step.label.as_str()),
+        Some("Post actions/checkout@v4"),
+        "post steps run at job end: {job:?}"
     );
 }
 
@@ -522,6 +548,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         volume_namespace: "fake-engine-semantics".to_string(),
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
+        actions: test_action_config(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -541,6 +568,78 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         ],
         "preparation phases report in order: image ensure, boot, workspace"
     );
+}
+
+/// A minimal `ActionRuntimeConfig` for tests that don't exercise a real
+/// `uses:` fetch/resolve: every trait-object field errors unconditionally,
+/// so a test fails loudly (not silently) if it ever reaches one.
+fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeConfig {
+    use greenlit_actions::CommitSha;
+    use greenlit_actions::resolve::{RefResolver, ResolveError};
+    use greenlit_actions::store::{ActionFetcher, ActionStore, FetchError};
+    use greenlit_runtime::executor::actions::node_runtime::{
+        PinnedNodeBundleSpecs, RuntimeBundleError, RuntimeBundleFetcher, RuntimeBundleSpec,
+        RuntimeStore,
+    };
+    use std::path::Path;
+    use std::sync::Arc;
+
+    struct NeverResolves;
+    #[async_trait::async_trait]
+    impl RefResolver for NeverResolves {
+        async fn resolve(
+            &self,
+            owner: &str,
+            repo: &str,
+            git_ref: &str,
+        ) -> Result<CommitSha, ResolveError> {
+            Err(ResolveError::NotFound {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                git_ref: git_ref.to_string(),
+            })
+        }
+    }
+    struct NeverFetches;
+    #[async_trait::async_trait]
+    impl ActionFetcher for NeverFetches {
+        async fn fetch(
+            &self,
+            owner: &str,
+            repo: &str,
+            sha: &CommitSha,
+            _dest: &Path,
+        ) -> Result<(), FetchError> {
+            Err(FetchError::Download {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                sha: sha.as_str().to_string(),
+                message: "not available in this test".to_string(),
+            })
+        }
+    }
+    struct NeverDownloads;
+    #[async_trait::async_trait]
+    impl RuntimeBundleFetcher for NeverDownloads {
+        async fn download(&self, spec: &RuntimeBundleSpec) -> Result<Vec<u8>, RuntimeBundleError> {
+            Err(RuntimeBundleError::Download {
+                url: spec.url.to_string(),
+                message: "not available in this test".to_string(),
+            })
+        }
+    }
+
+    greenlit_runtime::executor::actions::ActionRuntimeConfig {
+        resolver: Arc::new(NeverResolves),
+        store: ActionStore::at(std::env::temp_dir().join("greenlit-test-unused-action-store")),
+        fetcher: Arc::new(NeverFetches),
+        node_runtime_fetcher: Arc::new(NeverDownloads),
+        node_runtime_specs: Arc::new(PinnedNodeBundleSpecs),
+        node_runtime_store: RuntimeStore::at(
+            std::env::temp_dir().join("greenlit-test-unused-node-store"),
+        ),
+        github_token: None,
+    }
 }
 
 /// Deadlines small enough that timeout scenarios resolve in tens of
@@ -586,6 +685,7 @@ async fn run_single_job(
         volume_namespace: "fake-engine-semantics".to_string(),
         write_back: false,
         readiness: tiny_readiness(),
+        actions: test_action_config(),
     };
     let mut log: Vec<u8> = Vec::new();
     let mut recording = RecordingSink::default();

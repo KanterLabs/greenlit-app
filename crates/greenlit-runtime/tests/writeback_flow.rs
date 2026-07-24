@@ -15,6 +15,7 @@ use tar::{Builder, EntryType, Header};
 
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
+    RegistryAuth,
 };
 use greenlit_runtime::error::RuntimeError;
 use greenlit_runtime::progress::ProgressSink;
@@ -30,6 +31,7 @@ impl ContainerEngine for DiffEngine {
     async fn pull_image(
         &self,
         _image: &str,
+        _auth: Option<&RegistryAuth>,
         _progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
         Ok(())
@@ -63,6 +65,13 @@ impl ContainerEngine for DiffEngine {
         &self,
         _container: &str,
         _spec: &ExecSpec,
+        _sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError> {
+        Ok(ExecOutput { exit_code: 0 })
+    }
+    async fn run_container(
+        &self,
+        _id: &str,
         _sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError> {
         Ok(ExecOutput { exit_code: 0 })

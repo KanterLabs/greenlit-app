@@ -20,6 +20,10 @@ fn missing_literal_var_fails_with_location_and_fix() {
     assert!(stderr.contains("fix:"));
     assert!(stderr.contains("--var"));
     assert!(stderr.contains(".litci/vars"));
+    // `PHASE-3-actions.md` Variables: unresolved locally + no authentication
+    // configured stops before engine detection naming `litci auth` as the
+    // fix — the sandbox never seeds a token, so this is exactly that case.
+    assert!(stderr.contains("litci auth"), "{stderr}");
 }
 
 #[test]

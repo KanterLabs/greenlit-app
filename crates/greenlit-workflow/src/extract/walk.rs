@@ -97,6 +97,11 @@ pub(super) fn walk_expr(expr: &Expr, span: &Span, out: &mut StaticExtraction) {
                     }
                     return;
                 }
+                if root.eq_ignore_ascii_case("github")
+                    && matches!(index.as_ref(), Expr::Str(name) if name.eq_ignore_ascii_case("token"))
+                {
+                    out.references_github_token = true;
+                }
             }
             walk_expr(target, span, out);
             walk_expr(index, span, out);

@@ -1,18 +1,21 @@
-//! Executing one `run:` step: finishing its plan-time-deferred values against
-//! the live context, resolving its shell, running it as an exec, and folding
-//! its command files back into the job's live state.
+//! Executing one step: finishing its plan-time-deferred values against the
+//! live context, then either running a `run:` script as an exec, or
+//! dispatching a `uses:` step to its resolved action kind
+//! (`crate::executor::actions`) — folding either one's command files back
+//! into the job's live state identically.
 //!
 //! Every GitHub-faithful decision here delegates to the engine's execution
 //! semantics ([`greenlit_engine::execution`]): shell resolution, env layering,
 //! the `outcome`/`conclusion` model, and the implicit `success()` gate. This
 //! module is the runtime driver that turns those decisions into container execs.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
-use greenlit_engine::execution::env::{EnvLayers, apply_path_additions, layer_step_env};
+use greenlit_engine::execution::env::{EnvLayers, RunnerEnv, apply_path_additions, layer_step_env};
 use greenlit_engine::execution::outcome::{
     StepExit, StepResult, step_activates, step_result_from_exit, step_result_skipped,
 };
@@ -22,16 +25,22 @@ use greenlit_engine::execution::resolve::{
 use greenlit_engine::execution::shell::{ShellSelection, resolve_shell};
 use greenlit_engine::execution::{Masker, NeedRecord, StepRecord};
 use greenlit_engine::{Conclusion, StepKind, StepPlan};
-use greenlit_expr::{RunStatus, Value};
+use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::{ContainerEngine, ExecSpec};
 use crate::executor::ExecError;
+use crate::executor::actions::node_runtime::NodeVariant;
+use crate::executor::actions::post_chain::{NodePostEntry, PostAction, PostChain, PostEntry};
+use crate::executor::actions::resolve::{JobActionPlan, ResolvedUses};
+use crate::executor::actions::{checkout, composite, docker_action, node_runtime, nodejs};
 use crate::executor::cmdfiles::{self, CommandFilePaths};
 use crate::executor::context::{ContextRoots, LiveState, build_context, resolve_env_layer};
 use crate::executor::logsink::StepLogSink;
 
 /// Per-job constants a step needs — the container, the resolved env layers, the
-/// job defaults, and the run-wide context roots.
+/// job defaults, the run-wide context roots, and everything action execution
+/// needs beyond that (resolved actions, action/node-runtime configuration,
+/// the Docker-sibling shared workspace volume, if this job provisioned one).
 pub(crate) struct JobRuntime<'a> {
     /// The container engine.
     pub engine: &'a dyn ContainerEngine,
@@ -41,6 +50,11 @@ pub(crate) struct JobRuntime<'a> {
     pub roots: &'a ContextRoots,
     /// The `runner` context object.
     pub runner_ctx: &'a Value,
+    /// The runner/`github` env template this instance resolved from
+    /// (`crate::executor::actions::checkout` reads `repository`/`sha`/
+    /// `ref_full` directly from it rather than round-tripping through
+    /// expression `Value`s).
+    pub runner_env: &'a RunnerEnv,
     /// The `matrix` context value.
     pub matrix: &'a Value,
     /// The runner/base env layer (`GITHUB_*`/`RUNNER_*`).
@@ -61,6 +75,19 @@ pub(crate) struct JobRuntime<'a> {
     pub workspace: &'a str,
     /// Base directory for this job's per-step command files.
     pub cmdfiles_base: &'a str,
+    /// This job's resolved `uses:` steps (`crate::executor::actions::resolve`).
+    pub action_plan: &'a JobActionPlan,
+    /// Action resolution/fetch/runtime configuration.
+    pub action_config: &'a crate::executor::actions::ActionRuntimeConfig,
+    /// Where this job's pinned Node runtimes were mounted, if any.
+    pub node_mounts: &'a nodejs::NodeRuntimeMounts,
+    /// This run's volume-namespacing token
+    /// (`crate::RunConfig::volume_namespace`).
+    pub volume_namespace: &'a str,
+    /// The bare name of this job's shared Docker-action workspace volume,
+    /// if [`JobActionPlan::needs_docker_sibling`] provisioned one
+    /// (`crate::executor::actions::docker_action` module docs).
+    pub docker_workspace_volume: Option<&'a str>,
 }
 
 /// The job's evolving state across its steps.
@@ -73,6 +100,16 @@ pub(crate) struct StepLoopState {
     pub records: Vec<StepRecord>,
     /// The rolling job status.
     pub status: RunStatus,
+    /// The job-wide LIFO post-step stack every action instance (including
+    /// ones nested inside a composite) registers onto
+    /// (`crate::executor::actions::post_chain`).
+    pub post_chain: PostChain,
+    /// This job's cached libc probe result (`crate::executor::actions::node_runtime`),
+    /// probed once and reused by every action in the job.
+    pub node_variant: Option<NodeVariant>,
+    /// Per-action-instance `STATE_` maps, keyed by a stable state key shared
+    /// across that instance's pre/main/post phases.
+    pub action_state: HashMap<usize, IndexMap<String, String>>,
 }
 
 impl StepLoopState {
@@ -83,6 +120,9 @@ impl StepLoopState {
             path_additions: Vec::new(),
             records: Vec::new(),
             status: RunStatus::Success,
+            post_chain: PostChain::default(),
+            node_variant: None,
+            action_state: HashMap::new(),
         }
     }
 }
@@ -99,12 +139,189 @@ pub(crate) struct ExecutedStep {
     pub ran: bool,
 }
 
+/// Runs every top-level action's `pre:` script, in job order, before the
+/// job's first step — `PHASE-3-actions.md`: "pre steps run before the first
+/// step of the job in action order" (verified against the real runner,
+/// `crate::executor::actions::nodejs` module docs). Each `pre-if` defaults to
+/// `always()`, evaluated against the job's context *before any step has
+/// run* (empty `steps` context, no `GITHUB_ENV` accumulation yet) — matching
+/// the real runner's own front-loaded timing (a pre script genuinely cannot
+/// see a later step's output, on GitHub either).
+///
+/// # Errors
+/// Returns an [`ExecError`] on any engine or evaluation failure.
+pub(crate) async fn run_pre_steps(
+    job: &JobRuntime<'_>,
+    needs: &[NeedRecord],
+    steps: &[StepPlan],
+    state: &mut StepLoopState,
+    masker: &mut Masker,
+    out: &mut (dyn Write + Send),
+) -> Result<(), ExecError> {
+    for (index, step) in steps.iter().enumerate() {
+        let Some(ResolvedUses::Node(node)) =
+            job.action_plan.per_step.get(index).and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let Some(pre_script) = &node.runs.pre else {
+            continue;
+        };
+        let StepKind::Uses { with, .. } = &step.kind else {
+            continue;
+        };
+        let ctx = pre_pass_context(job, needs, state);
+        let with_resolved = resolve_env_layer(with, &ctx).map_err(ExecError::eval)?;
+        let pre_if = node.runs.pre_if.as_deref().unwrap_or("always()");
+        if !crate::executor::actions::template::resolve_condition(pre_if, &ctx)
+            .map_err(ExecError::template_eval)?
+        {
+            continue;
+        }
+        let input_env =
+            nodejs::input_env(&step_reference(step), &node.inputs, &with_resolved, &ctx)?;
+        let variant =
+            node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant)
+                .await?;
+        let node_binary = nodejs::node_binary(job.node_mounts, node.runs.using, variant)?;
+        let full_env = layered_env(job, state, &IndexMap::new());
+        let _ = writeln!(out, "  \u{25b6} Pre {}", step_reference(step));
+        nodejs::run_phase(
+            nodejs::PhaseRequest {
+                engine: job.engine,
+                container: job.container,
+                action_path: &node.action_path,
+                script: pre_script,
+                node_binary: &node_binary,
+                full_env: &full_env,
+                extra_env: &input_env,
+                cmdfiles_base: job.cmdfiles_base,
+                phase_key: &format!("{index}-pre"),
+                working_dir: job.workspace,
+            },
+            out,
+            masker,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Drains the job's post-step stack in LIFO order, running each entry
+/// regardless of the job's own final status (`PHASE-3-actions.md`: "post
+/// steps run in REVERSE order at job end REGARDLESS of failure") and
+/// returning one [`ExecutedStep`] per entry, in drain order.
+///
+/// # Errors
+/// Returns an [`ExecError`] on any engine or evaluation failure.
+pub(crate) async fn run_post_steps(
+    job: &JobRuntime<'_>,
+    needs: &[NeedRecord],
+    state: &mut StepLoopState,
+    masker: &mut Masker,
+    out: &mut (dyn Write + Send),
+) -> Result<Vec<ExecutedStep>, ExecError> {
+    let entries = state.post_chain.drain_reverse();
+    let mut results = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let started = Instant::now();
+        let label = masker.apply(&entry.label);
+        let ctx = pre_pass_context(job, needs, state);
+        let ran = match &entry.action {
+            PostAction::Checkout(post) => {
+                let _ = writeln!(out, "\u{25b6} {label}");
+                checkout::run_post(job.engine, job.container, post).await?;
+                true
+            }
+            PostAction::Node(post) => {
+                let post_if = post.post_if.as_deref().unwrap_or("always()");
+                if crate::executor::actions::template::resolve_condition(post_if, &ctx)
+                    .map_err(ExecError::template_eval)?
+                {
+                    let _ = writeln!(out, "\u{25b6} {label}");
+                    run_node_post(job, state, post, out, masker).await?;
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        let duration = started.elapsed();
+        if ran {
+            let _ = writeln!(out, "  {} {label}", status_sigil(Conclusion::Success));
+        } else {
+            let _ = writeln!(out, "  \u{2013} {label} (skipped)");
+        }
+        results.push(ExecutedStep {
+            result: if ran {
+                StepResult {
+                    outcome: Conclusion::Success,
+                    conclusion: Conclusion::Success,
+                }
+            } else {
+                step_result_skipped()
+            },
+            label,
+            duration,
+            ran,
+        });
+    }
+    Ok(results)
+}
+
+async fn run_node_post(
+    job: &JobRuntime<'_>,
+    state: &mut StepLoopState,
+    post: &NodePostEntry,
+    out: &mut (dyn Write + Send),
+    masker: &mut Masker,
+) -> Result<(), ExecError> {
+    let variant =
+        node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant).await?;
+    let node_binary = nodejs::node_binary(job.node_mounts, post.node_version, variant)?;
+    let mut input_env: Vec<(String, String)> = post
+        .with
+        .iter()
+        .map(|(k, v)| {
+            (
+                format!("INPUT_{}", k.replace(' ', "_").to_uppercase()),
+                v.clone(),
+            )
+        })
+        .collect();
+    if let Some(state_map) = state.action_state.get(&post.state_key) {
+        for (name, value) in state_map {
+            input_env.push((format!("STATE_{name}"), value.clone()));
+        }
+    }
+    let full_env = layered_env(job, state, &post.step_env);
+    nodejs::run_phase(
+        nodejs::PhaseRequest {
+            engine: job.engine,
+            container: job.container,
+            action_path: &post.action_path,
+            script: &post.post_script,
+            node_binary: &node_binary,
+            full_env: &full_env,
+            extra_env: &input_env,
+            cmdfiles_base: job.cmdfiles_base,
+            phase_key: &format!("{}-post", post.state_key),
+            working_dir: job.workspace,
+        },
+        out,
+        masker,
+    )
+    .await?;
+    Ok(())
+}
+
 /// Execute step `index`, mutating the job's live state and streaming its log.
 ///
 /// # Errors
 ///
 /// Returns [`ExecError`] on an engine failure, an unfinished expression, an
-/// unsupported shell, a `uses:` step (Phase 3), or a malformed command file.
+/// unsupported shell, an action resolution/execution failure, or a malformed
+/// command file.
 pub(crate) async fn execute_step(
     job: &JobRuntime<'_>,
     needs: &[NeedRecord],
@@ -191,21 +408,79 @@ pub(crate) async fn execute_step(
         });
     }
 
-    let (script_planned, step_shell_planned) = match &step.kind {
-        StepKind::Run { script, shell } => (script.as_ref(), shell.as_ref()),
-        StepKind::Uses {
-            reference, span, ..
-        } => {
-            return Err(ExecError::UsesUnsupported {
-                reference: reference.clone(),
-                span: span.clone(),
-            });
-        }
+    let continue_on_error = match &step.continue_on_error {
+        Some(planned) => resolve_bool(planned, &ctx).map_err(ExecError::eval)?,
+        None => false,
     };
 
+    let started = Instant::now();
+    let mut io = StepIo { out, masker };
+    let (exit, outputs) = match &step.kind {
+        StepKind::Run { .. } => {
+            let _ = writeln!(io.out, "\u{25b6} {label}");
+            run_script_step(job, step, &ctx, &full_env, index, state, &mut io).await?
+        }
+        StepKind::Uses { with, .. } => {
+            let with_resolved = resolve_env_layer(with, &ctx).map_err(ExecError::eval)?;
+            let _ = writeln!(io.out, "\u{25b6} {label}");
+            execute_uses_step(job, needs, step, index, &with_resolved, state, &mut io).await?
+        }
+    };
+    let duration = started.elapsed();
+
+    let result = step_result_from_exit(exit, continue_on_error);
+    if let Some(id) = &step.id {
+        state.records.push(StepRecord {
+            id: id.clone(),
+            outcome: result.outcome,
+            conclusion: result.conclusion,
+            outputs,
+        });
+    }
+    let _ = writeln!(io.out, "  {} {label}", status_sigil(result.conclusion));
+    Ok(ExecutedStep {
+        result,
+        label,
+        duration,
+        ran: true,
+    })
+}
+
+/// Bundles the step loop's two output sinks (the live log and the running
+/// masker) so a step-execution helper takes one parameter for them instead
+/// of two — the one pairing every dispatch path ([`run_script_step`],
+/// [`execute_uses_step`]) needs identically.
+struct StepIo<'a> {
+    out: &'a mut (dyn Write + Send),
+    masker: &'a mut Masker,
+}
+
+/// Runs a `run:` step's script exec — the Phase 2 path, unchanged in
+/// behavior; factored out so [`execute_step`] can share one tail
+/// (outcome/label/record-keeping) between it and [`execute_uses_step`].
+async fn run_script_step(
+    job: &JobRuntime<'_>,
+    step: &StepPlan,
+    ctx: &Context,
+    full_env: &IndexMap<String, String>,
+    index: usize,
+    state: &mut StepLoopState,
+    io: &mut StepIo<'_>,
+) -> Result<(StepExit, IndexMap<String, String>), ExecError> {
+    let StepKind::Run {
+        script: script_planned,
+        shell: step_shell_planned,
+    } = &step.kind
+    else {
+        return Err(ExecError::Infrastructure {
+            message: "internal error: run_script_step called on a non-run: step".to_string(),
+            fix: "report this as a Greenlit defect".to_string(),
+        });
+    };
+    let label_for_errors = step_label(step, index, ctx)?;
     let paths = CommandFilePaths::new(job.cmdfiles_base, index);
     let step_shell = match step_shell_planned {
-        Some(planned) => Some(resolve_string(planned, &ctx).map_err(ExecError::eval)?),
+        Some(planned) => Some(resolve_string(planned, ctx).map_err(ExecError::eval)?),
         None => None,
     };
     let shell = resolve_shell(
@@ -218,20 +493,16 @@ pub(crate) async fn execute_step(
         &paths.script,
     )
     .map_err(|source| ExecError::Shell {
-        label: label.clone(),
+        label: label_for_errors.clone(),
         source,
     })?;
-    let script = resolve_string(script_planned, &ctx).map_err(ExecError::eval)?;
-    let working_dir = resolve_working_dir(step, job, &ctx)?;
-    let continue_on_error = match &step.continue_on_error {
-        Some(planned) => resolve_bool(planned, &ctx).map_err(ExecError::eval)?,
-        None => false,
-    };
+    let script = resolve_string(script_planned, ctx).map_err(ExecError::eval)?;
+    let working_dir = resolve_working_dir(step, job, ctx)?;
     let timeout = match &step.timeout_minutes {
         Some(planned) => {
             Some(
-                resolve_minutes(planned, &ctx).map_err(|source| ExecError::Timeout {
-                    label: label.clone(),
+                resolve_minutes(planned, ctx).map_err(|source| ExecError::Timeout {
+                    label: label_for_errors.clone(),
                     source,
                 })?,
             )
@@ -241,17 +512,9 @@ pub(crate) async fn execute_step(
 
     cmdfiles::prepare(job.engine, job.container, &paths, &script)
         .await
-        .map_err(|source| mask_command_file_error(masker, &source))?;
+        .map_err(|source| mask_command_file_error(io.masker, &source))?;
 
-    let _ = writeln!(out, "\u{25b6} {label}");
-    let exec_env = exec_env_vec(&full_env, &paths);
-    // Wrap the resolved shell invocation so the running process records its
-    // own PID (as observed from *inside* the container's own pid namespace)
-    // before `exec`-replacing itself in place — `exec` preserves the PID, so
-    // the file stays valid for the whole step body. This is what lets a
-    // timeout termination (`run_exec`) reliably signal the right process; see
-    // `ContainerEngine::terminate`'s doc comment for why the daemon-reported
-    // exec PID cannot be used directly.
+    let exec_env = exec_env_vec(full_env, &paths);
     let wrapped_cmd = {
         let mut cmd = vec![
             "sh".to_string(),
@@ -268,22 +531,20 @@ pub(crate) async fn execute_step(
         working_dir: Some(working_dir),
     };
 
-    let started = Instant::now();
     let exit = run_exec(
         job.engine,
         job.container,
         &spec,
         &paths.pid,
         timeout,
-        out,
-        masker,
+        io.out,
+        io.masker,
     )
     .await?;
-    let duration = started.elapsed();
 
     let effects = cmdfiles::collect(job.engine, job.container, &paths)
         .await
-        .map_err(|source| mask_command_file_error(masker, &source))?;
+        .map_err(|source| mask_command_file_error(io.masker, &source))?;
     for assignment in &effects.env {
         state
             .accumulated
@@ -294,34 +555,273 @@ pub(crate) async fn execute_step(
         merged.append(&mut state.path_additions);
         state.path_additions = merged;
     }
+    if !effects.summary_within_limit {
+        // GitHub drops an over-cap job summary and notes it; mirror that.
+        let _ = writeln!(
+            io.out,
+            "  [warning] {label_for_errors}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+        );
+    }
     let mut outputs = IndexMap::new();
     for assignment in &effects.outputs {
         outputs.insert(assignment.name.clone(), assignment.value.clone());
     }
-    if !effects.summary_within_limit {
-        // GitHub drops an over-cap job summary and notes it; mirror that.
-        let _ = writeln!(
-            out,
-            "  [warning] {label}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
-        );
-    }
+    Ok((exit, outputs))
+}
 
-    let result = step_result_from_exit(exit, continue_on_error);
-    if let Some(id) = &step.id {
-        state.records.push(StepRecord {
-            id: id.clone(),
-            outcome: result.outcome,
-            conclusion: result.conclusion,
-            outputs,
+/// Build the exec environment vector, layering in the four command-file paths.
+fn exec_env_vec(
+    full_env: &IndexMap<String, String>,
+    paths: &CommandFilePaths,
+) -> Vec<(String, String)> {
+    let mut env = full_env.clone();
+    env.insert("GITHUB_ENV".to_string(), paths.env.clone());
+    env.insert("GITHUB_OUTPUT".to_string(), paths.output.clone());
+    env.insert("GITHUB_PATH".to_string(), paths.path.clone());
+    env.insert("GITHUB_STEP_SUMMARY".to_string(), paths.summary.clone());
+    env.into_iter().collect()
+}
+
+/// Dispatches a `uses:` step's main phase to its resolved action kind.
+async fn execute_uses_step(
+    job: &JobRuntime<'_>,
+    needs: &[NeedRecord],
+    step: &StepPlan,
+    index: usize,
+    with: &IndexMap<String, String>,
+    state: &mut StepLoopState,
+    io: &mut StepIo<'_>,
+) -> Result<(StepExit, IndexMap<String, String>), ExecError> {
+    let reference = step_reference(step);
+    let Some(resolved) = job.action_plan.per_step.get(index).and_then(Option::as_ref) else {
+        return Err(ExecError::Infrastructure {
+            message: format!("'{reference}' has no resolved action (internal inconsistency)"),
+            fix: "internal error: report this as a Greenlit defect".to_string(),
         });
+    };
+
+    match resolved {
+        ResolvedUses::Checkout => {
+            let step_span = uses_span(step);
+            let outcome = checkout::execute(
+                checkout::CheckoutRequest {
+                    engine: job.engine,
+                    container: job.container,
+                    step_span: &step_span,
+                    with,
+                    runner_env: job.runner_env,
+                    workspace: job.workspace,
+                    github_token: job.action_config.github_token.as_deref(),
+                },
+                io.masker,
+            )
+            .await?;
+            state.post_chain.push(PostEntry {
+                label: format!("Post {reference}"),
+                action: PostAction::Checkout(outcome.post),
+            });
+            Ok((StepExit::Success, outcome.outputs))
+        }
+        ResolvedUses::Node(node) => {
+            let full_env = layered_env(job, state, &IndexMap::new());
+            let ctx = build_context(
+                job.roots,
+                &LiveState {
+                    runner: job.runner_ctx,
+                    matrix: job.matrix,
+                    env: &full_env,
+                    steps: &state.records,
+                    needs,
+                    status: state.status,
+                },
+            );
+            let input_env = nodejs::input_env(&reference, &node.inputs, with, &ctx)?;
+            let variant =
+                node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant)
+                    .await?;
+            let node_binary = nodejs::node_binary(job.node_mounts, node.runs.using, variant)?;
+            let main_outcome = nodejs::run_phase(
+                nodejs::PhaseRequest {
+                    engine: job.engine,
+                    container: job.container,
+                    action_path: &node.action_path,
+                    script: &node.runs.main,
+                    node_binary: &node_binary,
+                    full_env: &full_env,
+                    extra_env: &input_env,
+                    cmdfiles_base: job.cmdfiles_base,
+                    phase_key: &format!("{index}-main"),
+                    working_dir: job.workspace,
+                },
+                io.out,
+                io.masker,
+            )
+            .await?;
+            for assignment in &main_outcome.env {
+                state
+                    .accumulated
+                    .insert(assignment.name.clone(), assignment.value.clone());
+            }
+            if !main_outcome.path_additions.is_empty() {
+                let mut merged = main_outcome.path_additions.clone();
+                merged.append(&mut state.path_additions);
+                state.path_additions = merged;
+            }
+            let state_map = state.action_state.entry(index).or_default();
+            for assignment in &main_outcome.state {
+                state_map.insert(assignment.name.clone(), assignment.value.clone());
+            }
+            if node.runs.post.is_some() {
+                state.post_chain.push(PostEntry {
+                    label: format!("Post {reference}"),
+                    action: PostAction::Node(Box::new(NodePostEntry {
+                        action_path: node.action_path.clone(),
+                        post_script: node.runs.post.clone().unwrap_or_default(),
+                        post_if: node.runs.post_if.clone(),
+                        with: with.clone(),
+                        step_env: IndexMap::new(),
+                        node_version: node.runs.using,
+                        state_key: index,
+                    })),
+                });
+            }
+            let mut outputs = IndexMap::new();
+            for assignment in &main_outcome.outputs {
+                outputs.insert(assignment.name.clone(), assignment.value.clone());
+            }
+            Ok((main_outcome.exit, outputs))
+        }
+        ResolvedUses::Composite(resolved_composite) => {
+            let env = composite::CompositeEnv {
+                engine: job.engine,
+                container: job.container,
+                roots: job.roots,
+                runner_ctx: job.runner_ctx,
+                matrix: job.matrix,
+                needs,
+                status: state.status,
+                cmdfiles_base: job.cmdfiles_base,
+                workspace: job.workspace,
+                node_mounts: job.node_mounts,
+                base_env: job.base_env,
+                workflow_env: job.workflow_env,
+                job_env: job.job_env,
+            };
+            let mut composite_state = composite::CompositeState {
+                masker: io.masker,
+                out: io.out,
+                post_chain: &mut state.post_chain,
+                node_variant: &mut state.node_variant,
+                job_accumulated: &mut state.accumulated,
+                job_path_additions: &mut state.path_additions,
+                action_state: &mut state.action_state,
+            };
+            let outcome =
+                composite::execute(&env, &mut composite_state, resolved_composite, with, index)
+                    .await?;
+            Ok((outcome.exit, outcome.outputs))
+        }
+        ResolvedUses::Docker(resolved_docker) => {
+            let Some(bare_volume) = job.docker_workspace_volume else {
+                return Err(ExecError::Infrastructure {
+                    message: format!(
+                        "'{reference}' is a Docker action, but this job's shared workspace volume was not provisioned"
+                    ),
+                    fix: "internal error: report this as a Greenlit defect".to_string(),
+                });
+            };
+            let full_env = layered_env(job, state, &IndexMap::new());
+            let ctx = build_context(
+                job.roots,
+                &LiveState {
+                    runner: job.runner_ctx,
+                    matrix: job.matrix,
+                    env: &full_env,
+                    steps: &state.records,
+                    needs,
+                    status: state.status,
+                },
+            );
+            let exit = docker_action::execute(
+                docker_action::DockerActionRequest {
+                    engine: job.engine,
+                    resolved: resolved_docker,
+                    reference: &reference,
+                    with,
+                    full_env: &full_env,
+                    ctx: &ctx,
+                    workspace: job.workspace,
+                    workspace_volume: bare_volume,
+                    volume_namespace: job.volume_namespace,
+                },
+                io.out,
+                io.masker,
+            )
+            .await?;
+            Ok((exit, IndexMap::new()))
+        }
     }
-    let _ = writeln!(out, "  {} {label}", status_sigil(result.conclusion));
-    Ok(ExecutedStep {
-        result,
-        label,
-        duration,
-        ran: true,
-    })
+}
+
+/// Builds the job's fully layered `env` (base+workflow+job+accumulated+
+/// `extra_step_env`), the same shape [`execute_step`] builds for a `run:`
+/// step, for use by an action dispatch that needs it directly rather than
+/// through a already-built [`Context`].
+fn layered_env(
+    job: &JobRuntime<'_>,
+    state: &StepLoopState,
+    extra_step_env: &IndexMap<String, String>,
+) -> IndexMap<String, String> {
+    let mut env = layer_step_env(EnvLayers {
+        base: job.base_env,
+        workflow: job.workflow_env,
+        job: job.job_env,
+        accumulated: &state.accumulated,
+        step: extra_step_env,
+    });
+    apply_path_additions(&mut env, &state.path_additions);
+    env
+}
+
+/// The job's context as it stands before any step has run (empty `steps`
+/// context, no `GITHUB_ENV` accumulation) — used for the front-loaded pre
+/// phase and, functionally identically, for post-if evaluation (which also
+/// has no per-step `steps` entry of its own to add).
+fn pre_pass_context(job: &JobRuntime<'_>, needs: &[NeedRecord], state: &StepLoopState) -> Context {
+    let env = layered_env(job, state, &IndexMap::new());
+    build_context(
+        job.roots,
+        &LiveState {
+            runner: job.runner_ctx,
+            matrix: job.matrix,
+            env: &env,
+            steps: &state.records,
+            needs,
+            status: state.status,
+        },
+    )
+}
+
+/// A step's `uses:` reference text, or a placeholder if this is somehow not
+/// a `uses:` step (defensive; every caller already matched on `StepKind::Uses`).
+fn step_reference(step: &StepPlan) -> String {
+    match &step.kind {
+        StepKind::Uses { reference, .. } => reference.clone(),
+        StepKind::Run { .. } => "run step".to_string(),
+    }
+}
+
+/// A step's authored span, for an action-execution error that needs to
+/// point at the `uses:` value.
+fn uses_span(step: &StepPlan) -> greenlit_workflow::Span {
+    match &step.kind {
+        StepKind::Uses { span, .. } => span.clone(),
+        StepKind::Run { .. } => greenlit_workflow::Span::new(
+            std::sync::Arc::from(""),
+            greenlit_workflow::Location::new(1, 1),
+            greenlit_workflow::Location::new(1, 1),
+        ),
+    }
 }
 
 /// Build the masked [`ExecError::CommandFile`] for a command-file failure.
@@ -400,19 +900,6 @@ fn resolve_working_dir(
         Some(dir) => format!("{}/{dir}", job.workspace.trim_end_matches('/')),
         None => job.workspace.to_string(),
     })
-}
-
-/// Build the exec environment vector, layering in the four command-file paths.
-fn exec_env_vec(
-    full_env: &IndexMap<String, String>,
-    paths: &CommandFilePaths,
-) -> Vec<(String, String)> {
-    let mut env = full_env.clone();
-    env.insert("GITHUB_ENV".to_string(), paths.env.clone());
-    env.insert("GITHUB_OUTPUT".to_string(), paths.output.clone());
-    env.insert("GITHUB_PATH".to_string(), paths.path.clone());
-    env.insert("GITHUB_STEP_SUMMARY".to_string(), paths.summary.clone());
-    env.into_iter().collect()
 }
 
 /// Record a skipped step in the `steps` context (only steps with an `id:`

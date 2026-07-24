@@ -2,6 +2,8 @@
 
 pub mod support;
 
+#[path = "cli_behavior/auth.rs"]
+mod auth;
 #[path = "cli_behavior/common.rs"]
 mod common;
 #[path = "cli_behavior/discovery.rs"]
@@ -18,3 +20,7 @@ mod git_context;
 mod repository;
 #[path = "cli_behavior/run_preflight.rs"]
 mod run_preflight;
+#[path = "cli_behavior/secrets.rs"]
+mod secrets;
+#[path = "cli_behavior/variables_remote.rs"]
+mod variables_remote;

@@ -80,6 +80,79 @@ pub fn seed_repo(tag: &str) -> PathBuf {
     root
 }
 
+/// A minimal `ActionRuntimeConfig` for tests that don't exercise `uses:`
+/// steps at all (a shell-only fixture): every trait-object field errors
+/// unconditionally, so the test fails loudly rather than silently if a
+/// `uses:` step is ever added to the fixture without updating this helper.
+pub fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeConfig {
+    use greenlit_actions::CommitSha;
+    use greenlit_actions::resolve::{RefResolver, ResolveError};
+    use greenlit_actions::store::{ActionFetcher, ActionStore, FetchError};
+    use greenlit_runtime::executor::actions::node_runtime::{
+        PinnedNodeBundleSpecs, RuntimeBundleError, RuntimeBundleFetcher, RuntimeBundleSpec,
+        RuntimeStore,
+    };
+    use std::path::Path;
+    use std::sync::Arc;
+
+    struct NeverResolves;
+    #[async_trait::async_trait]
+    impl RefResolver for NeverResolves {
+        async fn resolve(
+            &self,
+            owner: &str,
+            repo: &str,
+            git_ref: &str,
+        ) -> Result<CommitSha, ResolveError> {
+            Err(ResolveError::NotFound {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                git_ref: git_ref.to_string(),
+            })
+        }
+    }
+    struct NeverFetches;
+    #[async_trait::async_trait]
+    impl ActionFetcher for NeverFetches {
+        async fn fetch(
+            &self,
+            owner: &str,
+            repo: &str,
+            sha: &CommitSha,
+            _dest: &Path,
+        ) -> Result<(), FetchError> {
+            Err(FetchError::Download {
+                owner: owner.to_string(),
+                repo: repo.to_string(),
+                sha: sha.as_str().to_string(),
+                message: "not available in this test".to_string(),
+            })
+        }
+    }
+    struct NeverDownloads;
+    #[async_trait::async_trait]
+    impl RuntimeBundleFetcher for NeverDownloads {
+        async fn download(&self, spec: &RuntimeBundleSpec) -> Result<Vec<u8>, RuntimeBundleError> {
+            Err(RuntimeBundleError::Download {
+                url: spec.url.to_string(),
+                message: "not available in this test".to_string(),
+            })
+        }
+    }
+
+    greenlit_runtime::executor::actions::ActionRuntimeConfig {
+        resolver: Arc::new(NeverResolves),
+        store: ActionStore::at(std::env::temp_dir().join("greenlit-test-unused-action-store")),
+        fetcher: Arc::new(NeverFetches),
+        node_runtime_fetcher: Arc::new(NeverDownloads),
+        node_runtime_specs: Arc::new(PinnedNodeBundleSpecs),
+        node_runtime_store: RuntimeStore::at(
+            std::env::temp_dir().join("greenlit-test-unused-node-store"),
+        ),
+        github_token: None,
+    }
+}
+
 /// A deterministic fingerprint of a directory tree (relative paths + file
 /// bytes), for "host tree unchanged" assertions.
 pub fn tree_fingerprint(root: &Path) -> Vec<(String, Vec<u8>)> {

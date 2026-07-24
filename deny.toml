@@ -1,11 +1,12 @@
 # cargo-deny configuration for the greenlit-app workspace.
 #
-# Policy summary (see ARCHITECTURE.md "Known issues log" for the sole
-# duplicate-version exception):
+# Policy summary (see ARCHITECTURE.md "Known issues log" for the documented
+# exceptions):
 #   - licenses: allowlist of common permissive OSS licenses only.
 #   - advisories: RustSec security advisories are denied.
-#   - bans: duplicate dependency versions are denied except for one exact,
-#     documented syn 2.x transition entry.
+#   - bans: duplicate dependency versions are denied except for a small set
+#     of exact, documented entries (the syn 2.x transition, and the rustls
+#     TLS stack's own older transitive pins).
 
 [graph]
 all-features = false
@@ -29,6 +30,27 @@ allow = [
     "MIT",
     "Apache-2.0",
     "Unicode-3.0",
+    # `greenlit-actions`' `ureq` (rustls backend) dependency chain, added in
+    # Phase 3 for the GitHub API/tarball-download HTTPS clients: `ring`,
+    # `rustls-webpki`, and `untrusted` (`ring`'s own dependency) are all
+    # ISC-licensed; `ring` itself is dual-noted "Apache-2.0 AND ISC" (both
+    # apply to different files, not a choice). `subtle` (a constant-time
+    # comparison crate `ring` depends on) is BSD-3-Clause. All three remain
+    # standard OSI-approved permissive licenses — the Rust TLS ecosystem's
+    # pure-Rust crypto backends cluster around this license set, and there
+    # is no rustls crypto provider or HTTP+TLS client available that avoids
+    # it without instead linking system OpenSSL (which would break the
+    # "one distributable static host binary" commitment). See
+    # ARCHITECTURE.md "Known issues log".
+    "ISC",
+    "BSD-3-Clause",
+    # `webpki-roots` (Mozilla's bundled root CA list, used by `ureq`'s
+    # rustls backend for certificate verification) ships under the
+    # Community Data License Agreement — standard for a *data* bundle
+    # (a certificate list, not source code) and the conventional allowlist
+    # addition every rustls-with-bundled-roots consumer makes. See
+    # ARCHITECTURE.md "Known issues log".
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
@@ -46,6 +68,8 @@ allow-workspace = true
 deny = []
 skip = [
     { crate = "syn@2.0.119", reason = "Proc-macro dependencies are split across the syn 2-to-3 transition; see ARCHITECTURE.md" },
+    { crate = "getrandom@0.2.17", reason = "ring (via ureq's rustls backend) pins the older getrandom 0.2 line; the rest of the workspace (tempfile et al.) already uses 0.4. See ARCHITECTURE.md" },
+    { crate = "windows-sys@0.52.0", reason = "ring/rustls-webpki (via ureq's rustls backend) pin the older windows-sys 0.52 line, a Windows-only conditional dependency that never compiles on Greenlit's Linux x86_64 target; the rest of the workspace already uses 0.61. See ARCHITECTURE.md" },
 ]
 skip-tree = []
 

@@ -14,6 +14,37 @@ use async_trait::async_trait;
 use crate::error::RuntimeError;
 use crate::progress::ProgressSink;
 
+/// Private-registry credentials for an image pull.
+///
+/// `PHASE-3-actions.md` ("Job-container private-registry credentials"):
+/// `jobs.<id>.container.credentials.{username,password}` are resolved
+/// host-side (against the `secrets` context, like any other `env:`/`with:`
+/// value) *before* reaching the engine — this type is the already-resolved
+/// pair, never a `${{ }}` expression. Never logged or included in any
+/// `Debug`/error text a step's own output could echo back; callers mask both
+/// fields with the run's `greenlit_engine::execution::Masker` the same way
+/// every other resolved secret is (`AGENTS.md`: "secret values are masked in
+/// all log output").
+#[derive(Clone, PartialEq, Eq)]
+pub struct RegistryAuth {
+    /// The registry username.
+    pub username: String,
+    /// The registry password (or token).
+    pub password: String,
+}
+
+impl std::fmt::Debug for RegistryAuth {
+    /// Deliberately redacted: a `Debug`-formatted `RegistryAuth` must never
+    /// leak the password into a log line, panic message, or test failure
+    /// output that a masker never gets a chance to see.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryAuth")
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
+}
+
 /// A container image build request.
 ///
 /// The `context_tar` is an uncompressed (or gzip/xz) tar of the build context
@@ -149,12 +180,19 @@ pub trait ContainerEngine: Send + Sync {
     /// Pull an image by `name:tag` reference so it is present locally,
     /// reporting layer progress to `progress` as the daemon streams it.
     ///
+    /// `auth`, when supplied, authenticates the pull against a private
+    /// registry with already-host-resolved credentials
+    /// (`jobs.<id>.container.credentials`, `PHASE-3-actions.md`) — `None`
+    /// pulls anonymously/using the daemon's own configured credential store,
+    /// exactly like every pull before this parameter existed.
+    ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::Api`] if the daemon rejects or fails the pull.
     async fn pull_image(
         &self,
         image: &str,
+        auth: Option<&RegistryAuth>,
         progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError>;
 
@@ -230,6 +268,28 @@ pub trait ContainerEngine: Send + Sync {
         &self,
         container: &str,
         spec: &ExecSpec,
+        sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError>;
+
+    /// Runs a *created* container's own entrypoint/cmd to completion,
+    /// streaming its stdout/stderr to `sink` from start to exit and
+    /// returning its exit code.
+    ///
+    /// Unlike [`Self::exec`] (which runs an extra command inside an
+    /// already-idling container), this drives the container's own primary
+    /// process — the shape a Docker action's sibling container needs
+    /// (`crate::executor::actions::docker_action`): the sibling is created
+    /// with the action's real entrypoint/args as its `cmd`, started, and run
+    /// to completion here, exactly like `docker run` (as opposed to
+    /// `docker exec` into a long-lived idle container).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if starting the container, streaming its
+    /// logs, or waiting for it to exit fails at the daemon level.
+    async fn run_container(
+        &self,
+        id: &str,
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError>;
 

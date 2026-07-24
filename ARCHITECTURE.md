@@ -272,3 +272,308 @@ policy actively contains. They are not deferred Greenlit behavior.
   exception forces review whenever that old line changes. Upstream migration
   tracking includes [tokio-rs/tracing#3582](https://github.com/tokio-rs/tracing/issues/3582)
   and [clap-rs/clap#4824](https://github.com/clap-rs/clap/issues/4824).
+
+- **Phase 3's first outbound HTTPS clients pull in the Rust TLS ecosystem's
+  own license/version footprint.** `greenlit-actions` (`resolve::GitHubApiResolver`,
+  `store::TarballFetcher`) was the first crate in this workspace to make a
+  real HTTPS request (to `api.github.com`), via `ureq`'s `rustls` backend —
+  chosen over `native-tls` specifically because `native-tls` links system
+  OpenSSL, which would turn the shipped `litci` binary from a single static
+  executable into one with a host OpenSSL runtime dependency, contradicting
+  `greenlit-v0-spec.md` "Tech": "One distributable static host binary."
+  `greenlit-app` reuses the identical `ureq`/`rustls` choice for the same
+  reason: `litci auth`'s device-flow/refresh client
+  (`auth::device_flow::DeviceFlowClient`, `auth::refresh`) talks to
+  `github.com`, and the authenticated configuration-variables lookup
+  (`vars::remote::VariablesClient`) talks to `api.github.com`. Both crates
+  resolve to the one pinned `ureq` version, so this remains a single
+  dependency-tree footprint, not a duplicate. `rustls`'s dependency chain
+  (`ring`, `rustls-webpki`, `ring`'s own `untrusted`, and `ring`'s `subtle`)
+  is ISC- or BSD-3-Clause-licensed, and its bundled Mozilla root CA list
+  (`webpki-roots`) ships under CDLA-Permissive-2.0 — all still standard
+  OSI-approved/permissive terms, just outside this workspace's original
+  MIT/Apache-2.0/Unicode-3.0 allowlist, which predates any crate needing
+  outbound TLS. `deny.toml`'s `[licenses] allow` list was extended to admit
+  exactly these three, with the reasoning recorded inline there. There is no
+  rustls crypto provider or comparably minimal pure-Rust HTTPS client
+  available that avoids this footprint.
+
+- **`litci auth`'s token store chose the Linux kernel keyring over the
+  cross-platform `keyring` crate, trading persistence guarantees for a
+  smaller, daemon-free dependency.** `auth::token_store` uses
+  [`linux-keyutils`](https://docs.rs/linux-keyutils) directly against the
+  kernel's per-UID *persistent* keyring (`keyrings(7)`,
+  `KEYCTL_GET_PERSISTENT`) rather than the `keyring` crate, whose only
+  daemon-free Linux backend is that same `linux-keyutils` crate behind a
+  non-default feature — its *default* Linux backend is a D-Bus Secret
+  Service client (`zbus`), pulling a full async D-Bus stack and requiring a
+  running `gnome-keyring`/`kwalletd` session, commonly absent on headless
+  dev boxes, containers, and CI runners `litci auth` must not depend on. The
+  trade-off this creates: the kernel keyring is in-memory, not disk-resident
+  (a host reboot clears it, same as any session credential cache) and the
+  kernel expires it automatically after
+  `/proc/sys/kernel/keys/persistent_keyring_expiry` seconds of disuse. Both
+  cases surface as ordinary "not authenticated" (`auth::current_token`
+  returning `None`), which every caller already handles by pointing at
+  `litci auth` again — no special-case recovery path exists or is needed.
+  The documented `0600` file fallback under `~/.litci/auth.json` (with a
+  printed warning) covers the same "kernel keyring unavailable" case a
+  cross-platform crate's D-Bus backend failure would otherwise leave
+  unhandled. Compiled-binary integration tests force this same file-only
+  path via the internal `LITCI_TEST_NO_KEYRING` variable (`tests/support`'s
+  harness sets it for every sandboxed invocation) rather than exercising the
+  real kernel keyring, which is scoped to the test-runner process's UID and
+  so is not sandboxable the way a temporary `$HOME` is; the keyring code
+  path itself is instead covered by a unit test scoped to the thread-private
+  keyring identifier, which never touches persistent kernel state.
+
+- **`ring`'s own transitive pins duplicate two already-present crates at
+  older versions.** `ring` (via `rustls`, via `ureq`) depends on
+  `getrandom@0.2.17` and (through `rustls-webpki`) `windows-sys@0.52.0`,
+  while the rest of the workspace already resolves to `getrandom@0.4.3` and
+  `windows-sys@0.61.2` respectively (the latter is a Windows-only
+  conditional dependency that never compiles into Greenlit's Linux x86_64
+  binary at all). This workspace does not control `ring`'s own `Cargo.toml`
+  version requirements, so the two old-version entries are named exactly in
+  `deny.toml`'s `bans.skip`, mirroring the existing `syn@2.0.119` exception's
+  granularity — a version bump on either side requires deliberately updating
+  the pinned skip entry, not a silent pass.
+
+- **`uses:` execution is pinned against one `actions/runner` release,
+  independent of Phase 4's runner-image manifest.** Node-action execution
+  (node20/node24), composite-action nesting, Docker actions, and the pre/post
+  step protocol are all implemented by directly reading the pinned
+  `actions/runner` **v2.336.0** source
+  (<https://github.com/actions/runner/releases/tag/v2.336.0>) rather than
+  reverse-engineering behavior from observed hosted-runner output, per
+  `PHASE-3-actions.md`'s explicit "do not depend on Phase 4's runner-image
+  manifest for these" instruction. The four pinned Node runtime bundles
+  (`crate::executor::actions::node_runtime`, `greenlit-runtime`) come from
+  that release's own `src/Misc/externals.sh` packaging script, which declares
+  `NODE20_VERSION=20.20.2`/`NODE24_VERSION=24.18.0` and fetches a standard
+  (glibc) `linux-x64` tarball from `nodejs.org/dist` plus an Alpine (musl)
+  tarball from the separate `actions/alpine_nodejs` release for each version.
+  The standard tarballs' checksums come from nodejs.org's own published
+  `SHASUMS256.txt` for each version; the Alpine tarballs are release assets
+  nodejs.org does not publish a checksum for at all, so their `sha256` was
+  computed directly from the downloaded release asset during implementation
+  (the asset was fetched, hashed, and discarded — not taken from any
+  third-party republication). All four are re-verified against their live
+  sources as part of this work:
+
+  | version | variant | url | sha256 |
+  |---|---|---|---|
+  | node20 | standard | `https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.gz` | `19e56f0825510207dd904f087fe52faa0a4eb6b2aab5f0ea7a33830d04888b8b` |
+  | node20 | alpine | `https://github.com/actions/alpine_nodejs/releases/download/v20.20.2/node-v20.20.2-alpine-x64.tar.gz` | `f21a2253025a5d1a14332a0b1ed48871689c5ca9aa37a6141428944b75de7d91` |
+  | node24 | standard | `https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.gz` | `783130984963db7ba9cbd01089eaf2c2efb055c7c1693c943174b967b3050cb8` |
+  | node24 | alpine | `https://github.com/actions/alpine_nodejs/releases/download/v24.18.0/node-v24.18.0-alpine-x64.tar.gz` | `0103dd81376d57dcc2bcb39a13cfd6db19ab82f6c2c83a166e44d775f736d0d9` |
+
+  A job container's libc is not known until it is booted, so `RuntimeStore`
+  fetches and caches *both* variants a job needs (content-addressed under
+  `~/.litci/node-runtimes/<node20\|node24>/<standard\|alpine>/<sha256>/`) and
+  a per-job in-container probe (`cat /etc/*release | grep ^ID`, checked for
+  `alpine`) selects which bind-mount to expose as the executable path at exec
+  time — never both mounted live at once, and never a guess made from the
+  requested image name, which is not a reliable libc signal. Pre/post-step
+  ordering (pre in file order before a job's first step, post in *reverse*
+  push order at job end regardless of failure) and the `pre-if`/`post-if`
+  default-to-`always()` rule are taken from the same pinned release's
+  `JobExtension.cs`/`ExecutionContext.cs`/`StepsRunner.cs` (`PostJobSteps` is
+  literally a `Stack<IStep>`, which is why this crate's own `PostChain` is
+  push/reverse-drain) and `ActionManifestManager.cs`. Libc-family detection
+  as the variant-selection signal follows the same release's `StepHost.cs`.
+  Composite-action nesting depth is capped at 10, matching
+  `docs/adrs/1144-composite-actions.md`.
+
+- **A Docker action's sibling container shares the job's *live* workspace
+  through a run-scoped named volume, not a bind mount of the job container's
+  own view.** The job container's workspace is not necessarily a host
+  directory at all — under overlay isolation it is a private overlay upper
+  layer inside that one container, invisible to any sibling. Docker actions
+  must nonetheless run as a sibling container (never sharing the host Docker
+  socket with the job container, and never running inside it), per
+  `PHASE-3-actions.md`. The resolution: a job plan that contains any Docker
+  `uses:` step forces that job onto `IsolationStrategy::CopyIn` (rather than
+  overlay) and binds one namespaced, run-scoped named Docker volume
+  (`crate::executor::container::namespaced_volume_name`, the same
+  namespacing already used for other job volumes) at the workspace path in
+  *both* the job container and every Docker-action sibling for that job. A
+  copy-in job's workspace is, by construction, whatever is bind-mounted at
+  that path — so pointing that mount at a shared named volume instead of a
+  bind mount costs nothing beyond what copy-in isolation already does, and
+  requires no change to `greenlit-init`. Writes made by a `run:` step and by
+  a Docker-action sibling are therefore mutually visible for the remainder of
+  the job, proven end-to-end by
+  `crates/greenlit-runtime/tests/actions_docker.rs` against the real Docker
+  daemon (a `run:` step writes a file, a Docker action reads and appends to
+  it, and a later `run:` step reads back both halves). The tradeoff: a job
+  with a Docker action cannot use overlay isolation even if it would
+  otherwise qualify, and the run-scoped volume this creates is not cleaned up
+  automatically — `ContainerEngine` has no `remove_volume` operation yet, so
+  these volumes accumulate on the host until an operator prunes them
+  (`docker volume prune`); tracked here rather than silently left
+  undocumented, since automatic cleanup is a reasonable near-term follow-up
+  but was out of this task's scope.
+
+- **`actions/checkout` of the workflow's own repository is satisfied from the
+  already-materialized isolated workspace, with no network access; checking
+  out a *different* repository always performs a real, authenticated
+  clone.** `crate::executor::actions::checkout` special-cases exactly the
+  self-checkout shape (`with.repository` absent, or equal to the synthetic
+  event's own `owner/repo`) by treating the workspace already prepared by
+  `greenlit-init` as the checkout result outright and reading `ref`/`commit`
+  outputs from the already-known `RunnerEnv`, rather than re-cloning content
+  litci already isolated onto disk for the job. Checking out any other
+  repository is a real `git clone` executed inside the job container, using
+  a short-lived `http.https://github.com/.extraheader` basic-auth header
+  (the token is never embedded in the remote URL, so it cannot leak through
+  a logged `git remote -v` or similar) built from `litci auth`'s stored
+  token; with no token available, this fails immediately with the same
+  `litci auth` fix-it message used elsewhere, rather than silently attempting
+  an anonymous clone. `checkout`'s post step (credential cleanup, removing
+  the injected `extraheader` config) still appears in the post chain for
+  *both* shapes — a documented no-op for the self-checkout case, since there
+  is no injected credential to remove there, kept honest rather than
+  omitted, so the post-step *ordering* contract (exit criterion: checkout's
+  post step still runs even when a later step fails) holds identically
+  regardless of which shape triggered it.
+
+- **A composite action's nested `pre` steps run immediately before that
+  action's own nested main steps, not hoisted to the job's front alongside
+  ordinary top-level `pre` steps.** The pinned runner hoists every *top-level*
+  step's `pre` action to the front of the job and its `post` action to a
+  job-end stack, but a composite action's own nested steps are, at that
+  level, a single unit (the composite's containing `uses:` step is itself
+  what gets hoisted/stacked as one participant). This implementation
+  deliberately simplifies one layer further: a nested step's `pre` runs in
+  place, immediately before that same nested step's main action, rather than
+  additionally hoisting it to the outer job's front. This is a documented
+  fidelity gap, not an oversight — real-world composite actions rarely rely
+  on nested pre-step hoisting timing, and getting it exactly right would
+  require threading hoisted nested pre steps back out through the same
+  `JobActionPlan` pre-pass that already handles top-level steps, which was
+  not attempted this wave. Nested `post` steps are *not* similarly
+  simplified: they still push onto the job's shared, reverse-drained
+  `PostChain` and so run at job end in the correct overall LIFO position
+  alongside every other step's post action. A Docker action referenced from
+  inside a composite action's nested steps is rejected outright with a clear
+  error rather than attempted, since a nested Docker sibling would need the
+  same shared-workspace volume design as a top-level one but composed inside
+  an already-scoped composite context — deferred rather than guessed at.
+
+- **A manifest's declared input `default:` value is used as a literal
+  string, not evaluated as a `${{ }}` expression.** `actions/checkout`'s own
+  manifest and the marketplace actions this implementation was validated
+  against only use literal default values (`default: true`, `default: '1'`),
+  so this is not a fidelity gap for any action exercised here — but the
+  pinned runner's `ActionManifestManager.cs` does generically evaluate a
+  default value as an expression before substitution, which a marketplace
+  action relying on a non-literal, expression-valued `default:` would
+  observe differently under this implementation (the raw text would be
+  passed through, rather than evaluated). Recorded here as a known,
+  narrow fidelity gap rather than left silent.
+
+- **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
+  it out of the ordinary secrets chain.** GitHub secret and configuration
+  variable names share one documented rule: "must not start with the
+  `GITHUB_` prefix"
+  (<https://docs.github.com/en/actions/reference/security/secrets>,
+  <https://docs.github.com/en/actions/reference/workflows-and-actions/variables#naming-conventions-for-configuration-variables>).
+  A real repository can therefore never hold a user-created secret literally
+  named `GITHUB_TOKEN` — it is always the platform-populated token instead.
+  `crate::secrets::validate_name` (`crate::gh_names::validate_configuration_name`)
+  already rejects that exact name for the same reason it rejects any other
+  `GITHUB_`-prefixed one, so `crate::secrets`'s ordinary chain excludes
+  `GITHUB_TOKEN` from its candidate set outright rather than letting it reach
+  (and fail) that validator; `crate::auth::resolve_github_token` is its own,
+  separate resolution path (local override, if any, else the stored auth
+  token, else the empty string — never a hard failure, since GitHub itself
+  always provides a working token and a workflow that merely references it
+  should not be blocked from an unauthenticated local run). `github.token`
+  gets the identical treatment via a small, additive
+  `greenlit_workflow::extract::StaticExtraction::references_github_token`
+  flag (`extract::walk`), since — unlike `secrets.GITHUB_TOKEN` — no existing
+  Phase 1 extraction tracked a bare `github.*` field access at all.
+
+- **Every step's layered environment needs an explicit, tracked `PATH` from
+  job start — ordinary Docker `exec` inheritance alone stops being enough
+  the moment any step writes to `GITHUB_PATH`.** Before this wave, no
+  environment layer (`greenlit_engine::execution::env::RunnerEnv::into_map`,
+  the job/workflow `env:` layers, `GITHUB_ENV` accumulation) ever carried an
+  explicit `PATH` key at all — the container's own image-configured default
+  reached every step only through ordinary Docker `exec` environment
+  inheritance, invisible to Greenlit's own `IndexMap`-based layering. That
+  works for a job's *first* step, but `apply_path_additions`
+  (`greenlit_engine::execution::env`) documents its contract as *prepending*
+  onto whatever `PATH` the layered map already carries — and the instant one step
+  calls `core.addPath()` (`actions/setup-node` and most `setup-*` actions
+  do), every *later* step's `exec` starts carrying an explicit
+  `PATH=<additions>` entry, which Docker's exec-env merge applies key-for-key
+  over the container's live environment, silently dropping `/usr/bin` and
+  friends for the rest of the job — a real defect this wave found (and
+  fixed) building `fixtures/actions-ci`, invisible until then because no
+  earlier test ran a real `setup-*` action followed by another real step
+  against a live daemon. GitHub's own runner never has this gap: its
+  `ExecutionContext` seeds one explicit, always-current `PATH` value from the
+  runner process's own environment at job start
+  (`src/Runner.Worker/FileCommandManager.cs`'s `AddPathFileCommand` only ever
+  prepends onto it — `actions/runner` v2.336.0, pinned release, see the
+  Node-runtime entry above). `crate::executor::job::seed_container_path`
+  reproduces that: one `sh -c 'printf %s "$PATH"'` exec against the freshly
+  booted (and ready) job container, seeded into `base_env` before the step
+  loop starts — container-agnostic, so it works identically for the
+  convergent base image and an arbitrary user-specified
+  `jobs.<id>.container`. `crates/greenlit-runtime/tests/actions_composite.rs`
+  pins the regression (a `run:` step's own `GITHUB_PATH` addition must not
+  break a later composite step's access to system binaries).
+
+- **A composite step's own environment must be the same job-wide
+  base/workflow/job layers an ordinary top-level step sees, not just its own
+  `GITHUB_ENV` accumulation.** `crate::executor::actions::composite`'s own
+  module docs already state the intended rule ("env: accumulation is
+  job-wide, not composite-scoped"), but before this wave the implementation
+  only threaded the job's *accumulated* `GITHUB_ENV` writes into a nested
+  step's environment (and its `${{ env.* }}` context) — literal
+  workflow-level and job-level `env:` blocks, and the `base_env` fix above,
+  were never visible inside a composite's nested steps at all. Fixed by
+  threading `base_env`/`workflow_env`/`job_env` through `CompositeEnv`
+  (mirroring `crate::executor::step::layered_env` exactly) rather than
+  seeding nested execution from an empty map. A second, unrelated bug in the
+  same code path — a nested step's shell was resolved against
+  `{cmdfiles_dir}/script`, one directory short of where
+  `CommandFilePaths::new` actually places it
+  (`{cmdfiles_dir}/step-<n>/script`) — meant *every* composite `run:` step
+  failed outright ("no such file") before this wave, regardless of the env
+  gap; no prior test had ever executed a composite action's nested `run:`
+  step against a real daemon. Both are pinned directly by
+  `crates/greenlit-runtime/tests/actions_composite.rs`.
+
+- **A Docker action's sibling container does not receive the
+  `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
+  command-file protocol every other step kind gets.** GitHub's real runner
+  exposes these uniformly to *any* step, including a Docker container
+  action: `Runner.Worker/FileCommandManager.cs`'s `InitializeFiles` runs
+  once per step regardless of handler type, writing each file's
+  (container-translated) path into the step's `github` context before
+  dispatch (`actions/runner` v2.336.0, pinned release). This
+  implementation's `crate::executor::actions::docker_action::execute` passes
+  `INPUT_<NAME>` env vars (via the same `nodejs::input_env` every action kind
+  uses) but never creates or mounts the four command files, so a
+  marketplace Docker action that writes to `$GITHUB_OUTPUT`/`$GITHUB_ENV`
+  either silently loses that write or (if it does not tolerate an unset
+  variable) fails outright. `PHASE-3-actions.md`'s own "Action execution"
+  bullet for Docker actions ("pass args/entrypoint/env per spec; run as a
+  sibling container") does not name the workflow-command protocol the way
+  its JavaScript-action bullet explicitly does ("Env protocol: `INPUT_<NAME>`,
+  workflow command files, `STATE_` save-state..."), so this is treated as a
+  scoped, documented gap rather than an in-scope defect this wave fixed
+  silently — `fixtures/actions-ci`'s own Docker action deliberately proves
+  its execution through the shared workspace (a log file under
+  `$GITHUB_WORKSPACE`) instead, the same way
+  `crates/greenlit-runtime/tests/actions_docker.rs` already does. Closing
+  this gap would need the command files to live inside the job's shared
+  workspace volume (already the mechanism a Docker-sibling job uses for its
+  workspace — see the entry above) rather than the job container's own
+  ordinary, sibling-invisible temp storage, so a fix can reuse
+  `crate::executor::cmdfiles` unchanged once that plumbing exists; left for
+  a later wave.

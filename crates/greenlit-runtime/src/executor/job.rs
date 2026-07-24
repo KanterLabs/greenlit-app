@@ -8,7 +8,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use tracing::Instrument;
 
-use greenlit_engine::execution::env::{EnvLayers, apply_path_additions, layer_step_env};
+use greenlit_engine::execution::env::{EnvLayers, RunnerEnv, apply_path_additions, layer_step_env};
 use greenlit_engine::execution::job_outputs::finalize_outputs;
 use greenlit_engine::execution::outcome::{advance_status, job_result_from_status, needs_status};
 use greenlit_engine::execution::resolve::{resolve_condition, resolve_string};
@@ -16,25 +16,41 @@ use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
-use crate::engine::BindMount;
-use crate::executor::container::{ContainerAdditions, ResolvedContainer, validate_container};
+use crate::engine::{BindMount, ContainerEngine, ExecSpec};
+use crate::executor::actions::node_runtime;
+use crate::executor::actions::nodejs::NodeRuntimeMounts;
+use crate::executor::actions::resolve::{JobActionPlan, resolve_job_actions};
+use crate::executor::container::{
+    ContainerAdditions, ResolvedContainer, ResolvedCredentials, namespaced_volume_name,
+    validate_container,
+};
 use crate::executor::context::{
-    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::instance::JobInstance;
 use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
-use crate::executor::step::{JobRuntime, StepLoopState, execute_step};
+use crate::executor::step::{
+    JobRuntime, StepLoopState, execute_step, run_post_steps, run_pre_steps,
+};
 use crate::executor::{ExecError, Shared, stage_span};
 use crate::image::{INIT_IN_IMAGE_PATH, ensure_base_image, init_binary};
-use crate::isolation::isolation_container_spec;
+use crate::isolation::{IsolationStrategy, isolation_container_spec};
 use crate::platform::UbuntuRelease;
 use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
 
-/// The resolved per-job env layers and defaults threaded into the step loop.
+/// The bare (pre-namespacing) name of the run-scoped named volume backing a
+/// job's shared workspace when it contains a Docker action
+/// (`crate::executor::actions::docker_action` module docs) — namespaced the
+/// same way a workflow-authored `volumes:` entry is
+/// (`crate::executor::container::namespaced_volume_name`).
+const DOCKER_SIBLING_WORKSPACE_VOLUME: &str = "workspace";
+
+/// The resolved per-job env layers and defaults threaded into the step loop,
+/// plus everything action execution needs beyond that.
 struct RunnerLayers<'a> {
     runner_ctx: &'a Value,
     base_env: &'a IndexMap<String, String>,
@@ -44,6 +60,9 @@ struct RunnerLayers<'a> {
     default_wd: Option<&'a str>,
     in_container: bool,
     bash_available: bool,
+    action_plan: &'a JobActionPlan,
+    node_mounts: &'a NodeRuntimeMounts,
+    docker_workspace_volume: Option<&'a str>,
 }
 
 /// Run one job instance and produce its report.
@@ -66,7 +85,7 @@ pub(crate) async fn run_instance(
     let mut runner_env = shared.config.runner_env.clone();
     runner_env.job = job_id.0.clone();
     runner_env.workspace = shared.config.workspace.clone();
-    let base_env = runner_env.clone().into_map();
+    let mut base_env = runner_env.clone().into_map();
     let runner_ctx = runner_context(&runner_env);
 
     let needs_run_status = needs_status(needs);
@@ -100,6 +119,41 @@ pub(crate) async fn run_instance(
         needs_run_status,
     )?;
 
+    // Resolved *before* the container boots: every read-only bind the job's
+    // `uses:` steps need (fetched action source, pinned Node runtimes) and
+    // whether the job needs a Docker-action sibling — which decides the
+    // workspace isolation strategy below — must be known at container-create
+    // time (`crate::executor::actions` module docs).
+    let action_plan = resolve_job_actions(
+        instance.steps,
+        &shared.config.actions,
+        &shared.config.repo_host_path,
+        &shared.config.workspace,
+    )
+    .await?;
+    let (node_binds, node_mounts) = if action_plan.needs_node20 || action_plan.needs_node24 {
+        progress.on_progress(ProgressEvent::ActionRuntimeEnsureStarted);
+        let ensured = node_runtime::ensure_mounts(
+            &shared.config.actions.node_runtime_store,
+            shared.config.actions.node_runtime_fetcher.as_ref(),
+            shared.config.actions.node_runtime_specs.as_ref(),
+            action_plan.needs_node20,
+            action_plan.needs_node24,
+        )
+        .instrument(stage_span("action-runtime-ensure"))
+        .await
+        .map_err(|source| ExecError::Infrastructure {
+            message: format!("could not prepare a pinned Node action runtime: {source}"),
+            fix: "check network connectivity and retry".to_string(),
+        })?;
+        progress.on_progress(ProgressEvent::ActionRuntimeEnsureFinished);
+        ensured
+    } else {
+        (Vec::new(), NodeRuntimeMounts::default())
+    };
+    let mut extra_binds = action_plan.binds.clone();
+    extra_binds.extend(node_binds);
+
     let (image_tag, in_container, bash_available, additions) = resolve_image(
         shared,
         masker,
@@ -111,7 +165,16 @@ pub(crate) async fn run_instance(
     )
     .await?;
 
-    let container = boot_container(shared, &image_tag, in_container, &additions, progress).await?;
+    let container = boot_container(
+        shared,
+        &image_tag,
+        in_container,
+        &additions,
+        &extra_binds,
+        action_plan.needs_docker_sibling,
+        progress,
+    )
+    .await?;
 
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than
@@ -124,28 +187,37 @@ pub(crate) async fn run_instance(
     )
     .instrument(stage_span("overlay-setup"))
     .await;
+    let docker_workspace_volume = action_plan
+        .needs_docker_sibling
+        .then_some(DOCKER_SIBLING_WORKSPACE_VOLUME);
     let outcome = match ready {
-        Ok(()) => {
-            run_job_body(
-                shared,
-                masker,
-                instance,
-                RunnerLayers {
-                    runner_ctx: &runner_ctx,
-                    base_env: &base_env,
-                    workflow_env: &job_env.workflow_env,
-                    job_env: &job_env.job_env,
-                    default_shell: job_env.default_shell.as_deref(),
-                    default_wd: job_env.default_wd.as_deref(),
-                    in_container,
-                    bash_available,
-                },
-                &container,
-                needs,
-                out,
-            )
-            .await
-        }
+        Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
+            Ok(()) => {
+                run_job_body(
+                    shared,
+                    masker,
+                    instance,
+                    RunnerLayers {
+                        runner_ctx: &runner_ctx,
+                        base_env: &base_env,
+                        workflow_env: &job_env.workflow_env,
+                        job_env: &job_env.job_env,
+                        default_shell: job_env.default_shell.as_deref(),
+                        default_wd: job_env.default_wd.as_deref(),
+                        in_container,
+                        bash_available,
+                        action_plan: &action_plan,
+                        node_mounts: &node_mounts,
+                        docker_workspace_volume,
+                    },
+                    (&container, &runner_env),
+                    needs,
+                    out,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
 
@@ -178,7 +250,7 @@ async fn run_job_body(
     masker: &mut Masker,
     instance: &JobInstance<'_>,
     layers: RunnerLayers<'_>,
-    container: &str,
+    (container, runner_env): (&str, &RunnerEnv),
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
 ) -> Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError> {
@@ -187,6 +259,7 @@ async fn run_job_body(
         container,
         roots: shared.roots,
         runner_ctx: layers.runner_ctx,
+        runner_env,
         matrix: &instance.matrix,
         base_env: layers.base_env,
         workflow_env: layers.workflow_env,
@@ -197,14 +270,43 @@ async fn run_job_body(
         bash_available: layers.bash_available,
         workspace: &shared.config.workspace,
         cmdfiles_base: CMDFILES_BASE,
+        action_plan: layers.action_plan,
+        action_config: &shared.config.actions,
+        node_mounts: layers.node_mounts,
+        volume_namespace: &shared.config.volume_namespace,
+        docker_workspace_volume: layers.docker_workspace_volume,
     };
 
     let mut state = StepLoopState::new();
+    // Front-loaded, job-wide: every top-level action's `pre:` script runs
+    // before the job's first step, in action (job step) order
+    // (`crate::executor::step::run_pre_steps` module docs).
+    run_pre_steps(&job_rt, needs, instance.steps, &mut state, masker, out)
+        .instrument(stage_span("exec"))
+        .await?;
+
     let mut step_reports = Vec::with_capacity(instance.steps.len());
     for (index, step) in instance.steps.iter().enumerate() {
         let executed = execute_step(&job_rt, needs, step, index, &mut state, masker, out)
             .instrument(stage_span("exec"))
             .await?;
+        state.status = advance_status(state.status, executed.result.conclusion);
+        step_reports.push(StepReport {
+            label: executed.label,
+            outcome: executed.result.outcome,
+            conclusion: executed.result.conclusion,
+            duration: executed.duration,
+            ran: executed.ran,
+        });
+    }
+
+    // Drained regardless of the job's rolling status — "post steps run in
+    // REVERSE order at job end REGARDLESS of failure"
+    // (`crate::executor::step::run_post_steps` module docs).
+    let post_executed = run_post_steps(&job_rt, needs, &mut state, masker, out)
+        .instrument(stage_span("exec"))
+        .await?;
+    for executed in post_executed {
         state.status = advance_status(state.status, executed.result.conclusion);
         step_reports.push(StepReport {
             label: executed.label,
@@ -338,7 +440,7 @@ fn resolve_env_and_defaults(
 /// Returns `(image_tag, in_container, bash_available, additions)`.
 async fn resolve_image(
     shared: &Shared<'_>,
-    masker: &Masker,
+    masker: &mut Masker,
     runner_ctx: &Value,
     instance: &JobInstance<'_>,
     base_env: &IndexMap<String, String>,
@@ -356,6 +458,15 @@ async fn resolve_image(
                 RunStatus::Success,
             );
             let resolved = resolve_container(container_plan, &ctx)?;
+            // A resolved registry password/username may not already be a
+            // registered secret (e.g. a literal in `credentials:`, however
+            // inadvisable) — mask both before anything derived from them
+            // (the pull's progress events, a later error) can reach output,
+            // matching "never log them" (`PHASE-3-actions.md`).
+            if let Some(credentials) = &resolved.credentials {
+                masker.add(&credentials.username);
+                masker.add(&credentials.password);
+            }
             let additions = validate_container(
                 &resolved,
                 &shared.config.workspace,
@@ -374,7 +485,11 @@ async fn resolve_image(
                     };
                     shared
                         .engine
-                        .pull_image(&resolved.image, &mut masked)
+                        .pull_image(
+                            &resolved.image,
+                            additions.registry_auth.as_ref(),
+                            &mut masked,
+                        )
                         .await?;
                 }
                 Ok::<_, ExecError>(())
@@ -450,18 +565,23 @@ fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedCont
         )),
         None => None,
     };
-    let credentials_span = plan.credentials.as_ref().and_then(|creds| {
-        creds
-            .password
-            .as_ref()
-            .or(creds.username.as_ref())
-            .map(|value| value.span.clone())
-    });
+    let credentials = match &plan.credentials {
+        Some(creds) => Some(ResolvedCredentials {
+            username: match &creds.username {
+                Some(value) => resolve_string(value, ctx).map_err(ExecError::eval)?,
+                None => String::new(),
+            },
+            password: match &creds.password {
+                Some(value) => resolve_string(value, ctx).map_err(ExecError::eval)?,
+                None => String::new(),
+            },
+        }),
+        None => None,
+    };
     Ok(ResolvedContainer {
         image,
         image_span: plan.image.span.clone(),
-        has_credentials: plan.credentials.is_some(),
-        credentials_span,
+        credentials,
         env,
         volumes,
         ports,
@@ -469,12 +589,82 @@ fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedCont
     })
 }
 
+/// Queries the freshly booted (and now ready) job container's own default
+/// `PATH` — inherited from the image, before any step or `GITHUB_PATH`
+/// mutation — and seeds it into `base_env`.
+///
+/// Every later step's environment is built by
+/// [`greenlit_engine::execution::env::layer_step_env`] plus
+/// [`apply_path_additions`], and that function's documented contract is to
+/// *prepend* `GITHUB_PATH` additions onto whatever `PATH` the layered map
+/// already carries — never to invent one. Before this seed, no layer ever
+/// carried an explicit `PATH` key at all (`base_env` is built from
+/// [`RunnerEnv::into_map`], which has no `PATH` field), so the container's
+/// real `PATH` was reaching every step only through ordinary Docker `exec`
+/// environment inheritance, never through Greenlit's own layering. That
+/// works for the *first* step of a job, but the instant one step calls
+/// `core.addPath()` (`setup-node` and most `setup-*` actions do), the caller
+/// starts passing an explicit `PATH=<additions>` entry into every later
+/// `exec`, which *overrides* the container's inherited default outright
+/// (Docker merges an exec's explicit env over the container's live
+/// environment key-for-key) — silently dropping `/usr/bin` and friends from
+/// every subsequent step. GitHub's real runner never has this gap: its
+/// `ExecutionContext` tracks one explicit, always-current `PATH` value from
+/// the job's own start (seeded from the runner process's own environment),
+/// which `core.addPath` only ever prepends onto. Querying the booted
+/// container's own `PATH` once, up front, and seeding it into `base_env`
+/// gives Greenlit's layering that same explicit, always-current baseline —
+/// container-agnostic, so it works identically for the convergent base image
+/// and an arbitrary user-specified `jobs.<id>.container`.
+///
+/// # Errors
+///
+/// Returns an [`ExecError`] if the query exec itself could not be dispatched
+/// (an infrastructure failure, not a step failure) — a non-zero exit or
+/// empty output is treated as "no baseline available" rather than a hard
+/// failure, leaving `base_env` without `PATH` (the pre-fix behavior).
+async fn seed_container_path(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    base_env: &mut IndexMap<String, String>,
+) -> Result<(), ExecError> {
+    let spec = ExecSpec {
+        cmd: vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s' \"$PATH\"".to_string(),
+        ],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code == 0 {
+        let path = sink.text();
+        if !path.is_empty() {
+            base_env.insert("PATH".to_string(), path);
+        }
+    }
+    Ok(())
+}
+
 /// Create and start the isolated job container, returning its id.
+///
+/// `needs_docker_sibling` forces this job's workspace isolation to copy-in
+/// (regardless of the run's requested strategy) and binds a run-scoped named
+/// volume at the workspace path instead of leaving it container-local, so a
+/// Docker action's sibling container can mount the *same* volume
+/// (`crate::executor::actions::docker_action` module docs) — `greenlit-init`
+/// itself needs no change: its copy-in populate step fills whatever is
+/// already bind-mounted at the workspace path, oblivious to whether that is
+/// container-local storage or a named volume.
 async fn boot_container(
     shared: &Shared<'_>,
     image: &str,
     in_container: bool,
     additions: &ContainerAdditions,
+    extra_binds: &[BindMount],
+    needs_docker_sibling: bool,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ExecError> {
     let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
@@ -483,11 +673,16 @@ async fn boot_container(
         "-c".to_string(),
         format!("touch {READY_MARKER}; exec tail -f /dev/null"),
     ];
+    let strategy = if needs_docker_sibling {
+        IsolationStrategy::CopyIn
+    } else {
+        shared.config.strategy
+    };
     let mut spec = isolation_container_spec(
         image.to_string(),
         &repo,
         &shared.config.workspace,
-        shared.config.strategy,
+        strategy,
         idle,
     );
     // A job container image does not ship the helper; inject it read-only.
@@ -499,7 +694,18 @@ async fn boot_container(
             read_only: true,
         });
     }
+    if needs_docker_sibling {
+        spec.binds.push(BindMount {
+            host_path: namespaced_volume_name(
+                &shared.config.volume_namespace,
+                DOCKER_SIBLING_WORKSPACE_VOLUME,
+            ),
+            container_path: shared.config.workspace.clone(),
+            read_only: false,
+        });
+    }
     spec.binds.extend(additions.volume_binds.iter().cloned());
+    spec.binds.extend(extra_binds.iter().cloned());
     spec.env = additions.env.clone();
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 

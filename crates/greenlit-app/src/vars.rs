@@ -13,8 +13,10 @@ use greenlit_workflow::Span;
 use greenlit_workflow::extract::StaticExtraction;
 
 mod dotenv;
+mod remote;
 
 pub(crate) use dotenv::read_dotenv_vars;
+pub(crate) use remote::VariablesClient;
 
 const MAX_VAR_VALUE_BYTES: usize = 48 * 1024;
 
@@ -70,36 +72,12 @@ pub(crate) struct VarResolutionError {
     pub(crate) dynamic_lookup: Option<Span>,
 }
 
-/// Validates GitHub's configuration-variable naming rules.
-///
-/// GitHub permits only ASCII alphanumeric characters and underscores,
-/// forbids a leading digit and the case-insensitive `GITHUB_` prefix, and
-/// stores names uppercase. The documented 48 KB limit applies to a value,
-/// not to the name, so Greenlit deliberately invents no name-length cap.
-/// <https://docs.github.com/en/actions/reference/workflows-and-actions/variables#naming-conventions-for-configuration-variables>
-pub(crate) fn validate_name(name: &str) -> Result<(), &'static str> {
-    if name.is_empty() {
-        return Err("the name must not be empty");
-    }
-    if name
-        .get(.."GITHUB_".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GITHUB_"))
-    {
-        return Err("configuration-variable names must not start with GITHUB_");
-    }
-    if name.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-        return Err("configuration-variable names must not start with a digit");
-    }
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-    {
-        return Err(
-            "configuration-variable names may contain only ASCII letters, digits, and underscores",
-        );
-    }
-    Ok(())
-}
+/// Re-exports the shared naming rule under this module's expected name —
+/// see `crate::gh_names` for the cited GitHub documentation. Kept as a
+/// distinct name here (rather than callers using `crate::gh_names` directly)
+/// so `crate::vars::validate_name`'s existing call sites (`crate::cli`,
+/// `crate::vars::dotenv`) needed no change when the implementation moved.
+pub(crate) use crate::gh_names::validate_configuration_name as validate_name;
 
 fn canonical(name: &str) -> String {
     name.to_ascii_uppercase()
@@ -296,4 +274,143 @@ pub(crate) fn resolve_vars(
             dynamic_lookup,
         }))
     }
+}
+
+/// Internal test-only override for the GitHub REST API base URL (real
+/// `https://api.github.com` in production) — see `crate::auth`'s identical
+/// convention for its own base-URL override.
+const TEST_API_BASE_URL_ENV: &str = "LITCI_TEST_GITHUB_API_BASE_URL";
+
+fn api_base_url() -> String {
+    std::env::var(TEST_API_BASE_URL_ENV)
+        .unwrap_or_else(|_| remote::DEFAULT_API_BASE_URL.to_string())
+}
+
+/// The outcome of resolving `vars` with the authenticated remote leg
+/// available. `PHASE-3-actions.md` Variables: local values override remote
+/// values; a still-unresolved name with no authentication stops before
+/// engine detection naming `litci auth`; a successful authenticated lookup
+/// resolves an absent name to the empty string, matching GitHub.
+pub(crate) enum VarsOutcome {
+    /// Every referenced name resolved (locally, or with the remote leg).
+    Resolved(Value),
+    /// A local value violates GitHub's own storage rules (invalid name,
+    /// oversized value, ambiguous/non-Unicode process environment) — no
+    /// remote lookup could ever fix this, so it was never attempted.
+    LocalError(Box<VarResolutionError>),
+    /// Some names remain unresolved locally and no authentication is
+    /// configured (`crate::auth::current_token` returned `None` or failed).
+    AuthRequired(Box<VarResolutionError>),
+    /// Authentication is configured, but the remote lookup itself failed
+    /// (a permission shortfall or another API/transport error). Message
+    /// already includes its one fix action.
+    RemoteError(String),
+}
+
+/// Resolves `vars` through the complete v0 chain: `resolve_vars`'s local
+/// chain first, then (only when the *only* local problem is an unresolved
+/// literal name or a dynamic lookup — never for a hard local error) the
+/// authenticated GitHub configuration-variables API, with repository
+/// values overriding organization values.
+///
+/// The remote leg is layered in as an additional local source ranked
+/// beneath `.litci/vars` (never above it — "local values override remote
+/// values") by re-running the exact same local resolution with the
+/// remote-fetched entries appended to the dotenv list; this is what lets a
+/// name GitHub reports as absent resolve to the empty string on the second
+/// pass rather than remaining "missing", and what lets a dynamic lookup's
+/// fetched map satisfy `resolve_vars`'s "explicitly complete local map"
+/// requirement without a second, parallel resolution implementation.
+pub(crate) fn resolve_vars_with_remote(
+    extraction: &StaticExtraction,
+    cli: &[(String, String)],
+    dotenv: &[(String, String)],
+    dotenv_file_exists: bool,
+    repo_owner: &str,
+    repo_name: &str,
+) -> VarsOutcome {
+    let local_error = match resolve_vars(extraction, cli, dotenv, dotenv_file_exists) {
+        Ok(value) => return VarsOutcome::Resolved(value),
+        Err(error) => error,
+    };
+    let remote_could_help = local_error.invalid.is_empty()
+        && local_error.oversized.is_empty()
+        && local_error.ambiguous_process.is_empty()
+        && local_error.non_unicode_process.is_empty()
+        && (!local_error.missing.is_empty() || local_error.dynamic_lookup.is_some());
+    if !remote_could_help {
+        return VarsOutcome::LocalError(local_error);
+    }
+    let token = match crate::auth::current_token() {
+        Ok(Some(token)) => token,
+        Ok(None) | Err(_) => return VarsOutcome::AuthRequired(local_error),
+    };
+
+    let client = VariablesClient::with_base_url(token, api_base_url());
+    let remote_entries = if local_error.dynamic_lookup.is_some() {
+        fetch_complete_map(&client, repo_owner, repo_name)
+    } else {
+        fetch_named(&client, repo_owner, repo_name, &local_error.missing)
+    };
+    let remote_entries = match remote_entries {
+        Ok(entries) => entries,
+        Err(message) => return VarsOutcome::RemoteError(message),
+    };
+
+    let mut combined_dotenv = dotenv.to_vec();
+    combined_dotenv.extend(remote_entries);
+    match resolve_vars(extraction, cli, &combined_dotenv, true) {
+        Ok(value) => VarsOutcome::Resolved(value),
+        // Every name that could have been fixed by the remote leg was
+        // either given a real value or an explicit empty-string entry
+        // above, so a second failure here can only be a hard local error
+        // (or, in principle, a name the remote leg does not cover at all —
+        // neither happens by construction) and is reported unchanged.
+        Err(error) => VarsOutcome::LocalError(error),
+    }
+}
+
+/// Fetches the complete repository ∪ organization variable map for a
+/// dynamic `vars[...]` lookup, repository values overriding organization
+/// values (`PHASE-3-actions.md` Variables: "repository values override
+/// organization values").
+fn fetch_complete_map(
+    client: &VariablesClient,
+    owner: &str,
+    repo: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let mut merged = client
+        .list_org_variables(owner)
+        .map_err(|error| error.to_message_with_fix())?;
+    let repo_vars = client
+        .list_repo_variables(owner, repo)
+        .map_err(|error| error.to_message_with_fix())?;
+    merged.extend(repo_vars);
+    Ok(merged.into_iter().collect())
+}
+
+/// Fetches each literal missing name individually: repository value if
+/// present, else organization value, else an explicit empty string (GitHub
+/// parity: "a name absent from GitHub resolves to the empty string").
+fn fetch_named(
+    client: &VariablesClient,
+    owner: &str,
+    repo: &str,
+    missing: &[MissingVar],
+) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::with_capacity(missing.len());
+    for var in missing {
+        let repo_value = client
+            .get_repo_variable(owner, repo, &var.name)
+            .map_err(|error| error.to_message_with_fix())?;
+        let value = match repo_value {
+            Some(value) => value,
+            None => client
+                .get_org_variable(owner, &var.name)
+                .map_err(|error| error.to_message_with_fix())?
+                .unwrap_or_default(),
+        };
+        entries.push((var.name.clone(), value));
+    }
+    Ok(entries)
 }

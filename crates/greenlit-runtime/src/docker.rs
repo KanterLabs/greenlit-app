@@ -17,8 +17,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CommitContainerOptionsBuilder, CreateContainerOptionsBuilder,
-    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, RemoveContainerOptionsBuilder,
-    StopContainerOptionsBuilder,
+    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, LogsOptionsBuilder,
+    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -26,6 +26,7 @@ use futures_util::StreamExt;
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
+    RegistryAuth,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -183,6 +184,7 @@ impl ContainerEngine for DockerEngine {
     async fn pull_image(
         &self,
         image: &str,
+        auth: Option<&RegistryAuth>,
         progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
         let (name, tag) = split_reference(image);
@@ -193,8 +195,13 @@ impl ContainerEngine for DockerEngine {
         progress.on_progress(ProgressEvent::PullStarted {
             image: image.to_string(),
         });
+        let credentials = auth.map(|auth| bollard::auth::DockerCredentials {
+            username: Some(auth.username.clone()),
+            password: Some(auth.password.clone()),
+            ..Default::default()
+        });
         let mut layers: HashMap<String, (u64, Option<u64>)> = HashMap::new();
-        let mut stream = self.docker.create_image(Some(options), None, None);
+        let mut stream = self.docker.create_image(Some(options), None, credentials);
         while let Some(item) = stream.next().await {
             let info = item.map_err(|e| RuntimeError::api(Operation::PullImage, e))?;
             let (current_bytes, total_bytes) = fold_pull_progress(&mut layers, &info);
@@ -386,6 +393,46 @@ impl ContainerEngine for DockerEngine {
         // reports its code. A missing code would mean the daemon lost the exec;
         // surface it as a non-zero result rather than a false green.
         let exit_code = inspect.exit_code.unwrap_or(1);
+        Ok(ExecOutput { exit_code })
+    }
+
+    async fn run_container(
+        &self,
+        id: &str,
+        sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError> {
+        self.docker
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
+            .await
+            .map_err(|e| RuntimeError::api(Operation::StartContainer, e))?;
+
+        let log_options = LogsOptionsBuilder::new()
+            .follow(true)
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut logs = self.docker.logs(id, Some(log_options));
+        while let Some(item) = logs.next().await {
+            match item.map_err(|e| RuntimeError::api(Operation::ContainerLogs, e))? {
+                LogOutput::StdOut { message } => sink.on_stdout(&message),
+                LogOutput::StdErr { message } => sink.on_stderr(&message),
+                LogOutput::Console { message } => sink.on_stdout(&message),
+                LogOutput::StdIn { .. } => {}
+            }
+        }
+
+        let wait_options = WaitContainerOptionsBuilder::new().build();
+        let mut wait_stream = self.docker.wait_container(id, Some(wait_options));
+        let exit_code = match wait_stream.next().await {
+            Some(Ok(response)) => response.status_code,
+            // A container that already exited by the time `wait` was issued
+            // is reported this way by some daemon versions rather than a
+            // normal response; re-inspecting is unnecessary — the log
+            // stream above only ends once the container has stopped, so
+            // treat an empty/erroring wait as "already exited, unknown
+            // code" rather than failing the whole action.
+            Some(Err(_)) | None => 1,
+        };
         Ok(ExecOutput { exit_code })
     }
 
