@@ -90,6 +90,13 @@ impl ContainerEngine for FakeEngine {
         })
     }
 
+    async fn run_container(
+        &self,
+        _id: &str,
+        _sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError> {
+        Ok(ExecOutput { exit_code: 0 })
+    }
     async fn export_path(&self, _container: &str, _path: &str) -> Result<Vec<u8>, RuntimeError> {
         Ok(Vec::new())
     }

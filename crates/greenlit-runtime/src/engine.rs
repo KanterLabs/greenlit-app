@@ -22,7 +22,7 @@ use crate::progress::ProgressSink;
 /// value) *before* reaching the engine — this type is the already-resolved
 /// pair, never a `${{ }}` expression. Never logged or included in any
 /// `Debug`/error text a step's own output could echo back; callers mask both
-/// fields with the running [`crate::executor::report`] masker the same way
+/// fields with the run's `greenlit_engine::execution::Masker` the same way
 /// every other resolved secret is (`AGENTS.md`: "secret values are masked in
 /// all log output").
 #[derive(Clone, PartialEq, Eq)]
@@ -268,6 +268,28 @@ pub trait ContainerEngine: Send + Sync {
         &self,
         container: &str,
         spec: &ExecSpec,
+        sink: &mut (dyn ExecOutputSink + Send),
+    ) -> Result<ExecOutput, RuntimeError>;
+
+    /// Runs a *created* container's own entrypoint/cmd to completion,
+    /// streaming its stdout/stderr to `sink` from start to exit and
+    /// returning its exit code.
+    ///
+    /// Unlike [`Self::exec`] (which runs an extra command inside an
+    /// already-idling container), this drives the container's own primary
+    /// process — the shape a Docker action's sibling container needs
+    /// (`crate::executor::actions::docker_action`): the sibling is created
+    /// with the action's real entrypoint/args as its `cmd`, started, and run
+    /// to completion here, exactly like `docker run` (as opposed to
+    /// `docker exec` into a long-lived idle container).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if starting the container, streaming its
+    /// logs, or waiting for it to exit fails at the daemon level.
+    async fn run_container(
+        &self,
+        id: &str,
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError>;
 
