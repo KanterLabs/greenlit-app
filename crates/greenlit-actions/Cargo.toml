@@ -6,7 +6,94 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Typed errors for every fallible path, per `AGENTS.md` "Errors: thiserror
+# in library crates".
+thiserror = "2.0.19"
+# Stage spans (`action-resolve`/`action-fetch`) follow the same
+# `tracing::info_span!(target = "greenlit_metrics::timed_stage", ...)`
+# convention `greenlit-runtime`'s executor uses, so `greenlit-metrics`'
+# `Invocation` timing layer captures them without this crate depending on
+# `greenlit-metrics` itself. Version pinned to the workspace's existing use.
+tracing = "0.1.44"
+# `RefResolver`/`ActionFetcher` are held behind `&dyn Trait` at their call
+# sites (mirrors `greenlit-runtime`'s `ContainerEngine`/`EngineProber`), and
+# native `async fn` in a trait is not dyn-compatible. Same pinned version
+# already used by `greenlit-runtime`.
+async-trait = "0.1.90"
+# `spawn_blocking` dispatch for the two blocking `RefResolver`/`ActionFetcher`
+# backends (a `ureq` HTTP call, a `git` subprocess) off the async runtime,
+# per `AGENTS.md` "Async: tokio. No blocking calls on the async runtime."
+# Same feature set/version `greenlit-runtime` already pins.
+tokio = { version = "1.48.0", features = ["rt", "macros", "time"] }
+# Reused for `action.yml` duplicate-key detection: the runner's
+# `TemplateReader` compares mapping keys with .NET's
+# `StringComparer.OrdinalIgnoreCase`, which `greenlit-workflow`'s own YAML
+# tree builder already reproduces exactly (not naive ASCII/Unicode
+# uppercasing) via this function; reusing it avoids a second, subtly
+# different reimplementation of that comparison.
+greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
+# `action.yml`'s `runs.pre-if`/`post-if`/composite-step `if:` conditions and
+# every source-located parse error reuse `greenlit-workflow`'s
+# `Span`/`Location`/`Spanned` (file:line:col) types rather than a second,
+# identical span type — `action.yml` is parsed by the same GitHub
+# `YamlObjectReader`/`TemplateReader` machinery as workflow YAML (see
+# `manifest::yaml` module docs), so the same location model applies.
+greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
+# Order-preserving `inputs`/`outputs`/`env` maps, matching the `IndexMap`
+# convention `greenlit-runtime`'s execution semantics already use for the
+# same kind of name-to-value data.
+indexmap = "2.14.0"
+# Low-level pull-based YAML 1.2 parser (event stream with spans), the same
+# crate and version `greenlit-workflow` depends on directly for the same
+# reason: `action.yml` needs GitHub's duplicate-key rejection and scalar
+# typing, which the higher-level `saphyr` convenience crate cannot be
+# configured to perform (see `manifest::yaml` module docs). A second,
+# independent tree builder is required because `greenlit-workflow`'s own
+# (`crate::yaml::raw`) is a crate-private implementation detail, not part of
+# its public API.
+saphyr-parser = "0.0.11"
+# Minimal blocking HTTP client (rustls backend) for the two real network
+# calls this crate makes: the GitHub REST "get a commit" lookup
+# (`resolve::github_api`) and the repository tarball download
+# (`store::tarball`). Chosen over hand-assembling `hyper`/`hyper-util`/
+# `hyper-rustls` directly: this crate does not otherwise touch HTTP (unlike
+# `greenlit-runtime`, whose `bollard` dependency already pulls `hyper` for
+# the *local* Docker Unix socket, with no TLS stack at all), so there is no
+# existing HTTPS client wiring to extend, and `ureq`'s single blocking
+# `agent.get(url).call()` call shape is a direct fit for the
+# `spawn_blocking`-wrapped design `PHASE-3-actions.md` explicitly allows
+# ("a blocking client behind the injected trait driven via spawn_blocking is
+# acceptable if simpler"). `gzip`/`brotli` response-compression negotiation
+# is disabled (`default-features = false`): both calls read small JSON/octet
+# bodies once, and no other crate in the workspace already carries a gzip
+# decoder to share, so the default GitHub tarball payload's own `.tar.gz`
+# framing is decoded explicitly with `flate2` instead of negotiating a
+# second, HTTP-transport-level `Content-Encoding: gzip`.
+ureq = { version = "3.3.0", default-features = false, features = [
+    "rustls",
+    "json",
+] }
+# JSON body for the GitHub commit-lookup response (`{"sha": "..."}`); no new
+# dependency, `serde`/`serde_json` are already the workspace's chosen
+# (de)serialization crates.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# Decompresses the `.tar.gz` framing GitHub's repository-tarball endpoint
+# returns, ahead of unpacking with `tar` below. Pure-Rust `miniz_oxide`
+# backend (the crate's default): no C compiler/system zlib dependency, which
+# would complicate this crate's use from `greenlit-init`'s musl static build
+# neighbor in the same workspace.
+flate2 = "1.1.9"
+# Same USTAR reader `greenlit-runtime` already depends on (for its build
+# context tar and `--write-back` overlay export) at the identical pinned
+# version, reused here to unpack a fetched action tarball entry-by-entry so
+# extraction can be validated (path traversal, symlink escape, size bound)
+# before any file lands on disk.
+tar = { version = "0.4.46", default-features = false }
 
 [dev-dependencies]
 # Store and parser tests run against isolated temp directories.
 tempfile = "3.27.0"
+# Drives the async `RefResolver`/`ActionFetcher` trait surface in tests
+# without a real container/async-app runtime around them.
+tokio = { version = "1.48.0", features = ["rt", "macros", "time"] }

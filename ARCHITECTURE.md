@@ -272,3 +272,34 @@ policy actively contains. They are not deferred Greenlit behavior.
   exception forces review whenever that old line changes. Upstream migration
   tracking includes [tokio-rs/tracing#3582](https://github.com/tokio-rs/tracing/issues/3582)
   and [clap-rs/clap#4824](https://github.com/clap-rs/clap/issues/4824).
+
+- **Phase 3's first outbound HTTPS client pulls in the Rust TLS ecosystem's
+  own license/version footprint.** `greenlit-actions` (`resolve::GitHubApiResolver`,
+  `store::TarballFetcher`) is the first crate in this workspace to make a
+  real HTTPS request (to `api.github.com`), via `ureq`'s `rustls` backend —
+  chosen over `native-tls` specifically because `native-tls` links system
+  OpenSSL, which would turn the shipped `litci` binary from a single static
+  executable into one with a host OpenSSL runtime dependency, contradicting
+  `greenlit-v0-spec.md` "Tech": "One distributable static host binary."
+  `rustls`'s dependency chain (`ring`, `rustls-webpki`, `ring`'s own
+  `untrusted`, and `ring`'s `subtle`) is ISC- or BSD-3-Clause-licensed, and
+  its bundled Mozilla root CA list (`webpki-roots`) ships under
+  CDLA-Permissive-2.0 — all still standard OSI-approved/permissive terms,
+  just outside this workspace's original MIT/Apache-2.0/Unicode-3.0
+  allowlist, which predates any crate needing outbound TLS. `deny.toml`'s
+  `[licenses] allow` list was extended to admit exactly these three, with
+  the reasoning recorded inline there. There is no rustls crypto provider
+  or comparably minimal pure-Rust HTTPS client available that avoids this
+  footprint.
+
+- **`ring`'s own transitive pins duplicate two already-present crates at
+  older versions.** `ring` (via `rustls`, via `ureq`) depends on
+  `getrandom@0.2.17` and (through `rustls-webpki`) `windows-sys@0.52.0`,
+  while the rest of the workspace already resolves to `getrandom@0.4.3` and
+  `windows-sys@0.61.2` respectively (the latter is a Windows-only
+  conditional dependency that never compiles into Greenlit's Linux x86_64
+  binary at all). This workspace does not control `ring`'s own `Cargo.toml`
+  version requirements, so the two old-version entries are named exactly in
+  `deny.toml`'s `bans.skip`, mirroring the existing `syn@2.0.119` exception's
+  granularity — a version bump on either side requires deliberately updating
+  the pinned skip entry, not a silent pass.
