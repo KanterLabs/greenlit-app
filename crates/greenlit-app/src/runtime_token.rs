@@ -33,6 +33,13 @@
 pub(crate) struct RuntimeToken {
     /// The token handed to the job as `ACTIONS_RUNTIME_TOKEN`.
     pub value: String,
+    /// The signature blob URLs carry in place of a bearer header.
+    ///
+    /// Blob clients send no `Authorization`: `@azure/storage-blob` treats a
+    /// signed URL as self-authorizing, and `actions/cache` downloads its
+    /// `archiveLocation` with a bare HTTP client. Kept distinct from the
+    /// bearer token so the token never lands in a URL.
+    pub url_signature: String,
 }
 
 /// Mints a token for one run.
@@ -51,6 +58,7 @@ pub(crate) fn mint() -> Option<RuntimeToken> {
 
     Some(RuntimeToken {
         value: format!("{header}.{payload}.{signature}"),
+        url_signature: random_hex(32)?,
     })
 }
 
@@ -142,6 +150,16 @@ mod tests {
             scope.split(':').skip(1).all(|part| !part.is_empty()),
             "both backend ids must be present: {scope}"
         );
+    }
+
+    #[test]
+    fn the_url_signature_is_distinct_from_the_bearer_token() {
+        let minted = mint().expect("mint");
+        assert_ne!(
+            minted.url_signature, minted.value,
+            "the bearer token must never end up in a URL a client might log"
+        );
+        assert_eq!(minted.url_signature.len(), 64, "32 random bytes as hex");
     }
 
     #[test]

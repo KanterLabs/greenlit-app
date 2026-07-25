@@ -16,6 +16,8 @@ use std::net::Ipv4Addr;
 use greenlit_store::{CacheStore, ShimState};
 
 const TOKEN: &str = "runtime-token-for-this-run";
+/// Blob URLs authorize themselves; no client sends a header for them.
+const SIGNATURE: &str = "url-signature-for-this-run";
 
 /// A started shim plus the base URL a client would be handed.
 struct Fixture {
@@ -40,6 +42,7 @@ async fn start() -> Fixture {
         CacheStore::at(root.path()),
         greenlit_store::ArtifactStore::at(root.path().join("artifacts")),
         TOKEN,
+        SIGNATURE,
         base.clone(),
     );
     let shim = bound.serve(state);

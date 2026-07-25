@@ -39,6 +39,7 @@ axum = { version = "0.8.7", default-features = false, features = [
 # added for `TcpListener` and the async blob read.
 tokio = { version = "1.48.0", features = [
     "rt",
+    "rt-multi-thread",
     "macros",
     "net",
     "fs",

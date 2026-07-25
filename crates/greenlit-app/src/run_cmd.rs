@@ -513,7 +513,7 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
     if !home.is_absolute() {
         return None;
     }
-    let runtime_token = crate::runtime_token::mint()?.value;
+    let minted = crate::runtime_token::mint()?;
     Some(greenlit_runtime::StoreConfig {
         cache: greenlit_store::CacheStore::at(greenlit_store::CacheStore::default_path_under(
             &home,
@@ -522,7 +522,8 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
             greenlit_store::ArtifactStore::default_path_under(&home),
         ),
         toolcache_root: home.join(".litci").join("toolcache"),
-        runtime_token,
+        runtime_token: minted.value,
+        url_signature: minted.url_signature,
     })
 }
 

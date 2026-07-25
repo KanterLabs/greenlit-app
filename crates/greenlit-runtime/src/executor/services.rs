@@ -53,8 +53,14 @@ pub struct StoreConfig {
     pub artifacts: ArtifactStore,
     /// `~/.litci/toolcache`, bound into the job at `RUNNER_TOOL_CACHE`.
     pub toolcache_root: PathBuf,
-    /// The bearer token this run's shim requires.
+    /// The bearer token this run's shim requires on its API routes.
     pub runtime_token: String,
+    /// The per-run signature blob URLs carry in place of a bearer header.
+    ///
+    /// Separate from the token because blob clients never send a header and
+    /// the URL therefore has to authorize itself; keeping them distinct means
+    /// the bearer token never appears in a URL a client might log.
+    pub url_signature: String,
 }
 
 impl StoreConfig {
@@ -187,6 +193,7 @@ pub async fn create(
         store.cache.clone(),
         store.artifacts.clone(),
         store.runtime_token.clone(),
+        store.url_signature.clone(),
         base.clone(),
     );
     let shim = bound.serve(state);
