@@ -238,7 +238,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
                 "could not start the async runtime: {error}\n  fix: retry; if it persists, file an issue"
             )
         })?;
-    let action_locks = invocation
+    let action_preflight = invocation
         .time_stage("action-resolve", || {
             runtime.block_on(greenlit_runtime::preflight_plan_actions(
                 &execution_plan,
@@ -259,7 +259,11 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         )
     })?;
     for (reference, commit) in pinned_actions {
-        if !action_locks.values().any(|locked| locked == &commit) {
+        if !action_preflight
+            .actions
+            .values()
+            .any(|locked| locked == &commit)
+        {
             anyhow::bail!(
                 "finalized action resolution {reference}={commit} is absent from the preflight action inventory\n  fix: preserve the run directory and file a Greenlit defect"
             );
@@ -276,6 +280,15 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             ))
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let runner_locks = invocation
+        .time_stage("runner-resolve", || {
+            runtime.block_on(greenlit_runtime::preflight_plan_runners(
+                &engine,
+                &execution_plan,
+                &mut progress,
+            ))
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let run_lock = evidence.lock(crate::run_evidence::LockInputs {
         workflow_path: &workflow_path.source_name,
         event_name: event_kind.event_name(),
@@ -283,8 +296,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         selected_job: args.job.as_deref(),
         plan: &execution_plan,
         secrets: &all_secrets,
-        actions: action_locks,
+        actions: action_preflight.actions,
         containers: container_locks,
+        runners: runner_locks,
+        toolchains: action_preflight.toolchains,
     })?;
 
     // The local stores this run serves. A machine whose `HOME` cannot be

@@ -306,10 +306,16 @@ fn resolve_uses<'a>(
                 git_ref,
             }) => {
                 if owner == "actions" && repo == "checkout" {
-                    collector.identities.insert(
-                        reference.to_string(),
-                        "builtin:self-checkout-v1".to_string(),
-                    );
+                    let sha = resolve_ref(env.config.resolver.as_ref(), &owner, &repo, &git_ref)
+                        .await
+                        .map_err(|source| ExecError::ActionResolve {
+                            reference: reference.to_string(),
+                            span: span.clone(),
+                            source: Box::new(source),
+                        })?;
+                    collector
+                        .identities
+                        .insert(reference.to_string(), sha.as_str().to_string());
                     return Ok(ResolvedUses::Checkout);
                 }
                 let sha = resolve_ref(env.config.resolver.as_ref(), &owner, &repo, &git_ref)
@@ -645,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actions_checkout_is_special_cased_without_touching_the_resolver_or_fetcher() {
+    async fn actions_checkout_locks_the_ref_without_fetching_action_source() {
         let store_root = tempfile::tempdir().unwrap();
         let resolver = Arc::new(CountingResolver {
             calls: AtomicUsize::new(0),
@@ -664,10 +670,14 @@ mod tests {
 
         let plan = resolve_job_actions(&steps, &config, repo_host_path.path(), "/ws")
             .await
-            .expect("actions/checkout resolves without any network call");
+            .expect("actions/checkout ref resolves without fetching its source");
         assert!(matches!(plan.per_step[0], Some(ResolvedUses::Checkout)));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            plan.identities.get("actions/checkout@v4"),
+            Some(&"c".repeat(40))
+        );
     }
 
     #[tokio::test]

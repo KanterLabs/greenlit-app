@@ -191,6 +191,7 @@ pub fn plan(
 
     let execution_plan = ExecutionPlan {
         schema_version: 1,
+        compatibility: analyze_support(workflow),
         event_name,
         run_name,
         env,

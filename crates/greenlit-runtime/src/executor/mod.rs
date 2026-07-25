@@ -33,6 +33,7 @@ mod preflight;
 mod provision;
 mod readiness;
 mod report;
+mod runner_lock;
 mod services;
 mod step;
 mod step_ids;
@@ -59,6 +60,7 @@ use crate::image::ImageError;
 use crate::isolation::IsolationStrategy;
 use crate::progress::ProgressSink;
 
+pub use actions::ActionPreflight;
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
@@ -66,6 +68,7 @@ pub use image_lock::preflight_plan_images;
 pub use preflight::reject_uses_steps;
 pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
+pub use runner_lock::preflight_plan_runners;
 pub use services::{JobNetwork, StoreConfig};
 
 /// Everything the executor needs beyond the plan and the engine.

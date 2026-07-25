@@ -17,8 +17,8 @@
 //!   isolation strategy is chosen (see `docker_action`'s module docs for
 //!   why that matters).
 //! - `checkout` — `actions/checkout` is special-cased entirely: self-
-//!   checkout is satisfied from the already-isolated workspace with no
-//!   network and no fetch of the real `actions/checkout` source at all;
+//!   checkout is satisfied from the already-isolated workspace after its
+//!   mutable ref is locked, with no fetch of the real action source;
 //!   checkout of a different repository clones for real, inside the
 //!   container, over the network.
 //! - [`node_runtime`] — the pinned `actions/runner` Node runtime bundles
@@ -65,6 +65,14 @@ use greenlit_actions::store::{ActionFetcher, ActionStore};
 
 use node_runtime::{NodeBundleSpecs, RuntimeBundleFetcher};
 
+/// Immutable action and runtime identities discovered before execution.
+pub struct ActionPreflight {
+    /// Requested repository action refs mapped to full commit SHAs.
+    pub actions: std::collections::BTreeMap<String, String>,
+    /// Required Node runtime variants mapped to pinned bundle identities.
+    pub toolchains: std::collections::BTreeMap<String, String>,
+}
+
 /// Resolves and fetches every statically materialized action in an execution
 /// plan before the RunLock is finalized. Execution may then use a frozen
 /// [`greenlit_actions::resolve::PinnedRefResolver`] without mutable aliases.
@@ -77,21 +85,70 @@ pub async fn preflight_plan_actions(
     config: &ActionRuntimeConfig,
     repo_host_path: &std::path::Path,
     workspace: &str,
-) -> Result<std::collections::BTreeMap<String, String>, crate::executor::ExecError> {
+) -> Result<ActionPreflight, crate::executor::ExecError> {
     let mut identities = std::collections::BTreeMap::new();
+    let mut needs_node20 = false;
+    let mut needs_node24 = false;
     for job in &plan.jobs {
         if !job.steps.is_empty() {
             let resolved =
                 resolve::resolve_job_actions(&job.steps, config, repo_host_path, workspace).await?;
             identities.extend(resolved.identities);
+            needs_node20 |= resolved.needs_node20;
+            needs_node24 |= resolved.needs_node24;
         }
         for leg in &job.legs {
             let resolved =
                 resolve::resolve_job_actions(&leg.steps, config, repo_host_path, workspace).await?;
             identities.extend(resolved.identities);
+            needs_node20 |= resolved.needs_node20;
+            needs_node24 |= resolved.needs_node24;
         }
     }
-    Ok(identities)
+    let toolchains = locked_node_toolchains(
+        config.node_runtime_specs.as_ref(),
+        needs_node20,
+        needs_node24,
+    );
+    Ok(ActionPreflight {
+        actions: identities,
+        toolchains,
+    })
+}
+
+fn locked_node_toolchains(
+    specs: &dyn NodeBundleSpecs,
+    needs_node20: bool,
+    needs_node24: bool,
+) -> std::collections::BTreeMap<String, String> {
+    let mut toolchains = std::collections::BTreeMap::new();
+    for (needed, version, name) in [
+        (
+            needs_node20,
+            greenlit_actions::manifest::NodeVersion::Node20,
+            "node20",
+        ),
+        (
+            needs_node24,
+            greenlit_actions::manifest::NodeVersion::Node24,
+            "node24",
+        ),
+    ] {
+        if !needed {
+            continue;
+        }
+        for (variant, variant_name) in [
+            (node_runtime::NodeVariant::Standard, "standard"),
+            (node_runtime::NodeVariant::Alpine, "alpine"),
+        ] {
+            let spec = specs.spec(version, variant);
+            toolchains.insert(
+                format!("{name}.{variant_name}.linux-amd64"),
+                format!("{}#sha256:{}", spec.url, spec.sha256),
+            );
+        }
+    }
+    toolchains
 }
 
 /// Everything the executor needs to resolve, fetch, and run `uses:` steps,
@@ -136,4 +193,21 @@ pub struct ActionRuntimeConfig {
     /// (`PHASE-3-actions.md` "actions/checkout"), rather than attempting an
     /// anonymous clone that may or may not happen to work.
     pub github_token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_preflight_locks_every_required_node_variant() {
+        let locks = locked_node_toolchains(&node_runtime::PinnedNodeBundleSpecs, true, false);
+        assert_eq!(locks.len(), 2);
+        assert!(
+            locks["node20.standard.linux-amd64"].starts_with("https://nodejs.org/dist/v20.20.2/")
+        );
+        assert!(locks["node20.standard.linux-amd64"].contains("#sha256:19e56f0825510207"));
+        assert!(locks.contains_key("node20.alpine.linux-amd64"));
+        assert!(!locks.contains_key("node24.standard.linux-amd64"));
+    }
 }

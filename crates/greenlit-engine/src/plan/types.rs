@@ -7,6 +7,7 @@ use greenlit_expr::Value;
 use greenlit_workflow::Span;
 
 use crate::condition::Condition;
+use crate::evidence::SupportReport;
 use crate::graph::JobId;
 use crate::lints::Lint;
 use crate::matrix::{DEFAULT_MAX_MATRIX_LEGS, StrategyPlan};
@@ -20,6 +21,8 @@ use crate::runner::RunnerPlan;
 pub struct ExecutionPlan {
     /// Stable plan schema version.
     pub schema_version: u32,
+    /// Preflight compatibility findings included in `litci plan --json`.
+    pub compatibility: SupportReport,
     /// The simulated trigger's event name (`"push"`, `"pull_request"`,
     /// `"workflow_dispatch"`).
     pub event_name: String,

@@ -7,7 +7,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use greenlit_engine::planned::Evaluation;
 use greenlit_engine::{
     ExecutionConclusion, ExecutionPlan, ExecutionResultV1, FeatureFinding, FindingDisposition,
     JobLockV1, LockedSource, ResultEvidence, RunLockV1, SourceSnapshot, SupportReport,
@@ -32,6 +31,8 @@ pub(crate) struct LockInputs<'a> {
     pub(crate) secrets: &'a [(String, String)],
     pub(crate) actions: BTreeMap<String, String>,
     pub(crate) containers: BTreeMap<String, String>,
+    pub(crate) runners: BTreeMap<String, greenlit_engine::RunnerLockV1>,
+    pub(crate) toolchains: BTreeMap<String, String>,
 }
 
 impl RunEvidence {
@@ -137,6 +138,8 @@ impl RunEvidence {
             secrets,
             actions,
             containers,
+            runners,
+            toolchains,
         } = inputs;
         let workflow_digest = self
             .source
@@ -159,13 +162,14 @@ impl RunEvidence {
         let mut lock = RunLockV1::new(source, event_name);
         lock.inputs = inputs.iter().cloned().collect();
         lock.selected_job = selected_job.map(str::to_string);
-        lock.runners = runner_identities(plan);
+        lock.runners = runners;
         lock.secret_revisions = secrets
             .iter()
             .map(|(name, value)| (name.clone(), opaque_revision(value.as_bytes())))
             .collect();
         lock.actions = actions;
         lock.containers = containers;
+        lock.toolchains = toolchains;
         lock.compatibility = self.support.borrow().clone();
         write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
         self.write_job_locks(plan, &lock)?;
@@ -363,28 +367,16 @@ fn content_error(path: &str, error: greenlit_store::cas::CasError) -> anyhow::Er
 fn runner_fingerprint(run_lock: &RunLockV1, key: &str) -> String {
     run_lock.runners.get(key).map_or_else(
         || opaque_revision(b"runner:deferred"),
-        |runner| opaque_revision(format!("runner:{runner}:linux:amd64").as_bytes()),
+        |runner| {
+            opaque_revision(
+                format!(
+                    "runner:{}:{}:{}:{}",
+                    runner.provider, runner.image_digest, runner.os, runner.architecture
+                )
+                .as_bytes(),
+            )
+        },
     )
-}
-
-fn runner_identities(plan: &ExecutionPlan) -> BTreeMap<String, String> {
-    let mut runners = BTreeMap::new();
-    for job in &plan.jobs {
-        if let Some(runner) = &job.runner
-            && let Evaluation::Static(image) = &runner.evaluation
-        {
-            runners.insert(job.id.0.clone(), image.image_identifier().to_string());
-        }
-        for (index, leg) in job.legs.iter().enumerate() {
-            if let Evaluation::Static(image) = &leg.runner.evaluation {
-                runners.insert(
-                    format!("{}[{index}]", job.id.0),
-                    image.image_identifier().to_string(),
-                );
-            }
-        }
-    }
-    runners
 }
 
 fn local_support_report() -> SupportReport {

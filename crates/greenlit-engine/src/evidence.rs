@@ -81,6 +81,27 @@ pub struct LockedSource {
     pub workflow_digest: String,
 }
 
+/// Immutable identity of the environment selected for one concrete job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerLockV1 {
+    /// Runner expression or label requested by the workflow.
+    pub requested_label: String,
+    /// Concrete supported runner label selected after expression evaluation.
+    pub resolved_label: String,
+    /// Environment implementation that supplied the runner.
+    pub provider: String,
+    /// Local immutable image reference used to start the sandbox.
+    pub image_reference: String,
+    /// Engine-reported immutable image identity.
+    pub image_digest: String,
+    /// Selected operating system.
+    pub os: String,
+    /// Selected architecture.
+    pub architecture: String,
+    /// Greenlit runner implementation version.
+    pub runner_version: String,
+}
+
 /// Version-one immutable pre-execution resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunLockV1 {
@@ -95,7 +116,7 @@ pub struct RunLockV1 {
     /// Requested job filter, if any.
     pub selected_job: Option<String>,
     /// Runner identities by concrete job.
-    pub runners: BTreeMap<String, String>,
+    pub runners: BTreeMap<String, RunnerLockV1>,
     /// Action requested refs mapped to resolved commits.
     pub actions: BTreeMap<String, String>,
     /// Container requested refs mapped to resolved OCI digests.

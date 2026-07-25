@@ -1,5 +1,5 @@
-//! `actions/checkout` special-casing: satisfied entirely without fetching or
-//! executing the real `actions/checkout` source.
+//! `actions/checkout` special-casing: its ref is locked before execution, then
+//! it is satisfied without fetching or executing the real action source.
 //!
 //! `PHASE-3-actions.md`: "`actions/checkout` works tokenless for the
 //! already-present local repo: detect self-checkout and satisfy it from the
@@ -7,7 +7,7 @@
 //! repository performs a real clone and requires a token." This module is
 //! reached the moment [`crate::executor::actions::resolve`] recognizes
 //! `owner == "actions"` and `repo == "checkout"` in a step's `uses:` — the
-//! real `actions/checkout` action is never resolved, fetched, or run; this
+//! real `actions/checkout` action source is never fetched or run; this
 //! is a from-scratch, spec-scoped reimplementation of exactly the two
 //! documented outputs (`ref`, `commit`) and the one input combination v0
 //! needs (`repository`, `ref`, `token`, `path`).

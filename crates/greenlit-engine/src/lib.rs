@@ -56,8 +56,8 @@ pub use defer::{DeferReason, StatusFn, StepStatusField};
 pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
 pub use evidence::{
     Assurance, Compatibility, ExecutionConclusion, ExecutionResultV1, FeatureFinding,
-    FindingDisposition, JobLockV1, LockedSource, ResultEvidence, RunLockV1, SupportReport,
-    TraceEventV1, opaque_revision,
+    FindingDisposition, JobLockV1, LockedSource, ResultEvidence, RunLockV1, RunnerLockV1,
+    SupportReport, TraceEventV1, opaque_revision,
 };
 pub use execution::{Conclusion, StepExit, StepInvocation, StepResult};
 pub use git::GitError;

@@ -1,5 +1,8 @@
 {
   "schema_version": 1,
+  "compatibility": {
+    "findings": []
+  },
   "event_name": "push",
   "run_name": null,
   "env": {
