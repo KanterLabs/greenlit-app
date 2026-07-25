@@ -303,6 +303,12 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         for _ in 0..cache_counts.misses {
             invocation.record_lookup("cache", false);
         }
+        // Bytes are a property of the counter, not of any one lookup, so they
+        // are added once rather than divided across the loops above. A run
+        // that saved nothing adds nothing.
+        if cache_counts.bytes_written > 0 {
+            invocation.record_lookup_bytes("cache", true, cache_counts.bytes_written);
+        }
     }
     let action_counts = config.actions.store.counts();
     for _ in 0..action_counts.hits {

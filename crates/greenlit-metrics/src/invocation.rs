@@ -150,6 +150,16 @@ impl Invocation {
 
     /// Increments a named hit/miss counter.
     pub fn record_lookup(&self, name: impl Into<String>, hit: bool) {
+        self.record_lookup_bytes(name, hit, 0);
+    }
+
+    /// Increments a named counter and adds to the bytes it has moved.
+    ///
+    /// Separate from [`Invocation::record_lookup`] because most counters have
+    /// no meaningful byte count — an action fetch either hit the store or did
+    /// not — and defaulting to zero keeps those call sites unchanged rather
+    /// than making every one of them pass a `0`.
+    pub fn record_lookup_bytes(&self, name: impl Into<String>, hit: bool, bytes: u64) {
         let name = name.into();
         if let Ok(mut counters) = self.hit_miss.lock() {
             if let Some(counter) = counters.iter_mut().find(|counter| counter.name == name) {
@@ -158,11 +168,13 @@ impl Invocation {
                 } else {
                     counter.misses = counter.misses.saturating_add(1);
                 }
+                counter.bytes = counter.bytes.saturating_add(bytes);
             } else {
                 counters.push(HitMissCounter {
                     name,
                     hits: u64::from(hit),
                     misses: u64::from(!hit),
+                    bytes,
                 });
             }
         }
