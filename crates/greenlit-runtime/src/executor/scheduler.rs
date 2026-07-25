@@ -39,6 +39,7 @@ struct ConcurrencyGroup {
 #[derive(Clone)]
 struct ScheduleLimits {
     workers: Arc<Semaphore>,
+    machine_workers: Option<Arc<super::worker_pool::MachineWorkerPool>>,
     concurrency: ConcurrencyCoordinator,
 }
 
@@ -143,10 +144,19 @@ pub(super) async fn run(
     let workers = std::thread::available_parallelism()
         .map_or(2, |count| count.get())
         .max(2);
-    let worker_limit = Arc::new(Semaphore::new(workers));
+    let per_run_workers = if workers == 1 { 1 } else { workers - 1 };
+    let worker_limit = Arc::new(Semaphore::new(per_run_workers));
+    let machine_workers = match shared.config.store.as_ref() {
+        Some(store) => Some(Arc::new(
+            super::worker_pool::MachineWorkerPool::open(&store.toolcache_root_parent(), workers)
+                .await?,
+        )),
+        None => None,
+    };
     let concurrency = ConcurrencyCoordinator::default();
     let limits = ScheduleLimits {
         workers: worker_limit,
+        machine_workers,
         concurrency,
     };
     let mut completed = HashMap::new();
@@ -217,11 +227,15 @@ async fn run_group(
         let mut instance_writer = writer.clone();
         let mut instance_progress = progress.clone();
         let workers = Arc::clone(&limits.workers);
+        let machine_workers = limits.machine_workers.clone();
         let instance_needs = Arc::clone(&needs);
         let cancellation = shared.cancellation.clone();
         let coordinator = limits.concurrency.clone();
         let instance_key = format!("{}-{index:03}", group.id.0);
         async move {
+            if cancellation.is_cancelled() {
+                return Ok((index, cancelled_report(&group.id, instance, &masker)));
+            }
             let job_cancellation = crate::Cancellation::new();
             let concurrency_policy = super::instance::materialize_concurrency(
                 instance,
@@ -260,6 +274,16 @@ async fn run_group(
                     ));
                 }
             };
+            let machine_worker_permit = match machine_workers {
+                Some(pool) => match pool.acquire(&cancellation).await {
+                    Ok(permit) => Some(permit),
+                    Err(_) if cancellation.is_cancelled() => {
+                        return Ok((index, cancelled_report(&group.id, instance, &masker)));
+                    }
+                    Err(error) => return Err(error),
+                },
+                None => None,
+            };
             let job_shared = Shared {
                 engine: shared.engine,
                 config: shared.config,
@@ -289,6 +313,7 @@ async fn run_group(
                 }
             };
             drop(worker_permit);
+            drop(machine_worker_permit);
             drop(concurrency_permit);
             result.map(|report| (index, report))
         }

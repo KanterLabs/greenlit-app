@@ -38,6 +38,7 @@ mod scheduler;
 mod services;
 mod step;
 mod step_ids;
+mod worker_pool;
 
 use std::io::Write;
 use std::path::PathBuf;
