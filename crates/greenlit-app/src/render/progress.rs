@@ -102,8 +102,8 @@ impl<W: Write + Send> ProgressSink for ProgressRenderer<W> {
         match event {
             ProgressEvent::PullStarted { image } => {
                 let image = inline_escape(&image);
-                self.phase_line(&format!("image-ensure: pulling {image}"));
-                self.show_transient(&format!("image-ensure: pulling {image}"), true);
+                self.phase_line(&format!("image-ensure: checking {image}"));
+                self.show_transient(&format!("image-ensure: checking {image}"), true);
             }
             ProgressEvent::PullProgress {
                 current_bytes,
@@ -113,7 +113,7 @@ impl<W: Write + Send> ProgressSink for ProgressRenderer<W> {
                     Some(total) => format!("{} / {}", fmt_bytes(current_bytes), fmt_bytes(total)),
                     None => fmt_bytes(current_bytes),
                 };
-                self.show_transient(&format!("image-ensure: pulling ({progress})"), false);
+                self.show_transient(&format!("image-ensure: fetching ({progress})"), false);
             }
             ProgressEvent::PullFinished {
                 image,
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn non_tty_prints_phase_lines_only_and_never_rewrites() {
         let output = drive(false, pull_script());
-        assert!(output.contains("image-ensure: pulling rust:1.96.0\n"));
+        assert!(output.contains("image-ensure: checking rust:1.96.0\n"));
         assert!(output.contains("image-ensure: downloaded 100.0 MiB for rust:1.96.0\n"));
         assert!(output.contains("overlay-setup: workspace ready (copy-in)\n"));
         assert!(!output.contains('\r'), "no in-place rewrites off a tty");

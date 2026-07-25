@@ -94,6 +94,11 @@ jobs:
           LITCI_TEST_LIVE_FULL_CI: "1"
         run: cargo test -p greenlit-app --test cli_behavior policy_modes -- --nocapture
 
+      - name: Enforced native warm performance budgets
+        env:
+          LITCI_TEST_PERFORMANCE: "1"
+        run: cargo test -p greenlit-app --test performance_budgets -- --nocapture
+
   # TESTING.md "Dogfood clause": "from Phase 2 onward this repo's own workflow
   # must run green under Greenlit itself, and that run is a required CI step
   # from Phase 4 onward. A CI tool whose repo can't run its own CI locally has
