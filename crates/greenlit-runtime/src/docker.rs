@@ -132,13 +132,18 @@ fn connect_docker_host(url: &str) -> Result<Docker, RuntimeError> {
     })
 }
 
-/// Splits an image reference into `(name, tag)`.
+/// Splits an image reference into `(name, tag-or-digest)`.
 ///
 /// Docker's `/images/create` endpoint takes `fromImage` and `tag` as separate
-/// query parameters. The tag is the segment after the final `:` unless that
-/// segment contains a `/` (which means the `:` was a registry-host port, e.g.
+/// query parameters. A digest reference uses the repository before `@` and
+/// the complete `sha256:...` value as the second parameter. Otherwise the tag
+/// is the segment after the final `:` unless that segment contains a `/`
+/// (which means the `:` was a registry-host port, e.g.
 /// `localhost:5000/img`). A reference with no tag defaults to `latest`.
 fn split_reference(image: &str) -> (&str, &str) {
+    if let Some((name, digest)) = image.rsplit_once('@') {
+        return (name, digest);
+    }
     match image.rfind(':') {
         Some(idx) if !image[idx + 1..].contains('/') => (&image[..idx], &image[idx + 1..]),
         _ => (image, "latest"),
@@ -214,8 +219,10 @@ impl ContainerEngine for DockerEngine {
                 total_bytes,
             });
         }
+        let downloaded_bytes = layers.values().map(|(current, _)| current).sum();
         progress.on_progress(ProgressEvent::PullFinished {
             image: image.to_string(),
+            downloaded_bytes,
         });
         Ok(())
     }

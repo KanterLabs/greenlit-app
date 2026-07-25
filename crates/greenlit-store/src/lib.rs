@@ -30,6 +30,7 @@ pub mod cache;
 pub mod cas;
 pub mod error;
 mod layout;
+pub mod oci;
 pub mod server;
 
 pub use artifacts::{Artifact, ArtifactStore};

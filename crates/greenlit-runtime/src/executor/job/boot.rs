@@ -174,8 +174,11 @@ impl ProgressSink for MaskedPullSink<'_> {
             ProgressEvent::PullStarted { .. } => ProgressEvent::PullStarted {
                 image: self.masked_image.clone(),
             },
-            ProgressEvent::PullFinished { .. } => ProgressEvent::PullFinished {
+            ProgressEvent::PullFinished {
+                downloaded_bytes, ..
+            } => ProgressEvent::PullFinished {
                 image: self.masked_image.clone(),
+                downloaded_bytes,
             },
             other => other,
         };

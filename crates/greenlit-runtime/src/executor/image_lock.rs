@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use greenlit_engine::planned::Evaluation;
 use greenlit_engine::{ContainerPlan, ExecutionPlan, StepKind};
+use greenlit_store::cas::CasStore;
+use greenlit_store::oci::RegistryResolver;
 
 use crate::{ContainerEngine, ProgressSink};
 
@@ -20,6 +22,7 @@ pub async fn preflight_plan_images(
     engine: &dyn ContainerEngine,
     plan: &ExecutionPlan,
     additional_references: &[String],
+    content_store: &CasStore,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<BTreeMap<String, String>, ExecError> {
     let mut references = BTreeSet::new();
@@ -40,16 +43,54 @@ pub async fn preflight_plan_images(
     }
     references.extend(additional_references.iter().cloned());
     let mut identities = BTreeMap::new();
+    let resolver = RegistryResolver::new(content_store.clone());
     for reference in references {
-        engine.pull_image(&reference, None, progress).await?;
-        let identity = engine.image_identity(&reference).await?.ok_or_else(|| {
-            ExecError::Infrastructure {
+        let resolver = resolver.clone();
+        let reference_for_task = reference.clone();
+        let resolved =
+            tokio::task::spawn_blocking(move || resolver.resolve_linux_amd64(&reference_for_task))
+                .await
+                .map_err(|error| {
+                    ExecError::Infrastructure {
+            message: format!(
+                "container image resolution task for '{reference}' did not complete: {error}"
+            ),
+            fix: "retry; if this repeats, preserve the run directory and file a Greenlit defect"
+                .to_string(),
+        }
+                })?
+                .map_err(|error| ExecError::Infrastructure {
+                    message: format!("could not resolve container image '{reference}': {error}"),
+                    fix: "check registry connectivity and credentials, then retry".to_string(),
+                })?;
+        progress.on_progress(crate::ProgressEvent::ContentResolved {
+            item: reference.clone(),
+            identity: resolved.digest.to_string(),
+            cache_hit: resolved.cache_hit,
+        });
+        engine
+            .pull_image(&resolved.pull_reference, None, progress)
+            .await?;
+        let identity = engine
+            .image_identity(&resolved.pull_reference)
+            .await?
+            .ok_or_else(|| ExecError::Infrastructure {
                 message: format!(
-                    "container image '{reference}' has no immutable identity after materialization"
+                    "container image '{}' has no immutable identity after materialization",
+                    resolved.pull_reference
                 ),
                 fix: "use a registry image that exposes an OCI digest".to_string(),
-            }
-        })?;
+            })?;
+        if identity.digest != resolved.digest.as_str() {
+            return Err(ExecError::Infrastructure {
+                message: format!(
+                    "container engine materialized '{}' as {}, but the locked registry manifest is {}",
+                    resolved.pull_reference, identity.digest, resolved.digest
+                ),
+                fix: "remove the conflicting local image and retry the exact locked digest"
+                    .to_string(),
+            });
+        }
         if identity.os != "linux"
             || (identity.architecture != "amd64" && identity.architecture != "x86_64")
         {
@@ -61,7 +102,7 @@ pub async fn preflight_plan_images(
                 fix: "select a Linux amd64 image or run on a matching supported host".to_string(),
             });
         }
-        identities.insert(reference, identity.digest);
+        identities.insert(reference, resolved.digest.to_string());
     }
     Ok(identities)
 }

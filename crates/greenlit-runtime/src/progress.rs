@@ -37,6 +37,17 @@ pub enum ProgressEvent {
     PullFinished {
         /// The image reference that was pulled.
         image: String,
+        /// Layer bytes transferred by the daemon for this request.
+        downloaded_bytes: u64,
+    },
+    /// A registry alias was resolved to a verified platform manifest.
+    ContentResolved {
+        /// Preparation item that was resolved.
+        item: String,
+        /// Exact immutable identity selected.
+        identity: String,
+        /// Whether manifest/config bytes came from the machine-wide CAS.
+        cache_hit: bool,
     },
     /// An image build began.
     BuildStarted {

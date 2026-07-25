@@ -270,6 +270,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         }
     }
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
+    let content_store = open_content_store()?;
     let mut progress = render::progress::renderer_for_stderr();
     let container_locks = invocation
         .time_stage("image-resolve", || {
@@ -277,6 +278,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
                 &engine,
                 &execution_plan,
                 &action_preflight.container_images,
+                &content_store,
                 &mut progress,
             ))
         })
@@ -445,6 +447,26 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn open_content_store() -> anyhow::Result<greenlit_store::cas::CasStore> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine the user home directory (HOME is not set)\n  fix: set HOME, then retry"
+        )
+    })?;
+    let home = std::path::Path::new(&home);
+    if !home.is_absolute() {
+        anyhow::bail!(
+            "could not determine the user home directory (HOME is not absolute)\n  fix: set HOME to an absolute path, then retry"
+        );
+    }
+    greenlit_store::cas::CasStore::open(greenlit_store::cas::CasStore::default_path_under(home))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
+            )
+        })
 }
 
 /// Export, list, confirm, and apply every ran job's overlay diff, in the

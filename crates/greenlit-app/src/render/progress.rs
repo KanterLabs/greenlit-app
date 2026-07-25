@@ -115,9 +115,32 @@ impl<W: Write + Send> ProgressSink for ProgressRenderer<W> {
                 };
                 self.show_transient(&format!("image-ensure: pulling ({progress})"), false);
             }
-            ProgressEvent::PullFinished { image } => {
-                self.phase_line(&format!("image-ensure: pulled {}", inline_escape(&image)));
+            ProgressEvent::PullFinished {
+                image,
+                downloaded_bytes,
+            } => {
+                let image = inline_escape(&image);
+                if downloaded_bytes == 0 {
+                    self.phase_line(&format!("image-ensure: cache hit {image} (0 B downloaded)"));
+                } else {
+                    self.phase_line(&format!(
+                        "image-ensure: downloaded {} for {image}",
+                        fmt_bytes(downloaded_bytes)
+                    ));
+                }
                 self.clear_transient();
+            }
+            ProgressEvent::ContentResolved {
+                item,
+                identity,
+                cache_hit,
+            } => {
+                let source = if cache_hit { "CAS hit" } else { "verified now" };
+                self.phase_line(&format!(
+                    "image-resolve: {} -> {} ({source})",
+                    inline_escape(&item),
+                    inline_escape(&identity)
+                ));
             }
             ProgressEvent::BuildStarted { tag } => {
                 let tag = inline_escape(&tag);
@@ -236,6 +259,7 @@ mod tests {
             },
             ProgressEvent::PullFinished {
                 image: "rust:1.96.0".to_string(),
+                downloaded_bytes: 100 * 1024 * 1024,
             },
             ProgressEvent::BootStarted,
             ProgressEvent::BootFinished,
@@ -253,7 +277,7 @@ mod tests {
     fn non_tty_prints_phase_lines_only_and_never_rewrites() {
         let output = drive(false, pull_script());
         assert!(output.contains("image-ensure: pulling rust:1.96.0\n"));
-        assert!(output.contains("image-ensure: pulled rust:1.96.0\n"));
+        assert!(output.contains("image-ensure: downloaded 100.0 MiB for rust:1.96.0\n"));
         assert!(output.contains("overlay-setup: workspace ready (copy-in)\n"));
         assert!(!output.contains('\r'), "no in-place rewrites off a tty");
         assert!(

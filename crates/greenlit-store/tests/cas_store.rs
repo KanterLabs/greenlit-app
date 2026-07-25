@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
 use greenlit_store::cas::{CasError, CasStore, EnsureOutcome, HttpFetch, ObjectDigest};
+use greenlit_store::oci::RegistryResolver;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -260,4 +261,136 @@ fn canonical_tree_round_trip_preserves_files_links_modes_and_alias_identity() {
         fs::read_link(restored.join("main")).expect("link should read"),
         std::path::PathBuf::from("nested/action.js")
     );
+}
+
+#[test]
+fn registry_index_resolution_selects_and_verifies_the_linux_amd64_manifest() {
+    let config = br#"{"architecture":"amd64","os":"linux"}"#;
+    let config_digest = digest(config);
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":{},"digest":"{}"}},"layers":[]}}"#,
+        config.len(),
+        config_digest
+    );
+    let manifest_digest = digest(manifest.as_bytes());
+    let index = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":{},"digest":"{}","platform":{{"architecture":"amd64","os":"linux"}}}}]}}"#,
+        manifest.len(),
+        manifest_digest
+    );
+    let index_digest = digest(index.as_bytes());
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("registry should bind");
+    let address = listener
+        .local_addr()
+        .expect("registry address should resolve");
+    let manifest_for_server = manifest.clone();
+    let index_for_server = index.clone();
+    let config_for_server = config.to_vec();
+    let manifest_digest_for_server = manifest_digest.clone();
+    let config_digest_for_server = config_digest.clone();
+    let index_digest_for_server = index_digest.clone();
+    let server = std::thread::spawn(move || {
+        for request_number in 0..6 {
+            let (mut stream, _) = listener.accept().expect("registry request should arrive");
+            let mut request = [0_u8; 8192];
+            let read = stream.read(&mut request).expect("request should read");
+            let request = String::from_utf8_lossy(&request[..read]);
+            let first = request.lines().next().unwrap_or_default();
+            let (status, headers, body): (&str, String, &[u8]) = match request_number {
+                0 => (
+                    "401 Unauthorized",
+                    format!(
+                        "WWW-Authenticate: Bearer realm=\"http://{address}/token\",service=\"local\",scope=\"repository:repo:pull\"\r\n"
+                    ),
+                    b"",
+                ),
+                1 => (
+                    "200 OK",
+                    "Content-Type: application/json\r\n".to_string(),
+                    br#"{"token":"registry-token"}"#,
+                ),
+                2 => {
+                    assert!(first.starts_with("HEAD /v2/repo/manifests/test "));
+                    assert!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer registry-token")
+                    );
+                    (
+                        "200 OK",
+                        format!("Docker-Content-Digest: {index_digest_for_server}\r\n"),
+                        b"",
+                    )
+                }
+                3 => {
+                    assert!(first.starts_with("GET /v2/repo/manifests/test "));
+                    assert!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer registry-token")
+                    );
+                    (
+                        "200 OK",
+                        "Content-Type: application/vnd.oci.image.index.v1+json\r\n".to_string(),
+                        index_for_server.as_bytes(),
+                    )
+                }
+                4 => {
+                    assert!(first.contains(&format!(
+                        "/v2/repo/manifests/{}",
+                        manifest_digest_for_server
+                    )));
+                    (
+                        "200 OK",
+                        "Content-Type: application/vnd.oci.image.manifest.v1+json\r\n".to_string(),
+                        manifest_for_server.as_bytes(),
+                    )
+                }
+                _ => {
+                    assert!(first.contains(&format!("/v2/repo/blobs/{config_digest_for_server}")));
+                    (
+                        "200 OK",
+                        "Content-Type: application/octet-stream\r\n".to_string(),
+                        config_for_server.as_slice(),
+                    )
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .and_then(|()| stream.write_all(body))
+                .expect("registry response should write");
+        }
+    });
+
+    let temp = TempDir::new().expect("temp root should be created");
+    let store = CasStore::open(temp.path()).expect("store should open");
+    let resolver = RegistryResolver::new(store.clone());
+    let resolved = resolver
+        .resolve_linux_amd64(&format!("{address}/repo:test"))
+        .expect("platform should resolve");
+    assert_eq!(resolved.digest, manifest_digest);
+    assert_eq!(
+        resolved.pull_reference,
+        format!("{address}/repo@{}", resolved.digest)
+    );
+    assert_eq!(resolved.os, "linux");
+    assert_eq!(resolved.architecture, "amd64");
+    assert_eq!(
+        store
+            .read_verified(&resolved.digest)
+            .expect("manifest should verify"),
+        Some(manifest.into_bytes())
+    );
+    assert_eq!(
+        store
+            .read_verified(&config_digest)
+            .expect("config should verify"),
+        Some(config.to_vec())
+    );
+    server.join().expect("registry should finish");
 }
