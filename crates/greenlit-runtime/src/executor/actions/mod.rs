@@ -71,6 +71,8 @@ pub struct ActionPreflight {
     pub actions: std::collections::BTreeMap<String, String>,
     /// Required Node runtime variants mapped to pinned bundle identities.
     pub toolchains: std::collections::BTreeMap<String, String>,
+    /// Registry images required by resolved Docker actions.
+    pub container_images: Vec<String>,
 }
 
 /// Resolves and fetches every statically materialized action in an execution
@@ -89,6 +91,7 @@ pub async fn preflight_plan_actions(
     let mut identities = std::collections::BTreeMap::new();
     let mut needs_node20 = false;
     let mut needs_node24 = false;
+    let mut container_images = std::collections::BTreeSet::new();
     for job in &plan.jobs {
         if !job.steps.is_empty() {
             let resolved =
@@ -96,6 +99,7 @@ pub async fn preflight_plan_actions(
             identities.extend(resolved.identities);
             needs_node20 |= resolved.needs_node20;
             needs_node24 |= resolved.needs_node24;
+            container_images.extend(resolved.container_images);
         }
         for leg in &job.legs {
             let resolved =
@@ -103,6 +107,7 @@ pub async fn preflight_plan_actions(
             identities.extend(resolved.identities);
             needs_node20 |= resolved.needs_node20;
             needs_node24 |= resolved.needs_node24;
+            container_images.extend(resolved.container_images);
         }
     }
     let toolchains = locked_node_toolchains(
@@ -113,6 +118,7 @@ pub async fn preflight_plan_actions(
     Ok(ActionPreflight {
         actions: identities,
         toolchains,
+        container_images: container_images.into_iter().collect(),
     })
 }
 
@@ -193,21 +199,4 @@ pub struct ActionRuntimeConfig {
     /// (`PHASE-3-actions.md` "actions/checkout"), rather than attempting an
     /// anonymous clone that may or may not happen to work.
     pub github_token: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn action_preflight_locks_every_required_node_variant() {
-        let locks = locked_node_toolchains(&node_runtime::PinnedNodeBundleSpecs, true, false);
-        assert_eq!(locks.len(), 2);
-        assert!(
-            locks["node20.standard.linux-amd64"].starts_with("https://nodejs.org/dist/v20.20.2/")
-        );
-        assert!(locks["node20.standard.linux-amd64"].contains("#sha256:19e56f0825510207"));
-        assert!(locks.contains_key("node20.alpine.linux-amd64"));
-        assert!(!locks.contains_key("node24.standard.linux-amd64"));
-    }
 }

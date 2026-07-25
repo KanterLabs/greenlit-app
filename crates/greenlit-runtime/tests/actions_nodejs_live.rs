@@ -184,6 +184,7 @@ async fn a_real_node20_action_runs_with_the_real_pinned_bundle() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "actions-nodejs-live".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: real_action_config(store_root.path()),

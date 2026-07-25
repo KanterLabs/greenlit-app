@@ -254,6 +254,7 @@ pub(crate) async fn run_instance(
             Ok(resolved) => {
                 match services::start(
                     shared.engine,
+                    shared.config,
                     job_network.name(),
                     job_network.policy(),
                     &resolved,
@@ -312,8 +313,28 @@ pub(crate) async fn run_instance(
     // The network policy goes on before readiness, and therefore before any
     // workflow code runs: a container that has executed even one step under
     // an unrestricted network has already had its chance to reach the LAN.
-    if let Err(error) =
-        netguard::apply(shared.engine, &container, job_network.policy(), progress).await
+    let netguard_image = shared.config.locked_image(netguard::NETGUARD_IMAGE)?;
+    if shared.config.locked_images.is_some() && !shared.engine.image_exists(&netguard_image).await?
+    {
+        let _ = shared.engine.remove_container(&container).await;
+        services::stop(shared.engine, &services_started).await;
+        job_network.teardown(shared.engine).await;
+        return Err(ExecError::Infrastructure {
+            message: format!(
+                "locked network-guard image '{netguard_image}' disappeared before job startup"
+            ),
+            fix: "retry to prepare the exact image again; do not prune Docker images during an active run"
+                .to_string(),
+        });
+    }
+    if let Err(error) = netguard::apply(
+        shared.engine,
+        &container,
+        job_network.policy(),
+        &netguard_image,
+        progress,
+    )
+    .await
     {
         let _ = shared.engine.remove_container(&container).await;
         services::stop(shared.engine, &services_started).await;
@@ -542,6 +563,7 @@ async fn run_job_body(
         action_config: &shared.config.actions,
         node_mounts: layers.node_mounts,
         volume_namespace: &shared.config.volume_namespace,
+        locked_images: shared.config.locked_images.as_ref(),
         docker_volumes: layers.docker_volumes,
         step_action_ids: &step_action_ids,
     };

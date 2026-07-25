@@ -106,6 +106,10 @@ pub struct RunConfig {
     /// containers within one VM" behavior a workflow author would observe on
     /// GitHub.
     pub volume_namespace: String,
+    /// Requested container aliases mapped to the immutable image identities
+    /// finalized in the RunLock. `None` is reserved for injected test
+    /// executors that do not perform host-side resolution.
+    pub locked_images: Option<std::collections::BTreeMap<String, String>>,
     /// Whether `--write-back` was requested. When `true`, a ran job's
     /// container is kept alive (not torn down) so its overlay upper can be
     /// exported after the whole run finishes (`JobReport::container_id`);
@@ -119,6 +123,31 @@ pub struct RunConfig {
     /// Where the local cache, artifact, and toolcache stores live, when this
     /// run serves them. `None` runs with no cache service at all.
     pub store: Option<StoreConfig>,
+}
+
+impl RunConfig {
+    fn locked_image(&self, requested: &str) -> Result<String, ExecError> {
+        resolve_locked_image(self.locked_images.as_ref(), requested)
+    }
+}
+
+fn resolve_locked_image(
+    locks: Option<&std::collections::BTreeMap<String, String>>,
+    requested: &str,
+) -> Result<String, ExecError> {
+    let Some(locks) = locks else {
+        return Ok(requested.to_string());
+    };
+    locks
+        .get(requested)
+        .cloned()
+        .ok_or_else(|| ExecError::Infrastructure {
+            message: format!(
+                "container image '{requested}' is absent from the finalized RunLock"
+            ),
+            fix: "select a statically resolvable image or preserve the run directory and file a Greenlit defect"
+                .to_string(),
+        })
 }
 
 /// A failure during execution. Detection-time engine conditions never travel

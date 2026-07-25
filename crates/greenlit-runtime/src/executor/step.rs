@@ -89,6 +89,8 @@ pub(crate) struct JobRuntime<'a> {
     /// This run's volume-namespacing token
     /// (`crate::RunConfig::volume_namespace`).
     pub volume_namespace: &'a str,
+    /// Container aliases frozen by the RunLock.
+    pub locked_images: Option<&'a std::collections::BTreeMap<String, String>>,
     /// The bare names of this job's shared Docker-action volumes, if
     /// [`JobActionPlan::needs_docker_sibling`] provisioned them
     /// (`crate::executor::actions::docker_action` module docs).
@@ -746,6 +748,7 @@ async fn execute_uses_step(
                 github_token: job.action_config.github_token.as_deref(),
                 step_span: &step_span,
                 volume_namespace: job.volume_namespace,
+                locked_images: job.locked_images,
                 docker_volumes: job.docker_volumes,
                 base_env: job.base_env,
                 workflow_env: job.workflow_env,
@@ -807,6 +810,7 @@ async fn execute_uses_step(
                     cmdfiles: &paths,
                     volumes,
                     volume_namespace: job.volume_namespace,
+                    locked_images: job.locked_images,
                 },
                 io.out,
                 io.masker,

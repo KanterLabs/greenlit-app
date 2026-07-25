@@ -55,7 +55,7 @@ use crate::error::RuntimeError;
 /// Alpine is used because it is small and its `iptables` package speaks the
 /// `nf_tables` backend modern hosts use. It is pulled once and cached like
 /// any other image.
-const NETGUARD_IMAGE: &str = "alpine:3.20";
+pub(crate) const NETGUARD_IMAGE: &str = "alpine:3.20";
 
 /// Private ranges a workflow container must not reach.
 ///
@@ -91,14 +91,15 @@ pub async fn apply(
     engine: &dyn ContainerEngine,
     container: &str,
     policy: &Policy,
+    image: &str,
     progress: &mut (dyn crate::progress::ProgressSink + Send),
 ) -> Result<(), RuntimeError> {
-    if !engine.image_exists(NETGUARD_IMAGE).await? {
-        engine.pull_image(NETGUARD_IMAGE, None, progress).await?;
+    if !engine.image_exists(image).await? {
+        engine.pull_image(image, None, progress).await?;
     }
 
     let spec = ContainerSpec {
-        image: NETGUARD_IMAGE.to_string(),
+        image: image.to_string(),
         // Joining the target's namespace is what makes rules installed here
         // apply to it.
         network: Some(format!("container:{container}")),

@@ -276,6 +276,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             runtime.block_on(greenlit_runtime::preflight_plan_images(
                 &engine,
                 &execution_plan,
+                &action_preflight.container_images,
                 &mut progress,
             ))
         })
@@ -323,6 +324,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         // registers with the Phase 2 masker before any step runs").
         initial_masks: all_secrets.iter().map(|(_, value)| value.clone()).collect(),
         volume_namespace: run_volume_namespace(),
+        locked_images: Some(run_lock.containers.clone()),
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: actions_config,

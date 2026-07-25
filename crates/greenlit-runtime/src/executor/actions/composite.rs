@@ -113,6 +113,8 @@ pub(crate) struct CompositeEnv<'a> {
     /// This run's volume-namespacing token, for a nested Docker action's
     /// sibling container.
     pub volume_namespace: &'a str,
+    /// Container aliases frozen by the RunLock.
+    pub locked_images: Option<&'a std::collections::BTreeMap<String, String>>,
     /// The job's shared Docker-action volumes, if the pre-pass provisioned
     /// them (`super::docker_action` module docs). Present whenever the job
     /// contains a Docker action at *any* nesting depth, which is exactly
@@ -688,6 +690,7 @@ async fn run_nested_uses(
                     cmdfiles: &paths,
                     volumes,
                     volume_namespace: env.volume_namespace,
+                    locked_images: env.locked_images,
                 },
                 state.out,
                 state.masker,

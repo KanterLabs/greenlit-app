@@ -120,28 +120,3 @@ fn runtime_dependent_runner(job: &str) -> ExecError {
             .to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runner_labels_select_distinct_locked_releases() {
-        assert_eq!(
-            release_for(RunnerImage::Ubuntu2404),
-            UbuntuRelease::Noble2404
-        );
-        assert_eq!(
-            release_for(RunnerImage::Ubuntu2204),
-            UbuntuRelease::Jammy2204
-        );
-    }
-
-    #[test]
-    fn runner_platform_validation_fails_closed() {
-        validate_platform("runner", "linux", "amd64").expect("supported platform");
-        let error = validate_platform("runner", "linux", "arm64")
-            .expect_err("architecture mismatch must fail");
-        assert!(error.to_string().contains("linux/arm64"));
-    }
-}

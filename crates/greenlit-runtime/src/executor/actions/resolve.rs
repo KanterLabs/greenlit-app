@@ -146,6 +146,8 @@ pub(crate) struct JobActionPlan {
     pub needs_node24: bool,
     /// Every repository action reference mapped to its resolved commit.
     pub identities: BTreeMap<String, String>,
+    /// Static registry images required by Docker actions at any nesting depth.
+    pub container_images: std::collections::BTreeSet<String>,
 }
 
 /// Accumulates the aggregate results (binds, flags) while [`resolve_uses`]
@@ -165,6 +167,7 @@ struct Collector {
     needs_node20: bool,
     needs_node24: bool,
     identities: BTreeMap<String, String>,
+    container_images: std::collections::BTreeSet<String>,
 }
 
 /// Resolves every `uses:` step in `steps` (recursing into composites),
@@ -210,6 +213,7 @@ pub(crate) async fn resolve_job_actions(
         needs_node20: collector.needs_node20,
         needs_node24: collector.needs_node24,
         identities: collector.identities,
+        container_images: collector.container_images,
     })
 }
 
@@ -260,6 +264,7 @@ fn resolve_uses<'a>(
         match parsed {
             ActionRef::Docker { image } => {
                 collector.needs_docker_sibling = true;
+                collector.container_images.insert(image.clone());
                 Ok(ResolvedUses::Docker(ResolvedDocker {
                     source: DockerImageSource::Pull { image },
                     inputs: IndexMap::new(),
@@ -424,9 +429,21 @@ async fn dispatch_manifest(
         Runs::Docker(docker_runs) => {
             collector.needs_docker_sibling = true;
             let source = match docker_runs.image.strip_prefix("docker://") {
-                Some(image) => DockerImageSource::Pull {
-                    image: image.to_string(),
-                },
+                Some(image) => {
+                    if image.contains("${{") {
+                        return Err(ExecError::Infrastructure {
+                            message: format!(
+                                "Docker action '{reference}' has a runtime-dependent registry image"
+                            ),
+                            fix: "pin the action to a Dockerfile or a statically resolvable docker:// image"
+                                .to_string(),
+                        });
+                    }
+                    collector.container_images.insert(image.to_string());
+                    DockerImageSource::Pull {
+                        image: image.to_string(),
+                    }
+                }
                 None => DockerImageSource::Build {
                     host_action_dir,
                     dockerfile: docker_runs.image,
@@ -648,6 +665,7 @@ mod tests {
             .expect("docker:// needs no fetch at all");
         assert!(plan.needs_docker_sibling);
         assert!(matches!(plan.per_step[0], Some(ResolvedUses::Docker(_))));
+        assert!(plan.container_images.contains("alpine:3.19"));
     }
 
     #[tokio::test]

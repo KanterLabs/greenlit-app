@@ -261,6 +261,7 @@ pub struct StartedService {
 /// to stop them before it can remove the network they are attached to.
 pub async fn start(
     engine: &dyn ContainerEngine,
+    config: &crate::executor::RunConfig,
     network: &str,
     policy: &crate::executor::netguard::Policy,
     services: &[(String, ResolvedService)],
@@ -286,16 +287,29 @@ pub async fn start(
             };
         }
 
-        if !bail!(engine.image_exists(&service.image).await) {
+        let image = bail!(config.locked_image(&service.image));
+        if !bail!(engine.image_exists(&image).await) {
+            if config.locked_images.is_some() {
+                return Err(ServiceStartFailure {
+                    cause: crate::executor::ExecError::Infrastructure {
+                        message: format!(
+                            "locked service image '{image}' disappeared before service startup"
+                        ),
+                        fix: "retry to prepare the exact image again; do not prune Docker images during an active run"
+                            .to_string(),
+                    },
+                    started,
+                });
+            }
             bail!(
                 engine
-                    .pull_image(&service.image, service.registry_auth.as_ref(), progress)
+                    .pull_image(&image, service.registry_auth.as_ref(), progress)
                     .await
             );
         }
 
         let spec = ContainerSpec {
-            image: service.image.clone(),
+            image,
             env: service.env.clone(),
             network: Some(network.to_string()),
             // The service id is the name the job connects to.
@@ -319,7 +333,29 @@ pub async fn start(
         bail!(engine.start_container(&container).await);
         // A service is untrusted code too, and it is on the same bridge as
         // the job -- so it is contained by the same policy.
-        bail!(crate::executor::netguard::apply(engine, &container, policy, progress).await);
+        let netguard_image = bail!(config.locked_image(crate::executor::netguard::NETGUARD_IMAGE));
+        if config.locked_images.is_some() && !bail!(engine.image_exists(&netguard_image).await) {
+            return Err(ServiceStartFailure {
+                cause: crate::executor::ExecError::Infrastructure {
+                    message: format!(
+                        "locked network-guard image '{netguard_image}' disappeared before service startup"
+                    ),
+                    fix: "retry to prepare the exact image again; do not prune Docker images during an active run"
+                        .to_string(),
+                },
+                started,
+            });
+        }
+        bail!(
+            crate::executor::netguard::apply(
+                engine,
+                &container,
+                policy,
+                &netguard_image,
+                progress,
+            )
+            .await
+        );
         bail!(wait_healthy(engine, &container, id).await);
         progress.on_progress(ProgressEvent::ServiceReady {
             service: id.clone(),

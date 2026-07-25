@@ -145,16 +145,38 @@ async fn ensure_image(
     engine: &dyn ContainerEngine,
     source: &DockerImageSource,
     ctx: &Context,
+    locked_images: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Result<String, ExecError> {
     match source {
         DockerImageSource::Pull { image } => {
             let resolved =
                 template::resolve_template(image, ctx).map_err(ExecError::template_eval)?;
-            if !engine.image_exists(&resolved).await? {
+            let materialized = match locked_images {
+                Some(locks) => locks.get(&resolved).cloned().ok_or_else(|| {
+                    ExecError::Infrastructure {
+                        message: format!(
+                            "Docker action image '{resolved}' is absent from the finalized RunLock"
+                        ),
+                        fix: "use a statically resolvable Docker action image or preserve the run directory and file a Greenlit defect"
+                            .to_string(),
+                    }
+                })?,
+                None => resolved.clone(),
+            };
+            if !engine.image_exists(&materialized).await? {
+                if locked_images.is_some() {
+                    return Err(ExecError::Infrastructure {
+                        message: format!(
+                            "locked Docker action image '{materialized}' disappeared before step startup"
+                        ),
+                        fix: "retry to prepare the exact image again; do not prune Docker images during an active run"
+                            .to_string(),
+                    });
+                }
                 let mut null = crate::progress::ProgressNull;
                 engine.pull_image(&resolved, None, &mut null).await?;
             }
-            Ok(resolved)
+            Ok(materialized)
         }
         DockerImageSource::Build {
             host_action_dir,
@@ -231,6 +253,7 @@ pub(crate) struct DockerActionRequest<'a> {
     /// they always exist by the time this runs.
     pub volumes: SiblingVolumes,
     pub volume_namespace: &'a str,
+    pub locked_images: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// What one Docker action step produced: how it exited, and whatever it
@@ -265,8 +288,9 @@ pub(crate) async fn run_step(
         cmdfiles: paths,
         volumes,
         volume_namespace,
+        locked_images,
     } = request;
-    let image = ensure_image(engine, &resolved.source, ctx).await?;
+    let image = ensure_image(engine, &resolved.source, ctx, locked_images).await?;
 
     let mut args = Vec::with_capacity(resolved.args.len());
     for arg in &resolved.args {

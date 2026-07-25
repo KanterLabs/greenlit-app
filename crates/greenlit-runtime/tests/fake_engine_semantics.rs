@@ -55,6 +55,7 @@ struct ScriptedEngine {
     readiness: ReadinessScript,
     /// How many readiness polls have been answered.
     polls: AtomicUsize,
+    created_images: Mutex<Vec<String>>,
 }
 
 impl ScriptedEngine {
@@ -166,7 +167,8 @@ impl ContainerEngine for ScriptedEngine {
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {
         Ok("committed".to_string())
     }
-    async fn create_container(&self, _spec: &ContainerSpec) -> Result<String, RuntimeError> {
+    async fn create_container(&self, spec: &ContainerSpec) -> Result<String, RuntimeError> {
+        self.created_images.lock().unwrap().push(spec.image.clone());
         Ok(format!(
             "fake-{}",
             self.counter.fetch_add(1, Ordering::Relaxed)
@@ -286,6 +288,81 @@ impl ContainerEngine for ScriptedEngine {
     }
 }
 
+#[tokio::test]
+async fn execution_uses_locked_image_identity_instead_of_mutable_alias() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "locked-image.yml",
+        r#"
+on: push
+jobs:
+  only:
+    runs-on: ubuntu-latest
+    container:
+      image: mutable.example/tool:latest
+    steps:
+      - run: ECHO locked
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "locked-image".to_string(),
+        locked_images: Some(std::collections::BTreeMap::from([
+            (
+                "mutable.example/tool:latest".to_string(),
+                "sha256:immutable".to_string(),
+            ),
+            ("alpine:3.20".to_string(), "sha256:netguard".to_string()),
+        ])),
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+
+    run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+    let created = engine.created_images.lock().unwrap();
+    assert_eq!(
+        created.first().map(String::as_str),
+        Some("sha256:immutable")
+    );
+    assert!(
+        !created
+            .iter()
+            .any(|image| image == "mutable.example/tool:latest"),
+        "a mutable alias must never cross the container-engine boundary after locking: {created:?}"
+    );
+    assert!(created.iter().any(|image| image == "sha256:netguard"));
+    assert!(!created.iter().any(|image| image == "alpine:3.20"));
+}
+
 const WORKFLOW: &str = r#"
 name: fake-ci
 on: push
@@ -362,6 +439,7 @@ async fn dag_propagation_rollup_gating_and_masking() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
@@ -465,6 +543,7 @@ async fn checkouts_post_step_runs_even_when_a_later_step_fails() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
@@ -574,6 +653,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
@@ -599,9 +679,8 @@ async fn preparation_progress_events_arrive_in_phase_order() {
     );
 }
 
-/// A minimal `ActionRuntimeConfig` for tests that don't exercise a real
-/// `uses:` fetch/resolve: every trait-object field errors unconditionally,
-/// so a test fails loudly (not silently) if it ever reaches one.
+/// A minimal `ActionRuntimeConfig`: it resolves only the built-in checkout
+/// action identity and fails every source fetch or other action resolution.
 fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeConfig {
     use greenlit_actions::CommitSha;
     use greenlit_actions::resolve::{RefResolver, ResolveError};
@@ -613,15 +692,25 @@ fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeCon
     use std::path::Path;
     use std::sync::Arc;
 
-    struct NeverResolves;
+    struct CheckoutOnlyResolver;
     #[async_trait::async_trait]
-    impl RefResolver for NeverResolves {
+    impl RefResolver for CheckoutOnlyResolver {
         async fn resolve(
             &self,
             owner: &str,
             repo: &str,
             git_ref: &str,
         ) -> Result<CommitSha, ResolveError> {
+            if owner == "actions" && repo == "checkout" {
+                return CommitSha::parse(&"c".repeat(40)).map_err(|error| {
+                    ResolveError::TaskFailed {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        git_ref: git_ref.to_string(),
+                        message: error.to_string(),
+                    }
+                });
+            }
             Err(ResolveError::NotFound {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -659,7 +748,7 @@ fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeCon
     }
 
     greenlit_runtime::executor::actions::ActionRuntimeConfig {
-        resolver: Arc::new(NeverResolves),
+        resolver: Arc::new(CheckoutOnlyResolver),
         store: ActionStore::at(std::env::temp_dir().join("greenlit-test-unused-action-store")),
         fetcher: Arc::new(NeverFetches),
         node_runtime_fetcher: Arc::new(NeverDownloads),
@@ -712,6 +801,7 @@ async fn run_single_job(
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: tiny_readiness(),
         actions: test_action_config(),

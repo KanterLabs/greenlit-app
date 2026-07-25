@@ -19,9 +19,11 @@ use super::ExecError;
 pub async fn preflight_plan_images(
     engine: &dyn ContainerEngine,
     plan: &ExecutionPlan,
+    additional_references: &[String],
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<BTreeMap<String, String>, ExecError> {
     let mut references = BTreeSet::new();
+    references.insert(crate::executor::netguard::NETGUARD_IMAGE.to_string());
     for job in &plan.jobs {
         collect_container(job.container.as_ref(), &mut references)?;
         for service in job.services.values() {
@@ -36,6 +38,7 @@ pub async fn preflight_plan_images(
             collect_docker_steps(&leg.steps, &mut references);
         }
     }
+    references.extend(additional_references.iter().cloned());
     let mut identities = BTreeMap::new();
     for reference in references {
         engine.pull_image(&reference, None, progress).await?;

@@ -84,24 +84,30 @@ pub(super) async fn resolve_image(
                 &shared.config.workspace,
                 &shared.config.volume_namespace,
             )?;
+            let locked_image = shared.config.locked_image(&resolved.image)?;
             // Pull only when absent, so a present image (and an offline host)
             // still runs, and re-runs skip the registry round-trip. The image
             // reference is expression-resolved, so it is masked before it can
             // reach a progress display.
             let masked_image = masker.apply(&resolved.image);
             let ensure = async {
-                if !shared.engine.image_exists(&resolved.image).await? {
+                if !shared.engine.image_exists(&locked_image).await? {
+                    if shared.config.locked_images.is_some() {
+                        return Err(ExecError::Infrastructure {
+                            message: format!(
+                                "locked container image '{locked_image}' disappeared before job startup"
+                            ),
+                            fix: "retry to prepare the exact image again; do not prune Docker images during an active run"
+                                .to_string(),
+                        });
+                    }
                     let mut masked = MaskedPullSink {
                         inner: progress,
                         masked_image,
                     };
                     shared
                         .engine
-                        .pull_image(
-                            &resolved.image,
-                            additions.registry_auth.as_ref(),
-                            &mut masked,
-                        )
+                        .pull_image(&locked_image, additions.registry_auth.as_ref(), &mut masked)
                         .await?;
                 }
                 Ok::<_, ExecError>(())
@@ -110,7 +116,7 @@ pub(super) async fn resolve_image(
             // A job container image is not guaranteed to ship bash; GitHub
             // defaults such jobs to `sh`.
             Ok(ResolvedImage {
-                tag: resolved.image,
+                tag: locked_image,
                 base: None,
                 in_container: true,
                 bash_available: false,
