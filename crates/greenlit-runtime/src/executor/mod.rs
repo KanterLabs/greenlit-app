@@ -1,10 +1,10 @@
 //! The executor: drive a resolved [`ExecutionPlan`] to completion against a
-//! [`ContainerEngine`], one container per job, one exec per step, sequentially
-//! in DAG order.
+//! [`ContainerEngine`], one fresh container per job and one exec per step.
 //!
 //! `PHASE-2-execution.md` ("Job and step execution semantics", "Output and
 //! metrics"): one container per job; each step is an exec in that container;
-//! jobs run sequentially in topological order (parallelism is Phase 5). Every
+//! ready jobs and matrix legs run concurrently while steps remain sequential.
+//! Every
 //! GitHub-faithful rule — shell resolution, env layering, command files, the
 //! `outcome`/`conclusion` model, `needs` propagation, job outputs — is the
 //! engine's [`greenlit_engine::execution`] semantics; this module is the
@@ -34,22 +34,22 @@ mod readiness;
 mod report;
 mod runner_lock;
 mod runner_profile;
+mod scheduler;
 mod services;
 mod step;
 mod step_ids;
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 
+use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::contexts::merge_matrix_outputs;
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::execution::job_outputs::JobOutputError;
-use greenlit_engine::execution::{Masker, NeedRecord};
-use greenlit_engine::{Conclusion, EnvValue, ExecutionPlan, JobId};
+use greenlit_engine::{Conclusion, EnvValue, ExecutionPlan};
 use greenlit_expr::{EvalError, RealFs, Value};
 use greenlit_workflow::Span;
 
@@ -322,17 +322,18 @@ impl ExecError {
 }
 
 /// A completed job's aggregate result and its merged outputs, for dependents.
-struct CompletedJob {
-    result: Conclusion,
-    outputs: IndexMap<String, String>,
+#[derive(Clone)]
+pub(crate) struct CompletedJob {
+    pub(crate) result: Conclusion,
+    pub(crate) outputs: IndexMap<String, String>,
     /// Whether this job or any job in its own ancestor chain failed
     /// (transitively) — GitHub: "If you have a chain of dependent jobs,
     /// failure() returns true if any ancestor job fails."
     /// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions>
-    chain_failed: bool,
+    pub(crate) chain_failed: bool,
     /// Whether this job or any ancestor was cancelled (transitively), mirroring
     /// `chain_failed`'s propagation for `cancelled()`.
-    chain_cancelled: bool,
+    pub(crate) chain_cancelled: bool,
 }
 
 /// The run-wide, immutable context every job instance shares.
@@ -393,75 +394,7 @@ pub async fn run_plan(
         workflow_env: &plan.env,
     };
 
-    let mut job_reports: Vec<JobReport> = Vec::new();
-    let mut completed: HashMap<String, CompletedJob> = HashMap::new();
-
-    for group in &groups {
-        let mut instance_results: Vec<(Conclusion, IndexMap<String, String>)> = Vec::new();
-        for instance in &group.instances {
-            let needs = needs_records(instance.needs, &completed);
-            let report = job::run_instance(
-                &shared,
-                &mut masker,
-                instance,
-                &group.id,
-                &needs,
-                out,
-                progress,
-            )
-            .await?;
-            instance_results.push((report.result, report.outputs.clone()));
-            job_reports.push(report);
-        }
-        // The group's own ancestor-chain flags combine its own aggregate
-        // result with every direct dependency's already-computed chain
-        // flags, so a failure (or cancellation) keeps propagating downstream
-        // even through an intermediate job that itself only *skipped*
-        // because of it (finding: transitive `failure()` across ancestors).
-        let aggregated = aggregate(&instance_results);
-        let ancestors_failed = group
-            .needs
-            .iter()
-            .any(|need| completed.get(&need.0).is_some_and(|done| done.chain_failed));
-        let ancestors_cancelled = group.needs.iter().any(|need| {
-            completed
-                .get(&need.0)
-                .is_some_and(|done| done.chain_cancelled)
-        });
-        let chain_failed = ancestors_failed || matches!(aggregated.0, Conclusion::Failure);
-        let chain_cancelled = ancestors_cancelled || matches!(aggregated.0, Conclusion::Cancelled);
-        completed.insert(
-            group.id.0.clone(),
-            CompletedJob {
-                result: aggregated.0,
-                outputs: aggregated.1,
-                chain_failed,
-                chain_cancelled,
-            },
-        );
-    }
-
-    let overall = RunReport::overall_of(&job_reports);
-    Ok(RunReport {
-        jobs: job_reports,
-        overall,
-    })
-}
-
-/// Build the `needs` records for one instance from the completed dependencies.
-fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> Vec<NeedRecord> {
-    needs
-        .iter()
-        .filter_map(|need| {
-            completed.get(&need.0).map(|done| NeedRecord {
-                job: need.clone(),
-                result: done.result,
-                outputs: done.outputs.clone(),
-                chain_failed: done.chain_failed,
-                chain_cancelled: done.chain_cancelled,
-            })
-        })
-        .collect()
+    scheduler::run(&shared, &groups, &masker, out, progress).await
 }
 
 /// Aggregate a job's per-leg results into the single result and merged output
@@ -470,7 +403,7 @@ fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> 
 /// GitHub reports a matrix job's `needs.<id>.result` as the worst leg outcome
 /// (a single failed leg fails the dependency) and merges leg outputs, the last
 /// writer winning per key (`greenlit_engine::execution::contexts`).
-fn aggregate(
+pub(crate) fn aggregate(
     results: &[(Conclusion, IndexMap<String, String>)],
 ) -> (Conclusion, IndexMap<String, String>) {
     let result = if results.is_empty() {

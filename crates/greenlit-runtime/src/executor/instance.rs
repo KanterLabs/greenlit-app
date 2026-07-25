@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 use greenlit_engine::{
     Condition, ContainerPlan, EnvValue, Evaluation, ExecutionPlan, JobId, JobOutputsPlan, JobPlan,
     MatrixLeg, MatrixPlan, MatrixValue, Planned, RunDefaultsPlan, RunnerImage, StaticSkip,
-    StepPlan,
+    StepPlan, StrategyControl,
 };
 use greenlit_expr::Value;
 use greenlit_workflow::Span;
@@ -25,8 +25,6 @@ use crate::executor::ExecError;
 pub(crate) struct JobInstance<'a> {
     /// The instance's resolved display name.
     pub display: &'a Planned<String>,
-    /// Direct dependencies (shared across all legs of a matrix job).
-    pub needs: &'a [JobId],
     /// The resolved runner image.
     pub runner: RunnerImage,
     /// `container:`, if this job runs in a job container.
@@ -62,6 +60,12 @@ pub(crate) struct JobGroup<'a> {
     pub needs: &'a [JobId],
     /// Every instance of this job (one per matrix leg, or a single instance).
     pub instances: Vec<JobInstance<'a>>,
+    /// GitHub's matrix fail-fast policy.
+    pub fail_fast: bool,
+    /// Maximum legs from this group that may execute concurrently.
+    pub max_parallel: usize,
+    /// Deterministic dependency wave.
+    pub wave: u32,
 }
 
 /// Expand `plan` into job groups in topological (start) order.
@@ -82,6 +86,24 @@ pub(crate) fn expand(plan: &ExecutionPlan) -> Result<Vec<JobGroup<'_>>, ExecErro
             id: job_id.clone(),
             needs: &job.needs,
             instances: expand_job(job)?,
+            fail_fast: match &job.strategy.fail_fast {
+                StrategyControl::Static(value) => *value,
+                StrategyControl::Deferred(_) => {
+                    return Err(ExecError::DeferredMatrix {
+                        span: job.span.clone(),
+                    });
+                }
+            },
+            max_parallel: match &job.strategy.max_parallel {
+                Some(StrategyControl::Static(value)) => value.get() as usize,
+                Some(StrategyControl::Deferred(_)) => {
+                    return Err(ExecError::DeferredMatrix {
+                        span: job.span.clone(),
+                    });
+                }
+                None => job.legs.len().max(1),
+            },
+            wave: job.wave,
         });
     }
     Ok(groups)
@@ -105,7 +127,6 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
         let runner = static_runner(job.runner.as_ref(), &job.span)?;
         return Ok(vec![JobInstance {
             display: &job.name,
-            needs: &job.needs,
             runner,
             container: job.container.as_ref(),
             services: &job.services,
@@ -129,7 +150,6 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
         let matrix = legs.get(index).map_or(Value::Null, matrix_leg_value);
         instances.push(JobInstance {
             display: &leg.name,
-            needs: &job.needs,
             runner,
             container: leg.container.as_ref(),
             services: &leg.services,

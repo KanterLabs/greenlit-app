@@ -56,6 +56,10 @@ struct ScriptedEngine {
     /// How many readiness polls have been answered.
     polls: AtomicUsize,
     created_images: Mutex<Vec<String>>,
+    /// Hold container startup briefly so scheduler concurrency is observable.
+    delay_start: bool,
+    active_starts: AtomicUsize,
+    peak_starts: AtomicUsize,
 }
 
 impl ScriptedEngine {
@@ -175,6 +179,12 @@ impl ContainerEngine for ScriptedEngine {
         ))
     }
     async fn start_container(&self, _id: &str) -> Result<(), RuntimeError> {
+        if self.delay_start {
+            let active = self.active_starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_starts.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active_starts.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(())
     }
     async fn stop_container(&self, _id: &str) -> Result<(), RuntimeError> {
@@ -286,6 +296,157 @@ impl ContainerEngine for ScriptedEngine {
     async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn independent_ready_jobs_start_concurrently_and_report_in_plan_order() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "parallel.yml",
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ECHO first
+  second:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ECHO second
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "parallel-jobs".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+
+    assert!(
+        engine.peak_starts.load(Ordering::SeqCst) >= 2,
+        "both dependency-ready jobs must overlap"
+    );
+    assert_eq!(
+        report
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"],
+        "report order remains deterministic"
+    );
+}
+
+#[tokio::test]
+async fn matrix_max_parallel_and_fail_fast_leave_queued_legs_cancelled() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "matrix-fail-fast.yml",
+        r#"
+on: push
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        code: [1, 0, 0]
+    steps:
+      - run: EXIT ${{ matrix.code }}
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "matrix-fail-fast".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("ordinary step failure stays in the report");
+
+    assert_eq!(
+        report.jobs.iter().map(|job| job.result).collect::<Vec<_>>(),
+        vec![
+            Conclusion::Failure,
+            Conclusion::Cancelled,
+            Conclusion::Cancelled
+        ]
+    );
+    assert_eq!(
+        engine.peak_starts.load(Ordering::SeqCst),
+        1,
+        "max-parallel=1 never overlaps matrix legs"
+    );
 }
 
 #[tokio::test]
