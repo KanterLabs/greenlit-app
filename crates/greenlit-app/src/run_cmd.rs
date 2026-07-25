@@ -350,7 +350,19 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // than a broken run.
     let store_config = build_store_config(clean, args.hermetic);
 
-    let mut execution_image_locks = run_lock.containers.clone();
+    let mut execution_image_locks = run_lock
+        .containers
+        .iter()
+        .map(|(requested, digest)| {
+            greenlit_store::oci::immutable_pull_reference(requested, digest)
+                .map(|reference| (requested.clone(), reference))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not reconstruct locked container reference '{requested}': {error}\n  fix: preserve the run directory and file a Greenlit defect"
+                    )
+                })
+        })
+        .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?;
     execution_image_locks.extend(run_lock.runners.iter().map(|(key, runner)| {
         (
             format!("__greenlit_runner:{key}"),

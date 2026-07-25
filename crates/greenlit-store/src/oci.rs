@@ -43,6 +43,25 @@ pub struct ResolvedImage {
     pub lazy_compatible: bool,
 }
 
+/// Rebuilds the canonical immutable Docker pull reference for a locked
+/// platform-manifest digest.
+///
+/// RunLocks intentionally store the authored reference and digest as
+/// separate evidence fields. Docker execution still needs the repository
+/// name attached (`registry/repository@sha256:...`): a bare manifest digest
+/// is not a local image reference Docker can inspect or start.
+///
+/// # Errors
+///
+/// Returns [`OciError::InvalidReference`] when either the authored reference
+/// or locked digest is malformed.
+pub fn immutable_pull_reference(reference: &str, digest: &str) -> Result<String, OciError> {
+    let parsed = RegistryReference::parse(reference)?;
+    let digest = ObjectDigest::parse(digest)
+        .map_err(|error| invalid_ref(reference, &format!("locked digest {error}")))?;
+    Ok(format!("{}@{digest}", parsed.pull_name))
+}
+
 /// Registry parsing, authentication, protocol, or verification failure.
 #[derive(Debug, thiserror::Error)]
 pub enum OciError {
