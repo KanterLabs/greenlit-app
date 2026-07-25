@@ -15,6 +15,7 @@ mod gh_names;
 mod plan_cmd;
 mod render;
 mod run_cmd;
+mod runtime_token;
 mod secrets;
 mod setup_cmd;
 mod stats_cmd;

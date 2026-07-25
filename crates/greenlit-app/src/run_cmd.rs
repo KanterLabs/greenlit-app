@@ -513,7 +513,7 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
     if !home.is_absolute() {
         return None;
     }
-    let runtime_token = runtime_token()?;
+    let runtime_token = crate::runtime_token::mint()?.value;
     Some(greenlit_runtime::StoreConfig {
         cache: greenlit_store::CacheStore::at(greenlit_store::CacheStore::default_path_under(
             &home,
@@ -524,24 +524,6 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
         toolcache_root: home.join(".litci").join("toolcache"),
         runtime_token,
     })
-}
-
-/// A per-run bearer token for the shim.
-///
-/// This is the only thing standing between one container on the job bridge
-/// and another run's cache, so it is drawn from the kernel CSPRNG rather than
-/// derived from the pid and clock the way `run_volume_namespace` is — a
-/// volume name only has to be unique, but a token has to be unguessable. If
-/// `/dev/urandom` cannot be read the run proceeds with no shim at all rather
-/// than with a predictable token: an honest cache miss beats a guessable
-/// credential.
-fn runtime_token() -> Option<String> {
-    use std::io::Read;
-    let mut bytes = [0_u8; 32];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .ok()?;
-    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Build the runner/`github` environment template from local git metadata.

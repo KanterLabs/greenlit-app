@@ -49,6 +49,23 @@ use crate::server::state::ShimState;
 /// The twirp service every artifact call is addressed to.
 const SERVICE: &str = "github.actions.results.api.v1.ArtifactService";
 
+/// Requests are snake_case, responses are camelCase. This asymmetry is real,
+/// not an oversight.
+///
+/// The generated client serializes each request with
+/// `Request.toJson(request, { useProtoFieldName: true })` — proto field
+/// names, so `workflow_run_backend_id`. It parses each response with
+/// `Response.fromJson(data, { ignoreUnknownFields: true })` and **no**
+/// `useProtoFieldName`, so it expects protobuf-JSON's default lowerCamelCase
+/// — `signedUploadUrl`.
+///
+/// `ignoreUnknownFields` is what makes getting this wrong so quiet: a
+/// snake_case response is not rejected, it is *ignored*, leaving the field at
+/// its default. `upload-artifact` then calls `new BlobClient("")` and throws
+/// with an empty message, having never sent a single byte to the shim. That
+/// is precisely how the `full-ci` fixture failed, and no synthetic test
+/// caught it because those construct responses by hand.
+///
 /// The fields Greenlit reads from a twirp request.
 ///
 /// The client sends more than this — expiry, version, hashes — which are
@@ -76,21 +93,21 @@ struct ArtifactRequest {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct CreateResponse {
     ok: bool,
     signed_upload_url: String,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct FinalizeResponse {
     ok: bool,
     artifact_id: String,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct ListedArtifact {
     workflow_run_backend_id: String,
     workflow_job_run_backend_id: String,
@@ -100,19 +117,19 @@ struct ListedArtifact {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct ListResponse {
     artifacts: Vec<ListedArtifact>,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct SignedUrlResponse {
     signed_url: String,
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 struct DeleteResponse {
     ok: bool,
     artifact_id: String,
@@ -129,7 +146,7 @@ struct BlobQuery {
 pub(crate) fn routes(router: Router<Arc<ShimState>>) -> Router<Arc<ShimState>> {
     router
         .route(&format!("/twirp/{SERVICE}/{{method}}"), post(twirp))
-        .route("/_apis/artifacts/blobs/{id}", put(blob_put).get(blob_get))
+        .route("/greenlit/artifacts/{id}", put(blob_put).get(blob_get))
 }
 
 /// Dispatches one twirp call by method name.
@@ -286,8 +303,22 @@ async fn blob_put(
     };
 
     match result {
-        // Azure answers a successful write with 201, which the SDK checks.
-        Ok(()) => StatusCode::CREATED.into_response(),
+        // Azure answers a successful write with 201 plus a small set of
+        // response headers its SDK's generated deserializer reads. Returning
+        // a bare 201 makes the client throw with an *empty* message, which is
+        // exactly what the full-ci fixture hit -- so the shim answers the way
+        // the service it is standing in for answers.
+        Ok(()) => (
+            StatusCode::CREATED,
+            [
+                ("x-ms-request-id", request_id()),
+                ("x-ms-version", "2021-08-06".to_string()),
+                ("x-ms-request-server-encrypted", "false".to_string()),
+                ("etag", format!("\"{}\"", request_id())),
+                ("last-modified", "Thu, 01 Jan 1970 00:00:00 GMT".to_string()),
+            ],
+        )
+            .into_response(),
         Err(StoreError::UnknownReservation { .. }) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => failure(&error),
     }
@@ -309,6 +340,17 @@ async fn blob_get(
         Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// An opaque request identifier, in the shape Azure returns.
+///
+/// The value is never interpreted by anything; the client only requires that
+/// the header be present and well formed.
+fn request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("00000000-0000-0000-0000-{counter:012x}")
 }
 
 /// Reads a JSON field the client may send as a number or a string.

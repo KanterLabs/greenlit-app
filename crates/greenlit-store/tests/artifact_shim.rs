@@ -6,6 +6,13 @@
 //! Azure Block Blob upload to whatever URL it returned, a twirp
 //! `FinalizeArtifact`, then the download side's `ListArtifacts` →
 //! `GetSignedArtifactURL` → `GET`.
+//!
+//! Field naming is asymmetric and the tests assert it deliberately: the
+//! generated client sends `useProtoFieldName: true` (snake_case) but parses
+//! responses without it (lowerCamelCase). Because it also passes
+//! `ignoreUnknownFields`, a snake_case *response* is silently ignored rather
+//! than rejected — so a shim that got this wrong would look correct in every
+//! hand-written test while leaving the real client with an empty upload URL.
 
 use std::net::Ipv4Addr;
 
@@ -83,7 +90,7 @@ async fn the_upload_then_download_sequence_matches_the_client() {
         Some(true)
     );
     let upload_url = created
-        .get("signed_upload_url")
+        .get("signedUploadUrl")
         .and_then(serde_json::Value::as_str)
         .expect("the client uploads to exactly this URL")
         .to_string();
@@ -158,7 +165,7 @@ async fn the_upload_then_download_sequence_matches_the_client() {
         }),
     );
     let download_url = signed
-        .get("signed_url")
+        .get("signedUrl")
         .and_then(serde_json::Value::as_str)
         .expect("signed_url");
 
@@ -192,7 +199,7 @@ async fn a_small_artifact_may_arrive_as_one_unstaged_put() {
         serde_json::json!({ "workflow_run_backend_id": SCOPE, "name": "tiny" }),
     );
     let upload_url = created
-        .get("signed_upload_url")
+        .get("signedUploadUrl")
         .and_then(serde_json::Value::as_str)
         .expect("upload url")
         .to_string();
@@ -221,7 +228,7 @@ async fn a_small_artifact_may_arrive_as_one_unstaged_put() {
     let mut body = agent
         .get(
             signed
-                .get("signed_url")
+                .get("signedUrl")
                 .and_then(serde_json::Value::as_str)
                 .expect("url"),
         )
@@ -246,7 +253,7 @@ async fn an_artifact_is_scoped_to_its_run() {
         serde_json::json!({ "workflow_run_backend_id": SCOPE, "name": "scoped" }),
     );
     let url = created
-        .get("signed_upload_url")
+        .get("signedUploadUrl")
         .and_then(serde_json::Value::as_str)
         .expect("url")
         .to_string();
@@ -294,7 +301,7 @@ async fn an_unfinalized_upload_is_never_listed_or_downloadable() {
         serde_json::json!({ "workflow_run_backend_id": SCOPE, "name": "half" }),
     );
     let url = created
-        .get("signed_upload_url")
+        .get("signedUploadUrl")
         .and_then(serde_json::Value::as_str)
         .expect("url")
         .to_string();
