@@ -245,6 +245,59 @@ resources. Phase 5 ingests frozen source objects and establishes the package
 download-cache fast path. Phase 6 moves action, Node runtime, runner, and OCI
 content from their legacy stores into this verified boundary.
 
+## Phase 7 fresh-execution dataflow
+
+The executor schedules dependency-ready jobs asynchronously. A run-level
+semaphore bounds total workers, each matrix strategy adds its own
+`max-parallel` semaphore, and case-insensitive concurrency groups serialize
+owners while `cancel-in-progress` first cancels and cleans the prior owner.
+Reports remain in deterministic plan order even though dependency outputs are
+merged in actual completion order, matching GitHub's matrix-output behavior.
+
+Runtime-deferred matrices are materialized only after every `needs` result is
+available. Their axes, include/exclude entries, controls, runner labels,
+conditions, names, steps, and outputs are evaluated against the completed
+dependency context. Exact CLI matrix selection is applied to the concrete
+legs and persists only the selected JobLock.
+
+Every concrete job leg receives a unique resource namespace:
+
+```text
+immutable runner image + frozen source
+                  |
+                  v
+       reflink-first private workspace
+          (bounded copy fallback)
+                  |
+                  v
+  unique writable layer + command-file volume
+                  |
+                  +--> unique bridge + services
+                  +--> Docker-action siblings
+                  +--> optional DinD sidecar
+                  |
+                  v
+         one sequential step stream
+                  |
+                  v
+ cancel/finish --> reverse-order cleanup
+```
+
+Cancellation is a shared token observed around queued permits, immutable
+action/runtime/image preparation, service startup and health waits, container
+boot, and every active step. Cleanup remains uncancelled so a canceled run
+cannot leave a reusable dirty sandbox. CPU, memory, process, and writable-layer
+limits are applied before both job and service containers start. Explicit
+service ports bind to the job bridge gateway, so parallel jobs can request the
+same port without colliding on the host.
+
+Workspace materialization first attempts Linux `FICLONE` per regular file and
+falls back to a streaming copy while enforcing fixed entry and byte ceilings.
+The source is already frozen before this point, so concurrent host edits cannot
+produce a mixed checkout. A completed writable filesystem is never reused;
+warmth comes only from immutable images/CAS content and workflow-declared
+caches.
+
 ## Known issues log
 
 Entries here describe upstream quirks that the implementation or dependency
