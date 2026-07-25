@@ -88,12 +88,19 @@ pub(crate) fn install_command(recipe: &Recipe) -> String {
             // toolchain comes from the repository's own `rust-toolchain.toml`,
             // exactly as it does on a hosted runner, so Greenlit must not
             // pick one.
+            //
+            // *Every* proxy is linked, not just `cargo`/`rustc`/`rustup`.
+            // Cargo subcommands dispatch to a separate binary -- `cargo fmt`
+            // runs `cargo-fmt` -- so linking only the three obvious names
+            // produces a toolchain where `cargo build` works and `cargo fmt`
+            // reports "no such command", which is exactly what the capstone
+            // hit.
             "(export RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo RUSTUP_VERSION={version}; \
              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
              | sh -s -- -y --no-modify-path --default-toolchain none \
-             && ln -sf /usr/local/cargo/bin/rustup /usr/local/bin/rustup \
-             && ln -sf /usr/local/cargo/bin/cargo /usr/local/bin/cargo \
-             && ln -sf /usr/local/cargo/bin/rustc /usr/local/bin/rustc)"
+             && for proxy in /usr/local/cargo/bin/*; do \
+             ln -sf \"$proxy\" /usr/local/bin/\"$(basename \"$proxy\")\"; \
+             done)"
         ),
     }
 }
@@ -187,6 +194,11 @@ mod tests {
         assert!(
             shim.contains("RUSTUP_VERSION=1.29.0"),
             "the installer is pinned"
+        );
+        assert!(
+            shim.contains("/usr/local/cargo/bin/*"),
+            "every proxy is linked: `cargo fmt` dispatches to a separate `cargo-fmt` binary, \
+             so linking only cargo/rustc/rustup yields a toolchain missing its subcommands"
         );
         assert!(
             shim.contains("--default-toolchain none"),
