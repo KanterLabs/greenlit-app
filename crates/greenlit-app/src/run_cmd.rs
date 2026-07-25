@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::git::{collect_git_context, find_repository_root};
 use greenlit_engine::{
-    Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionPlan, JobId, PlanOptions, build_synthetic_event,
-    plan, validate_v0_support,
+    Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, PlanOptions,
+    build_synthetic_event, plan, validate_v0_support,
 };
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
@@ -83,11 +83,16 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
                 workflow_picker::resolve_or_pick(resolution, &repo_root, !args.no_input)
             })
             .map_err(|message| anyhow::anyhow!(message))?;
+    let evidence = invocation.time_stage("source-freeze", || {
+        crate::run_evidence::RunEvidence::capture(&repo_root)
+    })?;
+    let frozen_repo_root = evidence.source.root.clone();
+    let frozen_workflow_path = frozen_repo_root.join(&workflow_path.source_name);
 
     let workflow = invocation
         .time_stage("parse", || {
             greenlit_workflow::parse_workflow_file_with_name(
-                &workflow_path.read_path,
+                &frozen_workflow_path,
                 workflow_path.source_name.as_str(),
             )
         })
@@ -101,7 +106,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // lookup needs the repository owner/name before planning even starts,
     // and every later use (`build_runner_env`) reuses this same value
     // instead of re-collecting it.
-    let git = collect_git_context(&repo_root)
+    let git = collect_git_context(&frozen_repo_root)
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
     let repo_leaf = git
         .repository
@@ -167,8 +172,9 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
 
     let event_kind: greenlit_engine::EventKind = args.event.into();
     let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
-    let mut event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
-        .map_err(|error| errors::event_error(&error))?;
+    let mut event =
+        build_synthetic_event(event_kind, &frozen_repo_root, &workflow, &dispatch_inputs)
+            .map_err(|error| errors::event_error(&error))?;
     if references_token {
         // Baked in *before* planning: plan-time partial evaluation folds
         // `github.*` field access against this concrete object, so a later
@@ -191,7 +197,6 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // would otherwise surface only after image ensure, container boot, and a
     // potentially long workspace copy.
     reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
-
     if references_token && !github_token.is_empty() {
         let effective_permissions: Vec<Option<&greenlit_engine::PermissionsPlan>> = execution_plan
             .jobs
@@ -221,8 +226,53 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // `github.token` (host-side action fetching is not workflow-token
     // injection).
     let action_token = auth::current_token().ok().flatten();
-    let actions_config =
+    let (actions_config, pinned_resolver) =
         build_action_runtime_config(action_token).map_err(|message| anyhow::anyhow!(message))?;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not start the async runtime: {error}\n  fix: retry; if it persists, file an issue"
+            )
+        })?;
+    let action_locks = invocation
+        .time_stage("action-resolve", || {
+            runtime.block_on(greenlit_runtime::preflight_plan_actions(
+                &execution_plan,
+                &actions_config,
+                &frozen_repo_root,
+                &workspace,
+            ))
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    runtime
+        .block_on(pinned_resolver.freeze())
+        .map_err(|error| anyhow::anyhow!(
+            "could not finalize action resolutions: {error}\n  fix: retry after the mutable action ref stops changing"
+        ))?;
+    let pinned_actions = pinned_resolver.resolutions().map_err(|error| {
+        anyhow::anyhow!(
+            "could not read finalized action resolutions: {error}\n  fix: preserve the run directory and retry"
+        )
+    })?;
+    for (reference, commit) in pinned_actions {
+        if !action_locks.values().any(|locked| locked == &commit) {
+            anyhow::bail!(
+                "finalized action resolution {reference}={commit} is absent from the preflight action inventory\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+    }
+    let run_lock = evidence.lock(crate::run_evidence::LockInputs {
+        workflow_path: &workflow_path.source_name,
+        event_name: event_kind.event_name(),
+        inputs: &args.inputs,
+        selected_job: args.job.as_deref(),
+        plan: &execution_plan,
+        secrets: &all_secrets,
+        actions: action_locks,
+    })?;
 
     // The local stores this run serves. A machine whose `HOME` cannot be
     // resolved simply runs without them -- `actions/cache` then behaves as it
@@ -231,7 +281,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let store_config = build_store_config();
 
     let config = RunConfig {
-        repo_host_path: repo_root.clone(),
+        repo_host_path: frozen_repo_root,
         workspace: workspace.clone(),
         strategy: resolved_strategy(args.isolation, args.write_back),
         runner_env: build_runner_env(&git, event_kind, workflow_name, workspace),
@@ -250,15 +300,6 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         actions: actions_config,
         store: store_config.clone(),
     };
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "could not start the async runtime: {error}\n  fix: retry; if it persists, file an issue"
-            )
-        })?;
 
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
 
@@ -328,6 +369,25 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     render_run_table(&report, &mut out).map_err(|error| {
         anyhow::anyhow!(
             "could not write the run summary: {error}\n  fix: ensure stdout is writable"
+        )
+    })?;
+    let conclusion = if report.failed() {
+        ExecutionConclusion::Failed
+    } else {
+        ExecutionConclusion::Passed
+    };
+    let result = evidence.write_result(conclusion, run_lock.compatibility.clone())?;
+    writeln!(
+        io::stderr(),
+        "evidence: {} ({:?}/{:?}/{:?})",
+        evidence.run_id,
+        result.conclusion,
+        result.compatibility,
+        result.assurance
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "could not report the run evidence identity: {error}\n  fix: ensure stderr is writable"
         )
     })?;
 
@@ -451,8 +511,16 @@ async fn connect_engine() -> anyhow::Result<DockerEngine> {
 /// user home directory cannot be determined.
 fn build_action_runtime_config(
     token: Option<String>,
-) -> Result<greenlit_runtime::ActionRuntimeConfig, String> {
-    use greenlit_actions::resolve::{GitHubApiResolver, GitLsRemoteResolver, RefResolver};
+) -> Result<
+    (
+        greenlit_runtime::ActionRuntimeConfig,
+        std::sync::Arc<greenlit_actions::resolve::PinnedRefResolver>,
+    ),
+    String,
+> {
+    use greenlit_actions::resolve::{
+        GitHubApiResolver, GitLsRemoteResolver, PinnedRefResolver, RefResolver,
+    };
     use greenlit_actions::store::{
         ActionFetcher, ActionStore, FallbackFetcher, GitCloneFetcher, TarballFetcher,
     };
@@ -471,7 +539,7 @@ fn build_action_runtime_config(
         std::path::Path::new(&home),
     ));
 
-    let (resolver, fetcher): (Arc<dyn RefResolver>, Arc<dyn ActionFetcher>) = match &token {
+    let (inner_resolver, fetcher): (Arc<dyn RefResolver>, Arc<dyn ActionFetcher>) = match &token {
         Some(t) => (
             Arc::new(GitHubApiResolver::new(t.clone())),
             Arc::new(FallbackFetcher::new(
@@ -487,16 +555,20 @@ fn build_action_runtime_config(
             )),
         ),
     };
+    let resolver = Arc::new(PinnedRefResolver::new(inner_resolver));
 
-    Ok(greenlit_runtime::ActionRuntimeConfig {
+    Ok((
+        greenlit_runtime::ActionRuntimeConfig {
+            resolver: resolver.clone(),
+            store,
+            fetcher,
+            node_runtime_fetcher: Arc::new(HttpRuntimeBundleFetcher::new()),
+            node_runtime_specs: Arc::new(PinnedNodeBundleSpecs),
+            node_runtime_store,
+            github_token: token,
+        },
         resolver,
-        store,
-        fetcher,
-        node_runtime_fetcher: Arc::new(HttpRuntimeBundleFetcher::new()),
-        node_runtime_specs: Arc::new(PinnedNodeBundleSpecs),
-        node_runtime_store,
-        github_token: token,
-    })
+    ))
 }
 
 /// Opens the local cache, artifact, and toolcache stores for this run.
@@ -522,6 +594,7 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
             greenlit_store::ArtifactStore::default_path_under(&home),
         ),
         toolcache_root: home.join(".litci").join("toolcache"),
+        package_cache_root: home.join(".litci").join("package-cache"),
         runtime_token: minted.value,
         url_signature: minted.url_signature,
     })

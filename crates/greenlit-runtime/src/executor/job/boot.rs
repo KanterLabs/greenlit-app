@@ -365,6 +365,14 @@ pub(crate) async fn boot_container(
                 "could not prepare the toolcache; running without it"
             ),
         }
+        match services::cargo_download_binds(&store.package_cache_root) {
+            Ok(binds) => spec.binds.extend(binds),
+            Err(error) => tracing::debug!(
+                target: "greenlit_runtime::services",
+                %error,
+                "could not prepare Cargo download caches; running without them"
+            ),
+        }
     }
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 

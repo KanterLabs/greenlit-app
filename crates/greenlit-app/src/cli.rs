@@ -33,9 +33,17 @@ pub(crate) enum Command {
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
     Stats,
+    /// Inspect the immutable lock and result evidence for a local run.
+    Inspect(InspectArgs),
     /// Remove Greenlit's derived caches and built images. Credentials and run
     /// history are never touched.
     Clean(CleanArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct InspectArgs {
+    /// Run identity. When omitted, inspect the most recently created run.
+    pub(crate) run_id: Option<String>,
 }
 
 #[derive(Debug, clap::Args)]

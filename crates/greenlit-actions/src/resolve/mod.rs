@@ -21,9 +21,11 @@
 
 mod git_ls_remote;
 mod github_api;
+mod pinned;
 
 pub use git_ls_remote::GitLsRemoteResolver;
 pub use github_api::GitHubApiResolver;
+pub use pinned::PinnedRefResolver;
 
 use async_trait::async_trait;
 

@@ -12,9 +12,11 @@ mod cli;
 mod dotenv_format;
 mod errors;
 mod gh_names;
+mod inspect_cmd;
 mod plan_cmd;
 mod render;
 mod run_cmd;
+mod run_evidence;
 mod runtime_token;
 mod secrets;
 mod setup_cmd;
@@ -39,6 +41,7 @@ fn main() -> ExitCode {
         cli::Command::Setup(args) => setup_cmd::run(args),
         cli::Command::Auth(args) => auth_cmd::run(args),
         cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
+        cli::Command::Inspect(args) => inspect_cmd::run(args).map(|()| ExitCode::SUCCESS),
         cli::Command::Clean(args) => clean_cmd::run(args),
     };
     match result {

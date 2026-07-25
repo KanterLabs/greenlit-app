@@ -34,6 +34,7 @@
 pub mod condition;
 pub mod defer;
 pub mod event;
+pub mod evidence;
 pub mod execution;
 pub mod git;
 pub mod graph;
@@ -44,6 +45,7 @@ pub mod pass_through;
 pub mod plan;
 pub mod planned;
 pub mod runner;
+pub mod source;
 
 mod convert;
 mod json_shape;
@@ -52,6 +54,11 @@ mod partial_eval;
 pub use condition::{Condition, DeferredExpr, PlannedCond};
 pub use defer::{DeferReason, StatusFn, StepStatusField};
 pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
+pub use evidence::{
+    Assurance, Compatibility, ExecutionConclusion, ExecutionResultV1, FeatureFinding,
+    FindingDisposition, JobLockV1, LockedSource, ResultEvidence, RunLockV1, SupportReport,
+    opaque_revision,
+};
 pub use execution::{Conclusion, StepExit, StepInvocation, StepResult};
 pub use git::GitError;
 pub use graph::{DependencyCycle, GraphError, JobId};
@@ -70,3 +77,4 @@ pub use planned::{Evaluation, Planned};
 pub use runner::{
     RunnerError, RunnerImage, RunnerPlan, SUPPORTED_RUNNER_LABELS, resolve_runner_label,
 };
+pub use source::{SourceEntry, SourceEntryKind, SourceSnapshot, SourceSnapshotError};

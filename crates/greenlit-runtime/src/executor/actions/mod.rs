@@ -65,6 +65,35 @@ use greenlit_actions::store::{ActionFetcher, ActionStore};
 
 use node_runtime::{NodeBundleSpecs, RuntimeBundleFetcher};
 
+/// Resolves and fetches every statically materialized action in an execution
+/// plan before the RunLock is finalized. Execution may then use a frozen
+/// [`greenlit_actions::resolve::PinnedRefResolver`] without mutable aliases.
+///
+/// # Errors
+/// Returns the same actionable resolution, fetch, manifest, or recursion
+/// failure normal job preparation would return.
+pub async fn preflight_plan_actions(
+    plan: &greenlit_engine::ExecutionPlan,
+    config: &ActionRuntimeConfig,
+    repo_host_path: &std::path::Path,
+    workspace: &str,
+) -> Result<std::collections::BTreeMap<String, String>, crate::executor::ExecError> {
+    let mut identities = std::collections::BTreeMap::new();
+    for job in &plan.jobs {
+        if !job.steps.is_empty() {
+            let resolved =
+                resolve::resolve_job_actions(&job.steps, config, repo_host_path, workspace).await?;
+            identities.extend(resolved.identities);
+        }
+        for leg in &job.legs {
+            let resolved =
+                resolve::resolve_job_actions(&leg.steps, config, repo_host_path, workspace).await?;
+            identities.extend(resolved.identities);
+        }
+    }
+    Ok(identities)
+}
+
 /// Everything the executor needs to resolve, fetch, and run `uses:` steps,
 /// injected once per `litci run` invocation.
 ///

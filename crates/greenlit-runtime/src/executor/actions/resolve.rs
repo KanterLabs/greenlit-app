@@ -6,7 +6,7 @@
 //! [`super::super::job::boot_container`] rather than lazily, step by step,
 //! the way `run:` steps are handled.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -144,6 +144,8 @@ pub(crate) struct JobActionPlan {
     pub needs_node20: bool,
     /// Whether any resolved action needs the pinned Node 24 runtime.
     pub needs_node24: bool,
+    /// Every repository action reference mapped to its resolved commit.
+    pub identities: BTreeMap<String, String>,
 }
 
 /// Accumulates the aggregate results (binds, flags) while [`resolve_uses`]
@@ -162,6 +164,7 @@ struct Collector {
     needs_docker_sibling: bool,
     needs_node20: bool,
     needs_node24: bool,
+    identities: BTreeMap<String, String>,
 }
 
 /// Resolves every `uses:` step in `steps` (recursing into composites),
@@ -185,11 +188,18 @@ pub(crate) async fn resolve_job_actions(
     let mut collector = Collector::default();
     let mut per_step = Vec::with_capacity(steps.len());
     for step in steps {
-        let resolved = match &step.kind {
-            StepKind::Run { .. } => None,
-            StepKind::Uses {
-                reference, span, ..
-            } => Some(resolve_uses(reference, span, 0, &env, &mut collector).await?),
+        let statically_skipped = step.condition.as_ref().is_some_and(|condition| {
+            matches!(condition.eval, greenlit_engine::PlannedCond::Static(false))
+        });
+        let resolved = if statically_skipped {
+            None
+        } else {
+            match &step.kind {
+                StepKind::Run { .. } => None,
+                StepKind::Uses {
+                    reference, span, ..
+                } => Some(resolve_uses(reference, span, 0, &env, &mut collector).await?),
+            }
         };
         per_step.push(resolved);
     }
@@ -199,6 +209,7 @@ pub(crate) async fn resolve_job_actions(
         needs_docker_sibling: collector.needs_docker_sibling,
         needs_node20: collector.needs_node20,
         needs_node24: collector.needs_node24,
+        identities: collector.identities,
     })
 }
 
@@ -295,6 +306,10 @@ fn resolve_uses<'a>(
                 git_ref,
             }) => {
                 if owner == "actions" && repo == "checkout" {
+                    collector.identities.insert(
+                        reference.to_string(),
+                        "builtin:self-checkout-v1".to_string(),
+                    );
                     return Ok(ResolvedUses::Checkout);
                 }
                 let sha = resolve_ref(env.config.resolver.as_ref(), &owner, &repo, &git_ref)
@@ -304,6 +319,9 @@ fn resolve_uses<'a>(
                         span: span.clone(),
                         source: Box::new(source),
                     })?;
+                collector
+                    .identities
+                    .insert(reference.to_string(), sha.as_str().to_string());
                 let (host_dir, _outcome) = env
                     .config
                     .store

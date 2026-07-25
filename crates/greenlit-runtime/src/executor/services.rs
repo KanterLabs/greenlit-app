@@ -53,6 +53,9 @@ pub struct StoreConfig {
     pub artifacts: ArtifactStore,
     /// `~/.litci/toolcache`, bound into the job at `RUNNER_TOOL_CACHE`.
     pub toolcache_root: PathBuf,
+    /// Greenlit-owned dependency download caches. Installs still run; only
+    /// immutable/downloaded package material is reused.
+    pub package_cache_root: PathBuf,
     /// The bearer token this run's shim requires on its API routes.
     pub runtime_token: String,
     /// The per-run signature blob URLs carry in place of a bearer header.
@@ -424,6 +427,41 @@ pub fn toolcache_bind(
         container_path: container_path.to_string(),
         read_only: false,
     })
+}
+
+/// Writable Cargo download-cache binds for common runner and official Rust
+/// container layouts. Build outputs are deliberately not included.
+pub fn cargo_download_binds(
+    root: &std::path::Path,
+) -> std::io::Result<Vec<crate::engine::BindMount>> {
+    let registry = root.join("cargo").join("registry");
+    let git = root.join("cargo").join("git");
+    std::fs::create_dir_all(&registry)?;
+    std::fs::create_dir_all(&git)?;
+    let registry = registry.to_string_lossy().into_owned();
+    let git = git.to_string_lossy().into_owned();
+    Ok(vec![
+        crate::engine::BindMount {
+            host_path: registry.clone(),
+            container_path: "/usr/local/cargo/registry".to_string(),
+            read_only: false,
+        },
+        crate::engine::BindMount {
+            host_path: git.clone(),
+            container_path: "/usr/local/cargo/git".to_string(),
+            read_only: false,
+        },
+        crate::engine::BindMount {
+            host_path: registry,
+            container_path: "/home/runner/.cargo/registry".to_string(),
+            read_only: false,
+        },
+        crate::engine::BindMount {
+            host_path: git,
+            container_path: "/home/runner/.cargo/git".to_string(),
+            read_only: false,
+        },
+    ])
 }
 
 /// Parses a gateway address, ignoring any `/prefix` the daemon appends.

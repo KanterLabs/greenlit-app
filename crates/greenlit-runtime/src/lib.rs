@@ -50,7 +50,7 @@ pub use error::{Operation, RuntimeError};
 pub use executor::{
     ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport, StoreConfig,
     actions::ActionRuntimeConfig, actions::node_runtime::HttpRuntimeBundleFetcher,
-    container::ContainerRejection, reject_uses_steps, run_plan,
+    actions::preflight_plan_actions, container::ContainerRejection, reject_uses_steps, run_plan,
 };
 pub use image::{BaseImagePlan, ImageError, ensure_base_image, init_binary, plan_base_image};
 pub use isolation::{IsolationStrategy, isolation_container_spec};
