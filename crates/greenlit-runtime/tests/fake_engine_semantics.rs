@@ -146,6 +146,10 @@ impl ScriptedEngine {
                 }
             } else if let Some(rest) = line.strip_prefix("ECHO ") {
                 sink.on_stdout(format!("{rest}\n").as_bytes());
+            } else if let Some(rest) = line.strip_prefix("CHUNK ") {
+                sink.on_stdout(rest.as_bytes());
+            } else if let Some(rest) = line.strip_prefix("STDERR ") {
+                sink.on_stderr(format!("{rest}\n").as_bytes());
             } else if let Some(rest) = line.strip_prefix("EXIT ") {
                 exit = rest.trim().parse().unwrap_or(1);
             }
@@ -1001,6 +1005,91 @@ jobs:
             .contains(&config.resources),
         "service resource ceilings must be present before startup"
     );
+}
+
+#[tokio::test]
+async fn secret_masking_covers_chunks_encodings_annotations_and_structured_results() {
+    const SECRET: &str = "s3cr3t+/ value";
+    const STANDARD_BASE64: &str = "czNjcjN0Ky8gdmFsdWU=";
+    const BASE64_URL: &str = "czNjcjN0Ky8gdmFsdWU";
+    const PERCENT: &str = "s3cr3t%2B%2F%20value";
+    let workflow = greenlit_workflow::parse_workflow(
+        "secret-output.yml",
+        r#"
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: structured s3cr3t+/ value
+        run: |
+          ECHO direct s3cr3t+/ value
+          CHUNK split s3cr3t+/
+          ECHO  value
+          ECHO standard czNjcjN0Ky8gdmFsdWU=
+          STDERR url czNjcjN0Ky8gdmFsdWU
+          ECHO percent s3cr3t%2B%2F%20value
+          ECHO ::error::annotation s3cr3t+/ value
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: vec![SECRET.to_string()],
+        volume_namespace: "secret-output".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+    let mut output = Vec::new();
+    let report = run_plan(
+        &ScriptedEngine::default(),
+        &execution_plan,
+        &config,
+        &mut output,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run succeeds");
+    let output = String::from_utf8(output).expect("UTF-8 log");
+
+    assert!(output.contains("direct ***"), "{output}");
+    assert!(output.contains("split ***"), "{output}");
+    assert!(output.contains("[error] annotation ***"), "{output}");
+    for sensitive in [SECRET, STANDARD_BASE64, BASE64_URL, PERCENT] {
+        assert!(
+            !output.contains(sensitive),
+            "{sensitive} leaked in {output}"
+        );
+        assert!(
+            report
+                .jobs
+                .iter()
+                .flat_map(|job| job.steps.iter())
+                .all(|step| !step.label.contains(sensitive)),
+            "{sensitive} leaked in the structured report"
+        );
+    }
 }
 
 #[tokio::test]
