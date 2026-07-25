@@ -163,10 +163,10 @@ fn unsupported_preflight_persists_terminal_result_and_trace() {
         ".github/workflows/ci.yml",
         "\
 on: push
-concurrency: one-at-a-time
 jobs:
   build:
     runs-on: ubuntu-latest
+    environment: production
     steps:
       - run: echo blocked
 ",

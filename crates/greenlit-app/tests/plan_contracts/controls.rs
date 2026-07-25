@@ -83,3 +83,38 @@ fn workflow_expressions_use_the_runners_template_memory_budget() {
     assert_eq!(job(&plan, "budget")["condition"]["value"], false);
     assert_eq!(job(&plan, "budget")["skip"]["kind"], "condition-false");
 }
+
+#[test]
+fn workflow_and_job_concurrency_are_retained_without_inventing_dependency_values() {
+    let sandbox = sandbox_with_workflow(
+        r#"
+on: push
+concurrency:
+  group: run-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    outputs:
+      lane: ${{ steps.pick.outputs.lane }}
+    steps:
+      - id: pick
+        run: echo lane=deploy >> "$GITHUB_OUTPUT"
+  consumer:
+    needs: producer
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ needs.producer.outputs.lane }}
+      cancel-in-progress: ${{ fromJSON('true') }}
+    steps:
+      - run: echo serialized
+"#,
+    );
+    let (plan, _, _) = plan_json(&sandbox, &[]);
+
+    assert_eq!(plan["concurrency"]["group"]["evaluation"], "static");
+    assert_eq!(plan["concurrency"]["cancel_in_progress"]["value"], false);
+    let consumer = job(&plan, "consumer");
+    assert_eq!(consumer["concurrency"]["group"]["evaluation"], "deferred");
+    assert_eq!(consumer["concurrency"]["cancel_in_progress"]["value"], true);
+}

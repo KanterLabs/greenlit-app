@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, Evaluation, JobId};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 
 use super::instance::JobGroup;
 use super::report::{JobReport, RunReport};
@@ -24,6 +24,71 @@ struct GroupResult {
     id: String,
     completed: CompletedJob,
     reports: Vec<JobReport>,
+}
+
+#[derive(Clone, Default)]
+struct ConcurrencyCoordinator {
+    groups: Arc<AsyncMutex<HashMap<String, ConcurrencyGroup>>>,
+}
+
+struct ConcurrencyGroup {
+    gate: Arc<Semaphore>,
+    owner: Option<crate::Cancellation>,
+}
+
+#[derive(Clone)]
+struct ScheduleLimits {
+    workers: Arc<Semaphore>,
+    concurrency: ConcurrencyCoordinator,
+}
+
+impl ConcurrencyCoordinator {
+    async fn enter(
+        &self,
+        key: &str,
+        cancel_in_progress: bool,
+        owner: &crate::Cancellation,
+        run_cancellation: &crate::Cancellation,
+    ) -> Result<OwnedSemaphorePermit, ExecError> {
+        let (gate, immediate) = {
+            let mut groups = self.groups.lock().await;
+            let group = groups
+                .entry(key.to_string())
+                .or_insert_with(|| ConcurrencyGroup {
+                    gate: Arc::new(Semaphore::new(1)),
+                    owner: None,
+                });
+            if cancel_in_progress && let Some(current) = &group.owner {
+                current.cancel();
+            }
+            let gate = Arc::clone(&group.gate);
+            let immediate = Arc::clone(&gate).try_acquire_owned().ok();
+            if immediate.is_some() {
+                group.owner = Some(owner.clone());
+            }
+            (gate, immediate)
+        };
+        if let Some(permit) = immediate {
+            return Ok(permit);
+        }
+        let permit = tokio::select! {
+            permit = gate.acquire_owned() => permit.map_err(|_| ExecError::Infrastructure {
+                message: format!("concurrency group '{key}' closed before the job started"),
+                fix: "retry the run".to_string(),
+            })?,
+            () = run_cancellation.cancelled() => {
+                return Err(ExecError::Infrastructure {
+                    message: "run cancellation reached a queued concurrency group".to_string(),
+                    fix: "retry the run when ready".to_string(),
+                });
+            }
+        };
+        let mut groups = self.groups.lock().await;
+        if let Some(group) = groups.get_mut(key) {
+            group.owner = Some(owner.clone());
+        }
+        Ok(permit)
+    }
 }
 
 #[derive(Clone)]
@@ -79,6 +144,11 @@ pub(super) async fn run(
         .map_or(2, |count| count.get())
         .max(2);
     let worker_limit = Arc::new(Semaphore::new(workers));
+    let concurrency = ConcurrencyCoordinator::default();
+    let limits = ScheduleLimits {
+        workers: worker_limit,
+        concurrency,
+    };
     let mut completed = HashMap::new();
     let mut reports_by_group: HashMap<String, Vec<JobReport>> = HashMap::new();
     let max_wave = groups.iter().map(|group| group.wave).max().unwrap_or(0);
@@ -94,7 +164,7 @@ pub(super) async fn run(
                 baseline_masker,
                 writer.clone(),
                 progress.clone(),
-                Arc::clone(&worker_limit),
+                limits.clone(),
             ));
         }
 
@@ -134,20 +204,49 @@ async fn run_group(
     baseline_masker: &Masker,
     writer: SharedWriter<'_>,
     progress: SharedProgress<'_>,
-    worker_limit: Arc<Semaphore>,
+    limits: ScheduleLimits,
 ) -> Result<GroupResult, ExecError> {
     let needs = Arc::new(needs_records(group.needs, completed));
     let materialized = super::instance::materialize(group, shared.roots, needs.as_slice())?;
+    let group_fail_fast = materialized.fail_fast;
+    let group_max_parallel = materialized.max_parallel;
+    let group_total = materialized.instances.len();
     let mut running = FuturesUnordered::new();
     let make_leg = |index, instance| {
         let mut masker = baseline_masker.clone();
         let mut instance_writer = writer.clone();
         let mut instance_progress = progress.clone();
-        let workers = Arc::clone(&worker_limit);
+        let workers = Arc::clone(&limits.workers);
         let instance_needs = Arc::clone(&needs);
         let cancellation = shared.cancellation.clone();
+        let coordinator = limits.concurrency.clone();
         let instance_key = format!("{}-{index:03}", group.id.0);
         async move {
+            let job_cancellation = crate::Cancellation::new();
+            let concurrency_policy = super::instance::materialize_concurrency(
+                instance,
+                shared.roots,
+                instance_needs.as_slice(),
+                group_fail_fast,
+                std::num::NonZeroU32::new(u32::try_from(group_max_parallel).unwrap_or(u32::MAX)),
+                index,
+                group_total,
+            )?;
+            let concurrency_permit = match concurrency_policy {
+                Some((key, cancel_in_progress)) => {
+                    match coordinator
+                        .enter(&key, cancel_in_progress, &job_cancellation, &cancellation)
+                        .await
+                    {
+                        Ok(permit) => Some(permit),
+                        Err(_) if cancellation.is_cancelled() => {
+                            return Ok((index, cancelled_report(&group.id, instance, &masker)));
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => None,
+            };
             let worker_permit = tokio::select! {
                 permit = workers.acquire_owned() => permit.map_err(|_| ExecError::Infrastructure {
                         message: "the run worker pool closed before a ready job started"
@@ -161,8 +260,16 @@ async fn run_group(
                     ));
                 }
             };
+            let job_shared = Shared {
+                engine: shared.engine,
+                config: shared.config,
+                roots: shared.roots,
+                workflow_env: shared.workflow_env,
+                cancellation: &job_cancellation,
+                namespace: shared.namespace,
+            };
             let result = job::run_instance(
-                shared,
+                &job_shared,
                 &mut masker,
                 instance,
                 job::JobIdentity {
@@ -172,9 +279,17 @@ async fn run_group(
                 instance_needs.as_slice(),
                 &mut instance_writer,
                 &mut instance_progress,
-            )
-            .await;
+            );
+            tokio::pin!(result);
+            let result = tokio::select! {
+                result = &mut result => result,
+                () = cancellation.cancelled() => {
+                    job_cancellation.cancel();
+                    result.await
+                }
+            };
             drop(worker_permit);
+            drop(concurrency_permit);
             result.map(|report| (index, report))
         }
     };

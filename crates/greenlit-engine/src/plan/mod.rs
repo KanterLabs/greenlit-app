@@ -19,8 +19,8 @@ mod types;
 pub use error::PlanError;
 pub(crate) use error::RetainedFieldError;
 pub use types::{
-    ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanOptions,
-    RunDefaultsPlan, StaticSkip, StepKind, StepPlan,
+    ConcurrencyPlan, ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan,
+    PlanOptions, RunDefaultsPlan, StaticSkip, StepKind, StepPlan,
 };
 
 use greenlit_expr::Value;
@@ -38,7 +38,9 @@ use crate::partial_eval::{
     build_env_chain,
 };
 use crate::pass_through::plan_env_layer;
-use crate::planned::{Evaluation, plan_scalar_string, plan_template_string};
+use crate::planned::{
+    Evaluation, Planned, plan_scalar_bool, plan_scalar_string, plan_template_string,
+};
 pub(crate) use budget::PlanSizeBudget;
 
 /// Plans `workflow` against `event`, using `options` for local variable
@@ -125,6 +127,35 @@ pub fn plan(
         .as_ref()
         .map_or(&workflow.span, |permissions| &permissions.span);
     size_budget.add(&permissions, permissions_span)?;
+    let concurrency = workflow
+        .concurrency
+        .as_ref()
+        .map(|concurrency| {
+            let group = plan_template_string(
+                &concurrency.value.group.value,
+                &concurrency.value.group.span,
+                &workflow_ctx,
+            )
+            .map_err(|source| PlanError::WorkflowEval {
+                span: concurrency.value.group.span.clone(),
+                source: Box::new(source),
+            })?;
+            let cancel_in_progress = match &concurrency.value.cancel_in_progress {
+                Some(cancel) => plan_scalar_bool(cancel, &workflow_ctx).map_err(|source| {
+                    PlanError::WorkflowEval {
+                        span: cancel.span.clone(),
+                        source: Box::new(source),
+                    }
+                })?,
+                None => Planned::static_value(concurrency.span.clone(), "false".to_string(), false),
+            };
+            Ok::<ConcurrencyPlan, PlanError>(ConcurrencyPlan {
+                group,
+                cancel_in_progress,
+            })
+        })
+        .transpose()?;
+    size_budget.add(&concurrency, &workflow.span)?;
 
     let graph = build_graph(&workflow.jobs)?;
     let reference_index =
@@ -197,6 +228,7 @@ pub fn plan(
         env,
         defaults,
         permissions,
+        concurrency,
         jobs: job_plans,
         topo_order,
         lints,
@@ -230,13 +262,6 @@ pub fn validate_v0_support(workflow: &Workflow) -> Result<(), PlanError> {
 #[must_use]
 pub fn analyze_support(workflow: &Workflow) -> SupportReport {
     let mut findings = Vec::new();
-    if workflow.concurrency.is_some() {
-        findings.push(unsupported_finding(
-            "workflow.concurrency",
-            "workflow",
-            "workflow-level concurrency groups are not implemented",
-        ));
-    }
     for trigger in &workflow.on {
         if matches!(
             trigger.value,
@@ -256,13 +281,6 @@ pub fn analyze_support(workflow: &Workflow) -> SupportReport {
                 "job.environment",
                 &scope,
                 "GitHub environment protection and deployments are unavailable locally",
-            ));
-        }
-        if job.concurrency.is_some() {
-            findings.push(unsupported_finding(
-                "job.concurrency",
-                &scope,
-                "job-level concurrency groups are not implemented",
             ));
         }
         if job.reusable_call.is_some() {
@@ -377,12 +395,6 @@ fn plan_permissions(permissions: &greenlit_workflow::Spanned<Permissions>) -> Pe
 }
 
 fn reject_unsupported_workflow_constructs(workflow: &Workflow) -> Result<(), PlanError> {
-    if let Some(uc) = &workflow.concurrency {
-        return Err(PlanError::NotSupportedInV0 {
-            name: uc.name,
-            span: uc.location.clone(),
-        });
-    }
     for trigger in &workflow.on {
         if let greenlit_workflow::model::trigger::Trigger::WorkflowCall(uc) = &trigger.value {
             return Err(PlanError::NotSupportedInV0 {
@@ -395,7 +407,7 @@ fn reject_unsupported_workflow_constructs(workflow: &Workflow) -> Result<(), Pla
 }
 
 fn reject_unsupported_job_constructs(job: &Job) -> Result<(), PlanError> {
-    if let Some(uc) = [&job.environment, &job.concurrency, &job.reusable_call]
+    if let Some(uc) = [&job.environment, &job.reusable_call]
         .into_iter()
         .flatten()
         .next()

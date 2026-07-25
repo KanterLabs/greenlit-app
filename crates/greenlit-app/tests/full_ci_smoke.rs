@@ -81,6 +81,19 @@ fn docker_daemon_reachable() -> bool {
     })
 }
 
+fn persisted_results(home: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let root = home.join(".litci/runs");
+    let mut results = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(root).expect("read persisted runs") {
+        let entry = entry.expect("run directory entry");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let result = std::fs::read(entry.path().join("result.json"))
+            .expect("completed run retains result evidence");
+        results.insert(name, result);
+    }
+    results
+}
+
 #[test]
 fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     if std::env::var_os(LIVE_ENV_VAR).is_none() {
@@ -126,6 +139,8 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
         first_out.contains("all checks passed"),
         "the dependent job's artifact check must run: {first_out}"
     );
+    let cold_results = persisted_results(sandbox.home());
+    assert_eq!(cold_results.len(), 1);
 
     // ---- Run 2: same $HOME, so the cache and the image are there ----
     let second = sandbox.run(&["run", "--no-input"]);
@@ -156,6 +171,17 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     assert!(
         second_err.contains("hit(s)"),
         "the run record reports cache activity: {second_err}"
+    );
+    let warm_results = persisted_results(sandbox.home());
+    let warm_result = warm_results
+        .iter()
+        .find(|(run, _)| !cold_results.contains_key(*run))
+        .map(|(_, result)| result)
+        .expect("the warm run persisted distinct evidence");
+    assert_eq!(
+        warm_result,
+        cold_results.values().next().expect("cold result"),
+        "cache warmth may change performance evidence, never semantic result evidence"
     );
 
     // ---- Run 3: exact verified setup content only ----

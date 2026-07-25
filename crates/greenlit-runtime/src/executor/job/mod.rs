@@ -294,41 +294,48 @@ pub(crate) async fn run_instance(
     // `Drop`-based cleanup registry, so anything created before the container
     // has to be released on every path out — a rejected service definition
     // leaked an empty network until this was folded into one place.
-    let services_started =
-        match resolve_services(shared, masker, &runner_ctx, instance, &base_env, needs) {
-            Ok(resolved) => {
-                match services::start(
-                    shared.engine,
-                    &services::ServiceRuntime {
-                        config: shared.config,
-                        network: job_network.name(),
-                        policy: job_network.policy(),
-                        cancellation: shared.cancellation,
-                    },
-                    &resolved,
-                    masker,
-                    progress,
-                )
-                .await
-                {
-                    Ok(started) => started,
-                    Err(failure) => {
-                        // Some may already be running; stop them before removing
-                        // the network they are attached to.
-                        services::stop(shared.engine, &failure.started).await;
-                        job_network.teardown(shared.engine).await;
-                        if failure.cancelled {
-                            return Ok(cancelled_report(identity.id, display, started));
-                        }
-                        return Err(failure.cause);
+    let services_started = match resolve_services(
+        shared,
+        masker,
+        &runner_ctx,
+        instance,
+        &base_env,
+        needs,
+        job_network.policy().gateway.as_deref(),
+    ) {
+        Ok(resolved) => {
+            match services::start(
+                shared.engine,
+                &services::ServiceRuntime {
+                    config: shared.config,
+                    network: job_network.name(),
+                    policy: job_network.policy(),
+                    cancellation: shared.cancellation,
+                },
+                &resolved,
+                masker,
+                progress,
+            )
+            .await
+            {
+                Ok(started) => started,
+                Err(failure) => {
+                    // Some may already be running; stop them before removing
+                    // the network they are attached to.
+                    services::stop(shared.engine, &failure.started).await;
+                    job_network.teardown(shared.engine).await;
+                    if failure.cancelled {
+                        return Ok(cancelled_report(identity.id, display, started));
                     }
+                    return Err(failure.cause);
                 }
             }
-            Err(error) => {
-                job_network.teardown(shared.engine).await;
-                return Err(error);
-            }
-        };
+        }
+        Err(error) => {
+            job_network.teardown(shared.engine).await;
+            return Err(error);
+        }
+    };
 
     let resolved_image = tokio::select! {
         result = boot::resolve_image(
@@ -880,6 +887,7 @@ fn resolve_services(
     instance: &JobInstance<'_>,
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
+    publish_address: Option<&str>,
 ) -> Result<Vec<(String, services::ResolvedService)>, ExecError> {
     if instance.services.is_empty() {
         return Ok(Vec::new());
@@ -899,11 +907,18 @@ fn resolve_services(
         if let Some(credentials) = &request.credentials {
             masker.add(&credentials.password);
         }
-        let additions = validate_container(&request, &shared.config.workspace, shared.namespace)
-            .map_err(|rejection| ExecError::Infrastructure {
-                message: format!("service `{id}`: {rejection}"),
-                fix: "correct the service definition in the workflow".to_string(),
-            })?;
+        let mut additions =
+            validate_container(&request, &shared.config.workspace, shared.namespace).map_err(
+                |rejection| ExecError::Infrastructure {
+                    message: format!("service `{id}`: {rejection}"),
+                    fix: "correct the service definition in the workflow".to_string(),
+                },
+            )?;
+        if let Some(address) = publish_address {
+            for port in &mut additions.ports {
+                port.host_ip = Some(address.to_string());
+            }
+        }
 
         resolved.push((
             id.clone(),

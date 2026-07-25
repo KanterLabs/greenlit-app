@@ -10,11 +10,12 @@
 use indexmap::IndexMap;
 
 use crate::executor::ExecError;
+use greenlit_engine::execution::resolve::{resolve_bool, resolve_string};
 use greenlit_engine::execution::{NeedRecord, build_needs_context};
 use greenlit_engine::{
-    Condition, ContainerPlan, DEFAULT_MAX_MATRIX_LEGS, EnvValue, Evaluation, ExecutionPlan, JobId,
-    JobOutputsPlan, JobPlan, MatrixLeg, MatrixPlan, MatrixValue, Planned, RunDefaultsPlan,
-    RunnerImage, StaticSkip, StepPlan, materialize_controls, materialize_matrix,
+    ConcurrencyPlan, Condition, ContainerPlan, DEFAULT_MAX_MATRIX_LEGS, EnvValue, Evaluation,
+    ExecutionPlan, JobId, JobOutputsPlan, JobPlan, MatrixLeg, MatrixPlan, MatrixValue, Planned,
+    RunDefaultsPlan, RunnerImage, StaticSkip, StepPlan, materialize_controls, materialize_matrix,
     materialize_runner,
 };
 use greenlit_expr::{Context, RunStatus, Value};
@@ -41,12 +42,50 @@ pub(crate) struct JobInstance<'a> {
     pub job_env: &'a IndexMap<String, EnvValue>,
     /// Effective run defaults for this instance.
     pub defaults: &'a RunDefaultsPlan,
+    /// Job concurrency policy for this concrete instance.
+    pub concurrency: Option<&'a ConcurrencyPlan>,
     /// The job-output finalization plan.
     pub outputs: &'a JobOutputsPlan,
     /// The step sequence, in file order.
     pub steps: &'a [StepPlan],
     /// The `matrix` context value (`Null` for a non-matrix job).
     pub matrix: Value,
+}
+
+/// Resolve this concrete instance's concurrency key and cancellation policy.
+pub(crate) fn materialize_concurrency(
+    instance: &JobInstance<'_>,
+    roots: &super::context::ContextRoots,
+    needs: &[NeedRecord],
+    fail_fast: bool,
+    max_parallel: Option<std::num::NonZeroU32>,
+    index: usize,
+    total: usize,
+) -> Result<Option<(String, bool)>, ExecError> {
+    let Some(concurrency) = instance.concurrency else {
+        return Ok(None);
+    };
+    let context = Context::new(std::sync::Arc::clone(&roots.fs))
+        .with_github(roots.github.clone())
+        .with_vars(roots.vars.clone())
+        .with_inputs(roots.inputs.clone())
+        .with_secrets(roots.secrets.clone())
+        .with_needs(build_needs_context(needs))
+        .with_matrix(instance.matrix.clone())
+        .with_strategy(strategy_context(fail_fast, max_parallel, index, total))
+        .with_status(RunStatus::Success);
+    let group = resolve_string(&concurrency.group, &context)
+        .map_err(ExecError::eval)?
+        .to_lowercase();
+    if group.trim().is_empty() {
+        return Err(ExecError::Infrastructure {
+            message: "a job concurrency group resolved to an empty string".to_string(),
+            fix: "make `concurrency.group` resolve to a non-empty value".to_string(),
+        });
+    }
+    let cancel =
+        resolve_bool(&concurrency.cancel_in_progress, &context).map_err(ExecError::eval)?;
+    Ok(Some((group, cancel)))
 }
 
 /// All instances of one job id, in leg order (one for a non-matrix job).
@@ -127,6 +166,7 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
             skip: job.skip.as_ref(),
             job_env: &job.env,
             defaults: &job.defaults,
+            concurrency: job.concurrency.as_ref(),
             outputs: &job.outputs,
             steps: &job.steps,
             matrix: Value::Null,
@@ -152,6 +192,7 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
             skip: leg.skip.as_ref(),
             job_env: &leg.env,
             defaults: &leg.defaults,
+            concurrency: leg.concurrency.as_ref(),
             outputs: &leg.outputs,
             steps: &leg.steps,
             matrix,
@@ -200,6 +241,7 @@ pub(crate) fn materialize<'a>(
                     skip: group.job.skip.as_ref(),
                     job_env: &group.job.env,
                     defaults: &group.job.defaults,
+                    concurrency: group.job.concurrency.as_ref(),
                     outputs: &group.job.outputs,
                     steps: &group.job.steps,
                     matrix: Value::Null,
@@ -236,6 +278,7 @@ pub(crate) fn materialize<'a>(
                     skip: plan.skip.as_ref(),
                     job_env: &plan.env,
                     defaults: &plan.defaults,
+                    concurrency: plan.concurrency.as_ref(),
                     outputs: &plan.outputs,
                     steps: &plan.steps,
                     matrix,
@@ -295,6 +338,7 @@ pub(crate) fn materialize<'a>(
             skip: group.job.skip.as_ref(),
             job_env: &group.job.env,
             defaults: &group.job.defaults,
+            concurrency: group.job.concurrency.as_ref(),
             outputs: &group.job.outputs,
             steps: &group.job.steps,
             matrix,

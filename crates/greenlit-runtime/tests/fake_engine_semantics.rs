@@ -61,7 +61,9 @@ struct ScriptedEngine {
     polls: AtomicUsize,
     created_images: Mutex<Vec<String>>,
     created_resources: Mutex<Vec<greenlit_runtime::ResourceLimits>>,
+    published_addresses: Mutex<Vec<String>>,
     created_networks: Mutex<Vec<String>>,
+    network_gateways: Mutex<HashMap<String, String>>,
     /// Hold container startup briefly so scheduler concurrency is observable.
     delay_start: bool,
     active_starts: AtomicUsize,
@@ -190,6 +192,10 @@ impl ContainerEngine for ScriptedEngine {
     async fn create_container(&self, spec: &ContainerSpec) -> Result<String, RuntimeError> {
         self.created_images.lock().unwrap().push(spec.image.clone());
         self.created_resources.lock().unwrap().push(spec.resources);
+        self.published_addresses
+            .lock()
+            .unwrap()
+            .extend(spec.ports.iter().filter_map(|port| port.host_ip.clone()));
         Ok(format!(
             "fake-{}",
             self.counter.fetch_add(1, Ordering::Relaxed)
@@ -294,16 +300,22 @@ impl ContainerEngine for ScriptedEngine {
         Ok(Vec::new())
     }
     async fn create_network(&self, name: &str) -> Result<String, RuntimeError> {
-        self.created_networks.lock().unwrap().push(name.to_string());
+        let mut networks = self.created_networks.lock().unwrap();
+        networks.push(name.to_string());
+        let ordinal = networks.len();
+        self.network_gateways
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), format!("10.0.{ordinal}.1"));
         Ok("net".to_string())
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 
-    async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError> {
         Ok(NetworkInfo {
-            gateway: Some("10.0.0.1".to_string()),
+            gateway: self.network_gateways.lock().unwrap().get(name).cloned(),
             subnet: Some("10.0.0.0/16".to_string()),
         })
     }
@@ -343,10 +355,18 @@ on: push
 jobs:
   first:
     runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        ports: [5432:5432]
     steps:
       - run: ECHO first
   second:
     runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        ports: [5432:5432]
     steps:
       - run: ECHO second
 "#,
@@ -411,6 +431,13 @@ jobs:
         "concurrent jobs must have distinct networks"
     );
     drop(networks);
+    let published = engine.published_addresses.lock().unwrap();
+    assert_eq!(published.len(), 2);
+    assert_ne!(
+        published[0], published[1],
+        "identical authored host ports must bind to distinct job bridge addresses"
+    );
+    drop(published);
     assert!(
         engine
             .created_resources
@@ -430,6 +457,90 @@ jobs:
             .collect::<Vec<_>>(),
         vec!["first", "second"],
         "report order remains deterministic"
+    );
+}
+
+#[tokio::test]
+async fn a_case_insensitive_concurrency_group_cancels_its_in_progress_owner() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "concurrency.yml",
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: Deploy
+      cancel-in-progress: true
+    steps:
+      - run: ECHO first
+  second:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: true
+    steps:
+      - run: ECHO second
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "concurrency".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+    let conclusions = report.jobs.iter().map(|job| job.result).collect::<Vec<_>>();
+    assert_eq!(
+        conclusions
+            .iter()
+            .filter(|result| **result == Conclusion::Cancelled)
+            .count(),
+        1,
+        "the newer case-insensitive group owner cancels exactly one predecessor: {conclusions:?}"
+    );
+    assert_eq!(
+        conclusions
+            .iter()
+            .filter(|result| **result == Conclusion::Success)
+            .count(),
+        1
     );
 }
 

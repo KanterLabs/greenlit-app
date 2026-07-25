@@ -71,8 +71,9 @@ pub use matrix::{
 pub use outputs::{JobOutputsPlan, PlannedOutput, PlannedValue};
 pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue};
 pub use plan::{
-    ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanError, PlanOptions,
-    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, analyze_support, plan, validate_v0_support,
+    ConcurrencyPlan, ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan,
+    PlanError, PlanOptions, RunDefaultsPlan, StaticSkip, StepKind, StepPlan, analyze_support, plan,
+    validate_v0_support,
 };
 pub use planned::{Evaluation, Planned};
 pub use runner::{

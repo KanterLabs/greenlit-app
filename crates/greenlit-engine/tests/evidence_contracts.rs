@@ -71,9 +71,7 @@ jobs:
         codes,
         vec![
             "github.oidc",
-            "job.concurrency",
             "job.environment",
-            "workflow.concurrency",
             "workflow.reusable_trigger",
         ]
     );
