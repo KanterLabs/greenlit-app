@@ -30,7 +30,7 @@ use futures_util::StreamExt;
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
-    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
+    ExecOutputSink, ExecSpec, HealthState, ImageIdentity, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -230,6 +230,28 @@ impl ContainerEngine for DockerEngine {
             }) => Ok(false),
             Err(e) => Err(RuntimeError::api(Operation::InspectImage, e)),
         }
+    }
+
+    async fn image_identity(&self, image: &str) -> Result<Option<ImageIdentity>, RuntimeError> {
+        let inspected = match self.docker.inspect_image(image).await {
+            Ok(inspected) => inspected,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(RuntimeError::api(Operation::InspectImage, error)),
+        };
+        let digest = inspected
+            .repo_digests
+            .and_then(|digests| digests.into_iter().next())
+            .and_then(|name| name.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+            .or(inspected.id);
+        Ok(digest.map(|digest| ImageIdentity {
+            digest,
+            os: inspected.os.unwrap_or_else(|| "unknown".to_string()),
+            architecture: inspected
+                .architecture
+                .unwrap_or_else(|| "unknown".to_string()),
+        }))
     }
 
     async fn build_image(

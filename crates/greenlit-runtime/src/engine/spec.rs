@@ -69,6 +69,18 @@ pub struct CommitSpec {
     pub tag: String,
 }
 
+/// Immutable identity and platform reported for a locally materialized image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageIdentity {
+    /// Manifest digest when available, otherwise the content-addressed image
+    /// configuration digest.
+    pub digest: String,
+    /// Image operating system.
+    pub os: String,
+    /// Image CPU architecture.
+    pub architecture: String,
+}
+
 /// A host-directory bind into the container.
 ///
 /// Greenlit's only sanctioned host bind is the repository checkout, mounted

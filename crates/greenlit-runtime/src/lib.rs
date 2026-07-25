@@ -43,14 +43,15 @@ pub use detect::{Endpoint, EngineFix, EngineProber, EngineState, SystemProber, d
 pub use docker::DockerEngine;
 pub use engine::{
     BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
-    ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageSummary, NetworkInfo, PortBinding,
-    RegistryAuth, SinkNull,
+    ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo,
+    PortBinding, RegistryAuth, SinkNull,
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{
     ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport, StoreConfig,
     actions::ActionRuntimeConfig, actions::node_runtime::HttpRuntimeBundleFetcher,
-    actions::preflight_plan_actions, container::ContainerRejection, reject_uses_steps, run_plan,
+    actions::preflight_plan_actions, container::ContainerRejection, preflight_plan_images,
+    reject_uses_steps, run_plan,
 };
 pub use image::{BaseImagePlan, ImageError, ensure_base_image, init_binary, plan_base_image};
 pub use isolation::{IsolationStrategy, isolation_container_spec};

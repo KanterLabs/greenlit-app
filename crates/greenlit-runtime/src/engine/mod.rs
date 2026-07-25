@@ -21,7 +21,7 @@ use crate::progress::ProgressSink;
 
 pub use spec::{
     BindMount, BuildSpec, CommitSpec, ContainerSpec, ContainerState, ExecOutput, ExecSpec,
-    HealthCheck, HealthState, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
+    HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
 };
 
 /// Receives an exec's stdout/stderr as the daemon streams it.
@@ -86,6 +86,14 @@ pub trait ContainerEngine: Send + Sync {
     /// Returns [`RuntimeError::Api`] only for a real inspection failure; a
     /// simple "image not found" is reported as `Ok(false)`, not an error.
     async fn image_exists(&self, image: &str) -> Result<bool, RuntimeError>;
+
+    /// Returns the immutable identity and platform of a materialized image.
+    ///
+    /// Backends without an inspect equivalent return `None`; callers that
+    /// require a lock must fail closed rather than inventing an identity.
+    async fn image_identity(&self, _image: &str) -> Result<Option<ImageIdentity>, RuntimeError> {
+        Ok(None)
+    }
 
     /// Build an image from a context tar, tagging it `spec.tag`, reporting
     /// daemon build-output lines to `progress`.

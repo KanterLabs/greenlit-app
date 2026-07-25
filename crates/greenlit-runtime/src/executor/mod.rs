@@ -24,6 +24,7 @@ mod context;
 mod dind;
 mod event_json;
 mod health;
+mod image_lock;
 mod instance;
 mod job;
 mod logsink;
@@ -61,6 +62,7 @@ use crate::progress::ProgressSink;
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
+pub use image_lock::preflight_plan_images;
 pub use preflight::reject_uses_steps;
 pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};

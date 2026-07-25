@@ -264,6 +264,17 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             );
         }
     }
+    let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
+    let mut progress = render::progress::renderer_for_stderr();
+    let container_locks = invocation
+        .time_stage("image-resolve", || {
+            runtime.block_on(greenlit_runtime::preflight_plan_images(
+                &engine,
+                &execution_plan,
+                &mut progress,
+            ))
+        })
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     let run_lock = evidence.lock(crate::run_evidence::LockInputs {
         workflow_path: &workflow_path.source_name,
         event_name: event_kind.event_name(),
@@ -272,6 +283,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         plan: &execution_plan,
         secrets: &all_secrets,
         actions: action_locks,
+        containers: container_locks,
     })?;
 
     // The local stores this run serves. A machine whose `HOME` cannot be
@@ -301,13 +313,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         store: store_config.clone(),
     };
 
-    let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
-
     // `Stdout` (not a lock guard) is `Send`, which the executor's streaming sink
     // requires; each write still locks internally. Phase progress renders on
     // stderr so this stream stays the machine-parseable run log.
     let mut out = io::stdout();
-    let mut progress = render::progress::renderer_for_stderr();
     let report = runtime
         .block_on(run_plan(
             &engine,

@@ -27,6 +27,7 @@ pub(crate) struct LockInputs<'a> {
     pub(crate) plan: &'a ExecutionPlan,
     pub(crate) secrets: &'a [(String, String)],
     pub(crate) actions: BTreeMap<String, String>,
+    pub(crate) containers: BTreeMap<String, String>,
 }
 
 impl RunEvidence {
@@ -100,6 +101,7 @@ impl RunEvidence {
             plan,
             secrets,
             actions,
+            containers,
         } = inputs;
         let workflow_digest = self
             .source
@@ -128,6 +130,7 @@ impl RunEvidence {
             .map(|(name, value)| (name.clone(), opaque_revision(value.as_bytes())))
             .collect();
         lock.actions = actions;
+        lock.containers = containers;
         lock.compatibility = local_support_report();
         write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
         self.write_job_locks(plan, &lock)?;
