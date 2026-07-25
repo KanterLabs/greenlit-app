@@ -782,6 +782,7 @@ name = "greenlit-init"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustix",
  "tempfile",
  "thiserror",
 ]
