@@ -135,6 +135,10 @@ fn serve() -> anyhow::Result<()> {
 }
 
 async fn serve_async() -> anyhow::Result<()> {
+    // Background preparation must yield CPU to foreground user commands.
+    // Failing to lower priority is harmless on kernels that reject `nice`;
+    // it never changes correctness or daemon availability.
+    let _priority = rustix::process::nice(10);
     let socket = socket_path()?;
     let parent = socket
         .parent()
