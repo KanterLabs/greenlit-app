@@ -525,6 +525,20 @@ impl CasStore {
         self.catalog.record_run_state(run_id, lock_digest, state)
     }
 
+    /// Terminal run identities whose engine resources may be reconciled once
+    /// their individual leases are no longer active.
+    pub fn reclaimable_run_ids(&self) -> Result<Vec<String>, CasError> {
+        let candidates = self.catalog.terminal_run_ids()?;
+        candidates
+            .into_iter()
+            .filter_map(|run_id| match self.lease_is_active(&run_id) {
+                Ok(false) => Some(Ok(run_id)),
+                Ok(true) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
+    }
+
     /// Inspect catalog consistency, active leases, and reclaimable bytes
     /// without deleting anything.
     pub fn doctor(&self) -> Result<StoreDoctorReport, CasError> {

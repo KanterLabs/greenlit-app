@@ -342,6 +342,7 @@ pub async fn start(
             binds: service.volume_binds.clone(),
             labels: vec![
                 ("greenlit.managed".to_string(), "1".to_string()),
+                ("greenlit.run".to_string(), config.volume_namespace.clone()),
                 ("greenlit.service".to_string(), id.clone()),
             ],
             resources: config.resources,
@@ -386,6 +387,7 @@ pub async fn start(
                 &container,
                 policy,
                 &netguard_image,
+                &config.volume_namespace,
                 progress,
             ) => result,
             () = cancellation.cancelled() => {

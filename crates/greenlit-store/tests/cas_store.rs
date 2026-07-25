@@ -163,6 +163,19 @@ fn leases_block_gc_and_inconsistent_metadata_blocks_destruction() {
             std::time::Duration::from_secs(60),
         )
         .expect("active lease should persist");
+    store
+        .record_run_state("active-run", None, "completed")
+        .expect("terminal transition should persist");
+    store
+        .record_run_state("reclaimable-run", None, "aborted")
+        .expect("aborted transition should persist");
+    assert_eq!(
+        store
+            .reclaimable_run_ids()
+            .expect("recovery identities should load"),
+        vec!["reclaimable-run".to_string()],
+        "a terminal run with an active lease is not safe to reconcile"
+    );
     fs::write(temp.path().join("tmp/interrupted.partial"), b"partial")
         .expect("partial download should be retained");
 

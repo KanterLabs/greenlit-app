@@ -230,6 +230,12 @@ async fn reconcile_runtime_resources(litci_root: &Path) {
     if !report.is_consistent() || report.active_leases > 0 {
         return;
     }
+    let Ok(terminal_runs) = store.reclaimable_run_ids() else {
+        return;
+    };
+    if terminal_runs.is_empty() {
+        return;
+    }
     let EngineState::Available { endpoint } = greenlit_runtime::detect(&SystemProber::new()).await
     else {
         return;
@@ -237,7 +243,7 @@ async fn reconcile_runtime_resources(litci_root: &Path) {
     let Ok(engine) = greenlit_runtime::DockerEngine::connect(&endpoint) else {
         return;
     };
-    let _result = engine.reconcile_managed_resources().await;
+    let _result = engine.reconcile_managed_resources(&terminal_runs).await;
 }
 
 async fn handle(

@@ -97,12 +97,19 @@ impl DockerEngine {
         Ok(DockerEngine { docker })
     }
 
-    /// Remove every abandoned Greenlit runtime resource.
+    /// Remove runtime resources belonging to proven-terminal Greenlit runs.
     ///
     /// Callers must first prove that no active run lease exists. Containers
     /// are removed before networks and volumes so dependency ordering cannot
     /// strand a lower-level resource.
-    pub async fn reconcile_managed_resources(&self) -> Result<ReconcileReport, RuntimeError> {
+    pub async fn reconcile_managed_resources(
+        &self,
+        terminal_run_ids: &[String],
+    ) -> Result<ReconcileReport, RuntimeError> {
+        let terminal = terminal_run_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
         let container_options = ListContainersOptionsBuilder::new()
             .all(true)
             .filters(&HashMap::from([("label", vec!["greenlit.managed=1"])]))
@@ -114,7 +121,12 @@ impl DockerEngine {
             .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
         let mut report = ReconcileReport::default();
         for container in containers {
-            if let Some(id) = container.id {
+            let reclaimable = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("greenlit.run"))
+                .is_some_and(|run_id| terminal.contains(run_id.as_str()));
+            if reclaimable && let Some(id) = container.id {
                 self.remove_container(&id).await?;
                 report.containers = report.containers.saturating_add(1);
             }
@@ -126,10 +138,11 @@ impl DockerEngine {
             .await
             .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
         for network in networks {
-            if let Some(name) = network
-                .name
-                .filter(|name| name.starts_with("greenlit-run-"))
-            {
+            if let Some(name) = network.name.filter(|name| {
+                terminal
+                    .iter()
+                    .any(|run_id| resource_belongs_to_run(name, run_id))
+            }) {
                 self.remove_network(&name).await?;
                 report.networks = report.networks.saturating_add(1);
             }
@@ -143,13 +156,24 @@ impl DockerEngine {
             .volumes
             .unwrap_or_default();
         for volume in volumes {
-            if volume.name.starts_with("greenlit-run-") {
+            if terminal
+                .iter()
+                .any(|run_id| resource_belongs_to_run(&volume.name, run_id))
+            {
                 self.remove_volume(&volume.name).await?;
                 report.volumes = report.volumes.saturating_add(1);
             }
         }
         Ok(report)
     }
+}
+
+fn resource_belongs_to_run(name: &str, run_id: &str) -> bool {
+    let prefix = format!("greenlit-run-{run_id}");
+    name == prefix
+        || name
+            .strip_prefix(&prefix)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Dispatches a `DOCKER_HOST` URL to the matching bollard connector by scheme.

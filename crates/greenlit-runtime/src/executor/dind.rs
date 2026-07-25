@@ -110,6 +110,7 @@ pub(crate) fn job_uses_docker(scripts: impl IntoIterator<Item = impl AsRef<str>>
 pub(crate) async fn start(
     engine: &dyn ContainerEngine,
     network: &str,
+    run_id: &str,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<Dind, ExecError> {
     if !engine.image_exists(DIND_IMAGE).await? {
@@ -130,6 +131,7 @@ pub(crate) async fn start(
         env: vec![("DOCKER_TLS_CERTDIR".to_string(), String::new())],
         labels: vec![
             ("greenlit.managed".to_string(), "1".to_string()),
+            ("greenlit.run".to_string(), run_id.to_string()),
             ("greenlit.dind".to_string(), "1".to_string()),
         ],
         ..ContainerSpec::default()

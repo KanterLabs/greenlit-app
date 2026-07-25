@@ -421,6 +421,22 @@ impl Catalog {
         Ok(())
     }
 
+    pub(super) fn terminal_run_ids(&self) -> Result<Vec<String>, CasError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id FROM runs
+                 WHERE state IN ('completed','aborted')
+                 ORDER BY updated_at ASC LIMIT 10000",
+            )
+            .map_err(CasError::Catalog)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(CasError::Catalog)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(CasError::Catalog)
+    }
+
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CasError> {
         self.connection.lock().map_err(|_| CasError::CatalogState {
             path: self.path.display().to_string(),

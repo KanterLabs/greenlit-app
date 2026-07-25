@@ -417,6 +417,7 @@ pub(crate) async fn run_instance(
             &container,
             job_network.policy(),
             &netguard_image,
+            shared.namespace,
             progress,
         ) => result.map_err(ExecError::from),
         () = shared.cancellation.cancelled() => Ok(()),
@@ -439,7 +440,12 @@ pub(crate) async fn run_instance(
     // privileged container for a capability most workflows never use.
     let dind = if dind::job_uses_docker(instance.steps.iter().filter_map(step_script)) {
         let dind_start = tokio::select! {
-            result = dind::start(shared.engine, job_network.name(), progress) => Some(result),
+            result = dind::start(
+                shared.engine,
+                job_network.name(),
+                shared.namespace,
+                progress,
+            ) => Some(result),
             () = shared.cancellation.cancelled() => None,
         };
         match dind_start {

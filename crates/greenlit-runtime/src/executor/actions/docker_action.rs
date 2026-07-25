@@ -359,6 +359,7 @@ pub(crate) async fn run_step(
         network: Some(format!("container:{container}")),
         labels: vec![
             ("greenlit.managed".to_string(), "1".to_string()),
+            ("greenlit.run".to_string(), volume_namespace.to_string()),
             ("greenlit.docker-action".to_string(), "1".to_string()),
         ],
         binds: vec![

@@ -92,6 +92,7 @@ pub async fn apply(
     container: &str,
     policy: &Policy,
     image: &str,
+    run_id: &str,
     progress: &mut (dyn crate::progress::ProgressSink + Send),
 ) -> Result<(), RuntimeError> {
     if !engine.image_exists(image).await? {
@@ -108,6 +109,7 @@ pub async fn apply(
         cmd: vec![script(policy)],
         labels: vec![
             ("greenlit.managed".to_string(), "1".to_string()),
+            ("greenlit.run".to_string(), run_id.to_string()),
             ("greenlit.netguard".to_string(), "1".to_string()),
         ],
         ..ContainerSpec::default()

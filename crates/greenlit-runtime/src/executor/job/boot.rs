@@ -349,7 +349,13 @@ pub(crate) async fn boot_container(
             ),
         }
     }
-    spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
+    spec.labels = vec![
+        ("greenlit.managed".to_string(), "1".to_string()),
+        (
+            "greenlit.run".to_string(),
+            shared.config.volume_namespace.clone(),
+        ),
+    ];
     spec.resources = shared.config.resources;
 
     let engine = shared.engine;
