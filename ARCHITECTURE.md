@@ -298,6 +298,54 @@ produce a mixed checkout. A completed writable filesystem is never reused;
 warmth comes only from immutable images/CAS content and workflow-declared
 caches.
 
+## Phase 8 daemon and recovery dataflow
+
+The optional daemon is the same `litci` binary speaking a bounded,
+schema-versioned JSON protocol over a mode-0600 Unix socket. Linux peer
+credentials must match the daemon UID. A missing, stale, or incompatible
+daemon is replaced automatically; `--no-daemon` and every daemon failure use
+the same authoritative in-process resolution and execution path.
+
+```text
+repository changes ----> low-priority watcher
+                              |
+                     cancel stale preparation
+                              |
+                 +------------+-------------+
+                 |                          |
+       immutable action prefetch    one-use frozen source
+                 |                     template
+                 v                          |
+        verified shared stores       atomic client claim
+                                            |
+                                  re-hash current source
+                                            |
+                                 match ------+------ mismatch
+                                   |                   |
+                               adopt once       discard + capture
+```
+
+Run transitions and immutable-object references are durable in the CAS
+catalog. Leases heartbeat while a run owns content. Startup recovery first
+marks expired, unterminated runs aborted, then reconciles only engine resources
+whose `greenlit.run` label or exact namespace names a terminal, unleased run.
+Unlabelled resources, active runs, and unrelated managed containers are never
+eligible. Containers are removed before networks and named volumes.
+
+`litci doctor` reports catalog integrity, interrupted runs/downloads, leases,
+and reclaimable bytes without deleting data. `litci clean` uses the same
+reference graph: partial downloads are reclaimed before immutable objects,
+active leases and RunLock pins block deletion, and any catalog inconsistency
+blocks destructive collection.
+
+Repository-local persisted secrets are AES-256-GCM ciphertext in
+`.litci/secrets.vault`; the random 256-bit key exists only at mode 0600 under
+`~/.litci/vault.key`. Legacy plaintext dotenv secrets migrate atomically and
+are removed only after the encrypted vault is durable. Direct, multiline,
+standard/base64url, and percent-encoded variants are registered with the
+streaming masker before output reaches terminal logs, annotations, structured
+results, retained service logs, or errors.
+
 ## Known issues log
 
 Entries here describe upstream quirks that the implementation or dependency
