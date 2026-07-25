@@ -262,6 +262,7 @@ impl RunEvidence {
             )
         })?;
         write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
+        write_json_atomic(&self.directory.join("execution-plan.json"), plan)?;
         self.write_job_locks(plan, &lock)?;
         let leased = self.source_digests()?;
         self.content_store

@@ -305,6 +305,106 @@ pub struct ResultEvidence {
     pub github_confirmed: bool,
 }
 
+/// Identity of one authored step in exported GitHub confirmation evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubStepEvidenceV1 {
+    /// Stable zero-based authored position within the job.
+    pub index: usize,
+    /// Authored step id when one exists.
+    pub id: Option<String>,
+    /// Display name expected from the GitHub jobs API.
+    pub name: String,
+}
+
+/// Identity of one expanded job in exported GitHub confirmation evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubJobEvidenceV1 {
+    /// Authored job id.
+    pub id: String,
+    /// Exact GitHub display name, including matrix values when applicable.
+    pub name: String,
+    /// Authored steps in execution order.
+    pub steps: Vec<GithubStepEvidenceV1>,
+}
+
+/// Version-one external evidence artifact uploaded by an exported workflow.
+///
+/// The artifact contains only immutable, non-secret identities. GitHub run,
+/// job, step, workflow-content, and artifact metadata are checked separately
+/// before this document can upgrade a local result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubEvidenceV1 {
+    /// Schema discriminator.
+    pub schema_version: u32,
+    /// Full clean source commit.
+    pub source_commit: String,
+    /// Digest of the original selected workflow.
+    pub workflow_digest: String,
+    /// Digest of the separate fully pinned exported workflow.
+    pub exported_workflow_digest: String,
+    /// Repository-relative path at which the exported workflow must run.
+    pub exported_workflow_path: String,
+    /// Trigger event selected locally.
+    pub event: String,
+    /// Typed dispatch inputs rendered into stable strings.
+    pub inputs: BTreeMap<String, String>,
+    /// Action aliases mapped to full commits.
+    pub actions: BTreeMap<String, String>,
+    /// Container aliases mapped to OCI digests.
+    pub containers: BTreeMap<String, String>,
+    /// Toolchain requests mapped to exact identities.
+    pub toolchains: BTreeMap<String, String>,
+    /// Expanded job and authored-step identities.
+    pub jobs: Vec<GithubJobEvidenceV1>,
+}
+
+impl GithubEvidenceV1 {
+    /// Returns byte-stable compact JSON.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+
+    /// Returns the SHA-256 identity of the canonical artifact bytes.
+    pub fn digest(&self) -> Result<String, serde_json::Error> {
+        self.canonical_json().map(|bytes| sha256_identity(&bytes))
+    }
+
+    /// Verifies every lock field which can be equivalent across local and
+    /// GitHub execution. Secrets and host runtime fingerprints are
+    /// intentionally excluded: the exported workflow never receives secret
+    /// values and GitHub necessarily supplies a different control plane.
+    pub fn matches_lock(&self, lock: &RunLockV1) -> Result<(), String> {
+        if lock.source.dirty {
+            return Err("the local run used uncommitted source".to_string());
+        }
+        let checks = [
+            (
+                self.source_commit == lock.source.commit,
+                "source commit differs",
+            ),
+            (
+                self.workflow_digest == lock.source.workflow_digest,
+                "workflow semantics digest differs",
+            ),
+            (self.event == lock.event, "event differs"),
+            (self.inputs == lock.inputs, "workflow inputs differ"),
+            (self.actions == lock.actions, "resolved actions differ"),
+            (
+                self.containers == lock.containers,
+                "resolved containers differ",
+            ),
+            (
+                self.toolchains == lock.toolchains,
+                "resolved toolchains differ",
+            ),
+        ];
+        checks
+            .into_iter()
+            .find_map(|(matches, reason)| (!matches).then(|| reason.to_string()))
+            .map_or(Ok(()), Err)
+    }
+}
+
 /// Version-one independently dimensioned execution result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionResultV1 {

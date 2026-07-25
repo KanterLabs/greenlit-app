@@ -35,6 +35,10 @@ pub(crate) enum Command {
     Stats,
     /// Inspect the immutable lock and result evidence for a local run.
     Inspect(InspectArgs),
+    /// Export a separate, fully pinned workflow and GitHub evidence artifact.
+    Export(ExportArgs),
+    /// Import read-only GitHub evidence for a completed local run.
+    Confirm(ConfirmArgs),
     /// Diagnose local daemon, run, and storage state without deleting data.
     Doctor(DoctorArgs),
     /// Remove Greenlit's derived caches and built images. Credentials and run
@@ -43,6 +47,31 @@ pub(crate) enum Command {
     /// Internal per-user preparation daemon.
     #[command(name = "daemon", hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ExportArgs {
+    /// Completed local run identity. When omitted, export the latest run.
+    pub(crate) run_id: Option<String>,
+
+    /// Destination directory. Defaults to
+    /// `.litci/confirmation/<run-id>/`.
+    #[arg(short, long)]
+    pub(crate) output: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ConfirmArgs {
+    /// Completed local run identity.
+    pub(crate) run_id: String,
+
+    /// GitHub repository in `OWNER/REPO` form.
+    #[arg(long)]
+    pub(crate) repository: String,
+
+    /// Numeric GitHub Actions workflow-run identity.
+    #[arg(long = "github-run", value_parser = parse_positive_u64)]
+    pub(crate) github_run: u64,
 }
 
 #[derive(Debug, clap::Args)]
@@ -184,6 +213,14 @@ pub(crate) struct RunArgs {
 fn parse_positive_i64(value: &str) -> Result<i64, String> {
     value
         .parse::<i64>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| "value must be a positive integer".to_string())
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
         .ok()
         .filter(|parsed| *parsed > 0)
         .ok_or_else(|| "value must be a positive integer".to_string())

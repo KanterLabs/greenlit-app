@@ -14,6 +14,7 @@ mod doctor_cmd;
 mod dotenv_format;
 mod errors;
 mod gh_names;
+mod github_confirmation;
 mod inspect_cmd;
 mod plan_cmd;
 mod render;
@@ -44,6 +45,8 @@ fn main() -> ExitCode {
         cli::Command::Auth(args) => auth_cmd::run(args),
         cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
         cli::Command::Inspect(args) => inspect_cmd::run(args).map(|()| ExitCode::SUCCESS),
+        cli::Command::Export(args) => github_confirmation::export(args).map(|()| ExitCode::SUCCESS),
+        cli::Command::Confirm(args) => github_confirmation::confirm(args),
         cli::Command::Doctor(args) => doctor_cmd::run(args),
         cli::Command::Clean(args) => clean_cmd::run(args),
         cli::Command::Daemon(args) => daemon::command(args),
