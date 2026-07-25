@@ -1,8 +1,9 @@
 # ARCHITECTURE.md — Greenlit
 
-This document records the architecture implemented in Phase 1. It is updated
-with each phase summary; later-phase crates and runtime paths are intentionally
-absent until they exist.
+This document records the architecture as implemented. It is updated with
+each phase summary; crates and runtime paths appear as the phase that builds
+them lands. Phases 2 and 3 appended only to the known-issues log; Phase 4 adds
+a crate, so the boundary table and a second dataflow arrive with it.
 
 ## Crate boundaries
 
@@ -26,6 +27,10 @@ greenlit-metrics  -> (no Greenlit crates)
 | `greenlit-expr` | GitHub expression lexing, parsing, evaluation, coercion, contexts, status functions, JSON functions, and `hashFiles`. Filesystem access for `hashFiles` is injected behind `HashFilesFs`; `RealFs` is the local production implementation. |
 | `greenlit-engine` | The pure planning boundary over a typed workflow, synthetic event, and resolved local contexts. It builds the `needs` graph, detects cycles, expands matrices, validates runner labels, partially evaluates conditions/templates/outputs, preserves runtime-deferred values, and emits the serializable `ExecutionPlan`. Local Git metadata collection and synthetic event construction also live here. |
 | `greenlit-metrics` | Local invocation timing and persistence. It opens stage-labelled `tracing` spans, aggregates stage durations, appends schema-versioned NDJSON records, and reads those records for reporting. It has no network dependency or transmission path. |
+| `greenlit-runtime` (Phase 2) | The `ContainerEngine` port and its bollard backend, three-state engine detection, base images, workspace isolation, `--write-back`, and the executor that drives a plan. From Phase 4 it also owns the per-job network, service containers, the network policy, Docker-in-Docker, and lazy provisioning. |
+| `greenlit-actions` (Phase 3) | `uses:` parsing, ref→SHA resolution, the content-addressed action store, and `action.yml` parsing. |
+| `greenlit-store` (Phase 4) | The local `actions/cache` and artifact stores, and the axum shim that serves their wire protocols to unmodified actions. It performs no I/O outside its own root and opens no socket of its own — `greenlit-runtime` binds it onto the job network. |
+| `greenlit-init` (Phase 2) | The private container-only entrypoint helper that stacks the overlay and `exec`s the job command. Never a host command; embedded and extracted only into the base-image build context. |
 
 No Phase 1 crate starts containers, accesses a container engine, fetches an
 action, contacts GitHub, resolves remote variables, or prompts for secrets.
@@ -150,6 +155,44 @@ path before it reaches a host resource:
   repair/append writers take cross-process shared/exclusive locks, and each
   NDJSON record is bounded to 8 MiB. No Phase 1 dependency provides network or
   telemetry transport.
+
+## Phase 4 dataflow
+
+Everything Phase 4 added hangs off one resource created per job — the job's
+own bridge network — and the ordering below is load-bearing rather than
+incidental:
+
+```text
+                    create job network
+                            |
+              inspect it for the bridge gateway
+                            |
+          bind the shim on that gateway (cache + artifacts)
+                            |
+     start services on the bridge, gated on their health probes
+                            |
+                     boot the job container
+                            |
+       apply the network policy *before* any workflow code runs
+                            |
+        install provisioning shims (Greenlit runner images only)
+                            |
+         seed PATH: wrappers first, provisioning shims last
+                            |
+                        run the steps
+                            |
+     on success, converge: replay the installs in a clean base
+     container and commit that as this repo's per-repo image
+                            |
+   tear down container, then DinD, then services, then the network
+```
+
+A container reaches the host only at the bridge gateway — `127.0.0.1` inside
+a container is the container — which is why the shim binds there and why the
+gateway address has to be discovered rather than assumed. The policy is
+applied before readiness because a container that has executed even one step
+unrestricted has already had its chance to reach the LAN. Teardown runs in
+reverse because a network holding any attachment cannot be removed.
 
 ## Known issues log
 
@@ -408,12 +451,11 @@ policy actively contains. They are not deferred Greenlit behavior.
   daemon (a `run:` step writes a file, a Docker action reads and appends to
   it, and a later `run:` step reads back both halves). The tradeoff: a job
   with a Docker action cannot use overlay isolation even if it would
-  otherwise qualify, and the run-scoped volume this creates is not cleaned up
-  automatically — `ContainerEngine` has no `remove_volume` operation yet, so
-  these volumes accumulate on the host until an operator prunes them
-  (`docker volume prune`); tracked here rather than silently left
-  undocumented, since automatic cleanup is a reasonable near-term follow-up
-  but was out of this task's scope.
+  otherwise qualify. **Phase 4 closed the cleanup half of this entry**: the
+  port gained `remove_volume`, and the run-scoped volume is now removed after
+  the job container's own teardown (it has to follow, because a volume still
+  bound by a running container cannot be removed). Before that it leaked one
+  volume per run until an operator pruned by hand.
 
 - **`actions/checkout` of the workflow's own repository is satisfied from the
   already-materialized isolated workspace, with no network access; checking
@@ -577,3 +619,47 @@ policy actively contains. They are not deferred Greenlit behavior.
   ordinary, sibling-invisible temp storage, so a fix can reuse
   `crate::executor::cmdfiles` unchanged once that plumbing exists; left for
   a later wave.
+
+- **The network policy is enforced inside each container's own namespace, not
+  by host `DOCKER-USER` rules.** `PHASE-4-environment.md` names the host
+  chain, but Docker exposes no API for it, so honoring that literally would
+  mean shelling out to `iptables` under `sudo` on every `litci run` — against
+  the spec's "zero prerequisites" and the never-shell-out rule. Greenlit
+  instead starts a short-lived sidecar in the workflow container's own network
+  namespace with `CAP_NET_ADMIN`, installs the rules there, and lets it exit;
+  the rules persist for the namespace's life and the capability does not. This
+  is stronger than the host chain rather than merely equivalent — the workflow
+  container never holds `NET_ADMIN`, so code inside it cannot remove the rules
+  binding it, verified by a root-in-container `iptables -F` failing with
+  "Permission denied" while the drop stayed in force.
+
+- **Blob URLs authorize themselves; the bearer token does not reach them.**
+  `@azure/storage-blob` treats a signed URL as self-authorizing and sends no
+  `Authorization` header, and `actions/cache` fetches its `archiveLocation`
+  with a bare `HttpClient`. A shim that requires a bearer header on those
+  routes returns 401, which the Azure SDK surfaces as a `RestError` with an
+  **empty** message and which `actions/cache` reports as an ordinary cache
+  miss — two failure modes that both hide the cause. Greenlit therefore does
+  what the real service does and puts a per-run signature in the URL, kept
+  distinct from the bearer token so the token never lands in a URL a client
+  might log (`actions/cache` calls `setSecret` on the download URL for exactly
+  that reason). Evidence: reproducing the upload host-side against
+  `crates/greenlit-store/examples/shim_probe.rs` and printing `error.stack`
+  rather than `error.message`.
+
+- **The artifact twirp client sends snake_case and parses camelCase.** Requests
+  are serialized with `useProtoFieldName: true`; responses are parsed without
+  it, so protobuf-JSON's default lowerCamelCase applies. Because the same call
+  passes `ignoreUnknownFields`, a snake_case *response* is not rejected but
+  silently ignored, leaving the field at its default — an empty
+  `signedUploadUrl` that fails much later and elsewhere. Pinned by
+  `crates/greenlit-store/tests/artifact_shim.rs`.
+
+- **Provisioned apt packages carry no pinned version.** The runner-images
+  toolset manifest lists a package *set* with no versions, so a provisioned
+  apt package lands at whatever the Ubuntu archive currently offers. That is
+  what the hosted runner gets from the same archive, but it is weaker than
+  `PHASE-4-environment.md`'s "at the exact versions listed", which genuinely
+  holds only for tools the manifest versions explicitly. The distinction is
+  preserved in `Recipe::pinned_version` and surfaced in the install log as
+  `distribution default` rather than papered over with an invented number.
