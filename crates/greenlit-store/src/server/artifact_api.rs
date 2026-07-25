@@ -140,6 +140,9 @@ struct DeleteResponse {
 struct BlobQuery {
     comp: Option<String>,
     blockid: Option<String>,
+    /// The per-run URL signature. Blob clients send no `Authorization`
+    /// header, so this is what authorizes the request.
+    sig: Option<String>,
 }
 
 /// Builds the artifact routes onto `router`.
@@ -277,11 +280,10 @@ async fn blob_put(
     State(state): State<Arc<ShimState>>,
     Path(id): Path<i64>,
     Query(query): Query<BlobQuery>,
-    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err(denied) = state.authorize(&headers) {
-        return denied.into_response();
+    if !state.signature_matches(query.sig.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let store = state.artifacts();
@@ -328,10 +330,10 @@ async fn blob_put(
 async fn blob_get(
     State(state): State<Arc<ShimState>>,
     Path(id): Path<i64>,
-    headers: HeaderMap,
+    Query(query): Query<BlobQuery>,
 ) -> Response {
-    if let Err(denied) = state.authorize(&headers) {
-        return denied.into_response();
+    if !state.signature_matches(query.sig.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
     let Ok(path) = state.artifacts().blob_path(id) else {
         return StatusCode::NOT_FOUND.into_response();

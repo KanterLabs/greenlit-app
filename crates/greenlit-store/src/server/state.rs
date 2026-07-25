@@ -12,6 +12,7 @@ pub struct ShimState {
     cache: CacheStore,
     artifacts: ArtifactStore,
     token: String,
+    signature: String,
     base_url: String,
 }
 
@@ -29,14 +30,34 @@ impl ShimState {
         cache: CacheStore,
         artifacts: ArtifactStore,
         token: impl Into<String>,
+        signature: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
         Self {
             cache,
             artifacts,
             token: token.into(),
+            signature: signature.into(),
             base_url: base_url.into(),
         }
+    }
+
+    /// Whether a blob request carries this run's URL signature.
+    ///
+    /// Blob routes cannot be authorized by a bearer header, because the
+    /// clients that reach them never send one. `@azure/storage-blob` treats a
+    /// "signed" URL as self-authorizing and adds no `Authorization`, and
+    /// `actions/cache` fetches its `archiveLocation` with a bare `HttpClient`.
+    /// Requiring a header there produced a 401 that the Azure SDK surfaced as
+    /// a `RestError` with an *empty* message — an upload that failed for a
+    /// reason nothing printed.
+    ///
+    /// The real service solves this with a SAS in the URL, and so does this:
+    /// a per-run signature in the query string, kept separate from the bearer
+    /// token so the token itself never appears in a URL a client might log.
+    #[must_use]
+    pub fn signature_matches(&self, presented: Option<&str>) -> bool {
+        presented.is_some_and(|value| constant_time_eq(value.as_bytes(), self.signature.as_bytes()))
     }
 
     /// The cache store this shim serves.
@@ -61,8 +82,9 @@ impl ShimState {
     #[must_use]
     pub fn blob_url(&self, id: i64) -> String {
         format!(
-            "{}_apis/artifactcache/blobs/{id}",
-            with_trailing_slash(&self.base_url)
+            "{}_apis/artifactcache/blobs/{id}?sig={}",
+            with_trailing_slash(&self.base_url),
+            self.signature
         )
     }
 
@@ -70,8 +92,9 @@ impl ShimState {
     #[must_use]
     pub fn artifact_blob_url(&self, id: i64) -> String {
         format!(
-            "{}greenlit/artifacts/{id}",
-            with_trailing_slash(&self.base_url)
+            "{}greenlit/artifacts/{id}?sig={}",
+            with_trailing_slash(&self.base_url),
+            self.signature
         )
     }
 
@@ -139,6 +162,7 @@ mod tests {
             CacheStore::at("/tmp/unused"),
             ArtifactStore::at("/tmp/unused-artifacts"),
             "secret",
+            "urlsig",
             "http://10.0.0.1:8080",
         )
     }
@@ -174,11 +198,23 @@ mod tests {
     }
 
     #[test]
+    fn a_blob_url_carries_its_own_credential() {
+        // The clients that fetch these URLs send no `Authorization` header,
+        // so the URL has to authorize itself the way a real SAS does.
+        let state = state();
+        assert!(state.blob_url(1).contains("?sig=urlsig"));
+        assert!(state.artifact_blob_url(1).contains("?sig=urlsig"));
+        assert!(state.signature_matches(Some("urlsig")));
+        assert!(!state.signature_matches(Some("wrong")));
+        assert!(!state.signature_matches(None));
+    }
+
+    #[test]
     fn the_blob_url_is_addressable_from_the_container() {
         // The client concatenates onto the base, so the slash matters.
         assert_eq!(
             state().blob_url(7),
-            "http://10.0.0.1:8080/_apis/artifactcache/blobs/7"
+            "http://10.0.0.1:8080/_apis/artifactcache/blobs/7?sig=urlsig"
         );
         assert_eq!(with_trailing_slash("http://x/"), "http://x/");
         assert_eq!(with_trailing_slash("http://x"), "http://x/");

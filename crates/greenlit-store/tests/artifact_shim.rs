@@ -19,6 +19,8 @@ use std::net::Ipv4Addr;
 use greenlit_store::{ArtifactStore, CacheStore, ShimState};
 
 const TOKEN: &str = "runtime-token-for-this-run";
+/// Blob URLs authorize themselves; no client sends a header for them.
+const SIGNATURE: &str = "url-signature-for-this-run";
 const SERVICE: &str = "github.actions.results.api.v1.ArtifactService";
 const SCOPE: &str = "run-backend-id-1";
 
@@ -38,6 +40,7 @@ async fn start() -> Fixture {
         CacheStore::at(root.path().join("cache")),
         ArtifactStore::at(root.path().join("artifacts")),
         TOKEN,
+        SIGNATURE,
         base.clone(),
     );
     let shim = bound.serve(state);
@@ -100,16 +103,16 @@ async fn the_upload_then_download_sequence_matches_the_client() {
     //    how the blocks assemble -- honouring arrival order instead would
     //    produce a corrupt artifact that still finalizes cleanly.
     for (block_id, chunk) in [("YjAwMDI=", "world"), ("YjAwMDE=", "hello ")] {
+        // No `Authorization` header anywhere in this block: a blob client
+        // never sends one, so the URL's own `sig` has to carry it.
         let staged = agent
-            .put(&format!("{upload_url}?comp=block&blockid={block_id}"))
-            .header("Authorization", &format!("Bearer {TOKEN}"))
+            .put(&format!("{upload_url}&comp=block&blockid={block_id}"))
             .send(chunk)
             .expect("stage block");
         assert_eq!(staged.status(), 201);
     }
     let committed = agent
-        .put(&format!("{upload_url}?comp=blocklist"))
-        .header("Authorization", &format!("Bearer {TOKEN}"))
+        .put(&format!("{upload_url}&comp=blocklist"))
         .send(
             "<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>\
              <Latest>YjAwMDE=</Latest><Latest>YjAwMDI=</Latest></BlockList>",
@@ -169,11 +172,7 @@ async fn the_upload_then_download_sequence_matches_the_client() {
         .and_then(serde_json::Value::as_str)
         .expect("signed_url");
 
-    let mut downloaded = agent
-        .get(download_url)
-        .header("Authorization", &format!("Bearer {TOKEN}"))
-        .call()
-        .expect("download");
+    let mut downloaded = agent.get(download_url).call().expect("download");
     assert_eq!(
         downloaded.body_mut().read_to_string().expect("body"),
         "hello world",
@@ -206,7 +205,6 @@ async fn a_small_artifact_may_arrive_as_one_unstaged_put() {
 
     let put = agent
         .put(&upload_url)
-        .header("Authorization", &format!("Bearer {TOKEN}"))
         .header("x-ms-blob-type", "BlockBlob")
         .send("small")
         .expect("whole-blob put");
@@ -232,7 +230,6 @@ async fn a_small_artifact_may_arrive_as_one_unstaged_put() {
                 .and_then(serde_json::Value::as_str)
                 .expect("url"),
         )
-        .header("Authorization", &format!("Bearer {TOKEN}"))
         .call()
         .expect("download");
     assert_eq!(body.body_mut().read_to_string().expect("body"), "small");
@@ -257,11 +254,7 @@ async fn an_artifact_is_scoped_to_its_run() {
         .and_then(serde_json::Value::as_str)
         .expect("url")
         .to_string();
-    agent
-        .put(&url)
-        .header("Authorization", &format!("Bearer {TOKEN}"))
-        .send("x")
-        .expect("put");
+    agent.put(&url).send("x").expect("put");
     twirp(
         &agent,
         &base,
@@ -305,11 +298,7 @@ async fn an_unfinalized_upload_is_never_listed_or_downloadable() {
         .and_then(serde_json::Value::as_str)
         .expect("url")
         .to_string();
-    agent
-        .put(&url)
-        .header("Authorization", &format!("Bearer {TOKEN}"))
-        .send("partial")
-        .expect("put");
+    agent.put(&url).send("partial").expect("put");
     // No FinalizeArtifact -- the shape a killed job leaves behind.
 
     let listed = twirp(

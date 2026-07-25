@@ -175,13 +175,23 @@ async fn commit(
     }
 }
 
+/// The `?sig=` a blob URL carries in place of a bearer header.
+#[derive(Debug, Deserialize)]
+struct BlobQuery {
+    sig: Option<String>,
+}
+
 async fn download(
     State(state): State<Arc<ShimState>>,
     Path(id): Path<i64>,
-    headers: HeaderMap,
+    Query(query): Query<BlobQuery>,
 ) -> Response {
-    if let Err(denied) = state.authorize(&headers) {
-        return denied.into_response();
+    // `actions/cache` fetches `archiveLocation` with a bare `HttpClient` that
+    // sends no `Authorization`. Requiring one here turned every cache *hit*
+    // into a failed download, which the action reports as an ordinary miss --
+    // so the cache looked like it never restored anything.
+    if !state.signature_matches(query.sig.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
     }
 
     let store: &CacheStore = state.cache();
