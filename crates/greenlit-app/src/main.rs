@@ -9,6 +9,7 @@ mod auth;
 mod auth_cmd;
 mod clean_cmd;
 mod cli;
+mod daemon;
 mod dotenv_format;
 mod errors;
 mod gh_names;
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
         cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
         cli::Command::Inspect(args) => inspect_cmd::run(args).map(|()| ExitCode::SUCCESS),
         cli::Command::Clean(args) => clean_cmd::run(args),
+        cli::Command::Daemon(args) => daemon::command(args),
     };
     match result {
         Ok(code) => code,

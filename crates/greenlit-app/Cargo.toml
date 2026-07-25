@@ -32,7 +32,7 @@ greenlit-runtime = { path = "../greenlit-runtime", version = "0.1.0" }
 greenlit-store = { path = "../greenlit-store", version = "0.1.0" }
 # Async runtime for `litci run`/`litci setup`: the executor and engine detection
 # are async; the CLI drives them on a current-thread runtime via `block_on`.
-tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time", "signal"] }
+tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time", "signal", "net"] }
 # CLI argument parsing (derive API) -- the one new user-facing-flags
 # dependency this crate adds.
 clap = { version = "4.6.3", features = ["derive"] }
@@ -49,7 +49,7 @@ indexmap = "2.14.0"
 # Opens `.litci/vars` relative to an already-open repository directory with
 # no-follow semantics. This prevents a repository-authored symlink from
 # redirecting local-variable reads into host files.
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 # The interactive workflow picker shown when `.github/workflows/` holds
 # several files and no `-W` was passed. Prompt rendering goes to stderr, so
 # stdout stays machine-parseable; non-TTY invocations never prompt. Also

@@ -38,6 +38,20 @@ pub(crate) enum Command {
     /// Remove Greenlit's derived caches and built images. Credentials and run
     /// history are never touched.
     Clean(CleanArgs),
+    /// Internal per-user preparation daemon.
+    #[command(name = "daemon", hide = true)]
+    Daemon(DaemonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DaemonArgs {
+    /// Ask the current daemon to exit.
+    #[arg(long, conflicts_with = "status")]
+    pub(crate) shutdown: bool,
+
+    /// Report whether a compatible daemon is accepting requests.
+    #[arg(long, conflicts_with = "shutdown")]
+    pub(crate) status: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -125,6 +139,11 @@ pub(crate) struct RunArgs {
     /// verified locked content already present on this machine.
     #[arg(long)]
     pub(crate) offline: bool,
+
+    /// Run through the identical in-process path without contacting or
+    /// auto-starting the optional preparation daemon.
+    #[arg(long)]
+    pub(crate) no_daemon: bool,
 
     /// Maximum CPUs available to each job and service container.
     #[arg(long, value_name = "COUNT", value_parser = parse_cpus)]

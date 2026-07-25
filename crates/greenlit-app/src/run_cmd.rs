@@ -83,6 +83,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     })?;
     let repo_root = find_repository_root(&cwd)
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
+    crate::daemon::prepare(&repo_root, args.no_daemon);
     let workflow_path =
         workflow_discovery::resolve_workflow_path(args.workflow.as_deref(), &cwd, &repo_root)
             .and_then(|resolution| {

@@ -168,6 +168,48 @@ fn an_exact_matrix_case_is_selected_before_engine_work() {
 }
 
 #[test]
+fn daemon_and_no_daemon_paths_persist_identical_terminal_results() {
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", SELECTABLE_MATRIX_WORKFLOW);
+    sandbox.init_git();
+
+    let direct = sandbox.run_with_daemon(&["run", "--no-daemon"], &[SSH_DOCKER_HOST]);
+    assert!(!direct.status.success());
+    assert!(!sandbox.home().join(".litci/daemon/v1.sock").exists());
+
+    let managed = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
+    assert!(!managed.status.success());
+    let status = sandbox.run(&["daemon", "--status"]);
+    assert!(
+        status.status.success(),
+        "auto-managed daemon did not become ready: {}",
+        support::stderr_text(&status)
+    );
+
+    let mut results = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("run evidence exists")
+        .map(|entry| {
+            std::fs::read(
+                entry
+                    .expect("run evidence entry")
+                    .path()
+                    .join("result.json"),
+            )
+            .expect("terminal result exists")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results.pop(), results.pop());
+
+    let shutdown = sandbox.run(&["daemon", "--shutdown"]);
+    assert!(
+        shutdown.status.success(),
+        "daemon shutdown failed: {}",
+        support::stderr_text(&shutdown)
+    );
+}
+
+#[test]
 fn offline_resolution_names_the_exact_missing_action_ref_before_engine_work() {
     let output = run_workflow(WELL_FORMED_USES_WORKFLOW, &["--offline", "--no-input"]);
     assert!(!output.status.success());
