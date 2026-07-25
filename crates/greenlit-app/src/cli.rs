@@ -82,6 +82,11 @@ pub(crate) struct RunArgs {
     #[arg(short = 'j', long = "job")]
     pub(crate) job: Option<String>,
 
+    /// Select one exact matrix property, `KEY=JSON_VALUE`. Repeat for every
+    /// property in the desired case; requires `--job`.
+    #[arg(long = "matrix", value_name = "KEY=JSON_VALUE", value_parser = parse_key_val)]
+    pub(crate) matrix: Vec<(String, String)>,
+
     /// A local variable override, `KEY=VALUE`. Repeatable.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     pub(crate) vars: Vec<(String, String)>,

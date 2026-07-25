@@ -10,7 +10,7 @@ use crate::condition::Condition;
 use crate::evidence::SupportReport;
 use crate::graph::JobId;
 use crate::lints::Lint;
-use crate::matrix::{DEFAULT_MAX_MATRIX_LEGS, StrategyPlan};
+use crate::matrix::{DEFAULT_MAX_MATRIX_LEGS, MatrixValue, StrategyPlan};
 use crate::outputs::JobOutputsPlan;
 use crate::pass_through::{ContainerPlan, EnvValue};
 use crate::planned::Planned;
@@ -109,6 +109,9 @@ pub struct JobPlan {
     pub skip: Option<StaticSkip>,
     /// `strategy:`, resolved.
     pub strategy: StrategyPlan,
+    /// Exact matrix case selected by the CLI, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matrix_filter: Option<IndexMap<String, MatrixValue>>,
     /// One entry per [`StrategyPlan::legs`] leg, aligned by index. Empty for
     /// a non-matrix job, a zero-leg static matrix, or a matrix awaiting
     /// runtime materialization; [`StrategyPlan::matrix`] distinguishes them.

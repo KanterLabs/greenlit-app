@@ -288,6 +288,7 @@ pub(crate) fn plan_job(
         implicit_status_gate,
         skip: None,
         strategy,
+        matrix_filter: None,
         legs,
         outputs,
         steps,

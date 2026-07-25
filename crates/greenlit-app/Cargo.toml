@@ -43,6 +43,9 @@ anyhow = "1.0.103"
 # `serde::Serialize` (see `greenlit-engine`), so this crate only needs the
 # writer, not `serde` itself.
 serde_json = "1.0.151"
+# Preserves authored matrix-property order in exact `--matrix` selectors and
+# matches the planner's existing matrix representation.
+indexmap = "2.14.0"
 # Opens `.litci/vars` relative to an already-open repository directory with
 # no-follow semantics. This prevents a repository-authored symlink from
 # redirecting local-variable reads into host files.
@@ -94,10 +97,3 @@ linux-keyutils = "0.2.5"
 # the real developer machine's `~/.litci`. Same version already used by
 # `greenlit-metrics`'s own tests.
 tempfile = "3.27.0"
-# `greenlit_engine::PermissionsPlan::Scoped` holds its scopes in an
-# `IndexMap`; the token-permission-notice unit tests construct one directly.
-# Same pinned version the workspace already uses (`greenlit-engine`,
-# `greenlit-actions`) — a dev-only dependency since production code never
-# builds a `PermissionsPlan` itself (it only reads the one the planner
-# already produced).
-indexmap = "2.14.0"

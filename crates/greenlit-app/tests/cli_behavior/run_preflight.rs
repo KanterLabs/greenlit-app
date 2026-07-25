@@ -68,6 +68,19 @@ jobs:
       - uses: not-a-valid-reference
 ";
 
+const SELECTABLE_MATRIX_WORKFLOW: &str = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+        node: [20, 22]
+    steps:
+      - run: echo selected
+";
+
 fn run_workflow(workflow: &str, args: &[&str]) -> std::process::Output {
     let sandbox = Sandbox::new();
     sandbox.write(".github/workflows/ci.yml", workflow);
@@ -105,6 +118,52 @@ fn a_well_formed_uses_reference_passes_preflight_and_reaches_engine_detection() 
     assert!(
         stderr.contains("DOCKER_HOST"),
         "a syntactically valid uses: reference must reach engine detection: {stderr}"
+    );
+}
+
+#[test]
+fn an_exact_matrix_case_is_selected_before_engine_work() {
+    let exact = run_workflow(
+        SELECTABLE_MATRIX_WORKFLOW,
+        &[
+            "--job",
+            "build",
+            "--matrix",
+            "os=ubuntu-24.04",
+            "--matrix",
+            "node=20",
+        ],
+    );
+    let exact_stderr = support::stderr_text(&exact);
+    assert!(!exact.status.success());
+    assert!(
+        exact_stderr.contains("DOCKER_HOST"),
+        "one exact case proceeds to engine detection: {exact_stderr}"
+    );
+
+    let partial = run_workflow(
+        SELECTABLE_MATRIX_WORKFLOW,
+        &["--job", "build", "--matrix", "node=20"],
+    );
+    let partial_stderr = support::stderr_text(&partial);
+    assert!(
+        partial_stderr.contains("matched 0 cases"),
+        "a selector missing an authored property is not guessed: {partial_stderr}"
+    );
+    assert!(!partial_stderr.contains("DOCKER_HOST"), "{partial_stderr}");
+
+    let unscoped = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--matrix", "node=20"]);
+    let unscoped_stderr = support::stderr_text(&unscoped);
+    assert!(
+        unscoped_stderr.contains("`--matrix` needs one selected job"),
+        "{unscoped_stderr}"
+    );
+
+    let write_back = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--write-back"]);
+    let write_back_stderr = support::stderr_text(&write_back);
+    assert!(
+        write_back_stderr.contains("`--write-back` applies one selected job only"),
+        "{write_back_stderr}"
     );
 }
 

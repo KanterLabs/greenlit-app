@@ -115,6 +115,9 @@ pub struct RunLockV1 {
     pub inputs: BTreeMap<String, String>,
     /// Requested job filter, if any.
     pub selected_job: Option<String>,
+    /// Exact matrix selector supplied for the requested job.
+    #[serde(default)]
+    pub selected_matrix: BTreeMap<String, String>,
     /// Whether Greenlit preparation was restricted to verified local content.
     #[serde(default)]
     pub offline: bool,
@@ -142,6 +145,7 @@ impl RunLockV1 {
             event: event.into(),
             inputs: BTreeMap::new(),
             selected_job: None,
+            selected_matrix: BTreeMap::new(),
             offline: false,
             runners: BTreeMap::new(),
             actions: BTreeMap::new(),

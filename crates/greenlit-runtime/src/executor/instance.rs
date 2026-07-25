@@ -254,8 +254,11 @@ pub(crate) fn materialize<'a>(
             && let Some(MatrixPlan::Static { legs, .. }) = &group.job.strategy.matrix
             && !legs.is_empty()
         {
-            let mut instances = Vec::with_capacity(legs.len());
-            for (leg, plan) in legs.iter().zip(&group.job.legs) {
+            let selected = selected_leg_indices(group.job, legs)?;
+            let mut instances = Vec::with_capacity(selected.len());
+            for index in selected {
+                let leg = &legs[index];
+                let plan = &group.job.legs[index];
                 let matrix = matrix_leg_value(leg);
                 let runner_context = base_context
                     .clone()
@@ -287,8 +290,25 @@ pub(crate) fn materialize<'a>(
             return Ok(MaterializedGroup {
                 instances,
                 fail_fast,
-                max_parallel: max_parallel
-                    .map_or_else(|| legs.len().max(1), |value| value.get() as usize),
+                max_parallel: if group.job.matrix_filter.is_some() {
+                    1
+                } else {
+                    max_parallel.map_or_else(|| legs.len().max(1), |value| value.get() as usize)
+                },
+            });
+        }
+        if let (Some(MatrixPlan::Static { legs, .. }), Some(_)) =
+            (&group.job.strategy.matrix, &group.job.matrix_filter)
+        {
+            let selected = selected_leg_indices(group.job, legs)?;
+            let instances = selected
+                .into_iter()
+                .filter_map(|index| group.instances.get(index).cloned())
+                .collect::<Vec<_>>();
+            return Ok(MaterializedGroup {
+                max_parallel: 1,
+                instances,
+                fail_fast,
             });
         }
         return Ok(MaterializedGroup {
@@ -303,8 +323,10 @@ pub(crate) fn materialize<'a>(
 
     let legs = materialize_matrix(&group.job.strategy, &base_context, DEFAULT_MAX_MATRIX_LEGS)
         .map_err(|source| ExecError::MatrixRuntime { source })?;
-    let mut instances = Vec::with_capacity(legs.len());
-    for leg in &legs {
+    let selected = selected_leg_indices(group.job, &legs)?;
+    let mut instances = Vec::with_capacity(selected.len());
+    for index in selected {
+        let leg = &legs[index];
         let matrix = matrix_leg_value(leg);
         let runner_context = base_context
             .clone()
@@ -347,8 +369,43 @@ pub(crate) fn materialize<'a>(
     Ok(MaterializedGroup {
         instances,
         fail_fast,
-        max_parallel: max_parallel.map_or_else(|| legs.len().max(1), |value| value.get() as usize),
+        max_parallel: if group.job.matrix_filter.is_some() {
+            1
+        } else {
+            max_parallel.map_or_else(|| legs.len().max(1), |value| value.get() as usize)
+        },
     })
+}
+
+fn selected_leg_indices(job: &JobPlan, legs: &[MatrixLeg]) -> Result<Vec<usize>, ExecError> {
+    let Some(filter) = &job.matrix_filter else {
+        return Ok((0..legs.len()).collect());
+    };
+    let selected = legs
+        .iter()
+        .enumerate()
+        .filter(|(_, leg)| {
+            leg.values.len() == filter.len()
+                && filter.iter().all(|(key, expected)| {
+                    leg.values
+                        .get(key.as_str())
+                        .is_some_and(|actual| actual == expected)
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err(ExecError::Infrastructure {
+            message: format!(
+                "matrix selection for job '{}' matched {} cases",
+                job.id.0,
+                selected.len()
+            ),
+            fix: "specify every `--matrix KEY=JSON_VALUE` property so exactly one case matches"
+                .to_string(),
+        });
+    }
+    Ok(selected)
 }
 
 fn strategy_context(

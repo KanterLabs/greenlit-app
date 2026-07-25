@@ -16,8 +16,8 @@ use std::process::ExitCode;
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::git::{collect_git_context, find_repository_root};
 use greenlit_engine::{
-    Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, PlanOptions,
-    analyze_support, build_synthetic_event, plan, validate_v0_support,
+    Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, MatrixPlan,
+    MatrixValue, PlanOptions, analyze_support, build_synthetic_event, plan, validate_v0_support,
 };
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
@@ -64,6 +64,12 @@ fn resolved_strategy(isolation: IsolationArg, write_back: bool) -> IsolationStra
 fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> {
     validate_host().map_err(|host| anyhow::anyhow!("{host}\n  fix: {}", host.fix()))?;
     validate_request(args.write_back, args.no_input).map_err(|error| anyhow::anyhow!("{error}"))?;
+    if !args.matrix.is_empty() && args.job.is_none() {
+        anyhow::bail!("`--matrix` needs one selected job\n  fix: add `--job <job-id>`");
+    }
+    if args.write_back && args.job.is_none() {
+        anyhow::bail!("`--write-back` applies one selected job only\n  fix: add `--job <job-id>`");
+    }
     if args.write_back && args.isolation == IsolationArg::CopyIn {
         anyhow::bail!(
             "`--write-back` needs the container's overlay upper layer, which `--isolation copy-in` never creates (it copies the checkout in instead)\n  fix: drop `--isolation copy-in` (the default `auto` uses overlay when the host supports it), or omit `--write-back`"
@@ -201,7 +207,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         .time_stage("plan", || plan(&workflow, &event, &plan_options))
         .map_err(|error| errors::plan_error(&error))?;
     let execution_plan = match &args.job {
-        Some(job) => prune_to_job(&execution_plan, job)?,
+        Some(job) => prune_to_job(&execution_plan, job, &args.matrix, args.write_back)?,
         None => execution_plan,
     };
     // Fail before any engine work: a `uses:` step that is certain to execute
@@ -310,6 +316,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         event_name: event_kind.event_name(),
         inputs: &args.inputs,
         selected_job: args.job.as_deref(),
+        selected_matrix: &args.matrix,
         offline: args.offline,
         plan: &execution_plan,
         secrets: &all_secrets,
@@ -472,7 +479,11 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         // (or if the run itself failed the writeback loop still runs, since
         // a failed job's earlier steps may still have produced a diff worth
         // reviewing).
-        let write_back_result = runtime.block_on(write_back_all(&engine, &report, &repo_root));
+        let target = args.job.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("`--write-back` has no selected job\n  fix: add `--job <job-id>`")
+        })?;
+        let write_back_result =
+            runtime.block_on(write_back_one(&engine, &report, &repo_root, target));
         // Best-effort teardown of every preserved container, regardless of
         // whether write-back itself succeeded — a leaked container must
         // never be the difference between a successful and failed `run`.
@@ -511,20 +522,18 @@ fn open_content_store() -> anyhow::Result<greenlit_store::cas::CasStore> {
         })
 }
 
-/// Export, list, confirm, and apply every ran job's overlay diff, in the
-/// run's job order.
+/// Export, list, confirm, and apply the selected job's overlay diff.
 ///
 /// # Errors
 ///
-/// Returns an error on the first job whose export/apply fails. Jobs already
-/// processed keep whatever they applied; write-back never rolls back an
-/// earlier job's confirmed changes because a later one failed.
-async fn write_back_all(
+/// Returns an error when the selected job's export/apply fails.
+async fn write_back_one(
     engine: &DockerEngine,
     report: &RunReport,
     repo_root: &std::path::Path,
+    target: &str,
 ) -> anyhow::Result<()> {
-    for job in &report.jobs {
+    for job in report.jobs.iter().filter(|job| job.id == target) {
         let Some(container) = &job.container_id else {
             continue;
         };
@@ -733,7 +742,12 @@ fn build_runner_env(
 }
 
 /// Prune `plan` to the requested job and its transitive `needs:` closure.
-fn prune_to_job(plan: &ExecutionPlan, job: &str) -> anyhow::Result<ExecutionPlan> {
+fn prune_to_job(
+    plan: &ExecutionPlan,
+    job: &str,
+    selected_matrix: &[(String, String)],
+    write_back: bool,
+) -> anyhow::Result<ExecutionPlan> {
     let target = JobId(job.to_string());
     if !plan.jobs.iter().any(|candidate| candidate.id == target) {
         anyhow::bail!(
@@ -757,7 +771,96 @@ fn prune_to_job(plan: &ExecutionPlan, job: &str) -> anyhow::Result<ExecutionPlan
         .jobs
         .retain(|candidate| keep.contains(&candidate.id.0));
     pruned.topo_order.retain(|id| keep.contains(&id.0));
+    let selected = parse_matrix_filter(selected_matrix)?;
+    let target = pruned
+        .jobs
+        .iter_mut()
+        .find(|candidate| candidate.id.0 == job)
+        .ok_or_else(|| anyhow::anyhow!("selected job disappeared while pruning"))?;
+    if selected.is_some() && target.strategy.matrix.is_none() {
+        anyhow::bail!(
+            "job '{job}' is not a matrix job\n  fix: omit `--matrix`, or select a job with `strategy.matrix`"
+        );
+    }
+    if write_back && target.strategy.matrix.is_some() && selected.is_none() {
+        anyhow::bail!(
+            "`--write-back` needs one exact matrix case for job '{job}'\n  fix: repeat `--matrix KEY=JSON_VALUE` for every property in the desired case"
+        );
+    }
+    if let (Some(filter), Some(MatrixPlan::Static { legs, .. })) =
+        (&selected, &target.strategy.matrix)
+    {
+        let matches = legs
+            .iter()
+            .filter(|leg| matrix_leg_matches(leg, filter))
+            .count();
+        if matches != 1 {
+            anyhow::bail!(
+                "matrix selection for job '{job}' matched {matches} cases\n  fix: specify every matrix property so exactly one case matches"
+            );
+        }
+    }
+    target.matrix_filter = selected;
     Ok(pruned)
+}
+
+fn parse_matrix_filter(
+    selected: &[(String, String)],
+) -> anyhow::Result<Option<indexmap::IndexMap<String, MatrixValue>>> {
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    let mut filter = indexmap::IndexMap::new();
+    for (key, raw) in selected {
+        if filter.contains_key(key) {
+            anyhow::bail!(
+                "matrix property '{key}' was selected more than once\n  fix: pass each `--matrix KEY=JSON_VALUE` once"
+            );
+        }
+        let value = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+        filter.insert(key.clone(), json_matrix_value(&value)?);
+    }
+    Ok(Some(filter))
+}
+
+fn json_matrix_value(value: &serde_json::Value) -> anyhow::Result<MatrixValue> {
+    Ok(match value {
+        serde_json::Value::Null => MatrixValue::Null,
+        serde_json::Value::Bool(value) => MatrixValue::Bool(*value),
+        serde_json::Value::Number(value) => MatrixValue::Number(value.as_f64().ok_or_else(|| {
+            anyhow::anyhow!(
+                "matrix numeric selector is outside the supported range\n  fix: use a finite JSON number"
+            )
+        })?),
+        serde_json::Value::String(value) => MatrixValue::String(value.as_str().into()),
+        serde_json::Value::Array(values) => MatrixValue::Sequence(
+            values
+                .iter()
+                .map(json_matrix_value)
+                .collect::<anyhow::Result<Vec<_>>>()?
+                .into(),
+        ),
+        serde_json::Value::Object(values) => MatrixValue::Mapping(
+            values
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), json_matrix_value(value)?)))
+                .collect::<anyhow::Result<indexmap::IndexMap<_, _>>>()?
+                .into(),
+        ),
+    })
+}
+
+fn matrix_leg_matches(
+    leg: &greenlit_engine::MatrixLeg,
+    filter: &indexmap::IndexMap<String, MatrixValue>,
+) -> bool {
+    leg.values.len() == filter.len()
+        && filter.iter().all(|(key, value)| {
+            leg.values
+                .get(key.as_str())
+                .is_some_and(|actual| actual == value)
+        })
 }
 
 /// Render the end-of-run table: each job, its steps' outcomes and durations,

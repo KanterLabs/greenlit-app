@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use tokio::sync::Notify;
 
 use greenlit_engine::execution::env::RunnerEnv;
-use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
+use greenlit_engine::{Conclusion, EventKind, MatrixValue, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
@@ -666,7 +666,7 @@ jobs:
         inputs: Value::object(vec![]),
         deferred_github_properties: std::collections::BTreeSet::new(),
     };
-    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let mut execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
     let engine = ScriptedEngine::default();
     let config = RunConfig {
         repo_host_path: std::env::temp_dir(),
@@ -710,6 +710,33 @@ jobs:
             .jobs
             .iter()
             .all(|job| job.result == Conclusion::Success)
+    );
+
+    execution_plan
+        .jobs
+        .iter_mut()
+        .find(|job| job.id.0 == "consumer")
+        .expect("consumer job")
+        .matrix_filter = Some(indexmap::IndexMap::from([(
+        "os".to_string(),
+        MatrixValue::String("ubuntu-22.04".into()),
+    )]));
+    let selected = run_plan(
+        &ScriptedEngine::default(),
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("selected runtime matrix case completes");
+    assert_eq!(
+        selected
+            .jobs
+            .iter()
+            .map(|job| job.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["producer", "leg ubuntu-22.04", "direct"]
     );
 }
 

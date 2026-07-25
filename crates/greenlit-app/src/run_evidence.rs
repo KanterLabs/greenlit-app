@@ -27,6 +27,7 @@ pub(crate) struct LockInputs<'a> {
     pub(crate) event_name: &'a str,
     pub(crate) inputs: &'a [(String, String)],
     pub(crate) selected_job: Option<&'a str>,
+    pub(crate) selected_matrix: &'a [(String, String)],
     pub(crate) offline: bool,
     pub(crate) plan: &'a ExecutionPlan,
     pub(crate) secrets: &'a [(String, String)],
@@ -135,6 +136,7 @@ impl RunEvidence {
             event_name,
             inputs,
             selected_job,
+            selected_matrix,
             offline,
             plan,
             secrets,
@@ -164,6 +166,7 @@ impl RunEvidence {
         let mut lock = RunLockV1::new(source, event_name);
         lock.inputs = inputs.iter().cloned().collect();
         lock.selected_job = selected_job.map(str::to_string);
+        lock.selected_matrix = selected_matrix.iter().cloned().collect();
         lock.offline = offline;
         lock.runners = runners;
         lock.secret_revisions = secrets
