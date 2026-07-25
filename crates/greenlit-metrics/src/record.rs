@@ -5,6 +5,21 @@
 //! (alongside `litci plan --json`) allowed a snapshot test. [`SCHEMA_VERSION`]
 //! is bumped and a migration note added here whenever a field is added,
 //! renamed, or removed; existing fields are never repurposed.
+//!
+//! # Migration notes
+//!
+//! **1 → 2 (Phase 4).** [`HitMissCounter`] gained `bytes`, so a counter can
+//! report how much data it moved and not only how often it was consulted —
+//! `PHASE-4-environment.md` asks for "cache-shim hit/miss **and bytes
+//! served**", and hits alone cannot express that.
+//!
+//! [`crate::MetricsStore`] rejects any record whose version differs from
+//! [`SCHEMA_VERSION`], so this bump makes records written under version 1
+//! unreadable to `litci stats`; they are preserved on disk but skipped. That
+//! is deliberate rather than overlooked: `AGENTS.md` states "there is no
+//! legacy command or data-path compatibility requirement because no version
+//! has shipped", so a reader that silently upgraded old records would be
+//! carrying migration machinery for a population of zero.
 
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// value verbatim in its `schema_version` field so a future reader (a later
 /// phase, or `litci stats` after a schema change) can tell which shape a
 /// given NDJSON line was written under.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One completed pipeline stage's wall-clock timing, in the order it was
 /// recorded.
@@ -55,6 +70,13 @@ pub struct HitMissCounter {
     pub hits: u64,
     /// Misses requiring slower work.
     pub misses: u64,
+    /// Bytes this counter's subject moved, when that is meaningful.
+    ///
+    /// Zero for counters that only ever answer "was it there?" — an action
+    /// fetch either hit the store or did not. The cache shim reports what it
+    /// actually served, which is the number that tells a user whether a
+    /// cache is earning its disk.
+    pub bytes: u64,
 }
 
 /// One appended record: the complete stage-timing breakdown of a single
@@ -97,6 +119,12 @@ mod tests {
     // schema"). It pins the exact serialized field set, order, and types of
     // `InvocationRecord`; a deliberate schema change updates both this
     // expected string and `SCHEMA_VERSION`, never one without the other.
+    //
+    // `steps` and `hit_miss` carry a populated element each. They were empty
+    // vectors here until Phase 4, which meant this test pinned the *names*
+    // of those fields and nothing about the shape of what goes in them --
+    // a field could be added to `StepDuration` or `HitMissCounter` without
+    // the one declared stable surface noticing.
     #[test]
     fn invocation_record_json_shape_is_pinned() {
         let record = InvocationRecord {
@@ -118,17 +146,27 @@ mod tests {
                     duration_ms: 9.0,
                 },
             ],
-            steps: Vec::new(),
-            hit_miss: Vec::new(),
+            steps: vec![StepDuration {
+                job: "build".to_string(),
+                step: "compile".to_string(),
+                duration_ms: 7.5,
+            }],
+            hit_miss: vec![HitMissCounter {
+                name: "cache".to_string(),
+                hits: 3,
+                misses: 1,
+                bytes: 4096,
+            }],
         };
 
         let json = serde_json::to_string(&record).expect("record must serialize");
         assert_eq!(
             json,
-            "{\"schema_version\":1,\"command\":\"plan\",\"started_at_unix_ms\":1700000000000,\
+            "{\"schema_version\":2,\"command\":\"plan\",\"started_at_unix_ms\":1700000000000,\
              \"total_duration_ms\":12.5,\"stages\":[{\"name\":\"parse\",\"duration_ms\":1.0},\
              {\"name\":\"eval\",\"duration_ms\":2.5},{\"name\":\"plan\",\"duration_ms\":9.0}],\
-             \"steps\":[],\"hit_miss\":[]}"
+             \"steps\":[{\"job\":\"build\",\"step\":\"compile\",\"duration_ms\":7.5}],\
+             \"hit_miss\":[{\"name\":\"cache\",\"hits\":3,\"misses\":1,\"bytes\":4096}]}"
         );
 
         // Round-trips back to an equal value, independent of the pinned
