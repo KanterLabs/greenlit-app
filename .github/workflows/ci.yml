@@ -7,7 +7,7 @@ name: CI
 #   4. tools/check-stubs
 #   5. cargo test --workspace
 #   6. cargo doc --workspace --no-deps (warnings denied)
-#   7. criterion benches (record only until Phase 5; no budget gate yet)
+#   7. criterion benches plus the required native whole-run budget gate
 #
 # Plus the `dogfood` job below: from Phase 4 onward TESTING.md makes running
 # this repository's own gates under Greenlit itself a *required* CI step.
@@ -64,9 +64,9 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps
 
-      # 7. Criterion benches — record baselines only until Phase 5's budget
-      # gate exists (AGENTS.md Metrics, PHASE-1-engine-core.md).
-      - name: Criterion benchmarks (record only)
+      # 7. Criterion microbenchmarks retain trend baselines; the
+      # provider-and-policy job below enforces whole-run Phase 10 budgets.
+      - name: Criterion benchmarks
         run: cargo bench --workspace
 
   # TESTING.md snapshotter-path coverage forbids capability self-skips. This

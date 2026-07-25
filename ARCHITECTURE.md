@@ -401,6 +401,58 @@ A run may occupy at most one fewer than the machine worker count, preserving a
 slot for competing projects while per-run and matrix limits remain nested
 inside that global bound.
 
+## Phase 10 external-evidence and release boundary
+
+`litci export` reads only a completed clean run and produces a separate
+workflow. It never modifies `.github`, commits, pushes, dispatches, or sends a
+message. The exported workflow pins action commits and container digests,
+assigns deterministic names to unnamed steps, and adds one pinned
+`upload-artifact` evidence job. The evidence template carries a source
+placeholder which the GitHub job replaces with its own `GITHUB_SHA`; this
+avoids a self-referential commit identity while preserving an exact
+two-pass workflow-digest check.
+
+```text
+completed local run
+  RunLock + frozen workflow + ExecutionPlan
+                    |
+                    v
+       separate fully pinned workflow
+                    |
+             user-controlled Git operation
+                    |
+                    v
+     successful GitHub run + evidence ZIP
+                    |
+          read-only GitHub REST import
+                    |
+                    v
+ source/event/workflow/jobs/steps/artifact all match?
+          | no                         | yes
+          v                            v
+ preserve local result       classify from stored evidence
+                                      |
+                         github-confirmed only if the local
+                         run was already hermetic/supported
+```
+
+Confirmation verifies the remote run conclusion, exact source commit, event,
+workflow path and semantic digest, distinct successful job instances, ordered
+successful steps, a unique unexpired artifact, the API-provided archive
+digest, and exact canonical evidence bytes. Duplicate names cannot reuse one
+remote result, and a user job cannot impersonate the reserved evidence job.
+A matching GitHub pass cannot upgrade an unsupported, degraded, non-clean, or
+non-hermetic local result.
+
+The native Linux x86_64 CI path executes 20 unchanged warm runs and enforces
+sandbox p95 below two seconds, workflow p95 below 30 seconds, and zero
+Greenlit-controlled downloads. `tools/release-check` validates the optimized
+binary and packages all publishable workspace crates together so their
+unpublished path dependencies can be checked without publishing them. The
+private `greenlit-init` crate remains excluded. The release workflow requires
+an explicit `publish` input and the protected `release` environment; Phase 10
+does not itself publish any artifact.
+
 ## Known issues log
 
 Entries here describe upstream quirks that the implementation or dependency

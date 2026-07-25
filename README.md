@@ -381,7 +381,7 @@ The bar is deliberately high: no `unwrap`/`expect`/`panic!` outside tests, no `#
 - [greenlit-v0-spec.md](greenlit-v0-spec.md) — the product: principles, scope, security model, fidelity contract
 - [ARCHITECTURE.md](ARCHITECTURE.md) — crate boundaries, dataflow, known-issues log
 - [TESTING.md](TESTING.md) — what gets tested, and what's banned
-- [docs/](docs/) — the six phase briefs and the completed-phase summaries
+- [docs/](docs/) — the ten phase briefs and completed-phase summaries
 
 ## License
 
