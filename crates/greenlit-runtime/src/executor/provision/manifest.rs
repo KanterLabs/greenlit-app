@@ -150,13 +150,29 @@ fn parse_readme(markdown: &str, commands: &mut BTreeMap<String, Recipe>) {
         {
             continue;
         }
-        if name.trim().eq_ignore_ascii_case("rustup") {
-            commands.insert(
-                "rustup".to_string(),
-                Recipe::Rustup {
-                    version: version.to_string(),
-                },
-            );
+        match name.trim().to_ascii_lowercase().as_str() {
+            "rustup" => {
+                commands.insert(
+                    "rustup".to_string(),
+                    Recipe::Rustup {
+                        version: version.to_string(),
+                    },
+                );
+            }
+            // The runner image carries an interpreter the toolset JSON does
+            // not list, because it arrives through the toolcache rather than
+            // apt. Greenlit's slim base has none -- `ubuntu:24.04` ships no
+            // `python3` -- so without this a perfectly ordinary
+            // `run: python3 script.py` fails, as this repository's own
+            // `python3 tools/check-stubs` step did.
+            "python" => {
+                commands
+                    .entry("python3".to_string())
+                    .or_insert_with(|| Recipe::Apt {
+                        package: "python3".to_string(),
+                    });
+            }
+            _ => {}
         }
     }
 }
@@ -223,6 +239,20 @@ mod tests {
             manifest().recipe("rustup"),
             Some(&Recipe::Rustup {
                 version: "1.29.0".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_interpreter_the_toolset_omits_still_gets_a_recipe() {
+        // Python reaches the runner image through the toolcache, not apt, and
+        // Greenlit's slim base has none -- so `run: python3 …` needs a recipe
+        // or it fails on an image that plainly has Python.
+        let manifest = Manifest::parse(TOOLSET, "### Python\n- Python 3.12.3\n");
+        assert_eq!(
+            manifest.recipe("python3"),
+            Some(&Recipe::Apt {
+                package: "python3".to_string()
             })
         );
     }

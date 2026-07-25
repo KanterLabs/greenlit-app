@@ -106,7 +106,7 @@ impl Shim {
         self.address
     }
 
-    /// Stops the shim, waiting up to [`SHUTDOWN_GRACE`] for in-flight
+    /// Stops the shim, waiting up to a short grace period for in-flight
     /// requests to finish before abandoning any connection still open.
     ///
     /// Dropping a [`Shim`] also stops it; this is the form that lets a caller

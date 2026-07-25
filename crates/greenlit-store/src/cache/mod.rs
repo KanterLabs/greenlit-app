@@ -16,7 +16,7 @@
 //!
 //! `<id>` is the integer `cacheId` the client receives from a reservation and
 //! sends back on every upload chunk and on commit, so no key text ever
-//! becomes a path component. Ids come from [`crate::layout`], which allocates
+//! becomes a path component. Ids come from `crate::layout`, which allocates
 //! them by creating the directory so two concurrent reservations cannot be
 //! handed the same one even across processes.
 //!

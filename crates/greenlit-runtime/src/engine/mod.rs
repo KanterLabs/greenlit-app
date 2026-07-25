@@ -9,7 +9,7 @@
 //! The trait is object-safe (via `#[async_trait]`) so the engine can be held as
 //! `Box<dyn ContainerEngine>` behind the port boundary. Every method is async.
 //!
-//! The request and response *data* types live in [`spec`] and are re-exported
+//! The request and response *data* types live in the `spec` submodule and are re-exported
 //! here, so this module reads as the list of operations Greenlit performs.
 
 mod spec;
