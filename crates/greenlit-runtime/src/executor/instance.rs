@@ -3,34 +3,35 @@
 //!
 //! A non-matrix job is one instance; a statically expanded matrix job is one
 //! instance per leg, each carrying its own resolved runner, container, env,
-//! steps, and `matrix` context value. Runtime-materialized matrices and
-//! runtime-derived runner labels depend on data that only exists mid-run;
-//! `litci run` rejects them with a precise message rather than inventing a
-//! value (they remain a later-phase capability).
+//! steps, and `matrix` context value. Runtime-materialized matrices retain a
+//! template until their direct dependencies complete, then use those real
+//! outputs to create concrete instances.
 
 use indexmap::IndexMap;
 
-use greenlit_engine::{
-    Condition, ContainerPlan, EnvValue, Evaluation, ExecutionPlan, JobId, JobOutputsPlan, JobPlan,
-    MatrixLeg, MatrixPlan, MatrixValue, Planned, RunDefaultsPlan, RunnerImage, StaticSkip,
-    StepPlan,
-};
-use greenlit_expr::Value;
-use greenlit_workflow::Span;
-
 use crate::executor::ExecError;
+use greenlit_engine::execution::resolve::{resolve_bool, resolve_string};
+use greenlit_engine::execution::{NeedRecord, build_needs_context};
+use greenlit_engine::{
+    ConcurrencyPlan, Condition, ContainerPlan, DEFAULT_MAX_MATRIX_LEGS, EnvValue, Evaluation,
+    ExecutionPlan, JobId, JobOutputsPlan, JobPlan, MatrixLeg, MatrixPlan, MatrixValue, Planned,
+    RunDefaultsPlan, RunnerImage, StaticSkip, StepPlan, materialize_controls, materialize_matrix,
+    materialize_runner,
+};
+use greenlit_expr::{Context, RunStatus, Value};
 
 /// One concrete job instance ready to run. Borrows the plan; no plan data is
 /// cloned beyond the small computed `matrix` value.
+#[derive(Clone)]
 pub(crate) struct JobInstance<'a> {
     /// The instance's resolved display name.
     pub display: &'a Planned<String>,
-    /// Direct dependencies (shared across all legs of a matrix job).
-    pub needs: &'a [JobId],
     /// The resolved runner image.
     pub runner: RunnerImage,
     /// `container:`, if this job runs in a job container.
     pub container: Option<&'a ContainerPlan>,
+    /// `services:`, keyed by service id, in file order.
+    pub services: &'a IndexMap<String, ContainerPlan>,
     /// The job/leg `if:`, if authored.
     pub condition: Option<&'a Condition>,
     /// Whether the implicit `success()` gate applies to the job condition.
@@ -41,12 +42,50 @@ pub(crate) struct JobInstance<'a> {
     pub job_env: &'a IndexMap<String, EnvValue>,
     /// Effective run defaults for this instance.
     pub defaults: &'a RunDefaultsPlan,
+    /// Job concurrency policy for this concrete instance.
+    pub concurrency: Option<&'a ConcurrencyPlan>,
     /// The job-output finalization plan.
     pub outputs: &'a JobOutputsPlan,
     /// The step sequence, in file order.
     pub steps: &'a [StepPlan],
     /// The `matrix` context value (`Null` for a non-matrix job).
     pub matrix: Value,
+}
+
+/// Resolve this concrete instance's concurrency key and cancellation policy.
+pub(crate) fn materialize_concurrency(
+    instance: &JobInstance<'_>,
+    roots: &super::context::ContextRoots,
+    needs: &[NeedRecord],
+    fail_fast: bool,
+    max_parallel: Option<std::num::NonZeroU32>,
+    index: usize,
+    total: usize,
+) -> Result<Option<(String, bool)>, ExecError> {
+    let Some(concurrency) = instance.concurrency else {
+        return Ok(None);
+    };
+    let context = Context::new(std::sync::Arc::clone(&roots.fs))
+        .with_github(roots.github.clone())
+        .with_vars(roots.vars.clone())
+        .with_inputs(roots.inputs.clone())
+        .with_secrets(roots.secrets.clone())
+        .with_needs(build_needs_context(needs))
+        .with_matrix(instance.matrix.clone())
+        .with_strategy(strategy_context(fail_fast, max_parallel, index, total))
+        .with_status(RunStatus::Success);
+    let group = resolve_string(&concurrency.group, &context)
+        .map_err(ExecError::eval)?
+        .to_lowercase();
+    if group.trim().is_empty() {
+        return Err(ExecError::Infrastructure {
+            message: "a job concurrency group resolved to an empty string".to_string(),
+            fix: "make `concurrency.group` resolve to a non-empty value".to_string(),
+        });
+    }
+    let cancel =
+        resolve_bool(&concurrency.cancel_in_progress, &context).map_err(ExecError::eval)?;
+    Ok(Some((group, cancel)))
 }
 
 /// All instances of one job id, in leg order (one for a non-matrix job).
@@ -60,16 +99,30 @@ pub(crate) struct JobGroup<'a> {
     pub needs: &'a [JobId],
     /// Every instance of this job (one per matrix leg, or a single instance).
     pub instances: Vec<JobInstance<'a>>,
+    /// Deterministic dependency wave.
+    pub wave: u32,
+    /// Complete template retained for runtime materialization.
+    pub job: &'a JobPlan,
+}
+
+/// A job group after dependency outputs have materialized its matrix and
+/// scheduling controls.
+pub(crate) struct MaterializedGroup<'a> {
+    /// Concrete instances in GitHub creation order.
+    pub instances: Vec<JobInstance<'a>>,
+    /// GitHub's matrix fail-fast policy.
+    pub fail_fast: bool,
+    /// Maximum legs from this group that may execute concurrently.
+    pub max_parallel: usize,
 }
 
 /// Expand `plan` into job groups in topological (start) order.
 ///
 /// # Errors
 ///
-/// Returns [`ExecError::DeferredMatrix`] for a runtime-materialized matrix or
-/// [`ExecError::DeferredRunner`] for a runtime-derived `runs-on:` — both need
-/// data that does not exist until mid-run and are out of scope for v0's
-/// sequential executor.
+/// Returns [`ExecError::DeferredRunner`] only when a non-matrix job somehow
+/// retains a runtime-only runner label without a dependency materialization
+/// point.
 pub(crate) fn expand(plan: &ExecutionPlan) -> Result<Vec<JobGroup<'_>>, ExecError> {
     let mut groups = Vec::with_capacity(plan.topo_order.len());
     for job_id in &plan.topo_order {
@@ -80,6 +133,8 @@ pub(crate) fn expand(plan: &ExecutionPlan) -> Result<Vec<JobGroup<'_>>, ExecErro
             id: job_id.clone(),
             needs: &job.needs,
             instances: expand_job(job)?,
+            wave: job.wave,
+            job,
         });
     }
     Ok(groups)
@@ -88,9 +143,7 @@ pub(crate) fn expand(plan: &ExecutionPlan) -> Result<Vec<JobGroup<'_>>, ExecErro
 /// Expand one job plan into its instances.
 fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
     let matrix_legs = match &job.strategy.matrix {
-        Some(MatrixPlan::Deferred { span, .. }) => {
-            return Err(ExecError::DeferredMatrix { span: span.clone() });
-        }
+        Some(MatrixPlan::Deferred { .. }) => return Ok(Vec::new()),
         Some(MatrixPlan::Static { legs, .. }) => Some(legs.as_slice()),
         None => None,
     };
@@ -100,17 +153,20 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
         if matrix_legs.is_some() {
             return Ok(Vec::new());
         }
-        let runner = static_runner(job.runner.as_ref(), &job.span)?;
+        let Some(runner) = static_runner(job.runner.as_ref()) else {
+            return Ok(Vec::new());
+        };
         return Ok(vec![JobInstance {
             display: &job.name,
-            needs: &job.needs,
             runner,
             container: job.container.as_ref(),
+            services: &job.services,
             condition: job.condition.as_ref(),
             implicit_status_gate: job.implicit_status_gate,
             skip: job.skip.as_ref(),
             job_env: &job.env,
             defaults: &job.defaults,
+            concurrency: job.concurrency.as_ref(),
             outputs: &job.outputs,
             steps: &job.steps,
             matrix: Value::Null,
@@ -122,18 +178,21 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
     let legs = matrix_legs.unwrap_or(&[]);
     let mut instances = Vec::with_capacity(job.legs.len());
     for (index, leg) in job.legs.iter().enumerate() {
-        let runner = static_runner(Some(&leg.runner), &job.span)?;
+        let Some(runner) = static_runner(Some(&leg.runner)) else {
+            return Ok(Vec::new());
+        };
         let matrix = legs.get(index).map_or(Value::Null, matrix_leg_value);
         instances.push(JobInstance {
             display: &leg.name,
-            needs: &job.needs,
             runner,
             container: leg.container.as_ref(),
+            services: &leg.services,
             condition: leg.condition.as_ref(),
             implicit_status_gate: job.implicit_status_gate,
             skip: leg.skip.as_ref(),
             job_env: &leg.env,
             defaults: &leg.defaults,
+            concurrency: leg.concurrency.as_ref(),
             outputs: &leg.outputs,
             steps: &leg.steps,
             matrix,
@@ -142,14 +201,235 @@ fn expand_job(job: &JobPlan) -> Result<Vec<JobInstance<'_>>, ExecError> {
     Ok(instances)
 }
 
-/// Extract the statically-known runner image, or reject a runtime-deferred one.
-fn static_runner(
-    runner: Option<&Planned<RunnerImage>>,
-    span: &Span,
-) -> Result<RunnerImage, ExecError> {
+/// Materialize a group after all direct dependencies have completed.
+pub(crate) fn materialize<'a>(
+    group: &'a JobGroup<'a>,
+    roots: &super::context::ContextRoots,
+    needs: &[NeedRecord],
+) -> Result<MaterializedGroup<'a>, ExecError> {
+    let base_context = Context::new(std::sync::Arc::clone(&roots.fs))
+        .with_github(roots.github.clone())
+        .with_vars(roots.vars.clone())
+        .with_inputs(roots.inputs.clone())
+        .with_secrets(roots.secrets.clone())
+        .with_needs(build_needs_context(needs))
+        .with_status(RunStatus::Success);
+    let (fail_fast, max_parallel) = materialize_controls(&group.job.strategy, &base_context)
+        .map_err(|source| ExecError::MatrixRuntime { source })?;
+
+    if !group.job.strategy.is_matrix_deferred() {
+        if group.instances.is_empty() && group.job.strategy.matrix.is_none() {
+            let runner_plan =
+                group
+                    .job
+                    .runner
+                    .as_ref()
+                    .ok_or_else(|| ExecError::Infrastructure {
+                        message: format!("job '{}' has no retained runner template", group.id.0),
+                        fix: "preserve the run evidence and file a Greenlit defect".to_string(),
+                    })?;
+            let runner = materialize_runner(runner_plan, &base_context)
+                .map_err(|source| ExecError::RunnerRuntime { source })?;
+            return Ok(MaterializedGroup {
+                instances: vec![JobInstance {
+                    display: &group.job.name,
+                    runner,
+                    container: group.job.container.as_ref(),
+                    services: &group.job.services,
+                    condition: group.job.condition.as_ref(),
+                    implicit_status_gate: group.job.implicit_status_gate,
+                    skip: group.job.skip.as_ref(),
+                    job_env: &group.job.env,
+                    defaults: &group.job.defaults,
+                    concurrency: group.job.concurrency.as_ref(),
+                    outputs: &group.job.outputs,
+                    steps: &group.job.steps,
+                    matrix: Value::Null,
+                }],
+                fail_fast,
+                max_parallel: 1,
+            });
+        }
+        if group.instances.is_empty()
+            && let Some(MatrixPlan::Static { legs, .. }) = &group.job.strategy.matrix
+            && !legs.is_empty()
+        {
+            let selected = selected_leg_indices(group.job, legs)?;
+            let mut instances = Vec::with_capacity(selected.len());
+            for index in selected {
+                let leg = &legs[index];
+                let plan = &group.job.legs[index];
+                let matrix = matrix_leg_value(leg);
+                let runner_context = base_context
+                    .clone()
+                    .with_matrix(matrix.clone())
+                    .with_strategy(strategy_context(
+                        fail_fast,
+                        max_parallel,
+                        leg.index,
+                        legs.len(),
+                    ));
+                let runner = materialize_runner(&plan.runner, &runner_context)
+                    .map_err(|source| ExecError::RunnerRuntime { source })?;
+                instances.push(JobInstance {
+                    display: &plan.name,
+                    runner,
+                    container: plan.container.as_ref(),
+                    services: &plan.services,
+                    condition: plan.condition.as_ref(),
+                    implicit_status_gate: group.job.implicit_status_gate,
+                    skip: plan.skip.as_ref(),
+                    job_env: &plan.env,
+                    defaults: &plan.defaults,
+                    concurrency: plan.concurrency.as_ref(),
+                    outputs: &plan.outputs,
+                    steps: &plan.steps,
+                    matrix,
+                });
+            }
+            return Ok(MaterializedGroup {
+                instances,
+                fail_fast,
+                max_parallel: if group.job.matrix_filter.is_some() {
+                    1
+                } else {
+                    max_parallel.map_or_else(|| legs.len().max(1), |value| value.get() as usize)
+                },
+            });
+        }
+        if let (Some(MatrixPlan::Static { legs, .. }), Some(_)) =
+            (&group.job.strategy.matrix, &group.job.matrix_filter)
+        {
+            let selected = selected_leg_indices(group.job, legs)?;
+            let instances = selected
+                .into_iter()
+                .filter_map(|index| group.instances.get(index).cloned())
+                .collect::<Vec<_>>();
+            return Ok(MaterializedGroup {
+                max_parallel: 1,
+                instances,
+                fail_fast,
+            });
+        }
+        return Ok(MaterializedGroup {
+            instances: group.instances.clone(),
+            fail_fast,
+            max_parallel: max_parallel.map_or_else(
+                || group.instances.len().max(1),
+                |value| value.get() as usize,
+            ),
+        });
+    }
+
+    let legs = materialize_matrix(&group.job.strategy, &base_context, DEFAULT_MAX_MATRIX_LEGS)
+        .map_err(|source| ExecError::MatrixRuntime { source })?;
+    let selected = selected_leg_indices(group.job, &legs)?;
+    let mut instances = Vec::with_capacity(selected.len());
+    for index in selected {
+        let leg = &legs[index];
+        let matrix = matrix_leg_value(leg);
+        let runner_context = base_context
+            .clone()
+            .with_matrix(matrix.clone())
+            .with_strategy(strategy_context(
+                fail_fast,
+                max_parallel,
+                leg.index,
+                legs.len(),
+            ));
+        let runner_plan = group
+            .job
+            .runner
+            .as_ref()
+            .ok_or_else(|| ExecError::Infrastructure {
+                message: format!(
+                    "runtime matrix job '{}' has no retained runner template",
+                    group.id.0
+                ),
+                fix: "preserve the run evidence and file a Greenlit defect".to_string(),
+            })?;
+        let runner = materialize_runner(runner_plan, &runner_context)
+            .map_err(|source| ExecError::RunnerRuntime { source })?;
+        instances.push(JobInstance {
+            display: &group.job.name,
+            runner,
+            container: group.job.container.as_ref(),
+            services: &group.job.services,
+            condition: group.job.condition.as_ref(),
+            implicit_status_gate: group.job.implicit_status_gate,
+            skip: group.job.skip.as_ref(),
+            job_env: &group.job.env,
+            defaults: &group.job.defaults,
+            concurrency: group.job.concurrency.as_ref(),
+            outputs: &group.job.outputs,
+            steps: &group.job.steps,
+            matrix,
+        });
+    }
+    Ok(MaterializedGroup {
+        instances,
+        fail_fast,
+        max_parallel: if group.job.matrix_filter.is_some() {
+            1
+        } else {
+            max_parallel.map_or_else(|| legs.len().max(1), |value| value.get() as usize)
+        },
+    })
+}
+
+fn selected_leg_indices(job: &JobPlan, legs: &[MatrixLeg]) -> Result<Vec<usize>, ExecError> {
+    let Some(filter) = &job.matrix_filter else {
+        return Ok((0..legs.len()).collect());
+    };
+    let selected = legs
+        .iter()
+        .enumerate()
+        .filter(|(_, leg)| {
+            leg.values.len() == filter.len()
+                && filter.iter().all(|(key, expected)| {
+                    leg.values
+                        .get(key.as_str())
+                        .is_some_and(|actual| actual == expected)
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if selected.len() != 1 {
+        return Err(ExecError::Infrastructure {
+            message: format!(
+                "matrix selection for job '{}' matched {} cases",
+                job.id.0,
+                selected.len()
+            ),
+            fix: "specify every `--matrix KEY=JSON_VALUE` property so exactly one case matches"
+                .to_string(),
+        });
+    }
+    Ok(selected)
+}
+
+fn strategy_context(
+    fail_fast: bool,
+    max_parallel: Option<std::num::NonZeroU32>,
+    index: usize,
+    total: usize,
+) -> Value {
+    Value::object(vec![
+        ("fail-fast".to_string(), Value::Bool(fail_fast)),
+        ("job-index".to_string(), Value::Number(index as f64)),
+        ("job-total".to_string(), Value::Number(total as f64)),
+        (
+            "max-parallel".to_string(),
+            Value::Number(max_parallel.map_or(total.max(1) as f64, |value| f64::from(value.get()))),
+        ),
+    ])
+}
+
+/// Extract a statically-known runner image.
+fn static_runner(runner: Option<&Planned<RunnerImage>>) -> Option<RunnerImage> {
     match runner.map(|planned| &planned.evaluation) {
-        Some(Evaluation::Static(image)) => Ok(*image),
-        _ => Err(ExecError::DeferredRunner { span: span.clone() }),
+        Some(Evaluation::Static(image)) => Some(*image),
+        _ => None,
     }
 }
 

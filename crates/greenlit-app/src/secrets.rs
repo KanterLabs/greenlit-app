@@ -334,21 +334,23 @@ pub(crate) fn resolve_secrets(
     Ok(SecretsOutcome { resolved })
 }
 
-/// Prompts (no echo) for `name`'s value, then offers to persist it to
-/// `.litci/secrets` for future runs.
+/// Prompts (no echo) for `name`'s value, then offers to persist it to the
+/// encrypted repository-local vault for future runs.
 fn prompt_and_offer_to_save(repo_root: &Path, name: &str) -> Result<String, String> {
     let value = Password::with_theme(&ColorfulTheme::default())
         .with_prompt(format!("Enter a value for secret '{name}'"))
         .interact()
         .map_err(|error| format!("could not read a value for secret '{name}': {error}"))?;
     let save = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("Save '{name}' to .litci/secrets for future runs?"))
+        .with_prompt(format!(
+            "Save '{name}' to the encrypted .litci/secrets.vault for future runs?"
+        ))
         .default(false)
         .interact()
         .unwrap_or(false);
     if save {
         dotenv::append_secret(repo_root, name, &value)
-            .map_err(|message| format!("could not save '{name}' to .litci/secrets: {message}"))?;
+            .map_err(|message| format!("could not save '{name}' to the secret vault: {message}"))?;
     }
     Ok(value)
 }

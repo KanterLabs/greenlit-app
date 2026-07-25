@@ -7,15 +7,27 @@
 //! [`ContainerEngine::exec`] streams stdout and stderr to the sink separately,
 //! chunk by chunk, while returning the process exit code — the shape the
 //! execution layer's log folding, masking, and command-file parsing depend on.
+//!
+//! One test below (`run_container_reports_a_fast_containers_own_exit_code`)
+//! is a real-daemon check rather than a `FakeEngine` one: it pins
+//! [`ContainerEngine::run_container`]'s exit-code race fix, and only a true
+//! Docker daemon can race the wait stream against an already-exited
+//! container — a fake can't reproduce that timing (`TESTING.md`: the engine
+//! is a true external, so it is used real for behavior that depends on the
+//! daemon's own timing).
+
+mod dockerkit;
 
 use async_trait::async_trait;
 
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use greenlit_runtime::error::RuntimeError;
-use greenlit_runtime::progress::ProgressSink;
+use greenlit_runtime::progress::{ProgressNull, ProgressSink};
+
+use dockerkit::{CollectSink, engine_if_reachable, notice_no_daemon, unique_suffix};
 
 /// One framed output chunk the fake exec replays.
 enum Chunk {
@@ -108,6 +120,37 @@ impl ContainerEngine for FakeEngine {
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+
+    async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
+        Ok(NetworkInfo {
+            gateway: Some("10.0.0.1".to_string()),
+            subnet: Some("10.0.0.0/16".to_string()),
+        })
+    }
+
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: HealthState::None,
+        })
+    }
+
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 /// A sink that keeps stdout and stderr in separate buffers.
@@ -157,4 +200,43 @@ async fn exec_streams_stdout_and_stderr_separately_with_exit_code() {
     assert_eq!(sink.stderr, b"oops");
 
     engine.remove_container(&id).await.unwrap();
+}
+
+#[tokio::test]
+async fn run_container_reports_a_fast_containers_own_exit_code() {
+    let Some(engine) = engine_if_reachable().await else {
+        notice_no_daemon("run_container_reports_a_fast_containers_own_exit_code");
+        return;
+    };
+
+    // alpine is the small image the crate's other real-daemon fixtures
+    // already pull (`actions_docker.rs`, `actions_composite.rs`).
+    engine
+        .pull_image("alpine:3.19", None, &mut ProgressNull)
+        .await
+        .expect("pull alpine");
+
+    let name = format!("greenlit-exit-race-{}", unique_suffix());
+    let spec = ContainerSpec {
+        image: "alpine:3.19".to_string(),
+        name: Some(name),
+        // Exits almost immediately after `run_container` starts it, which is
+        // exactly the timing that can race the wait stream into missing the
+        // real status.
+        cmd: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
+        ..ContainerSpec::default()
+    };
+    let id = engine.create_container(&spec).await.expect("create");
+
+    let mut sink = CollectSink::default();
+    let result = engine.run_container(&id, &mut sink).await;
+    let _ = engine.remove_container(&id).await;
+
+    // Pins the fix: a short-lived container reports its own exit code, not
+    // the wait-stream-miss placeholder of 1.
+    assert_eq!(
+        result.expect("run_container"),
+        ExecOutput { exit_code: 7 },
+        "a short-lived container reports its own exit code, not a placeholder"
+    );
 }

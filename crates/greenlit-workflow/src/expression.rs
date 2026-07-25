@@ -12,10 +12,12 @@ use greenlit_expr::Expr;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ExpressionPolicy {
     RunName,
+    WorkflowConcurrency,
     WorkflowEnv,
     JobIf,
     JobStrategy,
     JobStrategyContext,
+    JobConcurrency,
     JobEnv,
     JobDefaultsRun,
     JobOutputs,
@@ -27,10 +29,12 @@ pub(crate) enum ExpressionPolicy {
 }
 
 const RUN_NAME: &[&str] = &["github", "inputs", "vars"];
+const WORKFLOW_CONCURRENCY: &[&str] = &["github", "inputs", "vars"];
 const WORKFLOW_ENV: &[&str] = &["github", "secrets", "inputs", "vars"];
 const JOB_IF: &[&str] = &["github", "needs", "vars", "inputs"];
 const JOB_STRATEGY: &[&str] = &["github", "needs", "vars", "inputs"];
 const JOB_STRATEGY_CONTEXT: &[&str] = &["github", "needs", "strategy", "matrix", "vars", "inputs"];
+const JOB_CONCURRENCY: &[&str] = &["github", "needs", "strategy", "matrix", "vars", "inputs"];
 const JOB_ENV: &[&str] = &[
     "github", "needs", "strategy", "matrix", "vars", "secrets", "inputs",
 ];
@@ -60,10 +64,12 @@ impl ExpressionPolicy {
     fn contexts(self) -> &'static [&'static str] {
         match self {
             Self::RunName => RUN_NAME,
+            Self::WorkflowConcurrency => WORKFLOW_CONCURRENCY,
             Self::WorkflowEnv => WORKFLOW_ENV,
             Self::JobIf => JOB_IF,
             Self::JobStrategy => JOB_STRATEGY,
             Self::JobStrategyContext => JOB_STRATEGY_CONTEXT,
+            Self::JobConcurrency => JOB_CONCURRENCY,
             Self::JobEnv => JOB_ENV,
             Self::JobDefaultsRun => JOB_DEFAULTS_RUN,
             Self::JobOutputs => JOB_OUTPUTS,

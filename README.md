@@ -205,15 +205,36 @@ Not a silent skip. Not a confusing failure forty seconds into a container boot. 
 ```
 litci run    [-e EVENT] [-W FILE] [-j JOB] [--var K=V] [--input K=V] [-s K=V]
              [--isolation auto|overlay|copy-in] [--write-back] [--no-input]
+             [--clean] [--hermetic] [--offline] [--no-daemon]
 litci plan   [--json] [-e EVENT] [-W FILE] [--var K=V] [--input K=V]
+litci export [RUN_ID] [--output DIRECTORY]
+litci confirm RUN_ID --repository OWNER/REPO --github-run ID
 litci setup  [-y]
 litci auth   [--pat | --gh]
 litci stats
+litci inspect [RUN_ID]
+litci doctor [--json]
+litci clean [-y]
 ```
 
 **`run`** is the habit command; everything else is occasional. `-j` runs one job and its transitive `needs:`. `-e` simulates `push`, `pull_request`, or `workflow_dispatch`.
 
 **`plan`** resolves everything it can without containers or network, and `--json` makes that output diffable.
+
+**`export`** writes a separate, fully pinned GitHub workflow and
+`greenlit-evidence-v1.json`. It never edits your workflows, commits, pushes,
+dispatches, or sends a message. Commit and trigger that separate file through
+your ordinary review process. The safe first-use sequence is: export, add the
+separate workflow to the commit you intend to test, rerun Greenlit at that
+clean commit, export that new run, verify the workflow file is unchanged, and
+then push or dispatch it. The evidence job fills in GitHub's actual commit at
+runtime, so the exported workflow has no self-referential commit hash.
+
+**`confirm`** performs read-only GitHub API calls. It upgrades an eligible
+hermetic result only after the source, event and inputs, pinned workflow bytes,
+actions, containers, toolchains, expanded jobs and steps, successful
+conclusions, and downloaded artifact digest all match. A GitHub pass with any
+mismatch is reported only as an observed pass.
 
 **`setup`** handles the container engine. Detection is three-state — reachable, installed but stopped, or absent — and each state maps to one action. Greenlit never shows you "cannot connect to Docker daemon".
 
@@ -300,17 +321,28 @@ Every `plan` and `run` appends one record to `~/.litci/metrics/runs.ndjson`: sta
 
 ## Where it is today
 
-Greenlit is **pre-release**, built in six phases. Three are done.
+Greenlit v0 is implementation-complete but **pre-release**: no crate, binary,
+container image, dashboard, or launch announcement has been published.
 
-Working now: full workflow parsing with source-located errors, the complete expression evaluator, `needs` DAG and matrix planning, `litci plan` and `litci plan --json`, real container-backed execution of `run:` steps with GitHub's shell, env-layering, command-file and masking semantics, job containers, read-only-plus-overlay isolation, JavaScript / composite / Docker actions, the secrets and variables chains, and `litci auth`. Greenlit runs this repository's own formatting, lint, stub-check and test gates under itself — inside a `rust:1.96.0` job container, green, in about 70 seconds.
+Working now includes full workflow planning and execution; JavaScript,
+composite, and Docker actions; services; cache and artifact shims; private
+fresh workspaces; immutable RunLocks and JobLocks; a machine-wide verified
+CAS; exact offline replay; daemon prefetch and crash recovery; lease-aware
+garbage collection; clean and hermetic policies; configured direct
+containerd/stargz lazy materialization with a verified eager fallback; and
+read-only GitHub confirmation through a separate pinned workflow.
 
-Coming in the remaining phases:
+Results deliberately have three independent dimensions: execution,
+compatibility, and assurance. A local pass is `local`, `clean`, or `hermetic`
+only when its stored evidence qualifies. `github-confirmed` is impossible
+without matching external evidence. The default official ARC runner images
+are pinned and reusable, but they are self-hosted runner images rather than
+the complete GitHub-hosted environment, so Greenlit reports that difference
+instead of claiming equivalence.
 
-- **Phase 4 — environment.** `actions/cache`, artifacts, running `services:` containers, per-repo convergent images that install exactly the tools your workflow uses at the versions the real runner has, a network policy that blocks your LAN while allowing the internet, and a Docker-in-Docker sidecar.
-- **Phase 5 — speed.** Parallel jobs and matrix fan-out, prefetch pipelining, and warm container reuse — with the spec's budgets (first step executing in under 2 s, warm re-run under 30 s) enforced by CI rather than asserted here.
-- **Phase 6 — parity.** The real proof: run ~50 popular repositories' workflows on GitHub and on Greenlit and diff every step outcome, published raw and live, with a public issue for every defect it finds.
-
-Two honest caveats until Phase 4 lands. `services:` **parses and appears in `litci plan` output but nothing starts it** — a workflow with a postgres service will plan cleanly and then fail when a step tries to connect. And the base image carries only bash, git, curl, wget, jq, tar, unzip, and build-essential; a workflow needing a language toolchain won't find one yet.
+Warm native-Linux budgets are enforced continuously: sandbox creation p95
+below two seconds, a typical warm workflow below 30 seconds, and zero
+Greenlit-controlled downloads on an unchanged warm run.
 
 Deliberately out of scope for v0, and rejected at plan time with a location and a fix rather than silently misbehaving: `concurrency`, reusable workflows (`workflow_call`), environments and deployments, OIDC, runner labels other than `ubuntu-latest` / `ubuntu-24.04` / `ubuntu-22.04`, the `cmd` / `powershell` / `pwsh` shells, privileged and host-namespace container options, and macOS, Windows, or non-x86_64 hosts.
 
@@ -340,6 +372,7 @@ python3 tools/check-stubs
 cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo bench --workspace
+LITCI_TEST_PERFORMANCE=1 cargo test -p greenlit-app --test performance_budgets -- --nocapture
 ```
 
 The bar is deliberately high: no `unwrap`/`expect`/`panic!` outside tests, no `#[allow]`, no `TODO` comments, no ignored tests. Every GitHub-matching behavior carries a comment citing the docs section or the observed run that pins it. Tests exist to pin GitHub's behavior and Greenlit's invariants, and nothing else — [TESTING.md](TESTING.md) is blunt about what does *not* get a test and why.
@@ -348,7 +381,7 @@ The bar is deliberately high: no `unwrap`/`expect`/`panic!` outside tests, no `#
 - [greenlit-v0-spec.md](greenlit-v0-spec.md) — the product: principles, scope, security model, fidelity contract
 - [ARCHITECTURE.md](ARCHITECTURE.md) — crate boundaries, dataflow, known-issues log
 - [TESTING.md](TESTING.md) — what gets tested, and what's banned
-- [docs/](docs/) — the six phase briefs and the completed-phase summaries
+- [docs/](docs/) — the ten phase briefs and completed-phase summaries
 
 ## License
 

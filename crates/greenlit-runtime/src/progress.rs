@@ -37,6 +37,17 @@ pub enum ProgressEvent {
     PullFinished {
         /// The image reference that was pulled.
         image: String,
+        /// Layer bytes transferred by the daemon for this request.
+        downloaded_bytes: u64,
+    },
+    /// A registry alias was resolved to a verified platform manifest.
+    ContentResolved {
+        /// Preparation item that was resolved.
+        item: String,
+        /// Exact immutable identity selected.
+        identity: String,
+        /// Whether manifest/config bytes came from the machine-wide CAS.
+        cache_hit: bool,
     },
     /// An image build began.
     BuildStarted {
@@ -63,6 +74,16 @@ pub enum ProgressEvent {
     /// (checked against the local cache, downloaded and checksum-verified
     /// on a miss) — the `action-runtime-ensure` stage
     /// (`crate::executor::actions::node_runtime`).
+    /// A service container is being started and waited on.
+    ServiceStarting {
+        /// The service id, which is also its hostname on the job network.
+        service: String,
+    },
+    /// A service reported healthy (or started, when it has no probe).
+    ServiceReady {
+        /// The service id.
+        service: String,
+    },
     ActionRuntimeEnsureStarted,
     /// The action runtime ensure finished; every Node action in the job can
     /// now run.

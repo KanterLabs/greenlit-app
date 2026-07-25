@@ -317,12 +317,24 @@ fn annotation_message_is_percent_decoded() {
 #[test]
 fn masker_redacts_registered_values_immediately() {
     let mut masker = Masker::new();
-    masker.add("s3cr3t");
+    masker.add("s3cr3t+/ value");
     masker.add("   "); // whitespace-only ignored
     assert!(!masker.is_empty());
     assert_eq!(
-        masker.apply("token is s3cr3t here"),
+        masker.apply("token is s3cr3t+/ value here"),
         format!("token is {MASK_TOKEN} here")
+    );
+    assert_eq!(
+        masker.apply("standard czNjcjN0Ky8gdmFsdWU="),
+        format!("standard {MASK_TOKEN}")
+    );
+    assert_eq!(
+        masker.apply("url czNjcjN0Ky8gdmFsdWU"),
+        format!("url {MASK_TOKEN}")
+    );
+    assert_eq!(
+        masker.apply("percent s3cr3t%2B%2F%20value"),
+        format!("percent {MASK_TOKEN}")
     );
     assert_eq!(masker.apply("nothing"), "nothing");
 }

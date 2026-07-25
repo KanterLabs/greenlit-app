@@ -341,7 +341,7 @@ fn plan_appends_exactly_one_metrics_record() {
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1);
     let record: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["schema_version"], greenlit_metrics::SCHEMA_VERSION);
     assert_eq!(record["command"], "plan");
     let stage_names: Vec<&str> = record["stages"]
         .as_array()

@@ -4,6 +4,7 @@
 use std::num::NonZeroU32;
 
 use greenlit_expr::Value;
+use greenlit_expr::value::to_number;
 use greenlit_workflow::model::job::{MatrixSource, Strategy};
 use greenlit_workflow::model::value::ScalarOrExpr;
 use greenlit_workflow::{Span, Spanned};
@@ -158,6 +159,94 @@ impl StrategyPlan {
                 .as_ref()
                 .is_some_and(StrategyControl::is_deferred)
     }
+}
+
+/// Materialize a matrix after all of its runtime dependencies are available.
+///
+/// Static plans are returned unchanged. Deferred plans re-evaluate their
+/// retained authored source against the supplied runtime context and run the
+/// same include/exclude/cartesian algorithm used during initial planning.
+pub fn materialize_matrix(
+    strategy: &StrategyPlan,
+    ctx: &greenlit_expr::Context,
+    cap: usize,
+) -> Result<Vec<super::MatrixLeg>, MatrixError> {
+    match &strategy.matrix {
+        None => Ok(Vec::new()),
+        Some(MatrixPlan::Static { legs, .. }) => Ok(legs.clone()),
+        Some(MatrixPlan::Deferred { span, source, .. }) => {
+            super::expand::expand_matrix_source_runtime(source, span, ctx, cap)
+                .map(|(legs, _)| legs)
+        }
+    }
+}
+
+/// Resolve runtime-dependent matrix scheduling controls.
+pub fn materialize_controls(
+    strategy: &StrategyPlan,
+    ctx: &greenlit_expr::Context,
+) -> Result<(bool, Option<NonZeroU32>), MatrixError> {
+    let fail_fast = match &strategy.fail_fast {
+        StrategyControl::Static(value) => *value,
+        StrategyControl::Deferred(planned) => {
+            let crate::planned::Evaluation::Deferred(deferred) = &planned.evaluation else {
+                return Ok((true, None));
+            };
+            match greenlit_expr::evaluate(&deferred.residual, ctx).map_err(|source| {
+                MatrixError::PartialEval {
+                    span: planned.span.clone(),
+                    source: source.into(),
+                }
+            })? {
+                Value::Bool(value) => value,
+                actual => {
+                    return Err(MatrixError::InvalidFailFastType {
+                        actual: super::value_kind_name(&actual),
+                        span: planned.span.clone(),
+                    });
+                }
+            }
+        }
+    };
+    let max_parallel = match &strategy.max_parallel {
+        None => None,
+        Some(StrategyControl::Static(value)) => Some(*value),
+        Some(StrategyControl::Deferred(planned)) => {
+            let crate::planned::Evaluation::Deferred(deferred) = &planned.evaluation else {
+                return Ok((fail_fast, None));
+            };
+            let value = greenlit_expr::evaluate(&deferred.residual, ctx).map_err(|source| {
+                MatrixError::PartialEval {
+                    span: planned.span.clone(),
+                    source: source.into(),
+                }
+            })?;
+            if !matches!(value, Value::Number(_)) {
+                return Err(MatrixError::InvalidMaxParallelType {
+                    actual: super::value_kind_name(&value),
+                    span: planned.span.clone(),
+                });
+            }
+            let number = to_number(&value);
+            if !number.is_finite()
+                || number.fract() != 0.0
+                || number < 1.0
+                || number > f64::from(u32::MAX)
+            {
+                return Err(MatrixError::InvalidMaxParallelValue {
+                    value: number,
+                    span: planned.span.clone(),
+                });
+            }
+            Some(NonZeroU32::new(number as u32).ok_or_else(|| {
+                MatrixError::InvalidMaxParallelValue {
+                    value: number,
+                    span: planned.span.clone(),
+                }
+            })?)
+        }
+    };
+    Ok((fail_fast, max_parallel))
 }
 
 /// Resolves `strategy:` and preserves runtime-dependent matrix/control

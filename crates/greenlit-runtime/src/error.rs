@@ -85,6 +85,8 @@ impl RuntimeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Operation {
+    /// Reading daemon version, kernel, and storage-driver facts.
+    InspectRuntime,
     /// Pulling an image.
     PullImage,
     /// Inspecting an image to test for its presence.
@@ -115,11 +117,26 @@ pub enum Operation {
     CreateNetwork,
     /// Removing a network.
     RemoveNetwork,
+    /// Inspecting a network for its gateway.
+    InspectNetwork,
+    /// Inspecting a container for its state, including health.
+    InspectContainer,
+    /// Creating a named volume.
+    CreateVolume,
+    /// Removing a named volume.
+    RemoveVolume,
+    /// Listing images, filtered by Greenlit's ownership label.
+    ListImages,
+    /// Removing an image.
+    RemoveImage,
+    /// Listing and removing abandoned Greenlit runtime resources.
+    ReconcileResources,
 }
 
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Operation::InspectRuntime => "inspect runtime",
             Operation::PullImage => "pull image",
             Operation::InspectImage => "inspect image",
             Operation::BuildImage => "build image",
@@ -135,6 +152,13 @@ impl fmt::Display for Operation {
             Operation::InspectExec => "inspect exec",
             Operation::CreateNetwork => "create network",
             Operation::RemoveNetwork => "remove network",
+            Operation::InspectNetwork => "inspect network",
+            Operation::InspectContainer => "inspect container",
+            Operation::CreateVolume => "create volume",
+            Operation::RemoveVolume => "remove volume",
+            Operation::ListImages => "list images",
+            Operation::RemoveImage => "remove image",
+            Operation::ReconcileResources => "reconcile abandoned resources",
         };
         f.write_str(name)
     }

@@ -80,10 +80,8 @@ pub fn seed_repo(tag: &str) -> PathBuf {
     root
 }
 
-/// A minimal `ActionRuntimeConfig` for tests that don't exercise `uses:`
-/// steps at all (a shell-only fixture): every trait-object field errors
-/// unconditionally, so the test fails loudly rather than silently if a
-/// `uses:` step is ever added to the fixture without updating this helper.
+/// A minimal `ActionRuntimeConfig` that resolves only the built-in checkout
+/// identity and fails every source fetch or other action resolution.
 pub fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeConfig {
     use greenlit_actions::CommitSha;
     use greenlit_actions::resolve::{RefResolver, ResolveError};
@@ -95,15 +93,25 @@ pub fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntim
     use std::path::Path;
     use std::sync::Arc;
 
-    struct NeverResolves;
+    struct CheckoutOnlyResolver;
     #[async_trait::async_trait]
-    impl RefResolver for NeverResolves {
+    impl RefResolver for CheckoutOnlyResolver {
         async fn resolve(
             &self,
             owner: &str,
             repo: &str,
             git_ref: &str,
         ) -> Result<CommitSha, ResolveError> {
+            if owner == "actions" && repo == "checkout" {
+                return CommitSha::parse(&"c".repeat(40)).map_err(|error| {
+                    ResolveError::TaskFailed {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        git_ref: git_ref.to_string(),
+                        message: error.to_string(),
+                    }
+                });
+            }
             Err(ResolveError::NotFound {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -141,7 +149,7 @@ pub fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntim
     }
 
     greenlit_runtime::executor::actions::ActionRuntimeConfig {
-        resolver: Arc::new(NeverResolves),
+        resolver: Arc::new(CheckoutOnlyResolver),
         store: ActionStore::at(std::env::temp_dir().join("greenlit-test-unused-action-store")),
         fetcher: Arc::new(NeverFetches),
         node_runtime_fetcher: Arc::new(NeverDownloads),

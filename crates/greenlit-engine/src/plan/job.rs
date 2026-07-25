@@ -137,7 +137,7 @@ pub(crate) fn plan_job(
     // `strategy.*` references remain residuals until Phase 2 materializes
     // its concrete legs after the prerequisites finish.
     // https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#matrix-context
-    let (runner, name, container, services, env, defaults, outputs, steps, legs) =
+    let (runner, name, container, services, env, defaults, concurrency, outputs, steps, legs) =
         if strategy.is_matrix_deferred() {
             let deferred_strategy = super::contexts::deferred_strategy_context_value(&strategy);
             let deferred_roots = StaticRoots {
@@ -167,6 +167,7 @@ pub(crate) fn plan_job(
                 instance.services,
                 instance.env,
                 instance.defaults,
+                instance.concurrency,
                 instance.outputs,
                 instance.steps,
                 Vec::new(),
@@ -196,6 +197,7 @@ pub(crate) fn plan_job(
                     services: instance.services,
                     env: instance.env,
                     defaults: instance.defaults,
+                    concurrency: instance.concurrency,
                     condition: leg_condition,
                     skip: None,
                     outputs: instance.outputs,
@@ -214,6 +216,7 @@ pub(crate) fn plan_job(
                 indexmap::IndexMap::new(),
                 indexmap::IndexMap::new(),
                 RunDefaultsPlan::default(),
+                None,
                 JobOutputsPlan::default(),
                 Vec::new(),
                 legs,
@@ -240,6 +243,7 @@ pub(crate) fn plan_job(
                 instance.services,
                 instance.env,
                 instance.defaults,
+                instance.concurrency,
                 instance.outputs,
                 instance.steps,
                 Vec::new(),
@@ -275,6 +279,7 @@ pub(crate) fn plan_job(
         env,
         defaults,
         permissions: None,
+        concurrency,
         condition: if strategy.is_matrix() && !strategy.is_matrix_deferred() {
             None
         } else {
@@ -283,6 +288,7 @@ pub(crate) fn plan_job(
         implicit_status_gate,
         skip: None,
         strategy,
+        matrix_filter: None,
         legs,
         outputs,
         steps,

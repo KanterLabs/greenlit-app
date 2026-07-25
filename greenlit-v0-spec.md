@@ -1,133 +1,245 @@
-# Greenlit — v0 Spec
+# Greenlit v0 — Evidence-first execution specification
 
 Product and repository: `greenlit-app`. User command: `litci`.
 
-**One line:** Run your GitHub Actions workflows locally, fast, with results you can trust. Green locally means green on GitHub.
+**One line:** Run GitHub Actions locally in fast, disposable Linux
+environments, and report exactly how closely each result corresponds to
+GitHub.
 
-## Problem
+## Priority order
 
-You can't run GitHub Actions locally. Debugging CI means push → wait 5–15 min → read logs → repeat. `act` exists but is an approximation: no `vars` context, incomplete `github` context, no cache emulation, unreliable service containers. Developers use it and still don't trust it.
+1. Never produce a false green.
+2. Preserve job isolation.
+3. Make execution reproducible and explainable.
+4. Match GitHub Actions semantics.
+5. Reduce startup time and downloads.
 
-## Product principles
+Performance work may change latency but may not silently change semantics or
+the meaning of a result.
 
-1. **Fidelity** — *if it passes here, it passes on GitHub.* Every engine decision serves this claim.
-2. **Zero config** — `litci run` works in any repo with no flags, no image selection, no setup file. If a workflow uses something unsupported, fail immediately with a precise message ("reusable workflows: not in v0"), never mysteriously.
-3. **Contained by default** — running marketplace actions means executing untrusted code on your laptop. Nothing an action does can touch the host. Security is not configurable off.
-4. **Fast by default** — performance targets are spec commitments, not aspirations: first step executing < 2s after `litci run`; warm re-runs in seconds.
+## Core model
 
-## v0 scope (in)
+Each run freezes its source and every statically resolvable immutable identity
+in a `RunLock` before any step executes. A needs-dependent job receives a
+`JobLock` after its dependencies finish and before its sandbox starts. A
+machine-wide SHA-256 CAS shares verified immutable runner, action, container,
+toolchain, source, and download content. Each job receives a new root
+writable layer, private workspace, command files, network, services, and
+resource namespace.
 
-1. **Workflow engine** — full YAML parse: jobs, steps, `needs`, job outputs, matrix, job-level containers, and `if:` conditions.
-2. **Expression evaluator** — complete `${{ }}` support: `github`, `env`, `secrets`, `vars`, `needs`, `matrix`, `steps`, `runner` contexts; all built-in functions. This is act's most-hit gap.
-3. **Stable Linux x64 runners, convergent slim images** — on Linux x86_64 hosts, `runs-on: ubuntu-latest`, `ubuntu-24.04`, and `ubuntu-22.04` start from a slim base (shells, git, curl, build tools). `ubuntu-latest` maps to 24.04 for v0. Missing tools are detected (static analysis of `uses:`/`run:` where possible, command-level lazy provisioning otherwise) and installed *at the exact versions listed in the matching GitHub runner-images manifest*, then cached as per-repo layers. Each repo converges to a small image containing exactly what it uses, at real-image versions. Every automatic install is logged visibly, and a user script is never restarted to recover a missing tool.
-4. **Action types** — JavaScript actions, composite actions, Docker actions. Covers ~all of the marketplace top 100.
-5. **Cache emulation** — `actions/cache` backed by a local store. Same keys, same restore semantics. Second most-hit gap; also what makes re-runs fast.
-6. **Service containers** — `services:` blocks with health checks and correct networking.
-7. **Artifacts** — `upload-artifact` / `download-artifact` against a local store.
-8. **Secrets/vars** — values can be overridden locally. Secrets resolve `-s KEY=VAL` → process environment → `.litci/secrets` (dotenv, `0600`, auto-gitignored) → interactive prompt. Greenlit statically detects every `secrets.*` reference and prompts for missing values before the run starts. Variables resolve `--var KEY=VAL` → process environment → `.litci/vars` → authenticated GitHub repository/organization variables; repository values override organization values. If a referenced value is still unresolved and the user is not authenticated, fail before execution with `litci auth` as the fix. A name absent after a successful API lookup resolves to an empty string. `GITHUB_TOKEN`: `litci auth` uses GitHub App device flow — the `greenlit-app` public client ID is embedded, tokens are read-only and limited to installed repositories, and refresh credentials are stored in the system keyring. Fallbacks: fine-grained PAT paste, or `gh` CLI passthrough with a broad-scope warning. Host-side variable lookup never injects the token into the workflow; workflows that never reference a token get none.
-9. **Output & metrics** — per-step logs with GitHub's grouping, exit codes, and an end-of-run table of step and stage timings. Every `plan` or `run` invocation appends a local metrics record (`~/.litci/metrics/`); read-only `litci stats` shows history and trends without adding a record. Metrics never leave the machine — no telemetry, ever.
+Static workflow analysis may prioritize prefetches. It never defines which
+tools exist: missing lazy content is fetched on demand, and an eager verified
+runner is the fallback where lazy materialization is unavailable.
 
-## Out (v0)
+## Required behavior
 
-- macOS and Windows hosts or runners; Linux hosts other than x86_64
-- `ubuntu-slim`, ARM, preview Ubuntu images, self-hosted labels, larger-runner labels, and custom runner groups
-- `concurrency`, environments/deployments, reusable workflows (`workflow_call`), OIDC
-- Any GUI, editor plugin, or hosted service
-- Step-level result caching or "smart skip" (changes semantics; breaks the fidelity claim)
+### Workflow and resolution
 
-## Security model
+- Discover `.github/workflows/*.yml`/`*.yaml`; select a workflow, job, or exact
+  matrix case; validate required dispatch inputs before containers start.
+- Parse jobs, matrices, `needs`, conditions, expressions, defaults,
+  permissions, environments, job containers, services, concurrency, local and
+  remote reusable workflows, and local/composite/JavaScript/container actions.
+- Resolve reusable workflows and actions recursively, detect cycles and depth
+  violations, and preserve GitHub-defined ordering while parallelizing ready
+  jobs.
+- Resolve action refs to full commits and OCI refs to index and selected
+  `linux/amd64` manifest digests. A mutable alias is rechecked before lock
+  finalization; if it moved, resolution restarts once and then fails.
+- `RunLock` records source/workflow/event/input identities, runner profile,
+  action commits/tree digests, static container digests, toolchain requests,
+  opaque secret revisions, policy versions, and the support report.
+- `JobLock` records the parent lock, matrix and dependency identities, dynamic
+  runner/container/service/toolchain resolutions, environment fingerprint,
+  resource policy, and sandbox configuration.
+- Locks use versioned canonical JSON, SHA-256 self-identities, and are stored
+  with the result. Secret values are forbidden in locks, traces, and errors.
 
-`act` bind-mounts your repo into the container and can hand actions the host Docker socket — a malicious or compromised action gets your files, and via the socket, effectively root on your machine. v0 does the opposite:
+### Compatibility and result truth
 
-- **Repo mounted read-only + writable overlay.** The container sees a writable checkout, but all writes land in a throwaway overlay layer — actions can never modify or plant files in your working tree, and there's no copy cost even on huge repos. An opt-in `--write-back` exports the overlay diff only after listing changed paths and receiving confirmation; the workflow container itself never gets host write access.
-- **No host Docker socket, ever.** Workflows that build/run images get an isolated Docker-in-Docker sidecar instead.
-- **Network: internet yes, host LAN no.** Actions can pull dependencies but can't reach `localhost`, your homelab, or anything on your subnet.
-- **Secret hygiene** — GitHub-style masking in all log output; `.litci/secrets` created `0600` and `.litci/` auto-added to `.gitignore`.
+Every run produces a source-located support report with `supported`,
+`degraded`, and `unsupported` findings. Unknown behavior fails closed.
+Unsupported findings block affected reachable jobs by default. Only findings
+explicitly marked forceable may run with `--allow-degraded`; security-breaking
+constructs are never forceable.
 
-"Safer than act" is a launch talking point, not just a property.
+Results have independent dimensions:
 
-## Fidelity contract (the differentiator)
+- Execution: `passed`, `failed`, `canceled`, `blocked`,
+  `preparation-failed`, or `aborted`.
+- Compatibility: `supported`, `degraded`, or `unsupported`.
+- Assurance: `none`, `local`, `clean`, `hermetic`, or
+  `github-confirmed`.
 
-- Build a **parity test suite**: clone the workflows of ~50 popular OSS repos, run each on GitHub and on Greenlit, and diff top-level workflow-step outcomes.
-- Raw parity is exact conclusion matches divided by the union of in-scope expanded workflow-step instances; a missing or extra step is a mismatch. `environment-drift` and `flaky` mismatches lower the raw score and are also published as separate counts. Repositories outside v0 are excluded before the denominator and listed with reasons.
-- Ship the raw parity score in the README and run the parity gate on every merge to main from Phase 6 onward. Launch gate: ≥95% raw step-level parity **and zero open `greenlit-defect` mismatches**. Defects get fixed, not filed away; classified environment drift and flakes may remain only with counts and rationale published.
-- Every `greenlit-defect` parity failure has a public issue. The suite is the roadmap and the marketing.
-- Host the parity results as a live dashboard on the owner's server/domain, updated by CI — the public credibility artifact and launch centerpiece.
+`clean` requires new writable state and all transparent Greenlit mutable
+caches disabled. `hermetic` additionally requires exact Greenlit environment,
+source, action, toolchain, container and architecture identities, no late
+mutable input, no disqualifying kernel/runtime capability, and no external
+step traffic. `github-confirmed` requires a matching successful GitHub run and
+evidence; it is not inferred from a local pass. Cache hits never upgrade
+assurance.
 
-## Speed
+### Source and checkout
 
-Targets, enforced by the benchmark suite in the project's CI:
+- Snapshot source at run start from tracked current bytes, tracked deletions,
+  and untracked nonignored files. Hard-exclude `.litci/`, reject special
+  nodes, preserve modes/symlinks/Git metadata, and retry concurrent changes.
+- A clean source reports its commit; a dirty source reports its commit plus a
+  stable snapshot digest and cannot be GitHub-confirmed.
+- Jobs and local actions read only the snapshot. Edits after locking cannot
+  create a mixed run.
+- `actions/checkout` of the current repository restores the locked local
+  snapshot. A different repository or ref performs a pinned checkout and
+  records the resulting identity.
+- Parallel jobs cannot mutate each other's workspaces. `--write-back` supports
+  one selected job and applies only after listing its diff and confirming the
+  host source has not changed.
 
-- **Start:** `litci run` → first step executing in < 2s (images pre-baked and pulled once; no per-run builds).
-- **Warm re-run:** typical test workflow < 30s.
-- **Parallelism:** async orchestration (tokio) — concurrent jobs respecting `needs`, matrix fan-out, parallel image pulls and action fetches.
-- **Pipelining:** prefetch job N+1's images and actions while job N runs.
-- **Persistent toolcache:** `setup-node`/`setup-python`-style toolchains cached on a permanent volume; those steps drop to near-zero.
-- **Warm container reuse:** keep booted containers; reset the overlay between runs.
-- Publish the benchmark chart: same workflow — GitHub queue+run vs Greenlit cold vs Greenlit warm.
+### Content and environment preparation
 
-**Constraint:** steps within a job stay sequential and never skip — result-caching would break the fidelity contract.
+- Immutable filesystem objects live in a machine-wide SHA-256 CAS. OCI layers
+  may remain in an engine-native digest store but are cataloged and leased by
+  the same metadata system.
+- Downloads are resumable, single-flight per digest across processes,
+  cancelable, digest verified, and atomically published. Corruption is
+  quarantined and refetched.
+- Runner labels map to immutable Greenlit profile manifests. Profiles record
+  OS, architecture, shell defaults, executor version, toolchain inventory,
+  logical profile digest, and eager/lazy OCI identities.
+- Greenlit never claims that an inferred minimal environment equals a complete
+  GitHub runner. GitHub runner image/version/kernel differences are evidence.
+- Static analysis prefetches likely actions, services, toolchains and runner
+  paths; an underprediction may affect performance only.
+- If every locked object is cached, offline execution succeeds. Missing
+  offline content reports the exact identity and performs no substitution.
+- Registry auth/rate-limit/network failures are preparation failures, not
+  workflow failures.
 
-**Deferred until benchmarks exist:** tmpfs for the overlay upper layer; lazy image layer loading. GPU is not a speed lever (orchestration is I/O-bound); GPU passthrough is a possible v1 *feature* for testing CUDA workflows.
+### Sandboxes, actions, services, and networks
 
-## CLI
+- Every job uses a fresh root writable layer, job-private CoW workspace,
+  process namespace, command-file directory, network, service set, and
+  namespaced volumes. No writable state is reused after user code.
+- Immutable runner/action/toolchain/source material is read-only. Job-private
+  workspace data may be shared only with that job's Docker-action siblings.
+- Implement JavaScript, container, and composite actions; pre/main/post phases;
+  checkout; `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`,
+  summaries; conditions; outputs through `needs`; timeouts; cancellation;
+  `continue-on-error`; shell/default/working-directory behavior.
+- Actions execute only from commits in a lock. Unknown `runs.using` values are
+  unsupported.
+- Services use resolved image digests and a job-scoped network, honor env,
+  credentials, ports, options, and health checks, retain timeout logs, and
+  always tear down without cross-run name/port collisions.
+- Internet is available by default; host loopback, host LAN, link-local
+  addresses, the host Docker socket, devices, host networking, privileged
+  workflow containers, and arbitrary host mounts are unavailable.
+- Greenlit-owned privileged infrastructure such as isolated DinD is recorded,
+  strictly scoped, and disqualifies hermetic assurance.
+- Fork/untrusted source receives no protected secrets. Secret values and
+  bounded common encodings are masked across output chunks, structured logs,
+  errors, traces, summaries, and service output.
+- Configured CPU, memory, process, and disk limits apply before job start.
 
-```
-litci run                       # run default push-event workflows
-litci run -j test               # single job
-litci run -e pull_request       # simulate event
-litci run -s KEY=VAL            # override a secret
-litci run --var KEY=VALUE       # override a configuration variable
-litci plan [--json]             # print the resolved execution plan, no containers
-litci auth                      # device-flow login (read-only token)
-litci setup                     # install/start the container engine
-litci clean                     # remove converged images, caches, warm pool
-litci stats                     # local invocation history and timing trends
-```
+### Cache policy
 
-One habit command (`run`); the rest are occasional. No config file required to start. The Cargo install package is `greenlit-app`; it installs the `litci` executable.
+Keep identities and policy distinct:
 
-## Tech
+- Runner, actions, OCI images, source, verified downloads and toolchains are
+  immutable and allowed in clean verification.
+- Package-download content may be reused by checksum/version/architecture, but
+  installation steps still run.
+- Workflow-authored `actions/cache` remains enabled and reported in every
+  mode.
+- Transparent compiled-output caches are disabled for clean/hermetic runs and
+  never mounted by default.
+- Job memoization is out of v0.
+- A miss changes performance only. Corruption causes eviction/refetch.
 
-- **Host platform: Linux x86_64 only for v0.** All engine access goes through one Rust trait (Docker-API client behind it), so future platforms and architectures are ports, not rewrites. WSL2 on x86_64 gives Windows users a working path.
-- **Supported runner labels:** `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`. Every other label is recognized and rejected during planning with the supported list and source location.
-- **Zero prerequisites:** engine detection is three-state — reachable → run; installed but daemon stopped → offer to start it (`sudo systemctl start docker`, honoring socket activation and rootless `--user` daemons); absent → `litci setup` installs Docker via the official script (sudo prompt, one confirmation). Detection order: `DOCKER_HOST` → Docker socket → Podman socket. Greenlit never surfaces "cannot connect to Docker daemon" — every failure maps to a state plus the one action that fixes it.
-- **Rust** — chosen for developer-fit, evaluator correctness, and launch branding. The runner remains I/O-bound orchestration.
-- Docker via API (bollard crate), no shelling out to `docker`, no daemon bundled on the host.
-- One distributable static host binary. `greenlit-init` is a private embedded build artifact extracted only into the base-image build context.
-- Install: brew, cargo, curl script. MIT license.
+### Scheduling and progress
 
-## Phases
+- Expand matrices deterministically. Start a job only after direct `needs`
+  results and outputs are final; evaluate GitHub-compatible skip/status rules.
+- Honor matrix `max-parallel` and `fail-fast`, workflow/job concurrency, a
+  global worker limit, and a per-project fairness limit.
+- Steps remain sequential and execute exactly once unless GitHub defines
+  otherwise. Cancellation reaches queued jobs, steps, actions, services,
+  containers and preparation tasks.
+- Show resolving, compatibility, runner, content, actions, toolchains,
+  services, sandbox, steps, and cleanup separately.
+- Every fetch identifies cache hit, prefetch, or current download; bytes;
+  shared storage reused; and the item causing the wait. Step-time traffic is
+  labeled workflow traffic.
 
-Ordered by dependency. Each phase ends at its exit criterion.
+### Daemon, recovery, and garbage collection
 
-**1. Engine core — parse and evaluate**
-- Workflow parser, expression evaluator, job DAG/matrix planning, job outputs/container modeling, supported-runner validation, static extraction, stable plan output, local variable overrides, local metrics, and `litci stats`.
-- *Exit:* given a workflow file, synthetic event, and any required local variable overrides, `litci plan` prints the fully resolved execution plan. No containers or network yet.
+The same `litci` binary may run a per-user optional daemon. `litci run`
+auto-starts/upgrades it, falls back to the identical in-process path, and
+supports `--no-daemon`. The daemon watches workflow, local-action, container,
+package-lock, toolchain and Git state; prepares immutable content and one-use
+clean templates; and yields resources to foreground runs. It never persists
+plaintext secrets or changes an active run's lock.
 
-**2. Execution — containers and `run:` steps**
-- Engine trait + bollard backend; three-state detection; stable x64 runner mapping; base and custom job containers; overlay isolation; shell and workflow-command semantics; job-output finalization and live `needs` propagation.
-- *Exit:* a real repo's shell-only workflow runs green end to end.
+Persist resource intent and state transitions before reporting completion.
+On process crash, reboot, interrupted download, runtime failure, disk
+exhaustion, or partial cleanup:
 
-**3. Actions, variables, secrets, auth**
-- Action resolution and fetch; pinned runner Node runtimes; JavaScript, composite, and Docker action execution.
-- Secrets chain, authenticated GitHub variable lookup, `litci auth` device flow, and PAT/`gh` fallbacks.
-- *Exit:* a workflow using `actions/checkout` + a `setup-*` action runs green.
+- reconcile recorded resources with actual containers, networks, volumes,
+  mounts and snapshots;
+- mark interrupted jobs aborted unless a future explicit resumption protocol
+  applies;
+- preserve locks, logs, service logs, trace and result evidence;
+- resume verified download progress;
+- remove abandoned writable resources;
+- never reuse a dirty sandbox.
 
-**4. Environment completeness**
-- Label-specific convergent images, command-level lazy provisioning, persistent toolcache, `actions/cache` emulation, artifacts, services, network policy, and DinD.
-- *Exit:* a realistic full workflow — services, cache, artifacts — matches its GitHub run step for step without replaying user scripts.
+Leases block deletion. GC removes abandoned writable state first, then
+unreferenced snapshots, then least-recently-used unpinned immutable content.
+Recent/pinned runs retain their references. Inconsistent metadata blocks
+destructive GC. `doctor` reports without deleting by default; `clean` previews
+reclaimable bytes and requires confirmation.
 
-**5. Speed**
-- Parallel jobs and matrix fan-out; prefetch pipelining; warm container reuse.
-- Benchmark suite in CI enforcing the targets (<2s to first step, <30s warm re-run).
-- *Exit:* the GitHub-vs-cold-vs-warm benchmark chart is generated automatically.
+### GitHub confirmation
 
-**6. Parity and launch readiness**
-- Parity suite: ~50 popular repos' workflows, raw step-level outcome diffing, and public issues for every Greenlit defect.
-- Live parity dashboard, README, install script, release automation, and owner-reviewed launch copy. In-scope defects found here are fixed under the existing phase rules; no new feature scope is added.
-- *Exit:* dashboard live at ≥95% raw parity with zero open `greenlit-defect` mismatches; launch materials reviewed and ready for separately authorized publication.
+Greenlit can export a separate workflow whose action/container references are
+fully pinned and which uploads `greenlit-evidence-v1.json`. Export does not
+edit, commit, push, dispatch, or message externally. Confirmation performs
+read-only GitHub API access and requires matching source commit, workflow
+semantics, event/inputs, action commits, container/toolchain requests, expanded
+job/step identities, successful conclusions, and evidence artifact digest.
+Without matching evidence, report only that a GitHub pass was observed.
 
-## Post-launch success goals
+## Performance targets
 
-Front page of Hacker News with the parity table and benchmark chart. Secondary: 1k GitHub stars, and `act` users confirming their broken workflows run green. These are aspirations, not engineering completion gates.
+- Warm native-Linux sandbox creation p95 under two seconds.
+- Warm typical workflow under 30 seconds.
+- Unchanged warm workflow: zero Greenlit-controlled external downloads.
+- First useful step begins before the complete runner downloads when the
+  selected provider supports lazy materialization.
+- Concurrent requests for one digest perform exactly one external download.
+- Typical private workspace materialization adds under 500 MB excluding
+  intentional build output.
+- Cancellation acknowledgment under one second.
+
+Docker Desktop, emulated architectures, large browser/Android toolchains, and
+workflow-controlled downloads may exceed these targets and must be identified
+in diagnostics.
+
+## Explicit non-goals
+
+- macOS/Windows/ARM hosted-runner emulation;
+- local GitHub OIDC issuance;
+- unsafe privileged/host/device/socket modes;
+- perfectly hermetic arbitrary internet responses;
+- remote CAS, compiled-job memoization, or guessed job skipping;
+- public package/image publication, dashboard deployment, or launch posts
+  without separate owner authorization.
+
+## Definition of done
+
+Every run has immutable locks and stored evidence; every job starts fresh;
+shared content is digest verified and concurrency safe; the support report
+explains known differences; classifications derive only from evidence;
+repeated runs are fast through immutable reuse rather than dirty containers;
+offline and crash behavior are exact; and no unsupported or uncertain behavior
+can silently produce a GitHub-equivalent claim.

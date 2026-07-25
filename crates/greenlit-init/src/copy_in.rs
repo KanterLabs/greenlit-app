@@ -8,6 +8,7 @@
 //! nodes (devices, FIFOs, sockets) are skipped rather than recreated.
 
 use std::fs;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,10 @@ use crate::error::InitError;
 /// multi-gigabyte tree reports every few hundred milliseconds, coarse enough
 /// that the callback (a status-file write) is noise against the copy itself.
 const PROGRESS_EVERY: u64 = 512;
+
+/// Resource ceilings for the bounded copy fallback.
+const MAX_COPY_FILES: u64 = 2_000_000;
+const MAX_COPY_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Copy the entire tree rooted at `lower` into `workspace`, creating
 /// `workspace` if needed. `on_progress` receives cumulative (files, bytes)
@@ -34,6 +39,22 @@ pub(crate) fn populate(
     lower: &Path,
     workspace: &Path,
     on_progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), InitError> {
+    populate_with_limits(
+        lower,
+        workspace,
+        on_progress,
+        MAX_COPY_FILES,
+        MAX_COPY_BYTES,
+    )
+}
+
+fn populate_with_limits(
+    lower: &Path,
+    workspace: &Path,
+    on_progress: &mut dyn FnMut(u64, u64),
+    max_files: u64,
+    max_bytes: u64,
 ) -> Result<(), InitError> {
     fs::create_dir_all(workspace).map_err(|source| InitError::PrepareDir {
         path: workspace.to_path_buf(),
@@ -68,7 +89,7 @@ pub(crate) fn populate(
                     path: dst.clone(),
                     source,
                 })?;
-                stack.push((src, dst));
+                stack.push((src.clone(), dst));
             } else if file_type.is_symlink() {
                 let target = fs::read_link(&src).map_err(|source| InitError::CopyIn {
                     path: src.clone(),
@@ -80,15 +101,31 @@ pub(crate) fn populate(
                 })?;
                 files += 1;
             } else if file_type.is_file() {
-                bytes += fs::copy(&src, &dst).map_err(|source| InitError::CopyIn {
+                let copied = clone_or_copy(&src, &dst).map_err(|source| InitError::CopyIn {
                     path: src.clone(),
                     source,
+                })?;
+                bytes = bytes.checked_add(copied).ok_or_else(|| InitError::CopyIn {
+                    path: src.clone(),
+                    source: limit_error("byte count overflowed"),
                 })?;
                 files += 1;
             } else if is_special(&file_type) {
                 // Devices, FIFOs, and sockets are runtime artifacts, not source
                 // content — skip them rather than attempt to recreate them.
                 continue;
+            }
+            if files > max_files {
+                return Err(InitError::CopyIn {
+                    path: src,
+                    source: limit_error("file count exceeded the workspace copy limit"),
+                });
+            }
+            if bytes > max_bytes {
+                return Err(InitError::CopyIn {
+                    path: src,
+                    source: limit_error("byte count exceeded the workspace copy limit"),
+                });
             }
             entries_seen += 1;
             if entries_seen.is_multiple_of(PROGRESS_EVERY) {
@@ -98,6 +135,31 @@ pub(crate) fn populate(
     }
     on_progress(files, bytes);
     Ok(())
+}
+
+fn clone_or_copy(source_path: &Path, destination_path: &Path) -> std::io::Result<u64> {
+    let source = File::open(source_path)?;
+    let destination = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(destination_path)?;
+    match rustix::fs::ioctl_ficlone(&destination, &source) {
+        Ok(()) => {
+            let metadata = source.metadata()?;
+            destination.set_permissions(metadata.permissions())?;
+            Ok(metadata.len())
+        }
+        Err(_) => {
+            drop(destination);
+            drop(source);
+            fs::copy(source_path, destination_path)
+        }
+    }
+}
+
+fn limit_error(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::FileTooLarge, message)
 }
 
 /// Whether a file type is a special node (device, FIFO, or socket) that the
@@ -163,5 +225,44 @@ mod tests {
         .expect("copy");
 
         assert_eq!(last, (2, 3), "two entries, three bytes of file content");
+    }
+
+    #[test]
+    fn fallback_copy_stops_at_its_declared_resource_bound() {
+        let lower = tempfile::tempdir().expect("lower");
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(lower.path().join("first"), b"1").expect("seed");
+        fs::write(lower.path().join("second"), b"2").expect("seed");
+
+        let error = populate_with_limits(
+            lower.path(),
+            &workspace.path().join("ws"),
+            &mut |_, _| {},
+            1,
+            1024,
+        )
+        .expect_err("the second file exceeds the test ceiling");
+
+        assert!(error.to_string().contains("file count exceeded"), "{error}");
+    }
+
+    #[test]
+    fn reflink_first_copy_preserves_bytes_and_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let lower = tempfile::tempdir().expect("lower");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let source = lower.path().join("script");
+        fs::write(&source, b"#!/bin/sh\n").expect("seed");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o751)).expect("mode");
+
+        populate(lower.path(), &workspace.path().join("ws"), &mut |_, _| {}).expect("copy");
+
+        let copied = workspace.path().join("ws/script");
+        assert_eq!(fs::read(&copied).expect("read"), b"#!/bin/sh\n");
+        assert_eq!(
+            fs::metadata(copied).expect("metadata").permissions().mode() & 0o777,
+            0o751
+        );
     }
 }

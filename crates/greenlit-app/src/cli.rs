@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// `litci` -- run your GitHub Actions workflows locally, fast, with results
-/// you can trust (`greenlit-v0-spec.md`). `clean` remains unimplemented.
+/// you can trust (`greenlit-v0-spec.md`).
 #[derive(Debug, Parser)]
 #[command(name = "litci", version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -33,6 +33,76 @@ pub(crate) enum Command {
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
     Stats,
+    /// Inspect the immutable lock and result evidence for a local run.
+    Inspect(InspectArgs),
+    /// Export a separate, fully pinned workflow and GitHub evidence artifact.
+    Export(ExportArgs),
+    /// Import read-only GitHub evidence for a completed local run.
+    Confirm(ConfirmArgs),
+    /// Diagnose local daemon, run, and storage state without deleting data.
+    Doctor(DoctorArgs),
+    /// Remove Greenlit's derived caches and built images. Credentials and run
+    /// history are never touched.
+    Clean(CleanArgs),
+    /// Internal per-user preparation daemon.
+    #[command(name = "daemon", hide = true)]
+    Daemon(DaemonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ExportArgs {
+    /// Completed local run identity. When omitted, export the latest run.
+    pub(crate) run_id: Option<String>,
+
+    /// Destination directory. Defaults to
+    /// `.litci/confirmation/<run-id>/`.
+    #[arg(short, long)]
+    pub(crate) output: Option<PathBuf>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ConfirmArgs {
+    /// Completed local run identity.
+    pub(crate) run_id: String,
+
+    /// GitHub repository in `OWNER/REPO` form.
+    #[arg(long)]
+    pub(crate) repository: String,
+
+    /// Numeric GitHub Actions workflow-run identity.
+    #[arg(long = "github-run", value_parser = parse_positive_u64)]
+    pub(crate) github_run: u64,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DoctorArgs {
+    /// Emit the report as machine-readable JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DaemonArgs {
+    /// Ask the current daemon to exit.
+    #[arg(long, conflicts_with = "status")]
+    pub(crate) shutdown: bool,
+
+    /// Report whether a compatible daemon is accepting requests.
+    #[arg(long, conflicts_with = "shutdown")]
+    pub(crate) status: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct InspectArgs {
+    /// Run identity. When omitted, inspect the most recently created run.
+    pub(crate) run_id: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct CleanArgs {
+    /// Pre-confirm the removal prompt (non-interactive).
+    #[arg(short = 'y', long = "yes")]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -63,6 +133,11 @@ pub(crate) struct RunArgs {
     /// Run only this job and its transitive `needs:` dependencies.
     #[arg(short = 'j', long = "job")]
     pub(crate) job: Option<String>,
+
+    /// Select one exact matrix property, `KEY=JSON_VALUE`. Repeat for every
+    /// property in the desired case; requires `--job`.
+    #[arg(long = "matrix", value_name = "KEY=JSON_VALUE", value_parser = parse_key_val)]
+    pub(crate) matrix: Vec<(String, String)>,
 
     /// A local variable override, `KEY=VALUE`. Repeatable.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
@@ -97,6 +172,71 @@ pub(crate) struct RunArgs {
     /// Disable every interactive prompt. Conflicts with `--write-back`.
     #[arg(long = "no-input")]
     pub(crate) no_input: bool,
+
+    /// Forbid Greenlit-controlled network access and use only previously
+    /// verified locked content already present on this machine.
+    #[arg(long)]
+    pub(crate) offline: bool,
+
+    /// Disable Greenlit's transparent mutable cache and toolcache reuse while
+    /// retaining verified immutable content from the machine-wide CAS.
+    #[arg(long)]
+    pub(crate) clean: bool,
+
+    /// Block workflow access to external networks and reject inputs whose
+    /// immutable identity cannot be finalized before the first step.
+    #[arg(long)]
+    pub(crate) hermetic: bool,
+
+    /// Run through the identical in-process path without contacting or
+    /// auto-starting the optional preparation daemon.
+    #[arg(long)]
+    pub(crate) no_daemon: bool,
+
+    /// Maximum CPUs available to each job and service container.
+    #[arg(long, value_name = "COUNT", value_parser = parse_cpus)]
+    pub(crate) cpus: Option<i64>,
+
+    /// Maximum memory available to each job and service container, in bytes.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_i64)]
+    pub(crate) memory: Option<i64>,
+
+    /// Maximum processes available to each job and service container.
+    #[arg(long, value_name = "COUNT", value_parser = parse_positive_i64)]
+    pub(crate) pids_limit: Option<i64>,
+
+    /// Maximum writable container-layer size, in bytes.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_i64)]
+    pub(crate) disk_limit: Option<i64>,
+}
+
+fn parse_positive_i64(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| "value must be a positive integer".to_string())
+}
+
+fn parse_positive_u64(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| "value must be a positive integer".to_string())
+}
+
+fn parse_cpus(value: &str) -> Result<i64, String> {
+    let cpus = value
+        .parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite() && *parsed > 0.0)
+        .ok_or_else(|| "CPU count must be a positive number".to_string())?;
+    let nano = cpus * 1_000_000_000.0;
+    if nano > i64::MAX as f64 {
+        return Err("CPU count is too large".to_string());
+    }
+    Ok(nano.round() as i64)
 }
 
 #[derive(Debug, clap::Args)]

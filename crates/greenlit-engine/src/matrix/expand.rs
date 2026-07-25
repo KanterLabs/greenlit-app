@@ -10,7 +10,7 @@ use greenlit_workflow::model::job::{Matrix, MatrixSource};
 use greenlit_workflow::model::value::{ScalarOrExpr, YamlValue};
 
 use crate::lints::Lint;
-use crate::partial_eval::{FoldCtx, TemplateFold, fold_template};
+use crate::partial_eval::{FoldCtx, TemplateFold, evaluate_template, fold_template};
 
 use super::algorithm::{checked_product_cardinality, run_algorithm};
 use super::{MatrixError, MatrixLeg, MatrixValue, ResolvedEntry, value_kind_name};
@@ -24,6 +24,25 @@ pub(super) fn expand_matrix_source(
     match source {
         MatrixSource::Inline(matrix) => expand_inline_matrix(matrix, span, ctx, cap),
         MatrixSource::Expression(text) => expand_expression_matrix(text, ctx, cap),
+    }
+}
+
+pub(super) fn expand_matrix_source_runtime(
+    source: &MatrixSource,
+    span: &Span,
+    ctx: &greenlit_expr::Context,
+    cap: usize,
+) -> Result<(Vec<MatrixLeg>, Vec<Lint>), MatrixError> {
+    match source {
+        MatrixSource::Inline(matrix) => expand_inline_matrix_runtime(matrix, span, ctx, cap),
+        MatrixSource::Expression(text) => {
+            let value =
+                evaluate_template(&text.value, ctx).map_err(|source| MatrixError::PartialEval {
+                    span: text.span.clone(),
+                    source,
+                })?;
+            expand_expression_value(value, &text.span, cap)
+        }
     }
 }
 
@@ -161,6 +180,14 @@ fn expand_expression_matrix(
         }
     };
 
+    expand_expression_value(value, &text.span, cap)
+}
+
+fn expand_expression_value(
+    value: greenlit_expr::Value,
+    span: &Span,
+    cap: usize,
+) -> Result<(Vec<MatrixLeg>, Vec<Lint>), MatrixError> {
     match value {
         greenlit_expr::Value::Object(obj) => {
             let mut axes = Vec::new();
@@ -168,9 +195,9 @@ fn expand_expression_matrix(
             let mut exclude = Vec::new();
             for (k, v) in obj.iter() {
                 if k.eq_ignore_ascii_case("include") {
-                    include = value_to_matrix_entries(v, "include", &text.span)?;
+                    include = value_to_matrix_entries(v, "include", span)?;
                 } else if k.eq_ignore_ascii_case("exclude") {
-                    exclude = value_to_matrix_entries(v, "exclude", &text.span)?
+                    exclude = value_to_matrix_entries(v, "exclude", span)?
                         .into_iter()
                         .map(|(_, entry, span)| (entry, span))
                         .collect();
@@ -179,7 +206,7 @@ fn expand_expression_matrix(
                         return Err(MatrixError::ExpressionFieldNotArray {
                             field: k.to_string(),
                             actual: value_kind_name(v),
-                            span: text.span.clone(),
+                            span: span.clone(),
                         });
                     };
                     axes.push((
@@ -192,12 +219,70 @@ fn expand_expression_matrix(
                     ));
                 }
             }
-            run_algorithm(axes, include, exclude, cap, text.span.clone())
+            run_algorithm(axes, include, exclude, cap, span.clone())
         }
-        _ => Err(MatrixError::ExpressionNotMatrixShaped {
-            span: text.span.clone(),
-        }),
+        _ => Err(MatrixError::ExpressionNotMatrixShaped { span: span.clone() }),
     }
+}
+
+fn expand_inline_matrix_runtime(
+    matrix: &Matrix,
+    source_span: &Span,
+    ctx: &greenlit_expr::Context,
+    cap: usize,
+) -> Result<(Vec<MatrixLeg>, Vec<Lint>), MatrixError> {
+    let mut axes = Vec::with_capacity(matrix.axes.len());
+    for (name, values) in &matrix.axes {
+        let mut converted = Vec::with_capacity(values.len());
+        for value in values {
+            if let YamlValue::Scalar(ScalarOrExpr::Expression(raw)) = &value.value {
+                let evaluated =
+                    evaluate_template(raw, ctx).map_err(|source| MatrixError::PartialEval {
+                        span: value.span.clone(),
+                        source,
+                    })?;
+                match evaluated {
+                    greenlit_expr::Value::Array(items) => {
+                        converted.extend(items.items().iter().map(expr_value_to_matrix_value))
+                    }
+                    actual => {
+                        return Err(MatrixError::ExpressionFieldNotArray {
+                            field: name.value.clone(),
+                            actual: value_kind_name(&actual),
+                            span: value.span.clone(),
+                        });
+                    }
+                }
+            } else {
+                converted.push(convert_yaml_value_runtime(value, ctx)?);
+            }
+        }
+        axes.push((name.value.clone(), converted));
+    }
+
+    let include = matrix
+        .include
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            Ok((
+                index,
+                convert_matrix_entry_runtime(entry, ctx)?,
+                entry.span.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, MatrixError>>()?;
+    let exclude = matrix
+        .exclude
+        .iter()
+        .map(|entry| {
+            Ok((
+                convert_matrix_entry_runtime(entry, ctx)?,
+                entry.span.clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>, MatrixError>>()?;
+    run_algorithm(axes, include, exclude, cap, source_span.clone())
 }
 
 /// `fromJSON(...)`-sourced `include`/`exclude` entries carry no per-entry
@@ -269,6 +354,47 @@ fn convert_matrix_entry(
         .iter()
         .map(|(k, v)| Ok((k.value.clone(), convert_yaml_value(v, ctx)?)))
         .collect()
+}
+
+fn convert_matrix_entry_runtime(
+    entry: &greenlit_workflow::Spanned<greenlit_workflow::model::job::MatrixEntry>,
+    ctx: &greenlit_expr::Context,
+) -> Result<ResolvedEntry, MatrixError> {
+    entry
+        .value
+        .iter()
+        .map(|(key, value)| Ok((key.value.clone(), convert_yaml_value_runtime(value, ctx)?)))
+        .collect()
+}
+
+fn convert_yaml_value_runtime(
+    value: &greenlit_workflow::Spanned<YamlValue>,
+    ctx: &greenlit_expr::Context,
+) -> Result<MatrixValue, MatrixError> {
+    match &value.value {
+        YamlValue::Scalar(ScalarOrExpr::Literal(scalar)) => Ok(scalar_to_matrix_value(scalar)),
+        YamlValue::Scalar(ScalarOrExpr::Expression(raw)) => evaluate_template(raw, ctx)
+            .map(|evaluated| expr_value_to_matrix_value(&evaluated))
+            .map_err(|source| MatrixError::PartialEval {
+                span: value.span.clone(),
+                source,
+            }),
+        YamlValue::Sequence(items) => Ok(MatrixValue::Sequence(
+            items
+                .iter()
+                .map(|item| convert_yaml_value_runtime(item, ctx))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        )),
+        YamlValue::Mapping(entries) => Ok(MatrixValue::Mapping(std::sync::Arc::new(
+            entries
+                .iter()
+                .map(|(key, nested)| {
+                    Ok((key.value.clone(), convert_yaml_value_runtime(nested, ctx)?))
+                })
+                .collect::<Result<IndexMap<_, _>, MatrixError>>()?,
+        ))),
+    }
 }
 
 fn convert_yaml_value(

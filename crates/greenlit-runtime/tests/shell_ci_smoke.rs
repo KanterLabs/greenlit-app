@@ -7,6 +7,12 @@
 //! `continue-on-error`, `if: failure()`, and a declared job output propagated to
 //! a direct `needs` dependent. The engine is a true external, so it is used real
 //! here, not faked (`TESTING.md`).
+//!
+//! Also covers the runtime-supplied `github` context roots and env vars this
+//! crate fills in at execution time rather than plan time: `GITHUB_EVENT_PATH`
+//! and the file it points at, `${{ github.event_path }}`/`workspace`/`job`,
+//! and per-step `GITHUB_ACTION` (id-less run steps deduping to `__run`/
+//! `__run_2`, an explicit `id:` winning outright).
 
 mod dockerkit;
 
@@ -44,6 +50,20 @@ fn synthetic_push_event() -> SyntheticEvent {
             "ref".to_string(),
             Value::String("refs/heads/main".to_string()),
         ),
+        // The `github.event` payload the executor serializes to
+        // `GITHUB_EVENT_PATH` (`crate::executor::event_json`); only the
+        // field this file's own assertion greps for is populated, matching
+        // this test's existing minimal-fixture style.
+        (
+            "event".to_string(),
+            Value::object(vec![(
+                "repository".to_string(),
+                Value::object(vec![(
+                    "full_name".to_string(),
+                    Value::String("greenlit/shell-ci".to_string()),
+                )]),
+            )]),
+        ),
     ]);
     SyntheticEvent {
         kind: EventKind::Push,
@@ -72,6 +92,7 @@ fn runner_env(workspace: &str) -> RunnerEnv {
         runner_name: "greenlit".to_string(),
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
+        actions_service: None,
     }
 }
 
@@ -105,9 +126,12 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "shell-ci-smoke".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -190,4 +214,44 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
 
     // The grouped output was folded and rendered.
     assert!(log.contains("Compiling"), "the group title is shown");
+
+    // `GITHUB_EVENT_PATH` points at a real file carrying the serialized
+    // `github.event` payload (`crate::executor::event_json`/
+    // `crate::executor::cmdfiles::write_event_file`), and `github.event_path`/
+    // `github.workspace`/`github.job` all resolve at runtime rather than
+    // staying deferred (`crate::executor::context::job_github_context`).
+    assert!(
+        log.contains("/event.json|"),
+        "github.event_path resolves to the written event file\n--- log ---\n{log}"
+    );
+    assert!(
+        log.contains(&format!("|{workspace}|build]")),
+        "github.workspace/job interpolate to this job's own values\n--- log ---\n{log}"
+    );
+
+    // Per-step `GITHUB_ACTION` (`crate::executor::step_ids`): an id-less
+    // `run:` step gets the runner's own default `__run`, a repeated one
+    // dedups to `__run_2`, and an explicit `id:` wins outright.
+    let action_ids_job = report
+        .jobs
+        .iter()
+        .find(|job| job.id == "action-ids")
+        .expect("action-ids job ran");
+    assert_eq!(
+        action_ids_job.result,
+        Conclusion::Success,
+        "action-ids job is green\n--- log ---\n{log}"
+    );
+    assert!(
+        log.contains("GITHUB_ACTION_IS:[__run]"),
+        "the first id-less run step's GITHUB_ACTION is __run\n--- log ---\n{log}"
+    );
+    assert!(
+        log.contains("GITHUB_ACTION_IS:[__run_2]"),
+        "the second id-less run step dedups to __run_2\n--- log ---\n{log}"
+    );
+    assert!(
+        log.contains("GITHUB_ACTION_IS:[explicit]"),
+        "an explicit id: wins outright over any generated candidate\n--- log ---\n{log}"
+    );
 }

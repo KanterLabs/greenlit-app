@@ -7,10 +7,14 @@ name: CI
 #   4. tools/check-stubs
 #   5. cargo test --workspace
 #   6. cargo doc --workspace --no-deps (warnings denied)
-#   7. criterion benches (record only until Phase 5; no budget gate yet)
+#   7. criterion benches plus the required native whole-run budget gate
+#
+# Plus the `dogfood` job below: from Phase 4 onward TESTING.md makes running
+# this repository's own gates under Greenlit itself a *required* CI step.
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,6 +55,13 @@ jobs:
       - name: Stub registry consistency
         run: python3 tools/check-stubs
 
+      # The real-daemon executor tests begin at the post-RunLock boundary.
+      # Provision the exact locked profile up front: once execution begins,
+      # Greenlit correctly refuses to replace a missing locked image.
+      - name: Prepare pinned runner profile for real-daemon tests
+        if: ${{ vars.GREENLIT_DOGFOOD != 'true' }}
+        run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+
       # 5. cargo test --workspace (oracle + integration + invariant)
       - name: Test
         run: cargo test --workspace
@@ -61,7 +72,76 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --no-deps
 
-      # 7. Criterion benches — record baselines only until Phase 5's budget
-      # gate exists (AGENTS.md Metrics, PHASE-1-engine-core.md).
-      - name: Criterion benchmarks (record only)
+      # 7. Criterion microbenchmarks retain trend baselines; the
+      # provider-and-policy job below enforces whole-run Phase 10 budgets.
+      - name: Criterion benchmarks
         run: cargo bench --workspace
+
+  # TESTING.md snapshotter-path coverage forbids capability self-skips. This
+  # job provisions a real, isolated containerd/stargz stack and runs the direct
+  # provider acceptance plus live clean/hermetic policy acceptance.
+  provider-and-policy:
+    name: configured stargz provider and policy modes
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Direct containerd/stargz provider
+        run: tools/test-stargz-provider
+
+      - name: Clean and hermetic policy modes
+        env:
+          LITCI_TEST_LIVE_FULL_CI: "1"
+        run: cargo test -p greenlit-app --test cli_behavior policy_modes -- --nocapture
+
+      - name: Enforced native warm performance budgets
+        env:
+          LITCI_TEST_PERFORMANCE: "1"
+        run: cargo test -p greenlit-app --test performance_budgets -- --nocapture
+
+  # TESTING.md "Dogfood clause": "from Phase 2 onward this repo's own workflow
+  # must run green under Greenlit itself, and that run is a required CI step
+  # from Phase 4 onward. A CI tool whose repo can't run its own CI locally has
+  # failed its founding premise."
+  #
+  # The dedicated workflow supplies its repository-declared Rust toolchain
+  # through an immutable job container. The locked ARC runner profile is
+  # intentionally not inferred to contain GitHub-hosted runner toolcache
+  # contents such as rustup.
+  dogfood:
+    name: this repo's own gates, under litci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Pull-request checkouts are detached merge commits. A synthetic manual
+      # dispatch still has a selected ref, so give that exact SHA a local
+      # branch instead of asking Greenlit to invent one.
+      - name: Prepare branch-backed source identity
+        run: git switch -C greenlit-ci "$GITHUB_SHA"
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build litci
+        run: cargo build --release -p greenlit-app
+
+      # A separate target dir keeps the inner run's build off the outer one:
+      # the host repo's `target/` is in the read-only lower layer, and
+      # building over it fights stale fingerprints.
+      - name: Run repository gates under Greenlit
+        env:
+          CARGO_TARGET_DIR: /tmp/dogfood-target
+        run: ./target/release/litci run -W .github/workflows/dogfood.yml -e workflow_dispatch --no-input

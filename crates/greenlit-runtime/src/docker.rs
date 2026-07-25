@@ -13,20 +13,26 @@ use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecResults};
 use bollard::models::{
-    ContainerConfig, ContainerCreateBody, CreateImageInfo, HostConfig, NetworkCreateRequest,
+    ContainerConfig, ContainerCreateBody, CreateImageInfo, EndpointSettings, HealthConfig,
+    HealthStatusEnum, HostConfig, NetworkCreateRequest, NetworkingConfig,
+    PortBinding as BollardPortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CommitContainerOptionsBuilder, CreateContainerOptionsBuilder,
-    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, LogsOptionsBuilder,
-    RemoveContainerOptionsBuilder, StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
+    CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, InspectContainerOptions,
+    ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
+    ListVolumesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    RemoveImageOptions, RemoveVolumeOptions, StopContainerOptionsBuilder,
+    WaitContainerOptionsBuilder,
 };
 use bytes::Bytes;
 use futures_util::StreamExt;
 
 use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageIdentity, ImageSummary, NetworkInfo, RegistryAuth,
+    RuntimeFingerprint,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -44,6 +50,17 @@ const STOP_GRACE_SECS: i32 = 10;
 #[derive(Clone)]
 pub struct DockerEngine {
     docker: Docker,
+}
+
+/// Abandoned runtime resources reclaimed during startup reconciliation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Containers removed before their networks and volumes.
+    pub containers: usize,
+    /// Job-private networks removed after containers.
+    pub networks: usize,
+    /// Job-private volumes removed last.
+    pub volumes: usize,
 }
 
 impl DockerEngine {
@@ -80,6 +97,84 @@ impl DockerEngine {
         };
         Ok(DockerEngine { docker })
     }
+
+    /// Remove runtime resources belonging to proven-terminal Greenlit runs.
+    ///
+    /// Callers must first prove that no active run lease exists. Containers
+    /// are removed before networks and volumes so dependency ordering cannot
+    /// strand a lower-level resource.
+    pub async fn reconcile_managed_resources(
+        &self,
+        terminal_run_ids: &[String],
+    ) -> Result<ReconcileReport, RuntimeError> {
+        let terminal = terminal_run_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let container_options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec!["greenlit.managed=1"])]))
+            .build();
+        let containers = self
+            .docker
+            .list_containers(Some(container_options))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
+        let mut report = ReconcileReport::default();
+        for container in containers {
+            let reclaimable = container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("greenlit.run"))
+                .is_some_and(|run_id| terminal.contains(run_id.as_str()));
+            if reclaimable && let Some(id) = container.id {
+                self.remove_container(&id).await?;
+                report.containers = report.containers.saturating_add(1);
+            }
+        }
+
+        let networks = self
+            .docker
+            .list_networks(Some(ListNetworksOptionsBuilder::new().build()))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
+        for network in networks {
+            if let Some(name) = network.name.filter(|name| {
+                terminal
+                    .iter()
+                    .any(|run_id| resource_belongs_to_run(name, run_id))
+            }) {
+                self.remove_network(&name).await?;
+                report.networks = report.networks.saturating_add(1);
+            }
+        }
+
+        let volumes = self
+            .docker
+            .list_volumes(Some(ListVolumesOptionsBuilder::new().build()))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?
+            .volumes
+            .unwrap_or_default();
+        for volume in volumes {
+            if terminal
+                .iter()
+                .any(|run_id| resource_belongs_to_run(&volume.name, run_id))
+            {
+                self.remove_volume(&volume.name).await?;
+                report.volumes = report.volumes.saturating_add(1);
+            }
+        }
+        Ok(report)
+    }
+}
+
+fn resource_belongs_to_run(name: &str, run_id: &str) -> bool {
+    let prefix = format!("greenlit-run-{run_id}");
+    name == prefix
+        || name
+            .strip_prefix(&prefix)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Dispatches a `DOCKER_HOST` URL to the matching bollard connector by scheme.
@@ -128,13 +223,18 @@ fn connect_docker_host(url: &str) -> Result<Docker, RuntimeError> {
     })
 }
 
-/// Splits an image reference into `(name, tag)`.
+/// Splits an image reference into `(name, tag-or-digest)`.
 ///
 /// Docker's `/images/create` endpoint takes `fromImage` and `tag` as separate
-/// query parameters. The tag is the segment after the final `:` unless that
-/// segment contains a `/` (which means the `:` was a registry-host port, e.g.
+/// query parameters. A digest reference uses the repository before `@` and
+/// the complete `sha256:...` value as the second parameter. Otherwise the tag
+/// is the segment after the final `:` unless that segment contains a `/`
+/// (which means the `:` was a registry-host port, e.g.
 /// `localhost:5000/img`). A reference with no tag defaults to `latest`.
 fn split_reference(image: &str) -> (&str, &str) {
+    if let Some((name, digest)) = image.rsplit_once('@') {
+        return (name, digest);
+    }
     match image.rfind(':') {
         Some(idx) if !image[idx + 1..].contains('/') => (&image[..idx], &image[idx + 1..]),
         _ => (image, "latest"),
@@ -181,6 +281,35 @@ fn fold_pull_progress(
 
 #[async_trait]
 impl ContainerEngine for DockerEngine {
+    async fn runtime_fingerprint(&self) -> Result<RuntimeFingerprint, RuntimeError> {
+        let version = self
+            .docker
+            .version()
+            .await
+            .map_err(|error| RuntimeError::api(Operation::InspectRuntime, error))?;
+        let info = self
+            .docker
+            .info()
+            .await
+            .map_err(|error| RuntimeError::api(Operation::InspectRuntime, error))?;
+        let implementation = version
+            .platform
+            .as_ref()
+            .map(|platform| platform.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "docker".to_string());
+        Ok(RuntimeFingerprint {
+            implementation,
+            version: version.version.unwrap_or_else(|| "unknown".to_string()),
+            kernel: version.kernel_version.unwrap_or_else(|| {
+                std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .map_or_else(|_| "unknown".to_string(), |value| value.trim().to_string())
+            }),
+            snapshotter: info.driver.unwrap_or_else(|| "unknown".to_string()),
+            privileged_infrastructure: vec!["network-policy-sidecar:CAP_NET_ADMIN".to_string()],
+        })
+    }
+
     async fn pull_image(
         &self,
         image: &str,
@@ -210,8 +339,10 @@ impl ContainerEngine for DockerEngine {
                 total_bytes,
             });
         }
+        let downloaded_bytes = layers.values().map(|(current, _)| current).sum();
         progress.on_progress(ProgressEvent::PullFinished {
             image: image.to_string(),
+            downloaded_bytes,
         });
         Ok(())
     }
@@ -226,6 +357,28 @@ impl ContainerEngine for DockerEngine {
             }) => Ok(false),
             Err(e) => Err(RuntimeError::api(Operation::InspectImage, e)),
         }
+    }
+
+    async fn image_identity(&self, image: &str) -> Result<Option<ImageIdentity>, RuntimeError> {
+        let inspected = match self.docker.inspect_image(image).await {
+            Ok(inspected) => inspected,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(RuntimeError::api(Operation::InspectImage, error)),
+        };
+        let digest = inspected
+            .repo_digests
+            .and_then(|digests| digests.into_iter().next())
+            .and_then(|name| name.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+            .or(inspected.id);
+        Ok(digest.map(|digest| ImageIdentity {
+            digest,
+            os: inspected.os.unwrap_or_else(|| "unknown".to_string()),
+            architecture: inspected
+                .architecture
+                .unwrap_or_else(|| "unknown".to_string()),
+        }))
     }
 
     async fn build_image(
@@ -289,18 +442,85 @@ impl ContainerEngine for DockerEngine {
                 format!("{}:{}{mode}", bind.host_path, bind.container_path)
             })
             .collect();
-        let host_config = (spec.network.is_some() || !binds.is_empty()).then(|| HostConfig {
+        // Published ports are expressed twice: `exposed_ports` on the config
+        // declares them, `port_bindings` on the host config says where they
+        // land. Greenlit always sets `host_ip`, so a service is reachable from
+        // the job and from nowhere else on the host.
+        let mut exposed_ports: Vec<String> = Vec::new();
+        let mut port_bindings: HashMap<String, Option<Vec<BollardPortBinding>>> = HashMap::new();
+        for port in &spec.ports {
+            let key = format!("{}/{}", port.container_port, port.protocol);
+            if !exposed_ports.contains(&key) {
+                exposed_ports.push(key.clone());
+            }
+            port_bindings
+                .entry(key)
+                .or_insert_with(|| Some(Vec::new()))
+                .get_or_insert_with(Vec::new)
+                .push(BollardPortBinding {
+                    host_ip: port.host_ip.clone(),
+                    host_port: port.host_port.map(|value| value.to_string()),
+                });
+        }
+
+        let needs_host_config = spec.network.is_some()
+            || !binds.is_empty()
+            || !spec.cap_add.is_empty()
+            || !port_bindings.is_empty()
+            || spec.privileged
+            || spec.resources != crate::engine::ResourceLimits::default();
+        let storage_opt = spec
+            .resources
+            .disk_bytes
+            .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
+        let host_config = needs_host_config.then(|| HostConfig {
             network_mode: spec.network.clone(),
             binds: (!binds.is_empty()).then_some(binds),
+            privileged: spec.privileged.then_some(true),
+            cap_add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
+            port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+            nano_cpus: spec.resources.nano_cpus,
+            memory: spec.resources.memory_bytes,
+            pids_limit: spec.resources.pids,
+            storage_opt,
             ..Default::default()
         });
+
+        // A network alias only applies to a *named* network, not to the
+        // `container:<id>` namespace-sharing mode the netguard sidecar uses,
+        // where the endpoint config has no meaning.
+        let networking_config = match (&spec.network, spec.network_aliases.is_empty()) {
+            (Some(network), false) if !network.starts_with("container:") => {
+                let endpoint = EndpointSettings {
+                    aliases: Some(spec.network_aliases.clone()),
+                    ..Default::default()
+                };
+                Some(NetworkingConfig {
+                    endpoints_config: Some(HashMap::from([(network.clone(), endpoint)])),
+                })
+            }
+            _ => None,
+        };
+
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
+            hostname: spec.hostname.clone(),
+            user: spec.user.clone(),
             entrypoint: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
             cmd: (!spec.cmd.is_empty()).then(|| spec.cmd.clone()),
             env: (!env.is_empty()).then_some(env),
             working_dir: spec.working_dir.clone(),
             labels: (!labels.is_empty()).then_some(labels),
+            exposed_ports: (!exposed_ports.is_empty()).then_some(exposed_ports),
+            healthcheck: spec.healthcheck.as_ref().map(|health| HealthConfig {
+                test: (!health.test.is_empty()).then(|| health.test.clone()),
+                interval: health.interval_nanos,
+                timeout: health.timeout_nanos,
+                retries: health.retries,
+                start_period: health.start_period_nanos,
+                ..Default::default()
+            }),
+            networking_config,
             host_config,
             ..Default::default()
         };
@@ -321,6 +541,94 @@ impl ContainerEngine for DockerEngine {
             .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
             .await
             .map_err(|e| RuntimeError::api(Operation::StartContainer, e))
+    }
+
+    async fn inspect_container(&self, id: &str) -> Result<ContainerState, RuntimeError> {
+        let response = self
+            .docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| RuntimeError::api(Operation::InspectContainer, e))?;
+        let state = response.state;
+        // A container with no configured probe reports `None`/`Empty` rather
+        // than a status, which the health gate must read as "nothing to wait
+        // for" -- not as "not healthy yet".
+        let health = state
+            .as_ref()
+            .and_then(|state| state.health.as_ref())
+            .and_then(|health| health.status)
+            .map_or(HealthState::None, |status| match status {
+                HealthStatusEnum::HEALTHY => HealthState::Healthy,
+                HealthStatusEnum::UNHEALTHY => HealthState::Unhealthy,
+                HealthStatusEnum::STARTING => HealthState::Starting,
+                HealthStatusEnum::NONE | HealthStatusEnum::EMPTY => HealthState::None,
+            });
+        Ok(ContainerState {
+            running: state.as_ref().and_then(|state| state.running) == Some(true),
+            exit_code: state.as_ref().and_then(|state| state.exit_code),
+            health,
+        })
+    }
+
+    async fn create_volume(&self, name: &str) -> Result<(), RuntimeError> {
+        self.docker
+            .create_volume(VolumeCreateRequest {
+                name: Some(name.to_string()),
+                ..Default::default()
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| RuntimeError::api(Operation::CreateVolume, e))
+    }
+
+    async fn remove_volume(&self, name: &str) -> Result<(), RuntimeError> {
+        match self
+            .docker
+            .remove_volume(name, None::<RemoveVolumeOptions>)
+            .await
+        {
+            Ok(()) => Ok(()),
+            // A volume that is already gone is the state the caller wanted.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(RuntimeError::api(Operation::RemoveVolume, e)),
+        }
+    }
+
+    async fn list_images(&self, label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        let options = ListImagesOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec![label])]))
+            .build();
+        let images = self
+            .docker
+            .list_images(Some(options))
+            .await
+            .map_err(|e| RuntimeError::api(Operation::ListImages, e))?;
+        Ok(images
+            .into_iter()
+            .map(|image| ImageSummary {
+                id: image.id,
+                tags: image.repo_tags,
+                size_bytes: u64::try_from(image.size).unwrap_or(0),
+            })
+            .collect())
+    }
+
+    async fn remove_image(&self, image: &str) -> Result<(), RuntimeError> {
+        match self
+            .docker
+            .remove_image(image, None::<RemoveImageOptions>, None)
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Already gone, same as `remove_volume`.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(RuntimeError::api(Operation::RemoveImage, e)),
+        }
     }
 
     async fn stop_container(&self, id: &str) -> Result<(), RuntimeError> {
@@ -426,14 +734,43 @@ impl ContainerEngine for DockerEngine {
         let exit_code = match wait_stream.next().await {
             Some(Ok(response)) => response.status_code,
             // A container that already exited by the time `wait` was issued
-            // is reported this way by some daemon versions rather than a
-            // normal response; re-inspecting is unnecessary — the log
-            // stream above only ends once the container has stopped, so
-            // treat an empty/erroring wait as "already exited, unknown
-            // code" rather than failing the whole action.
-            Some(Err(_)) | None => 1,
+            // can race the wait stream into reporting an empty/erroring
+            // response instead of the real status -- the stream can miss an
+            // already-exited container. Re-inspecting recovers the code the
+            // daemon actually recorded; only fall back to the placeholder 1
+            // if inspecting also fails or the daemon has no code for us.
+            Some(Err(_)) | None => match self.inspect_container(id).await {
+                Ok(state) => state.exit_code.unwrap_or(1),
+                Err(_) => 1,
+            },
         };
         Ok(ExecOutput { exit_code })
+    }
+
+    async fn container_logs(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        let options = LogsOptionsBuilder::new()
+            .follow(false)
+            .stdout(true)
+            .stderr(true)
+            .tail("200")
+            .build();
+        let mut stream = self.docker.logs(id, Some(options));
+        let mut output = Vec::new();
+        while let Some(item) = stream.next().await {
+            let message =
+                match item.map_err(|error| RuntimeError::api(Operation::ContainerLogs, error))? {
+                    LogOutput::StdOut { message }
+                    | LogOutput::StdErr { message }
+                    | LogOutput::Console { message } => message,
+                    LogOutput::StdIn { .. } => continue,
+                };
+            output.extend_from_slice(&message);
+            if output.len() > max_bytes {
+                let excess = output.len() - max_bytes;
+                output.drain(..excess);
+            }
+        }
+        Ok(output)
     }
 
     async fn export_path(&self, container: &str, path: &str) -> Result<Vec<u8>, RuntimeError> {
@@ -463,6 +800,30 @@ impl ContainerEngine for DockerEngine {
             .await
             .map_err(|e| RuntimeError::api(Operation::CreateNetwork, e))?;
         Ok(response.id)
+    }
+
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError> {
+        let network = self
+            .docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map_err(|e| RuntimeError::api(Operation::InspectNetwork, e))?;
+        // A bridge can carry both an IPv4 and an IPv6 config; Greenlit binds
+        // v4 only, matching the v0 host support statement.
+        let configs = network
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .unwrap_or_default();
+        let ipv4 = configs
+            .into_iter()
+            .find(|config| config.gateway.as_ref().is_some_and(|g| !g.contains(':')));
+        Ok(NetworkInfo {
+            gateway: ipv4.as_ref().and_then(|config| config.gateway.clone()),
+            subnet: ipv4.and_then(|config| config.subnet),
+        })
     }
 
     async fn remove_network(&self, name: &str) -> Result<(), RuntimeError> {

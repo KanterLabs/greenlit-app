@@ -62,7 +62,7 @@ pub enum YamlValue {
 
 /// A GitHub Actions construct that Greenlit recognizes syntactically —
 /// parsing succeeds and the construct's location is preserved — but does
-/// not execute in v0 (`greenlit-v0-spec.md` "Out (v0)": `concurrency`,
+/// not execute in v0 (`greenlit-v0-spec.md` "Out (v0)":
 /// environments/deployments, reusable workflows, OIDC).
 ///
 /// `greenlit-workflow` only records that the construct was present and
@@ -73,7 +73,7 @@ pub enum YamlValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnsupportedConstruct {
     /// The construct's name, as it should appear in the eventual rejection
-    /// message (e.g. `"concurrency"`, `"workflow_call"`, `"environment"`,
+    /// message (e.g. `"workflow_call"`, `"environment"`,
     /// `"reusable workflow call (jobs.<id>.uses)"`).
     pub name: &'static str,
     /// Where the construct appears.

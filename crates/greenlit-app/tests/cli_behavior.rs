@@ -16,6 +16,12 @@ mod dotenv;
 mod filters;
 #[path = "cli_behavior/git_context.rs"]
 mod git_context;
+#[path = "cli_behavior/github_confirmation.rs"]
+mod github_confirmation;
+#[path = "cli_behavior/inspect.rs"]
+mod inspect;
+#[path = "cli_behavior/policy_modes.rs"]
+mod policy_modes;
 #[path = "cli_behavior/repository.rs"]
 mod repository;
 #[path = "cli_behavior/run_preflight.rs"]

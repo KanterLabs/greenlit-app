@@ -1,0 +1,65 @@
+[package]
+name = "greenlit-store"
+description = "Local cache, artifact, and toolcache stores behind the workflow-facing shim server."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Typed errors for every fallible path, per `AGENTS.md` "Errors: thiserror
+# in library crates". Same pinned version as every other library crate here.
+thiserror = "2.0.19"
+# Entry metadata (`meta.json`) and the shim server's request/response bodies
+# are the exact JSON shapes `@actions/cache` sends and expects; `serde`/
+# `serde_json` are the workspace's already-chosen (de)serialization crates,
+# pinned to the versions `greenlit-actions` and `greenlit-metrics` use.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+# Stage spans (`cache-lookup`/`cache-save`/`artifact-upload`) follow the same
+# `tracing::info_span!(target = "greenlit_metrics::timed_stage", ...)`
+# convention `greenlit-runtime`'s executor and `greenlit-actions` already
+# use, so `greenlit-metrics`' `Invocation` timing layer captures them without
+# this crate depending on `greenlit-metrics` itself.
+tracing = "0.1.44"
+# The workflow-facing shim server. `PHASE-4-environment.md` names axum
+# directly ("Implement a local shim server (axum) on the job network"). It is
+# the only HTTP *server* in the workspace -- `greenlit-actions`' `ureq` and
+# `greenlit-runtime`'s `bollard` are both clients -- so there is no existing
+# server wiring to extend. `default-features = false` plus the two features
+# actually used keeps the multipart/ws/macro surface out of the build.
+axum = { version = "0.8.7", default-features = false, features = [
+    "http1",
+    "json",
+    "query",
+    "tokio",
+] }
+# The shim binds a listener, serves on the run's existing runtime, and reads
+# committed blobs back off disk without blocking it; same pinned version
+# `greenlit-runtime` and `greenlit-actions` already use, with `net`/`fs`
+# added for `TcpListener` and the async blob read.
+tokio = { version = "1.48.0", features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "fs",
+    "io-util",
+    "sync",
+] }
+# Immutable content identities and verification.
+sha2 = "0.11.0"
+# Machine-wide object/reference/lease metadata. `bundled` gives Greenlit one
+# reproducible SQLite implementation on every supported Linux host.
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
+# Verified immutable downloads. The same blocking rustls client and version is
+# already used by greenlit-actions and greenlit-runtime; CAS wraps it with
+# Range resumption and runs callers on a blocking worker.
+ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json"] }
+
+[dev-dependencies]
+# Every store test runs against an isolated temp root rather than the real
+# `~/.litci/`, matching `greenlit-actions`' store tests.
+tempfile = "3.27.0"
+# The shim is async, so its tests need a runtime to start it on.
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "net"] }

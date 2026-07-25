@@ -1,0 +1,9 @@
+name: warm performance
+on: push
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Useful step
+        run: test -f README.md
