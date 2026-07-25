@@ -38,6 +38,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::Instrument;
 
+use greenlit_store::cas::{CasError, CasStore, ObjectDigest};
+
 use crate::sha::CommitSha;
 use crate::stage_span;
 
@@ -88,6 +90,7 @@ struct Counters {
 pub struct ActionStore {
     root: PathBuf,
     counters: Arc<Counters>,
+    cas: Option<CasStore>,
 }
 
 impl ActionStore {
@@ -107,6 +110,18 @@ impl ActionStore {
         Self {
             root: root.into(),
             counters: Arc::new(Counters::default()),
+            cas: None,
+        }
+    }
+
+    /// Opens an explicit action directory backed by verified canonical trees
+    /// in `cas`.
+    #[must_use]
+    pub fn with_cas(root: impl Into<PathBuf>, cas: CasStore) -> Self {
+        Self {
+            root: root.into(),
+            counters: Arc::new(Counters::default()),
+            cas: Some(cas),
         }
     }
 
@@ -125,7 +140,9 @@ impl ActionStore {
         if !home.is_absolute() {
             return Err(StoreError::InvalidHomeDir);
         }
-        Ok(Self::at(Self::default_path_under(home)))
+        let cas =
+            CasStore::open(CasStore::default_path_under(home)).map_err(StoreError::Content)?;
+        Ok(Self::with_cas(Self::default_path_under(home), cas))
     }
 
     /// The store's root directory.
@@ -194,7 +211,14 @@ impl ActionStore {
         let span = stage_span("action-fetch");
         async move {
             let dest = self.action_dir(owner, repo, sha)?;
+            let alias = format!("{owner}/{repo}@{}", sha.as_str());
             if dest.is_dir() {
+                self.verify_or_migrate(&alias, &dest).await?;
+                self.counters.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok((dest, FetchOutcome::Hit));
+            }
+
+            if self.restore_from_cas(&alias, &dest).await? {
                 self.counters.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok((dest, FetchOutcome::Hit));
             }
@@ -218,6 +242,10 @@ impl ActionStore {
                 let _ = std::fs::remove_dir_all(&tmp);
                 return Err(StoreError::Fetch(error));
             }
+            if let Err(error) = self.verify_or_migrate(&alias, &tmp).await {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(error);
+            }
 
             match std::fs::rename(&tmp, &dest) {
                 Ok(()) => {
@@ -240,6 +268,87 @@ impl ActionStore {
         }
         .instrument(span)
         .await
+    }
+
+    async fn verify_or_migrate(&self, alias: &str, path: &Path) -> Result<(), StoreError> {
+        let Some(cas) = self.cas.clone() else {
+            return Ok(());
+        };
+        let alias = alias.to_string();
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let previous = cas.resolve_alias("action-commit", &alias)?;
+            let actual = if previous.is_some() {
+                cas.tree_digest(&path)?
+            } else {
+                cas.put_tree(&path)?
+            };
+            if let Some(expected) = previous
+                && expected != actual
+            {
+                return Err(StoreError::ContentIdentityChanged {
+                    alias,
+                    expected,
+                    actual,
+                });
+            }
+            cas.record_alias("action-commit", &alias, &actual)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?
+    }
+
+    async fn restore_from_cas(&self, alias: &str, dest: &Path) -> Result<bool, StoreError> {
+        let Some(cas) = self.cas.clone() else {
+            return Ok(false);
+        };
+        let Some(digest) = cas
+            .resolve_alias("action-commit", alias)
+            .map_err(StoreError::Content)?
+        else {
+            return Ok(false);
+        };
+        let parent = dest.parent().ok_or_else(|| StoreError::InvalidComponent {
+            component: dest.display().to_string(),
+            reason: "action directory has no parent",
+        })?;
+        std::fs::create_dir_all(parent).map_err(|source| StoreError::CreateDir {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let tmp = parent.join(temp_sibling_name());
+        std::fs::create_dir_all(&tmp).map_err(|source| StoreError::CreateDir {
+            path: tmp.clone(),
+            source,
+        })?;
+        let cas_for_task = cas.clone();
+        let digest_for_task = digest.clone();
+        let tmp_for_task = tmp.clone();
+        let materialized = tokio::task::spawn_blocking(move || {
+            cas_for_task.materialize_tree(&digest_for_task, &tmp_for_task)
+        })
+        .await
+        .map_err(|error| StoreError::Task(error.to_string()))?;
+        if let Err(error) = materialized {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(StoreError::Content(error));
+        }
+        match std::fs::rename(&tmp, dest) {
+            Ok(()) => Ok(true),
+            Err(_) if dest.is_dir() => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                self.verify_or_migrate(alias, dest).await?;
+                Ok(true)
+            }
+            Err(source) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                Err(StoreError::Install {
+                    path: dest.to_path_buf(),
+                    source,
+                })
+            }
+        }
     }
 }
 
@@ -324,6 +433,25 @@ pub enum StoreError {
     /// The injected [`ActionFetcher`] itself failed.
     #[error(transparent)]
     Fetch(#[from] FetchError),
+    /// The machine-wide verified content store failed.
+    #[error("verified action content: {0}")]
+    Content(#[from] CasError),
+    /// A supposedly immutable action commit resolved to different source
+    /// bytes than the tree already recorded for it.
+    #[error(
+        "action {alias} changed content after it was locked (expected {expected}, found {actual})"
+    )]
+    ContentIdentityChanged {
+        /// Immutable action commit alias.
+        alias: String,
+        /// Previously recorded tree identity.
+        expected: ObjectDigest,
+        /// Newly observed tree identity.
+        actual: ObjectDigest,
+    },
+    /// A blocking content task did not complete.
+    #[error("verified action content task did not complete: {0}")]
+    Task(String),
 }
 
 #[cfg(test)]

@@ -1,9 +1,11 @@
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
-use greenlit_store::cas::{CasError, CasStore, EnsureOutcome, ObjectDigest};
+use greenlit_store::cas::{CasError, CasStore, EnsureOutcome, HttpFetch, ObjectDigest};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -112,6 +114,11 @@ fn interrupted_partial_content_is_resumed_at_its_verified_offset() {
         .expect("validated digest should have prefix");
     let partial = temp.path().join("tmp").join(format!("{hex}.partial"));
     fs::write(&partial, b"resume").expect("partial should be seeded");
+    fs::write(
+        temp.path().join("inflight").join(hex),
+        "4294967295 stale-boot 0\n",
+    )
+    .expect("dead process lock should be seeded");
     let outcome = store
         .ensure_with(&expected, |path, offset| {
             assert_eq!(path, partial);
@@ -133,5 +140,124 @@ fn interrupted_partial_content_is_resumed_at_its_verified_offset() {
     assert_eq!(
         store.read_verified(&expected).expect("read should work"),
         Some(b"resume-me".to_vec())
+    );
+}
+
+#[test]
+fn interrupted_http_download_resumes_by_range_and_offline_requires_the_exact_object() {
+    let temp = TempDir::new().expect("temp root should be created");
+    let store = CasStore::open(temp.path()).expect("store should open");
+    let expected = digest(b"resume-me");
+    let hex = expected
+        .as_str()
+        .strip_prefix("sha256:")
+        .expect("validated digest should have prefix");
+    fs::write(
+        temp.path().join("tmp").join(format!("{hex}.partial")),
+        b"resume",
+    )
+    .expect("partial should be seeded");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("server should bind");
+    let address = listener
+        .local_addr()
+        .expect("server address should resolve");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should arrive");
+        let mut request = [0_u8; 2048];
+        let read = stream.read(&mut request).expect("request should read");
+        let request = String::from_utf8_lossy(&request[..read]);
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("range: bytes=6-")),
+            "resume request must name the retained offset:\n{request}"
+        );
+        stream
+            .write_all(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nContent-Range: bytes 6-8/9\r\nConnection: close\r\n\r\n-me",
+            )
+            .expect("response should write");
+    });
+    let fetch = HttpFetch {
+        url: format!("http://{address}/bundle"),
+        user_agent: "greenlit-test".to_string(),
+        max_bytes: 64,
+        offline: false,
+    };
+    assert_eq!(
+        store
+            .ensure_http(&expected, &fetch)
+            .expect("range download should resume"),
+        EnsureOutcome::Published
+    );
+    server.join().expect("server should finish");
+
+    let offline_hit = HttpFetch {
+        offline: true,
+        ..fetch.clone()
+    };
+    assert_eq!(
+        store
+            .ensure_http(&expected, &offline_hit)
+            .expect("verified content should work offline"),
+        EnsureOutcome::Hit
+    );
+
+    let missing = digest(b"not-cached");
+    assert!(matches!(
+        store.ensure_http(&missing, &offline_hit),
+        Err(CasError::OfflineMissing { digest, source_url })
+            if digest == missing && source_url == fetch.url
+    ));
+}
+
+#[test]
+fn canonical_tree_round_trip_preserves_files_links_modes_and_alias_identity() {
+    let temp = TempDir::new().expect("temp root should be created");
+    let source = temp.path().join("source");
+    let restored = temp.path().join("restored");
+    fs::create_dir_all(source.join("nested")).expect("source tree should be created");
+    fs::write(source.join("nested/action.js"), b"console.log('ok')\n")
+        .expect("source file should be written");
+    fs::set_permissions(
+        source.join("nested/action.js"),
+        fs::Permissions::from_mode(0o751),
+    )
+    .expect("source mode should be set");
+    std::os::unix::fs::symlink("nested/action.js", source.join("main"))
+        .expect("source link should be created");
+
+    let store = CasStore::open(temp.path().join("cas")).expect("store should open");
+    let tree = store.put_tree(&source).expect("tree should ingest");
+    store
+        .record_alias("action-commit", "owner/repo@commit", &tree)
+        .expect("alias should record");
+    assert_eq!(
+        store
+            .resolve_alias("action-commit", "owner/repo@commit")
+            .expect("alias should resolve"),
+        Some(tree.clone())
+    );
+
+    fs::create_dir(&restored).expect("restore root should be created");
+    store
+        .materialize_tree(&tree, &restored)
+        .expect("tree should materialize");
+    assert_eq!(
+        fs::read(restored.join("nested/action.js")).expect("file should read"),
+        b"console.log('ok')\n"
+    );
+    assert_eq!(
+        fs::symlink_metadata(restored.join("nested/action.js"))
+            .expect("metadata should read")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o751
+    );
+    assert_eq!(
+        fs::read_link(restored.join("main")).expect("link should read"),
+        std::path::PathBuf::from("nested/action.js")
     );
 }

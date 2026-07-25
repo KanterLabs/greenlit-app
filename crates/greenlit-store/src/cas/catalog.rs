@@ -90,6 +90,100 @@ impl Catalog {
         Ok(())
     }
 
+    pub(super) fn record_download(
+        &self,
+        digest: &ObjectDigest,
+        partial_bytes: u64,
+    ) -> Result<(), CasError> {
+        let partial_bytes = i64::try_from(partial_bytes).map_err(|_| CasError::ObjectTooLarge {
+            size: partial_bytes,
+        })?;
+        let now = unix_seconds()?;
+        self.connection()?
+            .execute(
+                "INSERT INTO downloads(digest,partial_bytes,updated_at)
+                 VALUES(?1,?2,?3)
+                 ON CONFLICT(digest) DO UPDATE SET
+                   partial_bytes=excluded.partial_bytes,
+                   updated_at=excluded.updated_at",
+                params![digest.as_str(), partial_bytes, now],
+            )
+            .map_err(CasError::Catalog)?;
+        Ok(())
+    }
+
+    pub(super) fn finish_download(&self, digest: &ObjectDigest) -> Result<(), CasError> {
+        self.connection()?
+            .execute(
+                "DELETE FROM downloads WHERE digest=?1",
+                params![digest.as_str()],
+            )
+            .map_err(CasError::Catalog)?;
+        Ok(())
+    }
+
+    pub(super) fn record_tree(
+        &self,
+        digest: &ObjectDigest,
+        manifest_digest: &ObjectDigest,
+    ) -> Result<(), CasError> {
+        self.connection()?
+            .execute(
+                "INSERT INTO trees(digest,manifest_digest) VALUES(?1,?2)
+                 ON CONFLICT(digest) DO UPDATE SET manifest_digest=excluded.manifest_digest",
+                params![digest.as_str(), manifest_digest.as_str()],
+            )
+            .map_err(CasError::Catalog)?;
+        Ok(())
+    }
+
+    pub(super) fn record_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+        resolved: &ObjectDigest,
+    ) -> Result<(), CasError> {
+        let now = unix_seconds()?;
+        self.connection()?
+            .execute(
+                "INSERT INTO aliases(kind,requested,resolved,checked_at)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(kind,requested) DO UPDATE SET
+                   resolved=excluded.resolved,
+                   checked_at=excluded.checked_at",
+                params![kind, requested, resolved.as_str(), now],
+            )
+            .map_err(CasError::Catalog)?;
+        Ok(())
+    }
+
+    pub(super) fn resolve_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+    ) -> Result<Option<ObjectDigest>, CasError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT resolved FROM aliases WHERE kind=?1 AND requested=?2")
+            .map_err(CasError::Catalog)?;
+        let mut rows = statement
+            .query(params![kind, requested])
+            .map_err(CasError::Catalog)?;
+        let value: Option<String> = rows
+            .next()
+            .map_err(CasError::Catalog)?
+            .map(|row| row.get(0))
+            .transpose()
+            .map_err(CasError::Catalog)?;
+        value
+            .map(|digest| {
+                ObjectDigest::parse(&digest).map_err(|_| CasError::CatalogState {
+                    path: self.path.display().to_string(),
+                })
+            })
+            .transpose()
+    }
+
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CasError> {
         self.connection.lock().map_err(|_| CasError::CatalogState {
             path: self.path.display().to_string(),

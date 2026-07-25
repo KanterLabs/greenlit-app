@@ -562,9 +562,17 @@ fn build_action_runtime_config(
         "could not determine the user home directory (HOME is not set)\n  fix: set HOME, then retry"
             .to_string()
     })?;
-    let node_runtime_store = RuntimeStore::at(RuntimeStore::default_path_under(
-        std::path::Path::new(&home),
-    ));
+    let home = std::path::Path::new(&home);
+    let cas = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(home),
+    )
+    .map_err(|error| {
+        format!(
+            "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
+        )
+    })?;
+    let node_runtime_store =
+        RuntimeStore::with_cas(RuntimeStore::default_path_under(home), cas, false);
 
     let (inner_resolver, fetcher): (Arc<dyn RefResolver>, Arc<dyn ActionFetcher>) = match &token {
         Some(t) => (

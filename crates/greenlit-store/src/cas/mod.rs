@@ -2,6 +2,8 @@
 
 mod catalog;
 mod digest;
+mod http;
+mod tree;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -12,6 +14,8 @@ use sha2::{Digest, Sha256};
 
 use catalog::Catalog;
 pub use digest::{InvalidDigest, ObjectDigest};
+pub use http::HttpFetch;
+pub use tree::{TreeEntry, TreeEntryKind, TreeManifest};
 
 const LOCK_WAIT: Duration = Duration::from_secs(120);
 const LOCK_POLL: Duration = Duration::from_millis(25);
@@ -73,6 +77,59 @@ pub enum CasError {
     ObjectTooLarge {
         /// Rejected byte length.
         size: u64,
+    },
+    /// Offline mode was requested but the exact object is absent.
+    #[error("offline content is missing: {digest} ({source_url})")]
+    OfflineMissing {
+        /// Required immutable identity.
+        digest: ObjectDigest,
+        /// Locked source that would provide it online.
+        source_url: String,
+    },
+    /// An immutable HTTP download failed.
+    #[error("could not fetch {digest} from {source_url}: {message}")]
+    Http {
+        /// Required immutable identity.
+        digest: ObjectDigest,
+        /// Locked source URL.
+        source_url: String,
+        /// Bounded transport or protocol detail.
+        message: String,
+    },
+    /// A server returned a resume range different from the requested offset.
+    #[error(
+        "could not resume {digest} from {source_url}: requested byte {requested}, server returned {returned}"
+    )]
+    ResumeMismatch {
+        /// Required immutable identity.
+        digest: ObjectDigest,
+        /// Locked source URL.
+        source_url: String,
+        /// Requested first byte.
+        requested: u64,
+        /// Returned Content-Range value.
+        returned: String,
+    },
+    /// A response exceeded the caller's immutable-object bound.
+    #[error("content for {digest} from {source_url} exceeds the {limit}-byte limit")]
+    ResponseTooLarge {
+        /// Required immutable identity.
+        digest: ObjectDigest,
+        /// Locked source URL.
+        source_url: String,
+        /// Configured byte limit.
+        limit: u64,
+    },
+    /// Canonical tree metadata could not be encoded or decoded.
+    #[error("content tree metadata: {0}")]
+    TreeJson(#[source] serde_json::Error),
+    /// A tree contains a path or node type that cannot be materialized safely.
+    #[error("invalid content tree entry {path}: {reason}")]
+    InvalidTree {
+        /// Relative tree path.
+        path: String,
+        /// Rejection reason.
+        reason: String,
     },
 }
 
@@ -176,7 +233,9 @@ impl CasStore {
                 .open(&lock_path)
             {
                 Ok(mut lock) => {
-                    writeln!(lock, "{}", std::process::id())
+                    writeln!(lock, "{}", current_process_identity())
+                        .map_err(|source| io_error(&lock_path, source))?;
+                    lock.sync_all()
                         .map_err(|source| io_error(&lock_path, source))?;
                     let guard = InFlightGuard { path: lock_path };
                     if self.usable_or_quarantined(digest)? {
@@ -187,7 +246,15 @@ impl CasStore {
                         .join("tmp")
                         .join(format!("{}.partial", digest.hex()));
                     let offset = fs::metadata(&partial).map_or(0, |metadata| metadata.len());
-                    materialize(&partial, offset)?;
+                    self.catalog.record_download(digest, offset)?;
+                    if let Err(error) = materialize(&partial, offset) {
+                        let retained =
+                            fs::metadata(&partial).map_or(offset, |metadata| metadata.len());
+                        self.catalog.record_download(digest, retained)?;
+                        return Err(error);
+                    }
+                    let retained = fs::metadata(&partial).map_or(offset, |metadata| metadata.len());
+                    self.catalog.record_download(digest, retained)?;
                     let (actual, size) = digest_file(&partial)?;
                     if &actual != digest {
                         self.quarantine(&partial, digest)?;
@@ -197,10 +264,18 @@ impl CasStore {
                         });
                     }
                     let outcome = self.publish_file(digest, &partial, size)?;
+                    self.catalog.finish_download(digest)?;
                     drop(guard);
                     return Ok(outcome);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if stale_lock(&lock_path)? {
+                        match fs::remove_file(&lock_path) {
+                            Ok(()) => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(source) => return Err(io_error(&lock_path, source)),
+                        }
+                    }
                     if self.usable_or_quarantined(digest)? {
                         return Ok(EnsureOutcome::Shared);
                     }
@@ -214,6 +289,83 @@ impl CasStore {
                 Err(source) => return Err(io_error(&lock_path, source)),
             }
         }
+    }
+
+    /// Ensures an exact object from HTTP, resuming a retained partial with a
+    /// `Range` request and refusing any network access in offline mode.
+    ///
+    /// Servers that ignore a valid Range request and return the entire object
+    /// with status 200 are handled by restarting the partial from byte zero.
+    /// A 206 response must begin at the requested byte.
+    pub fn ensure_http(
+        &self,
+        digest: &ObjectDigest,
+        fetch: &HttpFetch,
+    ) -> Result<EnsureOutcome, CasError> {
+        if self.usable_or_quarantined(digest)? {
+            return Ok(EnsureOutcome::Hit);
+        }
+        if fetch.offline {
+            return Err(CasError::OfflineMissing {
+                digest: digest.clone(),
+                source_url: fetch.url.clone(),
+            });
+        }
+        self.ensure_with(digest, |partial, offset| {
+            http::download(partial, offset, digest, fetch)
+        })
+    }
+
+    /// Returns the verified object's filesystem path when it exists.
+    ///
+    /// Corrupt content is quarantined and reported instead of returned.
+    pub fn verified_path(&self, digest: &ObjectDigest) -> Result<Option<PathBuf>, CasError> {
+        if self.has_verified(digest)? {
+            Ok(Some(self.object_path(digest)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Records a stable alias to an immutable object or tree identity.
+    pub fn record_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+        resolved: &ObjectDigest,
+    ) -> Result<(), CasError> {
+        self.catalog.record_alias(kind, requested, resolved)
+    }
+
+    /// Resolves an alias previously recorded by [`Self::record_alias`].
+    pub fn resolve_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+    ) -> Result<Option<ObjectDigest>, CasError> {
+        self.catalog.resolve_alias(kind, requested)
+    }
+
+    /// Ingests a directory as a canonical tree whose file and symlink
+    /// payloads are separate verified CAS objects.
+    pub fn put_tree(&self, root: &Path) -> Result<ObjectDigest, CasError> {
+        tree::put(self, root)
+    }
+
+    /// Computes a canonical tree identity without publishing or consulting
+    /// payload objects. This is the fast integrity check for a previously
+    /// migrated legacy tree.
+    pub fn tree_digest(&self, root: &Path) -> Result<ObjectDigest, CasError> {
+        tree::digest(root)
+    }
+
+    /// Materializes an ingested tree into an existing empty directory.
+    pub fn materialize_tree(
+        &self,
+        digest: &ObjectDigest,
+        destination: &Path,
+    ) -> Result<(), CasError> {
+        tree::materialize(self, digest, destination)
     }
 
     fn publish_bytes(
@@ -339,12 +491,7 @@ impl Drop for InFlightGuard {
 }
 
 fn digest_bytes(bytes: &[u8]) -> ObjectDigest {
-    let hash = Sha256::digest(bytes);
-    let mut hex = String::with_capacity(64);
-    for byte in hash {
-        hex.push_str(&format!("{byte:02x}"));
-    }
-    ObjectDigest(format!("sha256:{hex}"))
+    ObjectDigest::of_bytes(bytes)
 }
 
 fn digest_file(path: &Path) -> Result<(ObjectDigest, u64), CasError> {
@@ -380,4 +527,43 @@ fn io_error(path: &Path, source: std::io::Error) -> CasError {
         path: path.display().to_string(),
         source,
     }
+}
+
+fn current_process_identity() -> String {
+    let pid = std::process::id();
+    process_identity(pid).unwrap_or_else(|| format!("{pid} unknown unknown"))
+}
+
+fn process_identity(pid: u32) -> Option<String> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()?
+        .trim()
+        .to_string();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    let start_ticks = after_name.split_whitespace().nth(19)?;
+    Some(format!("{pid} {boot} {start_ticks}"))
+}
+
+fn stale_lock(path: &Path) -> Result<bool, CasError> {
+    let owner = match fs::read_to_string(path) {
+        Ok(owner) => owner.trim().to_string(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    let mut fields = owner.split_whitespace();
+    let Some(pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+        return lock_old_enough(path, Duration::from_secs(2));
+    };
+    if fields.next().is_none() || fields.next().is_none() || fields.next().is_some() {
+        return lock_old_enough(path, Duration::from_secs(2));
+    }
+    Ok(process_identity(pid).is_none_or(|identity| identity != owner))
+}
+
+fn lock_old_enough(path: &Path, minimum_age: Duration) -> Result<bool, CasError> {
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|source| io_error(path, source))?;
+    Ok(modified.elapsed().is_ok_and(|age| age >= minimum_age))
 }

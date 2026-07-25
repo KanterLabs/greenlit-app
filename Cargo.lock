@@ -711,6 +711,7 @@ dependencies = [
  "async-trait",
  "flate2",
  "greenlit-expr",
+ "greenlit-store",
  "greenlit-workflow",
  "indexmap",
  "saphyr-parser",

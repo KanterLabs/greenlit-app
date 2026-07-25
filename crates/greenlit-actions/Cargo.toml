@@ -39,6 +39,10 @@ greenlit-expr = { path = "../greenlit-expr", version = "0.1.0" }
 # `YamlObjectReader`/`TemplateReader` machinery as workflow YAML (see
 # `manifest::yaml` module docs), so the same location model applies.
 greenlit-workflow = { path = "../greenlit-workflow", version = "0.1.0" }
+# Machine-wide verified objects and canonical trees. Action commits remain the
+# semantic identity; this store preserves their fetched source as a verified
+# tree and lazily migrates the legacy directory cache.
+greenlit-store = { path = "../greenlit-store", version = "0.1.0" }
 # Order-preserving `inputs`/`outputs`/`env` maps, matching the `IndexMap`
 # convention `greenlit-runtime`'s execution semantics already use for the
 # same kind of name-to-value data.

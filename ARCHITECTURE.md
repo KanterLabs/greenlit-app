@@ -232,7 +232,7 @@ classification keeps execution outcome, compatibility, and assurance
 independent, so a locally successful run with an unsupported construct is
 still blocked from every green classification.
 
-The CAS root is `~/.litci/cas/`. Objects are verified before atomic
+The CAS root is `~/.litci/store/`. Objects are verified before atomic
 publication, corrupt entries are quarantined, and an SQLite-WAL catalog tracks
 objects, trees, aliases, references, downloads, leases, runs, and runtime
 resources. Phase 5 ingests frozen source objects and establishes the package
