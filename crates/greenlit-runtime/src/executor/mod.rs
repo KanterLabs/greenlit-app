@@ -105,9 +105,10 @@ pub struct RunConfig {
     /// before creating writable resources, so they cannot cross the fresh-job
     /// boundary.
     pub volume_namespace: String,
-    /// Requested container aliases mapped to the immutable image identities
-    /// finalized in the RunLock. `None` is reserved for injected test
-    /// executors that do not perform host-side resolution.
+    /// Requested container aliases and reserved per-job runner keys mapped to
+    /// the immutable image identities finalized in the RunLock. `None` is
+    /// reserved for injected test executors that do not perform host-side
+    /// resolution.
     pub locked_images: Option<std::collections::BTreeMap<String, String>>,
     /// Whether `--write-back` was requested. When `true`, a ran job's
     /// container is kept alive (not torn down) so its overlay upper can be
@@ -129,6 +130,31 @@ pub struct RunConfig {
 impl RunConfig {
     fn locked_image(&self, requested: &str) -> Result<String, ExecError> {
         resolve_locked_image(self.locked_images.as_ref(), requested)
+    }
+
+    fn locked_runner(
+        &self,
+        job: &str,
+        matrix_index: usize,
+        fallback: &str,
+    ) -> Result<String, ExecError> {
+        let Some(locks) = self.locked_images.as_ref() else {
+            return Ok(fallback.to_string());
+        };
+        const PREFIX: &str = "__greenlit_runner:";
+        if !locks.keys().any(|key| key.starts_with(PREFIX)) {
+            return Ok(fallback.to_string());
+        }
+        let matrix_key = format!("{PREFIX}{job}[{matrix_index}]");
+        let job_key = format!("{PREFIX}{job}");
+        locks
+            .get(&matrix_key)
+            .or_else(|| locks.get(&job_key))
+            .cloned()
+            .ok_or_else(|| ExecError::Infrastructure {
+                message: format!("runner for job '{job}' is absent from the finalized RunLock"),
+                fix: "preserve the run directory and file a Greenlit defect".to_string(),
+            })
     }
 }
 

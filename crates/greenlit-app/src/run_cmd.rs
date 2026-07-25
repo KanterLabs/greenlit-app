@@ -350,6 +350,13 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // than a broken run.
     let store_config = build_store_config(clean, args.hermetic);
 
+    let mut execution_image_locks = run_lock.containers.clone();
+    execution_image_locks.extend(run_lock.runners.iter().map(|(key, runner)| {
+        (
+            format!("__greenlit_runner:{key}"),
+            runner.image_reference.clone(),
+        )
+    }));
     let config = RunConfig {
         repo_host_path: frozen_repo_root,
         workspace: workspace.clone(),
@@ -365,7 +372,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         // registers with the Phase 2 masker before any step runs").
         initial_masks: all_secrets.iter().map(|(_, value)| value.clone()).collect(),
         volume_namespace: evidence.run_id.clone(),
-        locked_images: Some(run_lock.containers.clone()),
+        locked_images: Some(execution_image_locks),
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: actions_config,

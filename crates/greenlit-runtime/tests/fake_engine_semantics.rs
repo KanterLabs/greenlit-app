@@ -1105,6 +1105,11 @@ jobs:
       image: mutable.example/tool:latest
     steps:
       - run: ECHO locked
+  runner:
+    needs: only
+    runs-on: ubuntu-latest
+    steps:
+      - run: ECHO locked-runner
 "#,
     )
     .expect("parse");
@@ -1140,6 +1145,10 @@ jobs:
                     .to_string(),
                 "sha256:netguard".to_string(),
             ),
+            (
+                "__greenlit_runner:runner".to_string(),
+                "sha256:locked-runner".to_string(),
+            ),
         ])),
         write_back: false,
         readiness: ReadinessConfig::default(),
@@ -1169,6 +1178,13 @@ jobs:
         "a mutable alias must never cross the container-engine boundary after locking: {created:?}"
     );
     assert!(created.iter().any(|image| image == "sha256:netguard"));
+    assert!(created.iter().any(|image| image == "sha256:locked-runner"));
+    assert!(
+        !created
+            .iter()
+            .any(|image| image.starts_with("ghcr.io/actions/actions-runner@")),
+        "the execution path must use the runner identity finalized in the RunLock: {created:?}"
+    );
     assert!(!created.iter().any(|image| {
         image
             == "registry.k8s.io/debian-iptables@sha256:852d3c569932059bcab3a52cb6105c432d85b4b7bbd5fc93153b78010e34a783"

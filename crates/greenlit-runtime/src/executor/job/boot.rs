@@ -36,6 +36,11 @@ pub(super) struct ResolvedImage {
     pub(super) additions: ContainerAdditions,
 }
 
+pub(super) struct ResolveImageRequest<'a, 'b> {
+    pub(super) instance: &'a JobInstance<'b>,
+    pub(super) identity: super::JobIdentity<'a>,
+}
+
 /// Ensure the job's image exists and, for a job container, validate it.
 ///
 /// Returns `(image_tag, in_container, bash_available, additions)`.
@@ -43,11 +48,12 @@ pub(super) async fn resolve_image(
     shared: &Shared<'_>,
     masker: &mut Masker,
     runner_ctx: &Value,
-    instance: &JobInstance<'_>,
+    request: ResolveImageRequest<'_, '_>,
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<ResolvedImage, ExecError> {
+    let ResolveImageRequest { instance, identity } = request;
     match instance.container {
         Some(container_plan) => {
             let ctx = super::env_ctx(
@@ -109,9 +115,12 @@ pub(super) async fn resolve_image(
             })
         }
         None => {
-            let tag = runner_profile::for_runner(instance.runner)
-                .image
-                .to_string();
+            let profile = runner_profile::for_runner(instance.runner);
+            let tag = shared.config.locked_runner(
+                &identity.id.0,
+                identity.matrix_index,
+                profile.image,
+            )?;
             if !shared.engine.image_exists(&tag).await? {
                 return Err(ExecError::Infrastructure {
                     message: format!(

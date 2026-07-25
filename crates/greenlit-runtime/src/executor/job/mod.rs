@@ -86,6 +86,7 @@ struct RunnerLayers<'a> {
 pub(crate) struct JobIdentity<'a> {
     pub(crate) id: &'a JobId,
     pub(crate) instance_key: &'a str,
+    pub(crate) matrix_index: usize,
 }
 
 /// Run one job instance and produce its report.
@@ -342,7 +343,7 @@ pub(crate) async fn run_instance(
             shared,
             masker,
             &runner_ctx,
-            instance,
+            boot::ResolveImageRequest { instance, identity },
             &base_env,
             needs,
             progress,

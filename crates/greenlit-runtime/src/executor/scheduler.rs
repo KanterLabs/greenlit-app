@@ -299,6 +299,7 @@ async fn run_group(
                 job::JobIdentity {
                     id: &group.id,
                     instance_key: &instance_key,
+                    matrix_index: index,
                 },
                 instance_needs.as_slice(),
                 &mut instance_writer,
