@@ -30,6 +30,7 @@ use crate::executor::context::{
 use crate::executor::dind;
 use crate::executor::instance::JobInstance;
 use crate::executor::netguard;
+use crate::executor::provision;
 use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
@@ -288,6 +289,47 @@ pub(crate) async fn run_instance(
             services::stop(shared.engine, &services_started).await;
             job_network.teardown(shared.engine).await;
             return Err(error.into());
+        }
+    }
+
+    // Lazy provisioning, for Greenlit runner images only. A user-declared
+    // `container:` is left exactly as authored: a command missing from that
+    // image must fail the way it fails in the same job container on GitHub
+    // (`PHASE-4-environment.md`: "Never inject host-runner tools or
+    // convergence layers into a user-declared job container").
+    if !in_container && let Some(store) = shared.config.store.as_ref() {
+        let version = match instance.runner {
+            RunnerImage::Ubuntu2404 => "24.04",
+            RunnerImage::Ubuntu2204 => "22.04",
+        };
+        let label = instance.runner.image_identifier();
+        // A manifest that cannot be reached costs provisioning, not the run:
+        // the job proceeds against the slim base, and a genuinely missing
+        // command still fails at the step with its own message.
+        match provision::fetch::load(&store.toolcache_root_parent(), version)
+            .instrument(stage_span("manifest"))
+            .await
+        {
+            Ok(manifest) => {
+                let wanted =
+                    provision::mentioned_commands(instance.steps.iter().filter_map(step_script));
+                if let Err(error) =
+                    provision::install_shims(shared.engine, &container, &manifest, &wanted, label)
+                        .instrument(stage_span("provision"))
+                        .await
+                {
+                    tracing::debug!(
+                        target: "greenlit_runtime::provision",
+                        %error,
+                        "could not install provisioning shims; continuing without them"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                target: "greenlit_runtime::provision",
+                %error,
+                "could not load the runner-images manifest; continuing without provisioning"
+            ),
         }
     }
 

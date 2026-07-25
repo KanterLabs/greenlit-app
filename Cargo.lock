@@ -799,6 +799,7 @@ dependencies = [
  "greenlit-workflow",
  "indexmap",
  "rustix",
+ "serde_json",
  "sha2",
  "tar",
  "tempfile",

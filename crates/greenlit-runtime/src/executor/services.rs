@@ -24,7 +24,7 @@
 //! containers are attached to.
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use greenlit_engine::execution::env::ActionsService;
@@ -55,6 +55,19 @@ pub struct StoreConfig {
     pub toolcache_root: PathBuf,
     /// The bearer token this run's shim requires.
     pub runtime_token: String,
+}
+
+impl StoreConfig {
+    /// The `~/.litci` root every store sits under.
+    ///
+    /// Derived from the toolcache path rather than carried separately so the
+    /// two can never disagree about where user-local state lives.
+    #[must_use]
+    pub fn toolcache_root_parent(&self) -> PathBuf {
+        self.toolcache_root
+            .parent()
+            .map_or_else(|| self.toolcache_root.clone(), Path::to_path_buf)
+    }
 }
 
 /// The per-job network and everything bound to it.
