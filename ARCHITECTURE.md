@@ -346,10 +346,74 @@ standard/base64url, and percent-encoded variants are registered with the
 streaming masker before output reaches terminal logs, annotations, structured
 results, retained service logs, or errors.
 
+## Phase 9 provider and policy dataflow
+
+Runner preparation is split across backend-neutral `RunnerProvider` and
+`Snapshotter` interfaces. The OCI provider resolves and verifies the exact
+linux/amd64 manifest, config, and layer identities in the machine-wide CAS.
+Every host can pass that identity to the eager Docker snapshotter. Configured
+containerd hosts can instead use the direct tonic gRPC stargz snapshotter; no
+containerd or `ctr` subprocess participates in the product path.
+
+```text
+locked runner digest
+        |
+        v
+verified OCI manifest + layers in CAS
+        |
+        +----------> eager Docker materialization
+        |
+        `----------> direct containerd transfer
+                          |
+                 require eStargz TOC annotations
+                          |
+                 stargz remote snapshot prepare
+                          |
+             first step before all layer bytes arrive
+                          |
+             verified demand read of later content
+```
+
+The lazy path fails closed unless the stargz plugin reports linux/amd64 and
+remote snapshot annotation export. Access prioritization is an image-build
+property: likely files must be ordered into the immutable eStargz artifact
+rather than guessed from a workflow at runtime. Images without eStargz TOC
+annotations use the verified eager path.
+
+`--clean` disables Greenlit's mutable build cache, cache shim, artifact shim,
+and toolcache while retaining digest-verified immutable CAS and
+dependency-download reuse. `--hermetic` implies clean, rejects checkout of
+late mutable content during preflight, and installs a default-reject egress
+policy after the job's loopback, established traffic, internal shim, and
+private service network exceptions. External traffic and privileged
+infrastructure are recorded as evidence and cap assurance.
+
+RunLocks include the runner provider, snapshotter, architecture, kernel,
+container-runtime implementation/version, and privileged-infrastructure
+fingerprint. The executor passes the finalized runner image identity across a
+reserved internal lock boundary, so boot cannot silently fall back to a
+hardcoded runner alias.
+
+Worker concurrency is machine-wide, not merely process-local. Each foreground
+run acquires kernel-backed file-lock slots beneath
+`~/.litci/scheduler/v1/slots`; the kernel releases a crashed process's slots.
+A run may occupy at most one fewer than the machine worker count, preserving a
+slot for competing projects while per-run and matrix limits remain nested
+inside that global bound.
+
 ## Known issues log
 
 Entries here describe upstream quirks that the implementation or dependency
 policy actively contains. They are not deferred Greenlit behavior.
+
+- **The pinned official ARC runner images are ordinary gzip OCI images, not
+  eStargz artifacts.** The configured lazy provider therefore correctly uses
+  the eager fallback for those default images. The live provider suite builds
+  a pinned eStargz fixture, proves partial materialization and verified
+  on-demand reads, and compares it with eager execution. Publishing
+  Greenlit-maintained eStargz runner artifacts requires a separately
+  authorized release channel; Greenlit never labels an ordinary gzip image as
+  lazy or infers a smaller substitute.
 
 - **`hashFiles('/…')` documentation differs from hosted-runner behavior.**
   The expressions reference describes `/src/*.js` as a repository-root

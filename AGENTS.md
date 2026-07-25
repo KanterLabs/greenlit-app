@@ -92,8 +92,8 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 6 — Verified content | `docs/PHASE-6-parity-launch.md` | completed |
 | 7 — Fresh execution | `docs/PHASE-7-fresh-execution.md` | completed |
 | 8 — Daemon & recovery | `docs/PHASE-8-daemon-recovery.md` | completed |
-| 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | in progress |
-| 10 — Confirmation | `docs/PHASE-10-confirmation.md` | not started |
+| 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | completed |
+| 10 — Confirmation | `docs/PHASE-10-confirmation.md` | in progress |
 
 ## Target workspace layout
 
