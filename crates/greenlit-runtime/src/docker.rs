@@ -317,10 +317,12 @@ impl ContainerEngine for DockerEngine {
         let needs_host_config = spec.network.is_some()
             || !binds.is_empty()
             || !spec.cap_add.is_empty()
-            || !port_bindings.is_empty();
+            || !port_bindings.is_empty()
+            || spec.privileged;
         let host_config = needs_host_config.then(|| HostConfig {
             network_mode: spec.network.clone(),
             binds: (!binds.is_empty()).then_some(binds),
+            privileged: spec.privileged.then_some(true),
             cap_add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
             port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
             ..Default::default()

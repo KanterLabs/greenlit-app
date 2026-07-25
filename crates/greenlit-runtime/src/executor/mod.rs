@@ -21,6 +21,7 @@ pub mod actions;
 mod cmdfiles;
 pub mod container;
 mod context;
+mod dind;
 mod health;
 mod instance;
 mod job;

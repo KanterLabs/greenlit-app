@@ -27,6 +27,7 @@ use crate::executor::container::{
 use crate::executor::context::{
     CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
+use crate::executor::dind;
 use crate::executor::instance::JobInstance;
 use crate::executor::netguard;
 use crate::executor::readiness::{self, READY_MARKER};
@@ -43,6 +44,12 @@ use crate::progress::{ProgressEvent, ProgressSink};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
+
+/// Cap on the `PATH` read back from an untrusted job image.
+///
+/// Generous next to any real `PATH` (a stock Ubuntu image is well under 100
+/// bytes), while bounding what a hostile image can make the host hold.
+const MAX_PATH_BYTES: usize = 32 * 1024;
 
 /// The bare (pre-namespacing) name of the run-scoped named volume backing a
 /// job's shared workspace when it contains a Docker action
@@ -242,6 +249,48 @@ pub(crate) async fn run_instance(
         return Err(error.into());
     }
 
+    // Docker-in-Docker, only when the job's own scripts call `docker`.
+    // Starting a privileged daemon for every job would cost seconds and a
+    // privileged container for a capability most workflows never use.
+    let dind = if dind::job_uses_docker(instance.steps.iter().filter_map(step_script)) {
+        match dind::start(shared.engine, job_network.name(), progress).await {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) => {
+                let _ = shared.engine.remove_container(&container).await;
+                services::stop(shared.engine, &services_started).await;
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if dind.is_some() {
+        // The wrapper is installed before any step runs, so the very first
+        // `docker` invocation already reaches the sidecar -- the brief is
+        // explicit that a missing daemon must never be discovered by
+        // rerunning the user's step.
+        let install = ExecSpec {
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                dind::install_wrapper_script(),
+            ],
+            env: Vec::new(),
+            working_dir: None,
+        };
+        if let Err(error) = shared
+            .engine
+            .exec(&container, &install, &mut crate::engine::SinkNull)
+            .await
+        {
+            let _ = shared.engine.remove_container(&container).await;
+            services::stop(shared.engine, &services_started).await;
+            job_network.teardown(shared.engine).await;
+            return Err(error.into());
+        }
+    }
+
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than
     // returning early and leaking the container.
@@ -308,8 +357,12 @@ pub(crate) async fn run_instance(
             let _ = shared.engine.remove_volume(&volume).await;
         }
     }
-    // After the container, before the network: services hold attachments too,
-    // and a network with any attachment cannot be removed.
+    // After the container, before the network: services and the DinD sidecar
+    // hold attachments too, and a network with any attachment cannot be
+    // removed.
+    if let Some(sidecar) = &dind {
+        let _ = shared.engine.remove_container(sidecar.container()).await;
+    }
     services::stop(shared.engine, &services_started).await;
     job_network.teardown(shared.engine).await;
 
@@ -721,9 +774,29 @@ async fn seed_container_path(
     let mut sink = CaptureSink::default();
     let output = engine.exec(container, &spec, &mut sink).await?;
     if output.exit_code == 0 {
-        let path = sink.text();
+        let mut path = sink.text();
+        // The image is untrusted, and this read was previously unbounded --
+        // every HTTP path in the codebase caps its body read for the same
+        // reason. A `PATH` longer than this is not a real one.
+        if path.len() > MAX_PATH_BYTES {
+            path.truncate(MAX_PATH_BYTES);
+            // Truncation can land mid-entry; drop the partial tail rather
+            // than leaving a directory name that means something else.
+            if let Some(last) = path.rfind(':') {
+                path.truncate(last);
+            }
+        }
         if !path.is_empty() {
-            base_env.insert("PATH".to_string(), path);
+            // Wrappers first, provisioning shims last. The managed `docker`
+            // wrapper has to beat a CLI the job image already ships (a
+            // `docker:27-cli` job container has one at `/usr/local/bin`);
+            // a provisioning shim must lose to a real tool the workflow
+            // installs, because `apply_path_additions` only ever prepends
+            // and treats this whole string as one opaque tail segment.
+            base_env.insert(
+                "PATH".to_string(),
+                format!("{}:{path}:{}", dind::WRAPPER_DIR, dind::SHIM_DIR),
+            );
         }
     }
     Ok(())
@@ -959,4 +1032,24 @@ fn resolve_services(
         ));
     }
     Ok(resolved)
+}
+
+/// A `run:` step's script text, as far as planning resolved it.
+///
+/// A script whose body is still deferred contributes its authored source, so
+/// a `docker` call behind an expression is still detected — over-detecting
+/// costs one container, under-detecting costs a confusing failure.
+fn step_script(step: &greenlit_engine::StepPlan) -> Option<String> {
+    match &step.kind {
+        greenlit_engine::StepKind::Run { script, .. } => {
+            let planned = script.as_ref();
+            Some(match &planned.evaluation {
+                greenlit_engine::Evaluation::Static(value) => value.clone(),
+                // Still deferred: scan the authored source instead, so a
+                // `docker` call behind an expression is not missed.
+                greenlit_engine::Evaluation::Deferred(_) => planned.source.clone(),
+            })
+        }
+        greenlit_engine::StepKind::Uses { .. } => None,
+    }
 }
