@@ -2,6 +2,9 @@
 //! overlay readiness, the sequential step loop, job-output finalization, and
 //! teardown.
 
+mod boot;
+mod teardown;
+
 use std::io::Write;
 use std::time::Instant;
 
@@ -16,33 +19,29 @@ use greenlit_engine::execution::{Masker, NeedRecord};
 use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
-use crate::engine::{BindMount, ContainerEngine, ExecSpec};
+use crate::engine::ExecSpec;
 use crate::executor::actions::docker_action;
 use crate::executor::actions::node_runtime;
 use crate::executor::actions::nodejs::NodeRuntimeMounts;
 use crate::executor::actions::resolve::{JobActionPlan, resolve_job_actions};
-use crate::executor::container::{
-    ContainerAdditions, ResolvedContainer, ResolvedCredentials, namespaced_volume_name,
-    validate_container,
-};
+use crate::executor::container::{ResolvedContainer, ResolvedCredentials, validate_container};
 use crate::executor::context::{
-    CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
 use crate::executor::dind;
 use crate::executor::instance::JobInstance;
 use crate::executor::netguard;
 use crate::executor::provision;
-use crate::executor::readiness::{self, READY_MARKER};
+use crate::executor::readiness;
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
 use crate::executor::step::{
     JobRuntime, StepLoopState, execute_step, run_post_steps, run_pre_steps,
 };
 use crate::executor::{ExecError, Shared, stage_span};
-use crate::image::{INIT_IN_IMAGE_PATH, ensure_base_image, init_binary};
-use crate::isolation::{IsolationStrategy, isolation_container_spec};
-use crate::platform::UbuntuRelease;
 use crate::progress::{ProgressEvent, ProgressSink};
+
+pub(crate) use boot::{boot_container, seed_container_path};
 
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
@@ -62,27 +61,6 @@ const DOCKER_SIBLING_VOLUMES: docker_action::SiblingVolumes = docker_action::Sib
     workspace: "workspace",
     cmdfiles: "cmdfiles",
 };
-
-/// What `resolve_image` settled on for this job.
-struct ResolvedImage {
-    /// The image the container actually starts from — this repository's
-    /// converged image when one exists, else the base.
-    tag: String,
-    /// The *base* image the convergence is anchored to.
-    ///
-    /// Kept separate from `tag` because the converged tag is hashed over it:
-    /// hashing over `tag` instead would produce a new tag every time a
-    /// converged image was itself converged, so a repository would never
-    /// reuse one. `None` for a user-declared `container:`, which never
-    /// converges.
-    base: Option<String>,
-    /// Whether this is a user-declared `container:`.
-    in_container: bool,
-    /// Whether `bash` is known to be present.
-    bash_available: bool,
-    /// Validated job-container additions.
-    additions: ContainerAdditions,
-}
 
 /// The resolved per-job env layers and defaults threaded into the step loop,
 /// plus everything action execution needs beyond that.
@@ -238,7 +216,7 @@ pub(crate) async fn run_instance(
             }
         };
 
-    let resolved_image = resolve_image(
+    let resolved_image = boot::resolve_image(
         shared,
         masker,
         &runner_ctx,
@@ -248,7 +226,7 @@ pub(crate) async fn run_instance(
         progress,
     )
     .await?;
-    let ResolvedImage {
+    let boot::ResolvedImage {
         tag: image_tag,
         base: base_image_tag,
         in_container,
@@ -258,7 +236,7 @@ pub(crate) async fn run_instance(
 
     let container = boot_container(
         shared,
-        &BootRequest {
+        &boot::BootRequest {
             image: &image_tag,
             in_container,
             additions: &additions,
@@ -427,49 +405,24 @@ pub(crate) async fn run_instance(
         Err(error) => Err(error),
     };
 
-    // `--write-back` needs the container (and its overlay upper) reachable
-    // after the run to export the diff (`PHASE-2-execution.md` "Overlay
-    // isolation": "export the upper-layer diff ... after the run"); the
-    // caller (`litci run`) removes it once write-back has processed this
-    // job. Otherwise, best-effort teardown here and now: a leaked container
-    // is not a run failure, and it must not mask the job's real result or
-    // error.
-    // Convergence happens only for a green job on a Greenlit runner image:
-    // committing a container whose steps failed would bake a half-installed
-    // state into the image every later run starts from.
-    if !in_container
-        && matches!(&outcome, Ok((_, _, Conclusion::Success)))
-        && let Some(tag) = &converged_target
-        && let Some((manifest, base_image)) = &converged_source
-    {
-        let installed = provision::provisioned_commands(shared.engine, &container).await;
-        provision::build_converged(shared.engine, base_image, manifest, &installed, tag).await;
-    }
-
-    if !shared.config.write_back {
-        let _ = shared.engine.remove_container(&container).await;
-        // The Docker-sibling volumes outlive the container that bound them,
-        // so removing the container is not enough. Before `remove_volume`
-        // existed on the port these accumulated on the host until an
-        // operator ran `docker volume prune` -- the module doc in
-        // `actions::docker_action` already described a per-job removal that
-        // no code performed. Removal must follow the container, because a
-        // volume still in use cannot be removed.
-        if let Some(volumes) = docker_volumes {
-            for source in [volumes.workspace, volumes.cmdfiles] {
-                let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
-                let _ = shared.engine.remove_volume(&volume).await;
-            }
-        }
-    }
-    // After the container, before the network: services and the DinD sidecar
-    // hold attachments too, and a network with any attachment cannot be
-    // removed.
-    if let Some(sidecar) = &dind {
-        let _ = shared.engine.remove_container(sidecar.container()).await;
-    }
-    services::stop(shared.engine, &services_started).await;
-    job_network.teardown(shared.engine).await;
+    teardown::converge(
+        shared,
+        &container,
+        in_container,
+        &outcome,
+        &converged_target,
+        &converged_source,
+    )
+    .await;
+    teardown::teardown(
+        shared,
+        &container,
+        docker_volumes,
+        dind.as_ref(),
+        &services_started,
+        job_network,
+    )
+    .await;
 
     let (step_reports, outputs, result) = outcome?;
     Ok(JobReport {
@@ -674,136 +627,6 @@ fn resolve_env_and_defaults(
     })
 }
 
-/// Ensure the job's image exists and, for a job container, validate it.
-///
-/// Returns `(image_tag, in_container, bash_available, additions)`.
-async fn resolve_image(
-    shared: &Shared<'_>,
-    masker: &mut Masker,
-    runner_ctx: &Value,
-    instance: &JobInstance<'_>,
-    base_env: &IndexMap<String, String>,
-    needs: &[NeedRecord],
-    progress: &mut (dyn ProgressSink + Send),
-) -> Result<ResolvedImage, ExecError> {
-    match instance.container {
-        Some(container_plan) => {
-            let ctx = env_ctx(
-                shared.roots,
-                runner_ctx,
-                &instance.matrix,
-                base_env,
-                needs,
-                RunStatus::Success,
-            );
-            let resolved = resolve_container(container_plan, &ctx)?;
-            // A resolved registry password/username may not already be a
-            // registered secret (e.g. a literal in `credentials:`, however
-            // inadvisable) — mask both before anything derived from them
-            // (the pull's progress events, a later error) can reach output,
-            // matching "never log them" (`PHASE-3-actions.md`).
-            if let Some(credentials) = &resolved.credentials {
-                masker.add(&credentials.username);
-                masker.add(&credentials.password);
-            }
-            let additions = validate_container(
-                &resolved,
-                &shared.config.workspace,
-                &shared.config.volume_namespace,
-            )?;
-            // Pull only when absent, so a present image (and an offline host)
-            // still runs, and re-runs skip the registry round-trip. The image
-            // reference is expression-resolved, so it is masked before it can
-            // reach a progress display.
-            let masked_image = masker.apply(&resolved.image);
-            let ensure = async {
-                if !shared.engine.image_exists(&resolved.image).await? {
-                    let mut masked = MaskedPullSink {
-                        inner: progress,
-                        masked_image,
-                    };
-                    shared
-                        .engine
-                        .pull_image(
-                            &resolved.image,
-                            additions.registry_auth.as_ref(),
-                            &mut masked,
-                        )
-                        .await?;
-                }
-                Ok::<_, ExecError>(())
-            };
-            ensure.instrument(stage_span("image-ensure")).await?;
-            // A job container image is not guaranteed to ship bash; GitHub
-            // defaults such jobs to `sh`.
-            Ok(ResolvedImage {
-                tag: resolved.image,
-                base: None,
-                in_container: true,
-                bash_available: false,
-                additions,
-            })
-        }
-        None => {
-            let release = match instance.runner {
-                RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
-                RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
-            };
-            let base_tag = ensure_base_image(shared.engine, release, progress)
-                .instrument(stage_span("image-ensure"))
-                .await?;
-            // A previous run of this checkout may already have installed the
-            // tools its workflows use; starting from that image is what makes
-            // convergence pay off (`PHASE-4-environment.md`: "subsequent runs
-            // start from it").
-            let converged = provision::converged_tag(
-                &shared.config.repo_host_path,
-                &base_tag,
-                instance.runner.image_identifier(),
-            );
-            let tag = if shared
-                .engine
-                .image_exists(&converged)
-                .await
-                .unwrap_or(false)
-            {
-                converged
-            } else {
-                base_tag.clone()
-            };
-            Ok(ResolvedImage {
-                tag,
-                base: Some(base_tag),
-                in_container: false,
-                bash_available: true,
-                additions: ContainerAdditions::default(),
-            })
-        }
-    }
-}
-
-/// Replaces the image reference in pull events with its masked form before
-/// forwarding — the reference can interpolate `::add-mask::`ed values.
-struct MaskedPullSink<'a> {
-    inner: &'a mut (dyn ProgressSink + Send),
-    masked_image: String,
-}
-
-impl ProgressSink for MaskedPullSink<'_> {
-    fn on_progress(&mut self, event: ProgressEvent) {
-        let event = match event {
-            ProgressEvent::PullStarted { .. } => ProgressEvent::PullStarted {
-                image: self.masked_image.clone(),
-            },
-            ProgressEvent::PullFinished { .. } => ProgressEvent::PullFinished {
-                image: self.masked_image.clone(),
-            },
-            other => other,
-        };
-        self.inner.on_progress(event);
-    }
-}
-
 /// Resolve a `container:` plan's context-sensitive fields against `ctx`.
 fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedContainer, ExecError> {
     let image = resolve_string(&plan.image, ctx).map_err(ExecError::eval)?;
@@ -857,231 +680,6 @@ fn resolve_container(plan: &ContainerPlan, ctx: &Context) -> Result<ResolvedCont
         ports,
         options,
     })
-}
-
-/// Queries the freshly booted (and now ready) job container's own default
-/// `PATH` — inherited from the image, before any step or `GITHUB_PATH`
-/// mutation — and seeds it into `base_env`.
-///
-/// Every later step's environment is built by
-/// [`greenlit_engine::execution::env::layer_step_env`] plus
-/// [`apply_path_additions`], and that function's documented contract is to
-/// *prepend* `GITHUB_PATH` additions onto whatever `PATH` the layered map
-/// already carries — never to invent one. Before this seed, no layer ever
-/// carried an explicit `PATH` key at all (`base_env` is built from
-/// [`RunnerEnv::into_map`], which has no `PATH` field), so the container's
-/// real `PATH` was reaching every step only through ordinary Docker `exec`
-/// environment inheritance, never through Greenlit's own layering. That
-/// works for the *first* step of a job, but the instant one step calls
-/// `core.addPath()` (`setup-node` and most `setup-*` actions do), the caller
-/// starts passing an explicit `PATH=<additions>` entry into every later
-/// `exec`, which *overrides* the container's inherited default outright
-/// (Docker merges an exec's explicit env over the container's live
-/// environment key-for-key) — silently dropping `/usr/bin` and friends from
-/// every subsequent step. GitHub's real runner never has this gap: its
-/// `ExecutionContext` tracks one explicit, always-current `PATH` value from
-/// the job's own start (seeded from the runner process's own environment),
-/// which `core.addPath` only ever prepends onto. Querying the booted
-/// container's own `PATH` once, up front, and seeding it into `base_env`
-/// gives Greenlit's layering that same explicit, always-current baseline —
-/// container-agnostic, so it works identically for the convergent base image
-/// and an arbitrary user-specified `jobs.<id>.container`.
-///
-/// # Errors
-///
-/// Returns an [`ExecError`] if the query exec itself could not be dispatched
-/// (an infrastructure failure, not a step failure) — a non-zero exit or
-/// empty output is treated as "no baseline available" rather than a hard
-/// failure, leaving `base_env` without `PATH` (the pre-fix behavior).
-async fn seed_container_path(
-    engine: &dyn ContainerEngine,
-    container: &str,
-    base_env: &mut IndexMap<String, String>,
-) -> Result<(), ExecError> {
-    let spec = ExecSpec {
-        cmd: vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "printf '%s' \"$PATH\"".to_string(),
-        ],
-        env: Vec::new(),
-        working_dir: None,
-    };
-    let mut sink = CaptureSink::default();
-    let output = engine.exec(container, &spec, &mut sink).await?;
-    if output.exit_code == 0 {
-        let mut path = sink.text();
-        // The image is untrusted, and this read was previously unbounded --
-        // every HTTP path in the codebase caps its body read for the same
-        // reason. A `PATH` longer than this is not a real one.
-        if path.len() > MAX_PATH_BYTES {
-            path.truncate(MAX_PATH_BYTES);
-            // Truncation can land mid-entry; drop the partial tail rather
-            // than leaving a directory name that means something else.
-            if let Some(last) = path.rfind(':') {
-                path.truncate(last);
-            }
-        }
-        if !path.is_empty() {
-            // Wrappers first, provisioning shims last. The managed `docker`
-            // wrapper has to beat a CLI the job image already ships (a
-            // `docker:27-cli` job container has one at `/usr/local/bin`);
-            // a provisioning shim must lose to a real tool the workflow
-            // installs, because `apply_path_additions` only ever prepends
-            // and treats this whole string as one opaque tail segment.
-            base_env.insert(
-                "PATH".to_string(),
-                format!("{}:{path}:{}", dind::WRAPPER_DIR, dind::SHIM_DIR),
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Create and start the isolated job container, returning its id.
-///
-/// `needs_docker_sibling` forces this job's workspace isolation to copy-in
-/// (regardless of the run's requested strategy) and binds two run-scoped
-/// named volumes — one at the workspace path instead of leaving it
-/// container-local, one at [`CMDFILES_BASE`] — so a Docker action's sibling
-/// container can mount the *same* volumes and share both the checkout and
-/// the step's command files
-/// (`crate::executor::actions::docker_action` module docs). `greenlit-init`
-/// itself needs no change: its copy-in populate step fills whatever is
-/// already bind-mounted at the workspace path, oblivious to whether that is
-/// container-local storage or a named volume.
-/// Everything that shapes the job container, gathered so the boot call keeps
-/// one argument per *concern* rather than one per field.
-struct BootRequest<'a> {
-    /// The resolved image reference.
-    image: &'a str,
-    /// Whether this is a user-declared `container:` rather than a Greenlit
-    /// runner image — the flag that gates every convergence behavior.
-    in_container: bool,
-    /// Job-container `env:`/`volumes:`/credentials, already validated.
-    additions: &'a ContainerAdditions,
-    /// Read-only binds the job's `uses:` steps need.
-    extra_binds: &'a [BindMount],
-    /// Whether a Docker action forces the shared-workspace volume.
-    needs_docker_sibling: bool,
-    /// The job's own bridge network.
-    network: &'a str,
-}
-
-async fn boot_container(
-    shared: &Shared<'_>,
-    request: &BootRequest<'_>,
-    progress: &mut (dyn ProgressSink + Send),
-) -> Result<String, ExecError> {
-    let BootRequest {
-        image,
-        in_container,
-        additions,
-        extra_binds,
-        needs_docker_sibling,
-        network,
-    } = *request;
-    let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
-    let idle = vec![
-        "sh".to_string(),
-        "-c".to_string(),
-        format!("touch {READY_MARKER}; exec tail -f /dev/null"),
-    ];
-    let strategy = if needs_docker_sibling {
-        IsolationStrategy::CopyIn
-    } else {
-        shared.config.strategy
-    };
-    let mut spec = isolation_container_spec(
-        image.to_string(),
-        &repo,
-        &shared.config.workspace,
-        strategy,
-        idle,
-    );
-    // A job container image does not ship the helper; inject it read-only.
-    if in_container {
-        let helper = write_helper_binary()?;
-        spec.binds.push(BindMount {
-            host_path: helper,
-            container_path: INIT_IN_IMAGE_PATH.to_string(),
-            read_only: true,
-        });
-    }
-    if needs_docker_sibling {
-        for (source, mount_point) in [
-            (
-                DOCKER_SIBLING_VOLUMES.workspace,
-                shared.config.workspace.clone(),
-            ),
-            (DOCKER_SIBLING_VOLUMES.cmdfiles, CMDFILES_BASE.to_string()),
-        ] {
-            spec.binds.push(BindMount {
-                host_path: namespaced_volume_name(&shared.config.volume_namespace, source),
-                container_path: mount_point,
-                read_only: false,
-            });
-        }
-    }
-    spec.binds.extend(additions.volume_binds.iter().cloned());
-    spec.binds.extend(extra_binds.iter().cloned());
-    spec.env = additions.env.clone();
-    spec.network = Some(network.to_string());
-    // The persistent toolcache: a writable Greenlit-owned host directory, so a
-    // `setup-*` action finds what a previous run installed instead of
-    // downloading it again (`PHASE-4-environment.md`: "mount
-    // `~/.litci/toolcache` at `RUNNER_TOOL_CACHE`"). A failure to create it
-    // means no toolcache this run, not a failed run.
-    if let Some(store) = shared.config.store.as_ref() {
-        match services::toolcache_bind(
-            &store.toolcache_root,
-            &shared.config.runner_env.runner_tool_cache,
-        ) {
-            Ok(bind) => spec.binds.push(bind),
-            Err(error) => tracing::debug!(
-                target: "greenlit_runtime::services",
-                %error,
-                "could not prepare the toolcache; running without it"
-            ),
-        }
-    }
-    spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
-
-    let engine = shared.engine;
-    progress.on_progress(ProgressEvent::BootStarted);
-    let boot = async {
-        let id = engine.create_container(&spec).await?;
-        engine.start_container(&id).await?;
-        Ok::<_, ExecError>(id)
-    };
-    let id = boot.instrument(stage_span("container-boot")).await?;
-    progress.on_progress(ProgressEvent::BootFinished);
-    Ok(id)
-}
-
-/// Write the embedded `greenlit-init` bytes to a host temp file (mode 0755) so
-/// they can be bind-mounted into a job container.
-fn write_helper_binary() -> Result<String, ExecError> {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("greenlit-init-{}-{nanos}", std::process::id()));
-    std::fs::write(&path, init_binary()).map_err(helper_io_error)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(helper_io_error)?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-/// Map a helper-staging I/O error onto an [`ExecError`] with a fix.
-fn helper_io_error(source: std::io::Error) -> ExecError {
-    ExecError::Infrastructure {
-        message: format!("could not stage the greenlit-init helper: {source}"),
-        fix: "ensure the system temporary directory is writable".to_string(),
-    }
 }
 
 /// Build a context for env/defaults/activation resolution.
