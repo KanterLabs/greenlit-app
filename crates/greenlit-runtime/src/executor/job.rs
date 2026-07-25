@@ -59,6 +59,27 @@ const MAX_PATH_BYTES: usize = 32 * 1024;
 /// (`crate::executor::container::namespaced_volume_name`).
 const DOCKER_SIBLING_WORKSPACE_VOLUME: &str = "workspace";
 
+/// What `resolve_image` settled on for this job.
+struct ResolvedImage {
+    /// The image the container actually starts from — this repository's
+    /// converged image when one exists, else the base.
+    tag: String,
+    /// The *base* image the convergence is anchored to.
+    ///
+    /// Kept separate from `tag` because the converged tag is hashed over it:
+    /// hashing over `tag` instead would produce a new tag every time a
+    /// converged image was itself converged, so a repository would never
+    /// reuse one. `None` for a user-declared `container:`, which never
+    /// converges.
+    base: Option<String>,
+    /// Whether this is a user-declared `container:`.
+    in_container: bool,
+    /// Whether `bash` is known to be present.
+    bash_available: bool,
+    /// Validated job-container additions.
+    additions: ContainerAdditions,
+}
+
 /// The resolved per-job env layers and defaults threaded into the step loop,
 /// plus everything action execution needs beyond that.
 struct RunnerLayers<'a> {
@@ -213,7 +234,7 @@ pub(crate) async fn run_instance(
             }
         };
 
-    let (image_tag, in_container, bash_available, additions) = resolve_image(
+    let resolved_image = resolve_image(
         shared,
         masker,
         &runner_ctx,
@@ -223,6 +244,13 @@ pub(crate) async fn run_instance(
         progress,
     )
     .await?;
+    let ResolvedImage {
+        tag: image_tag,
+        base: base_image_tag,
+        in_container,
+        bash_available,
+        additions,
+    } = resolved_image;
 
     let container = boot_container(
         shared,
@@ -292,6 +320,13 @@ pub(crate) async fn run_instance(
         }
     }
 
+    // Set when this job is eligible to converge -- a Greenlit runner image
+    // with a store to cache the manifest in.
+    let mut converged_target: Option<String> = None;
+    // The manifest and base image this job converged against, kept so the
+    // converged image can be built from a clean base container at teardown.
+    let mut converged_source: Option<(provision::manifest::Manifest, String)> = None;
+
     // Lazy provisioning, for Greenlit runner images only. A user-declared
     // `container:` is left exactly as authored: a command missing from that
     // image must fail the way it fails in the same job container on GitHub
@@ -303,6 +338,13 @@ pub(crate) async fn run_instance(
             RunnerImage::Ubuntu2204 => "22.04",
         };
         let label = instance.runner.image_identifier();
+        if let Some(base) = base_image_tag.as_deref() {
+            converged_target = Some(provision::converged_tag(
+                &shared.config.repo_host_path,
+                base,
+                label,
+            ));
+        }
         // A manifest that cannot be reached costs provisioning, not the run:
         // the job proceeds against the slim base, and a genuinely missing
         // command still fails at the step with its own message.
@@ -313,6 +355,9 @@ pub(crate) async fn run_instance(
             Ok(manifest) => {
                 let wanted =
                     provision::mentioned_commands(instance.steps.iter().filter_map(step_script));
+                if let Some(base) = base_image_tag.clone() {
+                    converged_source = Some((manifest.clone(), base));
+                }
                 if let Err(error) =
                     provision::install_shims(shared.engine, &container, &manifest, &wanted, label)
                         .instrument(stage_span("provision"))
@@ -385,6 +430,18 @@ pub(crate) async fn run_instance(
     // job. Otherwise, best-effort teardown here and now: a leaked container
     // is not a run failure, and it must not mask the job's real result or
     // error.
+    // Convergence happens only for a green job on a Greenlit runner image:
+    // committing a container whose steps failed would bake a half-installed
+    // state into the image every later run starts from.
+    if !in_container
+        && matches!(&outcome, Ok((_, _, Conclusion::Success)))
+        && let Some(tag) = &converged_target
+        && let Some((manifest, base_image)) = &converged_source
+    {
+        let installed = provision::provisioned_commands(shared.engine, &container).await;
+        provision::build_converged(shared.engine, base_image, manifest, &installed, tag).await;
+    }
+
     if !shared.config.write_back {
         let _ = shared.engine.remove_container(&container).await;
         // The Docker-sibling workspace volume outlives the container that
@@ -622,7 +679,7 @@ async fn resolve_image(
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
     progress: &mut (dyn ProgressSink + Send),
-) -> Result<(String, bool, bool, ContainerAdditions), ExecError> {
+) -> Result<ResolvedImage, ExecError> {
     match instance.container {
         Some(container_plan) => {
             let ctx = env_ctx(
@@ -673,17 +730,48 @@ async fn resolve_image(
             ensure.instrument(stage_span("image-ensure")).await?;
             // A job container image is not guaranteed to ship bash; GitHub
             // defaults such jobs to `sh`.
-            Ok((resolved.image, true, false, additions))
+            Ok(ResolvedImage {
+                tag: resolved.image,
+                base: None,
+                in_container: true,
+                bash_available: false,
+                additions,
+            })
         }
         None => {
             let release = match instance.runner {
                 RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
                 RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
             };
-            let tag = ensure_base_image(shared.engine, release, progress)
+            let base_tag = ensure_base_image(shared.engine, release, progress)
                 .instrument(stage_span("image-ensure"))
                 .await?;
-            Ok((tag, false, true, ContainerAdditions::default()))
+            // A previous run of this checkout may already have installed the
+            // tools its workflows use; starting from that image is what makes
+            // convergence pay off (`PHASE-4-environment.md`: "subsequent runs
+            // start from it").
+            let converged = provision::converged_tag(
+                &shared.config.repo_host_path,
+                &base_tag,
+                instance.runner.image_identifier(),
+            );
+            let tag = if shared
+                .engine
+                .image_exists(&converged)
+                .await
+                .unwrap_or(false)
+            {
+                converged
+            } else {
+                base_tag.clone()
+            };
+            Ok(ResolvedImage {
+                tag,
+                base: Some(base_tag),
+                in_container: false,
+                bash_available: true,
+                additions: ContainerAdditions::default(),
+            })
         }
     }
 }

@@ -73,7 +73,11 @@ pub(crate) fn render(command: &str, recipe: &Recipe, shim_dir: &str, label: &str
 }
 
 /// The one fixed install command a shim carries.
-fn install_command(recipe: &Recipe) -> String {
+///
+/// Also replayed by [`super::build_converged`] in a clean container, so the
+/// converged image and the lazy install can never diverge on how a tool is
+/// installed.
+pub(crate) fn install_command(recipe: &Recipe) -> String {
     match recipe {
         Recipe::Apt { package } => format!(
             "(apt-get update -qq && apt-get install -y -qq --no-install-recommends {package})"
