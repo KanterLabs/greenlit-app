@@ -17,7 +17,7 @@ use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::git::{collect_git_context, find_repository_root};
 use greenlit_engine::{
     Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, PlanOptions,
-    build_synthetic_event, plan, validate_v0_support,
+    analyze_support, build_synthetic_event, plan, validate_v0_support,
 };
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
@@ -97,6 +97,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             )
         })
         .map_err(|error| errors::parse_error(&error))?;
+    evidence.merge_support(&analyze_support(&workflow))?;
     validate_v0_support(&workflow).map_err(|error| errors::plan_error(&error))?;
 
     let extraction = greenlit_workflow::extract_static(&workflow)

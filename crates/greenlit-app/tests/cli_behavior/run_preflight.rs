@@ -140,3 +140,47 @@ fn a_statically_skipped_malformed_uses_step_stays_accepted() {
     );
     assert!(!stderr.contains("not-a-valid-reference"), "{stderr}");
 }
+
+#[test]
+fn unsupported_preflight_persists_terminal_result_and_trace() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        ".github/workflows/ci.yml",
+        "\
+on: push
+concurrency: one-at-a-time
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo blocked
+",
+    );
+    sandbox.init_git();
+
+    let output = sandbox.run(&["run", "--no-input"]);
+    assert!(!output.status.success());
+    let runs = sandbox.home().join(".litci/runs");
+    let run = std::fs::read_dir(&runs)
+        .expect("run directory exists")
+        .next()
+        .expect("one run is persisted")
+        .expect("run entry is readable")
+        .path();
+    let result: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run.join("result.json")).expect("terminal result is persisted"),
+    )
+    .expect("terminal result is JSON");
+    assert_eq!(result["conclusion"], "preparation_failed");
+    assert_eq!(result["compatibility"], "unsupported");
+    assert_eq!(result["assurance"], "none");
+
+    let trace =
+        std::fs::read_to_string(run.join("trace.ndjson")).expect("append-only trace is persisted");
+    assert!(trace.contains("\"event\":\"source_locked\""), "{trace}");
+    assert!(
+        trace.contains("\"event\":\"compatibility_analyzed\""),
+        "{trace}"
+    );
+    assert!(trace.contains("\"event\":\"run_completed\""), "{trace}");
+}

@@ -167,6 +167,41 @@ impl JobLockV1 {
     }
 }
 
+/// One append-only fact in a run's execution trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEventV1 {
+    /// Schema discriminator.
+    pub schema_version: u32,
+    /// Monotonic sequence within this run, beginning at one.
+    pub sequence: u64,
+    /// Stable machine-readable event name.
+    pub event: String,
+    /// Deterministically ordered event attributes.
+    pub attributes: BTreeMap<String, String>,
+}
+
+impl TraceEventV1 {
+    /// Creates a schema-one trace event.
+    #[must_use]
+    pub fn new(
+        sequence: u64,
+        event: impl Into<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            sequence,
+            event: event.into(),
+            attributes,
+        }
+    }
+
+    /// Returns byte-stable compact JSON.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+}
+
 /// What happened while executing the selected work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

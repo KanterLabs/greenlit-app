@@ -1,5 +1,6 @@
 //! Persistent source, lock, and result evidence for one invocation.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -10,13 +11,16 @@ use greenlit_engine::planned::Evaluation;
 use greenlit_engine::{
     ExecutionConclusion, ExecutionPlan, ExecutionResultV1, FeatureFinding, FindingDisposition,
     JobLockV1, LockedSource, ResultEvidence, RunLockV1, SourceSnapshot, SupportReport,
-    opaque_revision,
+    TraceEventV1, opaque_revision,
 };
 
 pub(crate) struct RunEvidence {
     pub(crate) run_id: String,
     pub(crate) directory: PathBuf,
     pub(crate) source: SourceSnapshot,
+    next_trace_sequence: Cell<u64>,
+    terminal_result_written: Cell<bool>,
+    support: RefCell<SupportReport>,
 }
 
 pub(crate) struct LockInputs<'a> {
@@ -87,11 +91,40 @@ impl RunEvidence {
         })?;
         write_json_atomic(&directory.join("source-manifest.json"), &source.entries)?;
         ingest_source(&home, &source)?;
-        Ok(Self {
+        let evidence = Self {
             run_id,
             directory,
             source,
-        })
+            next_trace_sequence: Cell::new(1),
+            terminal_result_written: Cell::new(false),
+            support: RefCell::new(local_support_report()),
+        };
+        evidence.append_trace(
+            "source_locked",
+            BTreeMap::from([
+                (
+                    "snapshot_digest".to_string(),
+                    evidence.source.digest.clone(),
+                ),
+                ("dirty".to_string(), evidence.source.dirty.to_string()),
+            ]),
+        )?;
+        Ok(evidence)
+    }
+
+    pub(crate) fn merge_support(&self, report: &SupportReport) -> anyhow::Result<()> {
+        {
+            let mut support = self.support.borrow_mut();
+            support.findings.extend(report.findings.iter().cloned());
+            support.canonicalize();
+        }
+        self.append_trace(
+            "compatibility_analyzed",
+            BTreeMap::from([(
+                "compatibility".to_string(),
+                format!("{:?}", self.support.borrow().compatibility()),
+            )]),
+        )
     }
 
     pub(crate) fn lock(&self, inputs: LockInputs<'_>) -> anyhow::Result<RunLockV1> {
@@ -133,9 +166,20 @@ impl RunEvidence {
             .collect();
         lock.actions = actions;
         lock.containers = containers;
-        lock.compatibility = local_support_report();
+        lock.compatibility = self.support.borrow().clone();
         write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
         self.write_job_locks(plan, &lock)?;
+        self.append_trace(
+            "run_lock_finalized",
+            BTreeMap::from([(
+                "digest".to_string(),
+                lock.digest().map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
+                    )
+                })?,
+            )]),
+        )?;
         Ok(lock)
     }
 
@@ -152,7 +196,42 @@ impl RunEvidence {
             github_confirmed: false,
         });
         write_json_atomic(&self.directory.join("result.json"), &result)?;
+        self.append_trace(
+            "run_completed",
+            BTreeMap::from([
+                ("conclusion".to_string(), format!("{:?}", result.conclusion)),
+                (
+                    "compatibility".to_string(),
+                    format!("{:?}", result.compatibility),
+                ),
+                ("assurance".to_string(), format!("{:?}", result.assurance)),
+            ]),
+        )?;
+        self.terminal_result_written.set(true);
         Ok(result)
+    }
+
+    fn append_trace(
+        &self,
+        event: &str,
+        attributes: BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let sequence = self.next_trace_sequence.get();
+        let trace = TraceEventV1::new(sequence, event, attributes);
+        let path = self.directory.join("trace.ndjson");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| evidence_write_error(&path, error))?;
+        serde_json::to_writer(&mut file, &trace)
+            .map_err(|error| evidence_write_error(&path, error))?;
+        file.write_all(b"\n")
+            .map_err(|error| evidence_write_error(&path, error))?;
+        file.sync_all()
+            .map_err(|error| evidence_write_error(&path, error))?;
+        self.next_trace_sequence.set(sequence.saturating_add(1));
+        Ok(())
     }
 
     fn write_job_locks(&self, plan: &ExecutionPlan, run_lock: &RunLockV1) -> anyhow::Result<()> {
@@ -208,6 +287,18 @@ impl RunEvidence {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for RunEvidence {
+    fn drop(&mut self) {
+        if self.terminal_result_written.get() {
+            return;
+        }
+        let _ = self.write_result(
+            ExecutionConclusion::PreparationFailed,
+            self.support.borrow().clone(),
+        );
     }
 }
 

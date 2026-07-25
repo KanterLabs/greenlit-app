@@ -30,6 +30,7 @@ use greenlit_workflow::model::workflow::{
 };
 
 use crate::event::SyntheticEvent;
+use crate::evidence::{FeatureFinding, FindingDisposition, SupportReport};
 use crate::graph::{JobId, build_graph};
 use crate::lints::Lint;
 use crate::partial_eval::{
@@ -220,6 +221,87 @@ pub fn validate_v0_support(workflow: &Workflow) -> Result<(), PlanError> {
         reject_oidc_permissions(effective_permissions)?;
     }
     Ok(())
+}
+
+/// Inventories recognized workflow features whose semantics Greenlit cannot
+/// execute faithfully. The report is independent from policy: callers can
+/// persist it before [`validate_v0_support`] blocks execution.
+#[must_use]
+pub fn analyze_support(workflow: &Workflow) -> SupportReport {
+    let mut findings = Vec::new();
+    if workflow.concurrency.is_some() {
+        findings.push(unsupported_finding(
+            "workflow.concurrency",
+            "workflow",
+            "workflow-level concurrency groups are not implemented",
+        ));
+    }
+    for trigger in &workflow.on {
+        if matches!(
+            trigger.value,
+            greenlit_workflow::model::trigger::Trigger::WorkflowCall(_)
+        ) {
+            findings.push(unsupported_finding(
+                "workflow.reusable_trigger",
+                "workflow.on.workflow_call",
+                "reusable workflow triggers are not implemented",
+            ));
+        }
+    }
+    for job in &workflow.jobs {
+        let scope = format!("jobs.{}", job.id.value);
+        if job.environment.is_some() {
+            findings.push(unsupported_finding(
+                "job.environment",
+                &scope,
+                "GitHub environment protection and deployments are unavailable locally",
+            ));
+        }
+        if job.concurrency.is_some() {
+            findings.push(unsupported_finding(
+                "job.concurrency",
+                &scope,
+                "job-level concurrency groups are not implemented",
+            ));
+        }
+        if job.reusable_call.is_some() {
+            findings.push(unsupported_finding(
+                "job.reusable_workflow",
+                &scope,
+                "reusable workflow call jobs are not implemented",
+            ));
+        }
+        let effective_permissions = job.permissions.as_ref().or(workflow.permissions.as_ref());
+        if permissions_request_oidc(effective_permissions) {
+            findings.push(unsupported_finding(
+                "github.oidc",
+                &scope,
+                "GitHub OIDC token issuance is unavailable locally",
+            ));
+        }
+    }
+    let mut report = SupportReport { findings };
+    report.canonicalize();
+    report
+}
+
+fn unsupported_finding(code: &str, scope: &str, reason: &str) -> FeatureFinding {
+    FeatureFinding {
+        code: code.to_string(),
+        disposition: FindingDisposition::Unsupported,
+        scope: scope.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn permissions_request_oidc(permissions: Option<&greenlit_workflow::Spanned<Permissions>>) -> bool {
+    permissions.is_some_and(|permissions| match &permissions.value {
+        Permissions::All(PermissionLevelAll::WriteAll) => true,
+        Permissions::All(PermissionLevelAll::ReadAll) => false,
+        Permissions::Scoped(entries) => entries.iter().any(|(scope, level)| {
+            scope.value == "id-token" && level.value == PermissionLevel::Write
+        }),
+    })
 }
 
 fn plan_workflow_defaults(

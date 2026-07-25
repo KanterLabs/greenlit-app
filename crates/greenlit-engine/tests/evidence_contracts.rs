@@ -1,9 +1,8 @@
-use std::collections::BTreeMap;
-
 use greenlit_engine::{
     Assurance, Compatibility, ExecutionConclusion, ExecutionResultV1, FeatureFinding,
-    FindingDisposition, JobLockV1, ResultEvidence, SupportReport,
+    FindingDisposition, JobLockV1, ResultEvidence, SupportReport, TraceEventV1, analyze_support,
 };
+use std::collections::BTreeMap;
 
 #[test]
 fn unsupported_behavior_never_receives_passing_assurance() {
@@ -24,6 +23,61 @@ fn unsupported_behavior_never_receives_passing_assurance() {
     });
     assert_eq!(result.compatibility, Compatibility::Unsupported);
     assert_eq!(result.assurance, Assurance::None);
+}
+
+#[test]
+fn trace_event_json_is_byte_stable() {
+    let event = TraceEventV1::new(
+        1,
+        "source_locked",
+        BTreeMap::from([
+            ("dirty".to_string(), "false".to_string()),
+            ("snapshot_digest".to_string(), "sha256:abc".to_string()),
+        ]),
+    );
+    assert_eq!(
+        String::from_utf8(event.canonical_json().expect("trace serializes"))
+            .expect("trace JSON is UTF-8"),
+        r#"{"schema_version":1,"sequence":1,"event":"source_locked","attributes":{"dirty":"false","snapshot_digest":"sha256:abc"}}"#
+    );
+}
+
+#[test]
+fn support_analysis_inventories_every_recognized_unsupported_construct() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "unsupported.yml",
+        r#"
+on: workflow_call
+concurrency: workflow-group
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: production
+    concurrency: deploy-group
+    steps:
+      - run: echo blocked
+"#,
+    )
+    .expect("recognized unsupported constructs still parse");
+    let report = analyze_support(&workflow);
+    let codes = report
+        .findings
+        .iter()
+        .map(|finding| finding.code.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        codes,
+        vec![
+            "github.oidc",
+            "job.concurrency",
+            "job.environment",
+            "workflow.concurrency",
+            "workflow.reusable_trigger",
+        ]
+    );
+    assert_eq!(report.compatibility(), Compatibility::Unsupported);
 }
 
 #[test]

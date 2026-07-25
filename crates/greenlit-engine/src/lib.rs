@@ -57,7 +57,7 @@ pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
 pub use evidence::{
     Assurance, Compatibility, ExecutionConclusion, ExecutionResultV1, FeatureFinding,
     FindingDisposition, JobLockV1, LockedSource, ResultEvidence, RunLockV1, SupportReport,
-    opaque_revision,
+    TraceEventV1, opaque_revision,
 };
 pub use execution::{Conclusion, StepExit, StepInvocation, StepResult};
 pub use git::GitError;
@@ -71,7 +71,7 @@ pub use outputs::{JobOutputsPlan, PlannedOutput, PlannedValue};
 pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue};
 pub use plan::{
     ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanError, PlanOptions,
-    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, plan, validate_v0_support,
+    RunDefaultsPlan, StaticSkip, StepKind, StepPlan, analyze_support, plan, validate_v0_support,
 };
 pub use planned::{Evaluation, Planned};
 pub use runner::{
