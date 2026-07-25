@@ -647,6 +647,32 @@ policy actively contains. They are not deferred Greenlit behavior.
   binding it, verified by a root-in-container `iptables -F` failing with
   "Permission denied" while the drop stayed in force.
 
+- **A Docker action's sibling container joins the job container's network
+  namespace rather than getting a network of its own.** The sibling
+  originally ran on Docker's default bridge, which could not resolve a
+  `services:` container by hostname and, worse, sat entirely outside the
+  network policy above — that policy is installed into a specific namespace
+  and a default-bridge sibling was never the namespace it was pointed at.
+  The fix reuses the netguard sidecar's own mechanism: the sibling's spec now
+  sets `network` to `container:<job-container-id>`, the same
+  `--network container:<id>` form netguard uses to bind its rules into a
+  namespace. Joining that namespace, rather than attaching to the job's
+  bridge network as a second member, buys two things from one line: the
+  sibling is guarded from its first instruction (the rules were installed
+  into that namespace before the sibling ever started, so there is no
+  per-step sidecar run and no race), and it resolves a service's id for free,
+  since Docker's embedded DNS is owned by the network namespace, not by the
+  container. The tradeoff is stated in the module docs and confined to
+  something no workflow can observe: on GitHub's own runner a Docker
+  `uses:` action gets its own IP on the job's network, with its own
+  loopback; here the sibling shares the job container's namespace outright,
+  so `127.0.0.1` inside the action is the job container's loopback rather
+  than one of its own. Every fidelity-relevant behavior — service-id
+  reachability, internet access, and the LAN/metadata block — is identical
+  either way. Pinned by
+  `crates/greenlit-runtime/tests/actions_docker.rs`'s services-and-guard
+  test.
+
 - **Blob URLs authorize themselves; the bearer token does not reach them.**
   `@azure/storage-blob` treats a signed URL as self-authorizing and sends no
   `Authorization` header, and `actions/cache` fetches its `archiveLocation`

@@ -45,6 +45,43 @@
 //! `volumes:` entry, so it can never resolve to a pre-existing daemon-global
 //! volume.
 //!
+//! # Design: sharing the job container's network namespace
+//!
+//! A sibling on Docker's default bridge could not resolve a `services:`
+//! container by hostname, and — worse — was not covered by the network
+//! policy at all: [`crate::executor::netguard`] installs its rules by
+//! joining the *target* container's own network namespace
+//! (`--network container:<id>`, its module docs' "the mechanism"), and a
+//! plain-bridge sibling is a namespace the netguard sidecar never touched.
+//!
+//! **The chosen design**: the sibling joins the job container's network
+//! namespace the same way netguard does —
+//! `network: Some(format!("container:{container}"))` — instead of getting a
+//! network, IP, and alias of its own. One mechanism buys two things:
+//!
+//! * The rules netguard already installed into the job container's namespace
+//!   apply to the sibling from its first instruction. No per-sibling sidecar
+//!   run, and no race between the sibling starting and a policy landing —
+//!   the namespace was guarded before the sibling existed.
+//! * Docker's embedded DNS (`127.0.0.11`) is owned by the network namespace,
+//!   not by the container, so a sibling sharing the job's namespace resolves
+//!   a service's id exactly as the job container does — no separate network
+//!   attachment needed for the alias [`crate::executor::services`] gives
+//!   each service container (`network_aliases: vec![id.clone()]`, ~line
+//!   294-319) to resolve.
+//!
+//! **Tradeoff, stated plainly**: on GitHub's own runner a `uses: docker://`
+//! action gets its own IP on the job's network — its own namespace, attached
+//! to the same bridge as the job container, with its own loopback. Here the
+//! sibling shares the job container's namespace outright: same IP, same
+//! loopback. Every fidelity-relevant behavior an action could actually
+//! observe is identical either way — it reaches services by id, reaches the
+//! internet, and is blocked from the LAN and the cloud metadata address
+//! exactly as the job container is — so the divergence is confined to the
+//! one thing nothing in a workflow can tell apart from outside: whether
+//! `127.0.0.1` inside the action is a loopback it owns alone or one it
+//! shares with the job container.
+//!
 //! # Design: the command files a sibling can write
 //!
 //! A step's `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
@@ -242,6 +279,22 @@ pub(crate) async fn run_step(
 
     let input_env = nodejs::input_env(reference, &resolved.inputs, with, ctx)?;
     let mut env: IndexMap<String, String> = full_env.clone();
+    // The pinned runner's `ContainerActionHandler.RunAsync` calls only
+    // `AddInputsToEnvironment()` (ContainerActionHandler.cs:39) for a `uses:`
+    // container action — never `AddPrependPathToEnvironment()`, whose only
+    // callers are `NodeScriptActionHandler.cs:40` and `ScriptHandler.cs:288`.
+    // Prepend-path reaches a container *step* (`jobs.<id>.container`) through
+    // a wholly different mechanism, `ContainerStepHost.PrependPath`
+    // (`Handler.cs:205-233`), never used for `uses:` actions. So on the real
+    // runner a Docker action never sees the job's PATH at all — only the
+    // image's own. `full_env` here still carries the *job container's*
+    // seeded PATH (`/greenlit/wrappers`, `/greenlit/shims`, and any
+    // `GITHUB_PATH` accumulation), which must not leak into the sibling and
+    // shadow the action image's own PATH. Dropping the key, rather than
+    // forwarding it, is what makes the image's own `ENV PATH` win exactly as
+    // it does on the pinned runner (`actions/runner` v2.336.0, pinned
+    // release).
+    env.shift_remove("PATH");
     for (key, value) in input_env {
         env.insert(key, value);
     }
@@ -271,7 +324,15 @@ pub(crate) async fn run_step(
         cmd: args,
         env: env.into_iter().collect(),
         working_dir: Some(workspace.to_string()),
-        network: None,
+        // Joins the *job* container's own network namespace — the same
+        // `container:<id>` mode `crate::executor::netguard` uses to bind its
+        // sidecar's rules into a namespace (see the module docs' "sharing
+        // the job container's network namespace" section for why). Without
+        // this the sibling landed on Docker's default bridge: unable to
+        // resolve a `services:` container by id, and entirely outside the
+        // netguard policy, which only ever touches the namespace it was
+        // pointed at.
+        network: Some(format!("container:{container}")),
         labels: vec![
             ("greenlit.managed".to_string(), "1".to_string()),
             ("greenlit.docker-action".to_string(), "1".to_string()),
@@ -289,9 +350,11 @@ pub(crate) async fn run_step(
             },
         ],
         name: None,
-        // A Docker action gets no capabilities, no published ports, no health
-        // probe, and no network alias: it is a sibling that shares only the
-        // job's workspace and command-file volumes.
+        // A Docker action gets no capabilities, no published ports, no
+        // health probe, and no network alias of its own — `network` above
+        // already puts it in the job container's namespace, so it is a
+        // sibling that shares the job's workspace and command-file volumes
+        // *and* its network.
         ..ContainerSpec::default()
     };
 
