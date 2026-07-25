@@ -215,4 +215,63 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
             "the runtime token must never be echoed"
         );
     }
+
+    // Exact matrix selection is also an evidence boundary: unselected legs
+    // must not acquire JobLocks that imply they were resolved or executed.
+    sandbox.write(
+        ".github/workflows/ci.yml",
+        "\
+name: selected-matrix
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+        node: [20, 22]
+    steps:
+      - run: echo selected
+",
+    );
+    let selected = sandbox.run(&[
+        "run",
+        "--job",
+        "build",
+        "--matrix",
+        "os=ubuntu-24.04",
+        "--matrix",
+        "node=20",
+        "--no-input",
+    ]);
+    assert!(
+        selected.status.success(),
+        "selected matrix run failed\nstdout:\n{}\nstderr:\n{}",
+        support::stdout_text(&selected),
+        support::stderr_text(&selected)
+    );
+    let run = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("read matrix run evidence")
+        .map(|entry| entry.expect("matrix run entry").path())
+        .max()
+        .expect("matrix run persisted");
+    let locks = std::fs::read_dir(run.join("job-locks"))
+        .expect("selected job locks persisted")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("selected job locks readable");
+    assert_eq!(
+        locks.len(),
+        1,
+        "only the selected matrix case receives a JobLock"
+    );
+    let lock: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(locks[0].path()).expect("selected JobLock readable"))
+            .expect("selected JobLock is JSON");
+    assert_eq!(
+        lock["matrix"],
+        serde_json::json!({
+            "node": {"kind": "number", "value": 20.0},
+            "os": {"kind": "string", "value": "ubuntu-24.04"}
+        })
+    );
 }

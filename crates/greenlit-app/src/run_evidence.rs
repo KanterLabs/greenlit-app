@@ -9,9 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use greenlit_engine::{
     ExecutionConclusion, ExecutionPlan, ExecutionResultV1, FeatureFinding, FindingDisposition,
-    JobLockV1, LockedSource, ResultEvidence, RunLockV1, SourceSnapshot, SupportReport,
-    TraceEventV1, opaque_revision,
+    JobLockV1, LockedSource, MatrixKey, MatrixValue, ResultEvidence, RunLockV1, SourceSnapshot,
+    SupportReport, TraceEventV1, opaque_revision,
 };
+use indexmap::IndexMap;
 
 pub(crate) struct RunEvidence {
     pub(crate) run_id: String,
@@ -271,6 +272,9 @@ impl RunEvidence {
                 continue;
             }
             for leg in matrix_legs {
+                if !matrix_leg_selected(&leg.values, job.matrix_filter.as_ref()) {
+                    continue;
+                }
                 let key = format!("{}[{}]", job.id.0, leg.index);
                 let matrix = leg
                     .values
@@ -365,6 +369,20 @@ fn ingest_source(home: &Path, source: &SourceSnapshot) -> anyhow::Result<()> {
         .put_verified(&manifest_digest, &manifest)
         .map_err(|error| content_error("source-manifest.json", error))?;
     Ok(())
+}
+
+fn matrix_leg_selected(
+    values: &IndexMap<MatrixKey, MatrixValue>,
+    filter: Option<&IndexMap<String, MatrixValue>>,
+) -> bool {
+    filter.is_none_or(|filter| {
+        filter.iter().all(|(name, expected)| {
+            values
+                .iter()
+                .find(|(key, _)| key.as_str() == name)
+                .is_some_and(|(_, actual)| actual == expected)
+        })
+    })
 }
 
 fn content_error(path: &str, error: greenlit_store::cas::CasError) -> anyhow::Error {
