@@ -70,7 +70,7 @@ impl ShimState {
     #[must_use]
     pub fn artifact_blob_url(&self, id: i64) -> String {
         format!(
-            "{}_apis/artifacts/blobs/{id}",
+            "{}greenlit/artifacts/{id}",
             with_trailing_slash(&self.base_url)
         )
     }
