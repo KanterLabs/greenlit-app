@@ -7,9 +7,10 @@ use greenlit_expr::Value;
 use greenlit_workflow::Span;
 
 use crate::condition::Condition;
+use crate::evidence::SupportReport;
 use crate::graph::JobId;
 use crate::lints::Lint;
-use crate::matrix::{DEFAULT_MAX_MATRIX_LEGS, StrategyPlan};
+use crate::matrix::{DEFAULT_MAX_MATRIX_LEGS, MatrixValue, StrategyPlan};
 use crate::outputs::JobOutputsPlan;
 use crate::pass_through::{ContainerPlan, EnvValue};
 use crate::planned::Planned;
@@ -20,6 +21,8 @@ use crate::runner::RunnerPlan;
 pub struct ExecutionPlan {
     /// Stable plan schema version.
     pub schema_version: u32,
+    /// Preflight compatibility findings included in `litci plan --json`.
+    pub compatibility: SupportReport,
     /// The simulated trigger's event name (`"push"`, `"pull_request"`,
     /// `"workflow_dispatch"`).
     pub event_name: String,
@@ -36,6 +39,9 @@ pub struct ExecutionPlan {
     pub defaults: RunDefaultsPlan,
     /// Workflow token permissions.
     pub permissions: Option<PermissionsPlan>,
+    /// Workflow-wide concurrency group, when authored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencyPlan>,
     /// Every job, in the workflow file's declaration order.
     pub jobs: Vec<JobPlan>,
     /// The deterministic topological order — the order
@@ -87,6 +93,9 @@ pub struct JobPlan {
     /// declaration replaces the workflow-level declaration rather than
     /// merging with it; `None` means GitHub's configured default applies.
     pub permissions: Option<PermissionsPlan>,
+    /// Job concurrency policy for a non-matrix or deferred-matrix template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencyPlan>,
     /// This job's `if:`, resolved for a non-matrix job or retained once on a
     /// runtime-deferred matrix template. `None` for a statically expanded
     /// matrix — see each [`LegPlan`] instead — and when no `if:` was authored.
@@ -100,6 +109,9 @@ pub struct JobPlan {
     pub skip: Option<StaticSkip>,
     /// `strategy:`, resolved.
     pub strategy: StrategyPlan,
+    /// Exact matrix case selected by the CLI, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matrix_filter: Option<IndexMap<String, MatrixValue>>,
     /// One entry per [`StrategyPlan::legs`] leg, aligned by index. Empty for
     /// a non-matrix job, a zero-leg static matrix, or a matrix awaiting
     /// runtime materialization; [`StrategyPlan::matrix`] distinguishes them.
@@ -132,6 +144,9 @@ pub struct LegPlan {
     pub env: IndexMap<String, EnvValue>,
     /// Matrix-sensitive effective run defaults.
     pub defaults: RunDefaultsPlan,
+    /// Matrix-sensitive job concurrency policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<ConcurrencyPlan>,
     /// The job-level `if:` result copied to this instance after being
     /// evaluated once, before matrix application. GitHub does not expose
     /// `matrix` to `jobs.<job_id>.if`.
@@ -143,6 +158,15 @@ pub struct LegPlan {
     pub outputs: JobOutputsPlan,
     /// This instance's independently planned step sequence.
     pub steps: Vec<StepPlan>,
+}
+
+/// A planned workflow/job concurrency declaration.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConcurrencyPlan {
+    /// Case-insensitive group name, resolved at the latest safe point.
+    pub group: Planned<String>,
+    /// Whether a new owner cancels the current owner of this group.
+    pub cancel_in_progress: Planned<bool>,
 }
 
 /// A job/leg statically known to be skipped at plan time.

@@ -8,144 +8,22 @@
 //!
 //! The trait is object-safe (via `#[async_trait]`) so the engine can be held as
 //! `Box<dyn ContainerEngine>` behind the port boundary. Every method is async.
+//!
+//! The request and response *data* types live in the `spec` submodule and are re-exported
+//! here, so this module reads as the list of operations Greenlit performs.
+
+mod spec;
 
 use async_trait::async_trait;
 
 use crate::error::RuntimeError;
 use crate::progress::ProgressSink;
 
-/// Private-registry credentials for an image pull.
-///
-/// `PHASE-3-actions.md` ("Job-container private-registry credentials"):
-/// `jobs.<id>.container.credentials.{username,password}` are resolved
-/// host-side (against the `secrets` context, like any other `env:`/`with:`
-/// value) *before* reaching the engine — this type is the already-resolved
-/// pair, never a `${{ }}` expression. Never logged or included in any
-/// `Debug`/error text a step's own output could echo back; callers mask both
-/// fields with the run's `greenlit_engine::execution::Masker` the same way
-/// every other resolved secret is (`AGENTS.md`: "secret values are masked in
-/// all log output").
-#[derive(Clone, PartialEq, Eq)]
-pub struct RegistryAuth {
-    /// The registry username.
-    pub username: String,
-    /// The registry password (or token).
-    pub password: String,
-}
-
-impl std::fmt::Debug for RegistryAuth {
-    /// Deliberately redacted: a `Debug`-formatted `RegistryAuth` must never
-    /// leak the password into a log line, panic message, or test failure
-    /// output that a masker never gets a chance to see.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegistryAuth")
-            .field("username", &self.username)
-            .field("password", &"[redacted]")
-            .finish()
-    }
-}
-
-/// A container image build request.
-///
-/// The `context_tar` is an uncompressed (or gzip/xz) tar of the build context
-/// with the `dockerfile` inside it — the exact bytes Docker's `/build` endpoint
-/// expects. The base image build (a later Phase 2 task group) assembles this
-/// context; the engine only ships it to the daemon.
-#[derive(Debug, Clone)]
-pub struct BuildSpec {
-    /// Tar archive of the build context (must contain `dockerfile`).
-    pub context_tar: Vec<u8>,
-    /// Path of the Dockerfile within the context (usually `Dockerfile`).
-    pub dockerfile: String,
-    /// The `name:tag` to tag the built image with.
-    pub tag: String,
-    /// `ARG` values passed to the build.
-    pub build_args: Vec<(String, String)>,
-}
-
-/// A request to commit a running/stopped container into a new image.
-#[derive(Debug, Clone)]
-pub struct CommitSpec {
-    /// The container id (or name) to commit.
-    pub container: String,
-    /// The image repository to commit into (e.g. `greenlit/myrepo`).
-    pub repo: String,
-    /// The tag to apply (e.g. a content hash).
-    pub tag: String,
-}
-
-/// A host-directory bind into the container.
-///
-/// Greenlit's only sanctioned host bind is the repository checkout, mounted
-/// **read-only** as the overlay lower layer — defense in depth beneath the
-/// container-local overlay isolation (`PHASE-2-execution.md` "Overlay
-/// isolation": "The host repo bind mount is read-only at the Docker level,
-/// independent of the overlay"). A read-write host bind is never constructed for
-/// a workflow container; the `read_only` flag exists so the read-only intent is
-/// explicit at the type level rather than implied by a string suffix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BindMount {
-    /// Absolute host path to bind.
-    pub host_path: String,
-    /// Absolute path the bind appears at inside the container.
-    pub container_path: String,
-    /// Whether the bind is read-only. Greenlit sets this `true` for the repo
-    /// lower layer; the writable overlay lives container-local, not on a host
-    /// bind.
-    pub read_only: bool,
-}
-
-/// A container to create.
-///
-/// Only the fields Phase 2's shell execution and overlay isolation need are
-/// modelled here. The containment-breaking `options` rejection (privileged, host
-/// networking, host PID/IPC, arbitrary host binds, …) is enforced by the
-/// execution task group that builds these specs, before they reach the engine —
-/// the engine faithfully creates what it is given.
-#[derive(Debug, Clone, Default)]
-pub struct ContainerSpec {
-    /// Image reference to run (`name:tag` or id).
-    pub image: String,
-    /// Optional explicit container name.
-    pub name: Option<String>,
-    /// Entrypoint override; empty means the image default.
-    pub entrypoint: Vec<String>,
-    /// Command / args; empty means the image default.
-    pub cmd: Vec<String>,
-    /// Environment variables as `(key, value)` pairs.
-    pub env: Vec<(String, String)>,
-    /// Working directory inside the container.
-    pub working_dir: Option<String>,
-    /// Name of a user-defined network to attach to, if any.
-    pub network: Option<String>,
-    /// Labels to stamp on the container (Greenlit ownership tags).
-    pub labels: Vec<(String, String)>,
-    /// Host binds for the container. Greenlit populates this only with the
-    /// read-only repository lower layer for overlay isolation.
-    pub binds: Vec<BindMount>,
-}
-
-/// A single `exec` inside an already-running container — one workflow step.
-#[derive(Debug, Clone, Default)]
-pub struct ExecSpec {
-    /// The command to run (argv form, already shell-resolved by the caller).
-    pub cmd: Vec<String>,
-    /// Environment variables layered for this step, as `(key, value)`.
-    pub env: Vec<(String, String)>,
-    /// Working directory for this exec.
-    pub working_dir: Option<String>,
-}
-
-/// The terminal result of an [`ContainerEngine::exec`] — its exit code.
-///
-/// Streamed stdout/stderr are delivered incrementally through the
-/// [`ExecOutputSink`] while the command runs; only the exit code remains at the
-/// end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecOutput {
-    /// Process exit code (`0` on success).
-    pub exit_code: i64,
-}
+pub use spec::{
+    BindMount, BuildSpec, CommitSpec, ContainerSpec, ContainerState, ExecOutput, ExecSpec,
+    HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
+    ResourceLimits, RuntimeFingerprint,
+};
 
 /// Receives an exec's stdout/stderr as the daemon streams it.
 ///
@@ -173,10 +51,22 @@ impl ExecOutputSink for SinkNull {
 /// The container-engine port.
 ///
 /// One trait, every backend behind it. Methods map one-to-one onto the Docker
-/// Engine API operations Phase 2 needs. Implementations must never shell out to
-/// the `docker` binary (`AGENTS.md`).
+/// Engine API operations Greenlit needs. Implementations must never shell out
+/// to the `docker` binary (`AGENTS.md`).
 #[async_trait]
 pub trait ContainerEngine: Send + Sync {
+    /// Returns runtime/kernel/snapshotter facts that affect equivalence.
+    async fn runtime_fingerprint(&self) -> Result<RuntimeFingerprint, RuntimeError> {
+        Ok(RuntimeFingerprint {
+            implementation: "unknown".to_string(),
+            version: "unknown".to_string(),
+            kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map_or_else(|_| "unknown".to_string(), |value| value.trim().to_string()),
+            snapshotter: "unknown".to_string(),
+            privileged_infrastructure: vec!["network-policy-sidecar:CAP_NET_ADMIN".to_string()],
+        })
+    }
+
     /// Pull an image by `name:tag` reference so it is present locally,
     /// reporting layer progress to `progress` as the daemon streams it.
     ///
@@ -210,6 +100,14 @@ pub trait ContainerEngine: Send + Sync {
     /// simple "image not found" is reported as `Ok(false)`, not an error.
     async fn image_exists(&self, image: &str) -> Result<bool, RuntimeError>;
 
+    /// Returns the immutable identity and platform of a materialized image.
+    ///
+    /// Backends without an inspect equivalent return `None`; callers that
+    /// require a lock must fail closed rather than inventing an identity.
+    async fn image_identity(&self, _image: &str) -> Result<Option<ImageIdentity>, RuntimeError> {
+        Ok(None)
+    }
+
     /// Build an image from a context tar, tagging it `spec.tag`, reporting
     /// daemon build-output lines to `progress`.
     ///
@@ -228,6 +126,25 @@ pub trait ContainerEngine: Send + Sync {
     ///
     /// Returns [`RuntimeError::Api`] if the commit fails.
     async fn commit_container(&self, spec: &CommitSpec) -> Result<String, RuntimeError>;
+
+    /// Every image carrying `label`, given as `key=value`.
+    ///
+    /// `litci clean` uses this to find Greenlit's own converged images by the
+    /// ownership label it stamps, rather than by pattern-matching tag text
+    /// that a user's own image could imitate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if the listing fails.
+    async fn list_images(&self, label: &str) -> Result<Vec<ImageSummary>, RuntimeError>;
+
+    /// Remove an image by reference or id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if removal fails. An image that is
+    /// already gone is not an error.
+    async fn remove_image(&self, image: &str) -> Result<(), RuntimeError>;
 
     /// Create a container from `spec`, returning its id.
     ///
@@ -256,6 +173,38 @@ pub trait ContainerEngine: Send + Sync {
     ///
     /// Returns [`RuntimeError::Api`] if removal fails.
     async fn remove_container(&self, id: &str) -> Result<(), RuntimeError>;
+
+    /// The parts of a container's state Greenlit acts on, including what its
+    /// health probe last reported.
+    ///
+    /// The service health gate polls this until a service reports
+    /// [`HealthState::Healthy`] or its deadline elapses
+    /// (`PHASE-4-environment.md`: "health-check gating … poll until healthy or
+    /// timeout").
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if the inspection fails.
+    async fn inspect_container(&self, id: &str) -> Result<ContainerState, RuntimeError>;
+
+    /// Create a named volume, if it does not already exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if creation fails.
+    async fn create_volume(&self, name: &str) -> Result<(), RuntimeError>;
+
+    /// Remove a named volume.
+    ///
+    /// Greenlit's run-scoped volumes are removed at the end of the run that
+    /// created them; before this existed they accumulated on the host until an
+    /// operator pruned them by hand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if removal fails. A volume that is
+    /// already gone is not an error.
+    async fn remove_volume(&self, name: &str) -> Result<(), RuntimeError>;
 
     /// Run `spec` as an exec inside container `container`, streaming stdout and
     /// stderr to `sink` as they arrive and returning the exit code.
@@ -292,6 +241,14 @@ pub trait ContainerEngine: Send + Sync {
         id: &str,
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError>;
+
+    /// Read a bounded tail of a container's combined stdout/stderr logs.
+    ///
+    /// Used to retain service diagnostics when health gating fails. Backends
+    /// without log access return an empty buffer.
+    async fn container_logs(&self, _id: &str, _max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        Ok(Vec::new())
+    }
 
     /// Best-effort termination of a still-running exec whose process wrote its
     /// own PID to `pid_file` at start (see `crate::executor::step`'s
@@ -358,6 +315,13 @@ pub trait ContainerEngine: Send + Sync {
     ///
     /// Returns [`RuntimeError::Api`] if creation fails.
     async fn create_network(&self, name: &str) -> Result<String, RuntimeError>;
+
+    /// The gateway address of a network Greenlit created.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::Api`] if the inspection fails.
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError>;
 
     /// Remove a network by name or id.
     ///

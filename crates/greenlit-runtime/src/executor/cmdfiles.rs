@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use greenlit_engine::execution::command_files::{
     Assignment, EnvFileError, accept_step_summary, parse_env_file, parse_path_file,
 };
+use indexmap::IndexMap;
 
 use crate::engine::{ContainerEngine, ExecSpec};
 use crate::error::RuntimeError;
@@ -91,6 +92,64 @@ pub(crate) struct CommandFileEffects {
     pub summary_within_limit: bool,
 }
 
+/// The filename [`write_event_file`] writes under a job's `CMDFILES_BASE`
+/// (`crate::executor::job::CMDFILES_BASE`).
+const EVENT_FILE_NAME: &str = "event.json";
+
+/// The in-container path [`write_event_file`] writes the run's event payload
+/// to, given a job's `CMDFILES_BASE`-rooted directory — the value threaded
+/// into `GITHUB_EVENT_PATH` and the `github.event_path` context property
+/// (`crate::executor::context::job_github_context`), so both stay
+/// byte-for-byte the same string as what this module actually writes.
+pub(crate) fn event_file_path(base: &str) -> String {
+    format!("{base}/{EVENT_FILE_NAME}")
+}
+
+/// Writes `event_json` (already-serialized, real JSON — see
+/// `crate::executor::event_json`) to [`event_file_path`], once per job after
+/// its container is ready, using the same quoted-heredoc technique
+/// [`prepare`] uses for a step's script (no shell expansion of the JSON
+/// body, and no risk of a delimiter collision with event content).
+///
+/// `base` is a job's `CMDFILES_BASE`-rooted directory. For a job that
+/// provisions a Docker-sibling shared volume
+/// (`crate::executor::job::DOCKER_SIBLING_VOLUMES`), that directory is the
+/// shared volume itself, so a Docker action's sibling container sees the
+/// identical file at the identical path — deliberate, not a leak: this file
+/// is read-only, non-secret content (the same widening rationale
+/// [`open_to_sibling`]'s doc comment gives does not even need to apply here,
+/// since nothing about this file is credential-bearing).
+///
+/// # Errors
+///
+/// Returns [`CommandFileError::Prepare`] if the writing exec fails or exits
+/// non-zero.
+pub(crate) async fn write_event_file(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    base: &str,
+    event_json: &str,
+) -> Result<(), CommandFileError> {
+    let delimiter = heredoc_delimiter(event_json);
+    let program = format!(
+        "mkdir -p {base} && cat > {path} <<'{delimiter}'\n{event_json}\n{delimiter}\n",
+        path = event_file_path(base),
+    );
+    let spec = ExecSpec {
+        cmd: vec!["sh".to_string(), "-c".to_string(), program],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code != 0 {
+        return Err(CommandFileError::Prepare {
+            exit_code: output.exit_code,
+        });
+    }
+    Ok(())
+}
+
 /// Create the step directory, truncate the four command files fresh, and write
 /// the step `script`.
 ///
@@ -134,6 +193,81 @@ pub(crate) async fn prepare(
         });
     }
     Ok(())
+}
+
+/// Widen this step's command files so a *sibling* container can write them.
+///
+/// Every other step kind writes its command files from inside the job
+/// container, as the same user that [`prepare`] created them as. A Docker
+/// action does not: it runs in a second container, as whatever user its own
+/// image declares — frequently not root (`USER node` is a common last line
+/// of an action's Dockerfile). Without this, such an action's very first
+/// `>> "$GITHUB_OUTPUT"` fails with a permission error that has nothing to
+/// do with the workflow.
+///
+/// The widened files sit on a run-scoped named volume that only this run's
+/// own containers mount, and are removed with it
+/// (`crate::executor::actions::docker_action` module docs), so this is a
+/// per-step relaxation inside an already-isolated boundary rather than a
+/// widening of anything the host can see.
+///
+/// # Errors
+///
+/// Returns [`CommandFileError`] if the exec fails or exits non-zero.
+pub(crate) async fn open_to_sibling(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    paths: &CommandFilePaths,
+) -> Result<(), CommandFileError> {
+    let program = format!(
+        "chmod 0777 {dir} && chmod 0666 {env} {output} {path} {summary}",
+        dir = paths.dir,
+        env = paths.env,
+        output = paths.output,
+        path = paths.path,
+        summary = paths.summary,
+    );
+    let spec = ExecSpec {
+        cmd: vec!["sh".to_string(), "-c".to_string(), program],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code != 0 {
+        return Err(CommandFileError::Prepare {
+            exit_code: output.exit_code,
+        });
+    }
+    Ok(())
+}
+
+/// Fold a step's collected effects into the job's live state, returning the
+/// step's own `outputs` map.
+///
+/// `GITHUB_ENV` assignments override the job's accumulation in file order;
+/// `GITHUB_PATH` additions are prepended ahead of everything already there
+/// (highest priority first, which is why this is a prepend and not a push).
+/// Every step kind that has command files applies them identically — this is
+/// that one rule, in one place.
+pub(crate) fn apply_effects(
+    effects: &CommandFileEffects,
+    accumulated: &mut IndexMap<String, String>,
+    path_additions: &mut Vec<String>,
+) -> IndexMap<String, String> {
+    for assignment in &effects.env {
+        accumulated.insert(assignment.name.clone(), assignment.value.clone());
+    }
+    if !effects.path_additions.is_empty() {
+        let mut merged = effects.path_additions.clone();
+        merged.append(path_additions);
+        *path_additions = merged;
+    }
+    effects
+        .outputs
+        .iter()
+        .map(|assignment| (assignment.name.clone(), assignment.value.clone()))
+        .collect()
 }
 
 /// Read and parse a step's four command files after it ran.
@@ -214,5 +348,13 @@ mod tests {
         let script = "line\nGREENLIT_SCRIPT_EOF_0\nmore";
         let delimiter = heredoc_delimiter(script);
         assert!(!script.lines().any(|line| line == delimiter));
+    }
+
+    #[test]
+    fn event_file_path_is_rooted_under_the_given_base() {
+        assert_eq!(
+            event_file_path("/greenlit/cmdfiles"),
+            "/greenlit/cmdfiles/event.json"
+        );
     }
 }

@@ -6,7 +6,7 @@
 //! [`super::super::job::boot_container`] rather than lazily, step by step,
 //! the way `run:` steps are handled.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
@@ -144,6 +144,10 @@ pub(crate) struct JobActionPlan {
     pub needs_node20: bool,
     /// Whether any resolved action needs the pinned Node 24 runtime.
     pub needs_node24: bool,
+    /// Every repository action reference mapped to its resolved commit.
+    pub identities: BTreeMap<String, String>,
+    /// Static registry images required by Docker actions at any nesting depth.
+    pub container_images: std::collections::BTreeSet<String>,
 }
 
 /// Accumulates the aggregate results (binds, flags) while [`resolve_uses`]
@@ -162,6 +166,8 @@ struct Collector {
     needs_docker_sibling: bool,
     needs_node20: bool,
     needs_node24: bool,
+    identities: BTreeMap<String, String>,
+    container_images: std::collections::BTreeSet<String>,
 }
 
 /// Resolves every `uses:` step in `steps` (recursing into composites),
@@ -185,11 +191,18 @@ pub(crate) async fn resolve_job_actions(
     let mut collector = Collector::default();
     let mut per_step = Vec::with_capacity(steps.len());
     for step in steps {
-        let resolved = match &step.kind {
-            StepKind::Run { .. } => None,
-            StepKind::Uses {
-                reference, span, ..
-            } => Some(resolve_uses(reference, span, 0, &env, &mut collector).await?),
+        let statically_skipped = step.condition.as_ref().is_some_and(|condition| {
+            matches!(condition.eval, greenlit_engine::PlannedCond::Static(false))
+        });
+        let resolved = if statically_skipped {
+            None
+        } else {
+            match &step.kind {
+                StepKind::Run { .. } => None,
+                StepKind::Uses {
+                    reference, span, ..
+                } => Some(resolve_uses(reference, span, 0, &env, &mut collector).await?),
+            }
         };
         per_step.push(resolved);
     }
@@ -199,6 +212,8 @@ pub(crate) async fn resolve_job_actions(
         needs_docker_sibling: collector.needs_docker_sibling,
         needs_node20: collector.needs_node20,
         needs_node24: collector.needs_node24,
+        identities: collector.identities,
+        container_images: collector.container_images,
     })
 }
 
@@ -249,6 +264,7 @@ fn resolve_uses<'a>(
         match parsed {
             ActionRef::Docker { image } => {
                 collector.needs_docker_sibling = true;
+                collector.container_images.insert(image.clone());
                 Ok(ResolvedUses::Docker(ResolvedDocker {
                     source: DockerImageSource::Pull { image },
                     inputs: IndexMap::new(),
@@ -295,6 +311,16 @@ fn resolve_uses<'a>(
                 git_ref,
             }) => {
                 if owner == "actions" && repo == "checkout" {
+                    let sha = resolve_ref(env.config.resolver.as_ref(), &owner, &repo, &git_ref)
+                        .await
+                        .map_err(|source| ExecError::ActionResolve {
+                            reference: reference.to_string(),
+                            span: span.clone(),
+                            source: Box::new(source),
+                        })?;
+                    collector
+                        .identities
+                        .insert(reference.to_string(), sha.as_str().to_string());
                     return Ok(ResolvedUses::Checkout);
                 }
                 let sha = resolve_ref(env.config.resolver.as_ref(), &owner, &repo, &git_ref)
@@ -304,6 +330,9 @@ fn resolve_uses<'a>(
                         span: span.clone(),
                         source: Box::new(source),
                     })?;
+                collector
+                    .identities
+                    .insert(reference.to_string(), sha.as_str().to_string());
                 let (host_dir, _outcome) = env
                     .config
                     .store
@@ -400,9 +429,21 @@ async fn dispatch_manifest(
         Runs::Docker(docker_runs) => {
             collector.needs_docker_sibling = true;
             let source = match docker_runs.image.strip_prefix("docker://") {
-                Some(image) => DockerImageSource::Pull {
-                    image: image.to_string(),
-                },
+                Some(image) => {
+                    if image.contains("${{") {
+                        return Err(ExecError::Infrastructure {
+                            message: format!(
+                                "Docker action '{reference}' has a runtime-dependent registry image"
+                            ),
+                            fix: "pin the action to a Dockerfile or a statically resolvable docker:// image"
+                                .to_string(),
+                        });
+                    }
+                    collector.container_images.insert(image.to_string());
+                    DockerImageSource::Pull {
+                        image: image.to_string(),
+                    }
+                }
                 None => DockerImageSource::Build {
                     host_action_dir,
                     dockerfile: docker_runs.image,
@@ -624,10 +665,11 @@ mod tests {
             .expect("docker:// needs no fetch at all");
         assert!(plan.needs_docker_sibling);
         assert!(matches!(plan.per_step[0], Some(ResolvedUses::Docker(_))));
+        assert!(plan.container_images.contains("alpine:3.19"));
     }
 
     #[tokio::test]
-    async fn actions_checkout_is_special_cased_without_touching_the_resolver_or_fetcher() {
+    async fn actions_checkout_locks_the_ref_without_fetching_action_source() {
         let store_root = tempfile::tempdir().unwrap();
         let resolver = Arc::new(CountingResolver {
             calls: AtomicUsize::new(0),
@@ -646,10 +688,14 @@ mod tests {
 
         let plan = resolve_job_actions(&steps, &config, repo_host_path.path(), "/ws")
             .await
-            .expect("actions/checkout resolves without any network call");
+            .expect("actions/checkout ref resolves without fetching its source");
         assert!(matches!(plan.per_step[0], Some(ResolvedUses::Checkout)));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            plan.identities.get("actions/checkout@v4"),
+            Some(&"c".repeat(40))
+        );
     }
 
     #[tokio::test]

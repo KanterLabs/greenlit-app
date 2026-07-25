@@ -21,7 +21,7 @@
 
 use greenlit_actions::ActionRef;
 use greenlit_engine::plan::{StepKind, StepPlan};
-use greenlit_engine::{Condition, ExecutionPlan, PlannedCond};
+use greenlit_engine::{Condition, Evaluation, ExecutionPlan, PlannedCond};
 
 use crate::executor::ExecError;
 
@@ -45,6 +45,75 @@ pub fn reject_uses_steps(plan: &ExecutionPlan) -> Result<(), ExecError> {
                 continue;
             }
             scan_steps(&leg.steps)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects checkout inputs that would make hermetic execution discover source
+/// identity after the immutable run lock has been finalized.
+///
+/// GitHub's checkout action defaults to the current repository. Greenlit
+/// satisfies that case from the frozen source snapshot. A different
+/// repository performs a network fetch, while a deferred repository input is
+/// not knowable at lock time; both are late mutable inputs and therefore fail
+/// closed in hermetic mode.
+///
+/// # Errors
+///
+/// Returns [`ExecError::HermeticLateInput`] for the first affected checkout.
+pub fn reject_hermetic_late_inputs(
+    plan: &ExecutionPlan,
+    current_repository: &str,
+) -> Result<(), ExecError> {
+    for job in &plan.jobs {
+        if job.skip.is_some() {
+            continue;
+        }
+        scan_hermetic_steps(&job.steps, current_repository)?;
+        for leg in &job.legs {
+            if leg.skip.is_some() {
+                continue;
+            }
+            scan_hermetic_steps(&leg.steps, current_repository)?;
+        }
+    }
+    Ok(())
+}
+
+fn scan_hermetic_steps(steps: &[StepPlan], current_repository: &str) -> Result<(), ExecError> {
+    for step in steps {
+        let StepKind::Uses {
+            reference,
+            span,
+            with,
+        } = &step.kind
+        else {
+            continue;
+        };
+        let Ok(ActionRef::Repository(remote)) = ActionRef::parse(reference) else {
+            continue;
+        };
+        if remote.owner != "actions" || remote.repo != "checkout" {
+            continue;
+        }
+        let Some(repository) = with.get("repository") else {
+            continue;
+        };
+        match &repository.evaluation {
+            Evaluation::Static(value) if value.is_empty() || value == current_repository => {}
+            Evaluation::Static(value) => {
+                return Err(ExecError::HermeticLateInput {
+                    input: format!("repository={value}"),
+                    span: span.clone(),
+                });
+            }
+            Evaluation::Deferred(_) => {
+                return Err(ExecError::HermeticLateInput {
+                    input: format!("repository={}", repository.source),
+                    span: span.clone(),
+                });
+            }
         }
     }
     Ok(())
@@ -134,5 +203,20 @@ mod tests {
             "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - id: first\n        run: echo hi\n      - if: steps.first.outcome == 'success'\n        uses: not-a-valid-reference\n",
         );
         reject_uses_steps(&plan).expect("a deferred condition may resolve false at runtime");
+    }
+
+    #[test]
+    fn hermetic_preflight_accepts_only_the_frozen_current_checkout() {
+        let self_checkout = planned(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: owner/project\n",
+        );
+        reject_hermetic_late_inputs(&self_checkout, "owner/project")
+            .expect("the frozen current repository has a locked identity");
+
+        let other_checkout = planned(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          repository: owner/other\n",
+        );
+        let error = reject_hermetic_late_inputs(&other_checkout, "owner/project").unwrap_err();
+        assert!(matches!(error, ExecError::HermeticLateInput { .. }));
     }
 }

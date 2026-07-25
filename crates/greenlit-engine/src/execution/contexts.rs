@@ -100,10 +100,9 @@ pub fn build_needs_context(records: &[NeedRecord]) -> Value {
 /// outputs; the value from the last leg to write a given key wins, so a
 /// later-completing leg overwrites earlier legs for shared keys.
 ///
-/// v0 runs jobs (and thus matrix legs) sequentially in DAG order, so "last"
-/// is the last leg in iteration order. This is documented/observed behavior:
-/// matrix jobs share one downstream `needs` entry and clobber each other's
-/// outputs.
+/// The caller supplies legs in completion order, so "last" is the last leg
+/// that completed. This is documented/observed behavior: matrix jobs share
+/// one downstream `needs` entry and clobber each other's outputs.
 /// <https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#needs-context>
 pub fn merge_matrix_outputs<'a, I>(legs: I) -> IndexMap<String, String>
 where

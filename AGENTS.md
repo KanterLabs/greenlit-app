@@ -23,7 +23,7 @@ These names are final for v0. There is no legacy command or data-path compatibil
 1. `AGENTS.md` — this file: working rules, stub discipline, quality bar, metrics rules, status tables.
 2. `greenlit-v0-spec.md` — the product: principles, scope, security model, CLI, phase summaries.
 3. `TESTING.md` — the four test classes, the banned list, the internal CI pipeline.
-4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-6-parity-launch.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time.
+4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-10-confirmation.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time. Phases 1–4 record the original executor foundation; Phases 5–10 replace its environment and execution architecture with the evidence-first design in the v0 spec.
 
 `README.md` is the repository's public front door, not a governance document: it describes what ships, and the documents above remain authoritative when they disagree.
 
@@ -33,7 +33,7 @@ Precedence on conflict: phase file over spec for implementation detail; spec ove
 
 - **Head agent:** reads all documents once for orientation, then owns sequencing and enforcement — activates one phase at a time, delegates it, verifies exit criteria by *running* the verification commands, maintains the Phase status and Stub registry tables, and writes each phase summary. Never implements ahead of the active phase.
 - **Worker agents:** receive exactly four documents — this file, the spec, TESTING.md, and the active phase file — and implement only that phase.
-- **Owner (human):** supplies the Owner-provided inputs below on their listed schedule and performs one cumulative review after Phase 5. Phases 1–4 advance automatically after their mechanical completion gates pass; Phase 6 activates only after the post-Phase-5 owner approval.
+- **Owner (human):** supplies the Owner-provided inputs below on their listed schedule. The owner approved the evidence-first v0 replacement and uninterrupted progression through Phases 5–10 on 2026-07-25. Public publication and launch remain separately authorized actions.
 
 ## Owner-provided inputs
 
@@ -46,7 +46,7 @@ Agents must request these from the owner at the listed point and stop rather tha
 | Dashboard deploy target: host, path, SSH access | Phase 6 |
 | crates.io token + repo release permissions | Phase 6 |
 | Explicit authorization and timing for public launch posts | End of Phase 6 |
-| Cumulative Phases 1–5 summary review/approval | End of Phase 5, before Phase 6 activates |
+| Explicit authorization for public runner-image/package publication | End of Phase 10 |
 
 ## First actions
 
@@ -60,7 +60,7 @@ The crate tree below is the target layout, not a requirement to create future-ph
 
 1. Read this file, the spec, `TESTING.md`, and the **current phase file only**. The head agent's one-time orientation read of every phase is the sole exception. Do not read ahead or implement anything from a later phase.
 2. Work strictly within the current phase's scope. If a task requires something from a later phase, do not build it early — and do not fake it silently. Follow the **Stub discipline** below; it is the only permitted form of deferral.
-3. A phase is complete only when every item in its **Exit criteria** passes via the listed verification commands and the complete cumulative pipeline in TESTING.md passes. Then update the status table and write the phase summary. Phases 1–4 activate the next phase immediately; Phase 5 stops for the cumulative owner review before Phase 6 activates.
+3. A phase is complete only when every item in its **Exit criteria** passes via the listed verification commands and the complete cumulative pipeline in TESTING.md passes. Then update the status table and write the phase summary. The next phase activates immediately through Phase 10; only external publication requires a separate owner authorization.
 4. Never mark a criterion passed without running its verification.
 5. If the spec and a phase file conflict, the phase file wins for implementation detail; the spec wins for product behavior. Flag the conflict in your summary.
 
@@ -87,9 +87,13 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 1 — Engine core | `docs/PHASE-1-engine-core.md` | completed |
 | 2 — Execution | `docs/PHASE-2-execution.md` | completed |
 | 3 — Actions | `docs/PHASE-3-actions.md` | completed |
-| 4 — Environment | `docs/PHASE-4-environment.md` | not started |
-| 5 — Speed | `docs/PHASE-5-speed.md` | not started |
-| 6 — Parity & launch | `docs/PHASE-6-parity-launch.md` | not started |
+| 4 — Environment | `docs/PHASE-4-environment.md` | completed |
+| 5 — Resolution evidence | `docs/PHASE-5-speed.md` | completed |
+| 6 — Verified content | `docs/PHASE-6-parity-launch.md` | completed |
+| 7 — Fresh execution | `docs/PHASE-7-fresh-execution.md` | completed |
+| 8 — Daemon & recovery | `docs/PHASE-8-daemon-recovery.md` | completed |
+| 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | completed |
+| 10 — Confirmation | `docs/PHASE-10-confirmation.md` | completed |
 
 ## Target workspace layout
 
@@ -116,7 +120,8 @@ Phase 1 creates `greenlit-app`, `greenlit-workflow`, `greenlit-expr`, `greenlit-
 - **Security:** repo is mounted read-only with a throwaway overlay upper layer; the host Docker socket is never mounted into any workflow container; workflow containers cannot reach the host LAN; secret values are masked in all log output. These are not configurable off.
 - **Host filesystem evaluation:** `hashFiles` never reads outside its supplied workspace root or opens special filesystem nodes; directory enumeration state is proportional to traversal depth, the exact canonical-directory alias registry has fixed entry and retained-path-byte ceilings, symbolic-link alias graphs stay bounded, and evaluation returns at the runner-compatible fixed deadline, with abandoned workers held within a fixed live-worker bound (see ARCHITECTURE.md known issues).
 - **UX:** every error maps to a state plus the one action that fixes it. No raw stack traces, no "cannot connect to Docker daemon".
-- **Performance budgets** (enforced from Phase 5): < 2s from `litci run` to first step executing; < 30s warm re-run of a typical test workflow.
+- **Performance budgets** (enforced at Phase 10): < 2s from `litci run` to first step executing on the warm native-Linux profile; < 30s warm re-run of a typical test workflow. Earlier replacement phases record regressions without taking semantic shortcuts to meet them.
+- **Offline replay:** `litci run --offline` performs no Greenlit-controlled network access. It uses only exact, previously verified identities and names the first missing identity without substituting another version.
 - v0 hosts are Linux x86_64. All engine access goes through the `ContainerEngine` trait in `greenlit-runtime` so other platforms and architectures remain ports.
 
 ## Quality bar
@@ -167,4 +172,4 @@ Cleanliness is enforced mechanically, not aspirationally:
 
 ## Definition of done (per phase)
 
-Code + tests + the complete TESTING.md pipeline passing + status table updated + `tools/check-stubs` clean for the active and all earlier phases + a short summary listing: what was built, deviations from the phase file, new dependencies, tests added/deleted, stubs created (with registry rows), and stubs realized (with commits). Phases 1–4 transition immediately after this mechanical gate; Phase 5 additionally requires the cumulative owner approval before Phase 6 begins.
+Code + tests + the complete TESTING.md pipeline passing + status table updated + `tools/check-stubs` clean for the active and all earlier phases + a short summary listing: what was built, deviations from the phase file, new dependencies, tests added/deleted, stubs created (with registry rows), and stubs realized (with commits). Phases transition immediately through Phase 10; publication remains outside the phase-completion gate.

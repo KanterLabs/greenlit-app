@@ -21,6 +21,9 @@ path = "src/main.rs"
 # embedding contract in `src/lib.rs`).
 libc = "0.2.187"
 thiserror = "2.0.19"
+# Safe FICLONE wrapper for reflink-first workspace materialization. This is
+# already pinned by the workspace and keeps ioctl unsafety out of this module.
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 # Status-file and copy-progress tests write into isolated temp directories.

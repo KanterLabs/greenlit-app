@@ -10,7 +10,7 @@ use crate::parse::util::{
     Entries, as_mapping, find, find_pair, key_text, parse_defaults, raw_string,
     reject_unknown_keys, require, scalar_or_expr_map, string_list,
 };
-use crate::parse::workflow::parse_permissions;
+use crate::parse::workflow::{parse_concurrency, parse_permissions};
 use crate::span::Spanned;
 use crate::yaml::raw::RawNode;
 
@@ -145,10 +145,9 @@ fn parse_job(key: &Spanned<RawNode>, value: &Spanned<RawNode>) -> Result<Job, Pa
         name: "environment",
         location: k.span.clone(),
     });
-    let concurrency = find_pair(entries, "concurrency").map(|(k, _)| UnsupportedConstruct {
-        name: "concurrency",
-        location: k.span.clone(),
-    });
+    let concurrency = find(entries, "concurrency")
+        .map(parse_concurrency)
+        .transpose()?;
 
     Ok(Job {
         span: value.span.clone(),

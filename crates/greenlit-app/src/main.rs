@@ -2,18 +2,25 @@
 
 //! `litci` -- the Greenlit CLI binary (`greenlit-v0-spec.md`).
 //!
-//! `plan`/`stats` landed in Phase 1, `run`/`setup` in Phase 2, and `auth` in
-//! Phase 3 (`PHASE-3-actions.md` Auth); `clean` remains unimplemented.
+//! `plan`/`stats` landed in Phase 1, `run`/`setup` in Phase 2, `auth` in
+//! Phase 3 (`PHASE-3-actions.md` Auth), and `clean` in Phase 4.
 
 mod auth;
 mod auth_cmd;
+mod clean_cmd;
 mod cli;
+mod daemon;
+mod doctor_cmd;
 mod dotenv_format;
 mod errors;
 mod gh_names;
+mod github_confirmation;
+mod inspect_cmd;
 mod plan_cmd;
 mod render;
 mod run_cmd;
+mod run_evidence;
+mod runtime_token;
 mod secrets;
 mod setup_cmd;
 mod stats_cmd;
@@ -37,6 +44,12 @@ fn main() -> ExitCode {
         cli::Command::Setup(args) => setup_cmd::run(args),
         cli::Command::Auth(args) => auth_cmd::run(args),
         cli::Command::Stats => stats_cmd::run().map(|()| ExitCode::SUCCESS),
+        cli::Command::Inspect(args) => inspect_cmd::run(args).map(|()| ExitCode::SUCCESS),
+        cli::Command::Export(args) => github_confirmation::export(args).map(|()| ExitCode::SUCCESS),
+        cli::Command::Confirm(args) => github_confirmation::confirm(args),
+        cli::Command::Doctor(args) => doctor_cmd::run(args),
+        cli::Command::Clean(args) => clean_cmd::run(args),
+        cli::Command::Daemon(args) => daemon::command(args),
     };
     match result {
         Ok(code) => code,

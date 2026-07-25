@@ -28,11 +28,12 @@ the real network (the marketplace action and the pinned Node runtime
 bundles are real network fetches — see that test's module doc comment for
 why it is opt-in rather than part of the default `cargo test` path).
 
-Docker actions in this implementation do not receive the
+Docker actions now receive the full
 `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
-command-file protocol (see `ARCHITECTURE.md`'s known-issues log), so the
-Docker action here proves its execution through the shared job workspace
-(a log file under `$GITHUB_WORKSPACE`) rather than through `$GITHUB_OUTPUT`,
-mirroring `crates/greenlit-runtime/tests/actions_docker.rs`.
+command-file protocol (`ARCHITECTURE.md`'s known-issues log records this as
+closed by the action-fidelity wave), so the Docker action here proves its
+execution two ways at once: through the shared job workspace (a log file
+under `$GITHUB_WORKSPACE`) *and* through a `$GITHUB_OUTPUT` value a later
+step consumes, mirroring `crates/greenlit-runtime/tests/actions_docker.rs`.
 
 `litci run` completes this workflow green.

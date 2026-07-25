@@ -140,6 +140,18 @@ impl Sandbox {
         self.run_from_with_env(".", args, extra_env)
     }
 
+    /// Runs with the production daemon default enabled. Ordinary integration
+    /// calls suppress background daemons so isolated temp homes can disappear
+    /// immediately; daemon lifecycle coverage opts back in explicitly here.
+    pub fn run_with_daemon(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+        let mut cmd = self.command_from(Path::new("."), args);
+        cmd.env_remove("LITCI_TEST_DISABLE_DAEMON");
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
+        cmd.output().expect("spawn litci with daemon enabled")
+    }
+
     /// Runs `litci` with raw operating-system environment strings. Linux
     /// permits non-UTF-8 values, so malformed process input needs this path
     /// rather than the ordinary UTF-8 convenience wrapper above.
@@ -225,6 +237,7 @@ impl Sandbox {
             // that wants to simulate an authenticated state pre-seeds
             // `~/.litci/auth.json` directly (`Sandbox::write_home`) instead.
             .env("LITCI_TEST_NO_KEYRING", "1")
+            .env("LITCI_TEST_DISABLE_DAEMON", "1")
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0");

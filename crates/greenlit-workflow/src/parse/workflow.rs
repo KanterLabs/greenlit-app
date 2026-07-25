@@ -1,13 +1,14 @@
 //! The workflow root mapping.
 
 use crate::error::ParseError;
-use crate::model::value::UnsupportedConstruct;
-use crate::model::workflow::{PermissionLevel, PermissionLevelAll, Permissions, Workflow};
+use crate::model::workflow::{
+    Concurrency, PermissionLevel, PermissionLevelAll, Permissions, Workflow,
+};
 use crate::parse::job::parse_jobs;
 use crate::parse::trigger::parse_on;
 use crate::parse::util::{
-    as_mapping, find, find_pair, key_text, parse_defaults, raw_string, reject_unknown_keys,
-    require, scalar_or_expr_map,
+    as_mapping, find, key_text, parse_defaults, raw_string, reject_unknown_keys, require,
+    scalar_or_expr_map, spanned_scalar_or_expr,
 };
 use crate::span::Spanned;
 use crate::yaml::raw::{RawNode, parse_raw};
@@ -148,10 +149,9 @@ pub fn parse_workflow(
             ))
         })
         .transpose()?;
-    let concurrency = find_pair(entries, "concurrency").map(|(k, _)| UnsupportedConstruct {
-        name: "concurrency",
-        location: k.span.clone(),
-    });
+    let concurrency = find(entries, "concurrency")
+        .map(parse_concurrency)
+        .transpose()?;
     let jobs_node = require(entries, "jobs", &root.span, "workflow")?;
     let jobs = parse_jobs(jobs_node)?;
 
@@ -168,6 +168,38 @@ pub fn parse_workflow(
     };
     crate::validate::validate_workflow(&workflow)?;
     Ok(workflow)
+}
+
+pub(crate) fn parse_concurrency(
+    node: &Spanned<RawNode>,
+) -> Result<Spanned<Concurrency>, ParseError> {
+    let concurrency = match &node.value {
+        RawNode::Scalar(_) => Concurrency {
+            group: raw_string(node, "concurrency")?,
+            cancel_in_progress: None,
+        },
+        RawNode::Mapping(entries) => {
+            reject_unknown_keys(entries, &["group", "cancel-in-progress"], "concurrency")?;
+            let group = raw_string(
+                require(entries, "group", &node.span, "concurrency")?,
+                "concurrency.group",
+            )?;
+            let cancel_in_progress = find(entries, "cancel-in-progress")
+                .map(|value| spanned_scalar_or_expr(value, "concurrency.cancel-in-progress"))
+                .transpose()?;
+            Concurrency {
+                group,
+                cancel_in_progress,
+            }
+        }
+        RawNode::Sequence(_) => {
+            return Err(ParseError::Schema {
+                span: node.span.clone(),
+                message: "concurrency must be a string or mapping".to_string(),
+            });
+        }
+    };
+    Ok(Spanned::new(concurrency, node.span.clone()))
 }
 
 /// [`parse_workflow`], reading `path` from disk first and using it

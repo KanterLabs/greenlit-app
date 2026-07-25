@@ -1,8 +1,8 @@
 # ARCHITECTURE.md — Greenlit
 
-This document records the architecture implemented in Phase 1. It is updated
-with each phase summary; later-phase crates and runtime paths are intentionally
-absent until they exist.
+This document records the architecture as implemented. It is updated with
+each phase summary; crates and runtime paths appear as the phase that builds
+them lands.
 
 ## Crate boundaries
 
@@ -26,6 +26,10 @@ greenlit-metrics  -> (no Greenlit crates)
 | `greenlit-expr` | GitHub expression lexing, parsing, evaluation, coercion, contexts, status functions, JSON functions, and `hashFiles`. Filesystem access for `hashFiles` is injected behind `HashFilesFs`; `RealFs` is the local production implementation. |
 | `greenlit-engine` | The pure planning boundary over a typed workflow, synthetic event, and resolved local contexts. It builds the `needs` graph, detects cycles, expands matrices, validates runner labels, partially evaluates conditions/templates/outputs, preserves runtime-deferred values, and emits the serializable `ExecutionPlan`. Local Git metadata collection and synthetic event construction also live here. |
 | `greenlit-metrics` | Local invocation timing and persistence. It opens stage-labelled `tracing` spans, aggregates stage durations, appends schema-versioned NDJSON records, and reads those records for reporting. It has no network dependency or transmission path. |
+| `greenlit-runtime` (Phase 2) | The `ContainerEngine` port and its bollard backend, three-state engine detection, base images, workspace isolation, `--write-back`, and the executor that drives a plan. From Phase 4 it also owns the per-job network, service containers, the network policy, Docker-in-Docker, and lazy provisioning. |
+| `greenlit-actions` (Phase 3) | `uses:` parsing, ref→SHA resolution, the content-addressed action store, and `action.yml` parsing. |
+| `greenlit-store` (Phase 4; verified-content extension in Phase 6) | The local `actions/cache` and artifact stores, the axum shim that serves their wire protocols to unmodified actions, and the machine-wide SHA-256 CAS. CAS objects publish atomically after verification; cross-process in-flight files single-flight materialization; corrupt objects move to quarantine; a SQLite-WAL catalog records objects, trees, aliases, references, downloads, leases, runs, and resources. It performs no I/O outside its own root and opens no socket of its own — `greenlit-runtime` binds the shim onto the job network. |
+| `greenlit-init` (Phase 2) | The private container-only entrypoint helper that stacks the overlay and `exec`s the job command. Never a host command; embedded and extracted only into the base-image build context. |
 
 No Phase 1 crate starts containers, accesses a container engine, fetches an
 action, contacts GitHub, resolves remote variables, or prompts for secrets.
@@ -151,10 +155,317 @@ path before it reaches a host resource:
   NDJSON record is bounded to 8 MiB. No Phase 1 dependency provides network or
   telemetry transport.
 
+## Job environment dataflow
+
+Everything around one job hangs off its own bridge network, and the ordering
+below is load-bearing rather than incidental. Phase 6 removed Phase 4's
+runtime apt convergence and command shims: a runner now starts only from an
+official GitHub ARC image pinned to its Linux amd64 platform-manifest digest.
+The support report explicitly calls this a self-hosted profile rather than a
+complete GitHub-hosted runner image.
+
+```text
+                    create job network
+                            |
+              inspect it for the bridge gateway
+                            |
+          bind the shim on that gateway (cache + artifacts)
+                            |
+     start services on the bridge, gated on their health probes
+                            |
+       boot the exact locked runner profile or job container
+                            |
+       apply the network policy *before* any workflow code runs
+                            |
+             seed the image's actual PATH once
+                            |
+                        run the steps
+                            |
+   tear down container, then DinD, then services, then the network
+```
+
+A container reaches the host only at the bridge gateway — `127.0.0.1` inside
+a container is the container — which is why the shim binds there and why the
+gateway address has to be discovered rather than assumed. The policy is
+applied before readiness because a container that has executed even one step
+unrestricted has already had its chance to reach the LAN. Teardown runs in
+reverse because a network holding any attachment cannot be removed.
+
+Runner profiles are fixed in `executor::runner_profile`: Ubuntu 24.04 uses
+the official ARC runner 2.336.0 image and Ubuntu 22.04 uses 2.321.0, each by
+its exact amd64 manifest digest. Registry manifests/configs are verified in
+the machine-wide CAS, Docker materializes only the digest reference, and
+offline replay requires both the CAS metadata and exact daemon image.
+Greenlit's private init helper is injected read-only; the profile is never
+rebuilt or mutated. Legacy `greenlit/converged-*` images are not consulted.
+
+## Phase 5 immutable-resolution dataflow
+
+Execution no longer reads mutable project or registry state after its lock is
+finalized:
+
+```text
+live repository
+      |
+      v
+canonical source snapshot -----> machine-wide SHA-256 CAS
+      |
+      v
+workflow parse + compatibility inventory
+      |
+      v
+resolve and recheck mutable action/container aliases
+      |
+      v
+RunLock + per-job JobLocks
+      |
+      +----> ~/.litci/runs/<run-id>/run-lock.json
+      +----> ~/.litci/runs/<run-id>/support-report.json
+      |
+      v
+fresh job execution from frozen source + locked identities
+      |
+      v
+append-only trace.ndjson + terminal result.json
+```
+
+The RunLock names the frozen source tree, workflow, runner provider and image,
+architecture, runner version, action commits, container digests, toolchain
+artifacts, secret revision digests, and compatibility findings. The engine
+boundary receives immutable container identities; a mutable tag cannot be
+passed to job, service, Docker-action, or internal sidecar creation. Result
+classification keeps execution outcome, compatibility, and assurance
+independent, so a locally successful run with an unsupported construct is
+still blocked from every green classification.
+
+The CAS root is `~/.litci/store/`. Objects are verified before atomic
+publication, corrupt entries are quarantined, and an SQLite-WAL catalog tracks
+objects, trees, aliases, references, downloads, leases, runs, and runtime
+resources. Phase 5 ingests frozen source objects and establishes the package
+download-cache fast path. Phase 6 moves action, Node runtime, runner, and OCI
+content from their legacy stores into this verified boundary.
+
+## Phase 7 fresh-execution dataflow
+
+The executor schedules dependency-ready jobs asynchronously. A run-level
+semaphore bounds total workers, each matrix strategy adds its own
+`max-parallel` semaphore, and case-insensitive concurrency groups serialize
+owners while `cancel-in-progress` first cancels and cleans the prior owner.
+Reports remain in deterministic plan order even though dependency outputs are
+merged in actual completion order, matching GitHub's matrix-output behavior.
+
+Runtime-deferred matrices are materialized only after every `needs` result is
+available. Their axes, include/exclude entries, controls, runner labels,
+conditions, names, steps, and outputs are evaluated against the completed
+dependency context. Exact CLI matrix selection is applied to the concrete
+legs and persists only the selected JobLock.
+
+Every concrete job leg receives a unique resource namespace:
+
+```text
+immutable runner image + frozen source
+                  |
+                  v
+       reflink-first private workspace
+          (bounded copy fallback)
+                  |
+                  v
+  unique writable layer + command-file volume
+                  |
+                  +--> unique bridge + services
+                  +--> Docker-action siblings
+                  +--> optional DinD sidecar
+                  |
+                  v
+         one sequential step stream
+                  |
+                  v
+ cancel/finish --> reverse-order cleanup
+```
+
+Cancellation is a shared token observed around queued permits, immutable
+action/runtime/image preparation, service startup and health waits, container
+boot, and every active step. Cleanup remains uncancelled so a canceled run
+cannot leave a reusable dirty sandbox. CPU, memory, process, and writable-layer
+limits are applied before both job and service containers start. Explicit
+service ports bind to the job bridge gateway, so parallel jobs can request the
+same port without colliding on the host.
+
+Workspace materialization first attempts Linux `FICLONE` per regular file and
+falls back to a streaming copy while enforcing fixed entry and byte ceilings.
+The source is already frozen before this point, so concurrent host edits cannot
+produce a mixed checkout. A completed writable filesystem is never reused;
+warmth comes only from immutable images/CAS content and workflow-declared
+caches.
+
+## Phase 8 daemon and recovery dataflow
+
+The optional daemon is the same `litci` binary speaking a bounded,
+schema-versioned JSON protocol over a mode-0600 Unix socket. Linux peer
+credentials must match the daemon UID. A missing, stale, or incompatible
+daemon is replaced automatically; `--no-daemon` and every daemon failure use
+the same authoritative in-process resolution and execution path.
+
+```text
+repository changes ----> low-priority watcher
+                              |
+                     cancel stale preparation
+                              |
+                 +------------+-------------+
+                 |                          |
+       immutable action prefetch    one-use frozen source
+                 |                     template
+                 v                          |
+        verified shared stores       atomic client claim
+                                            |
+                                  re-hash current source
+                                            |
+                                 match ------+------ mismatch
+                                   |                   |
+                               adopt once       discard + capture
+```
+
+Run transitions and immutable-object references are durable in the CAS
+catalog. Leases heartbeat while a run owns content. Startup recovery first
+marks expired, unterminated runs aborted, then reconciles only engine resources
+whose `greenlit.run` label or exact namespace names a terminal, unleased run.
+Unlabelled resources, active runs, and unrelated managed containers are never
+eligible. Containers are removed before networks and named volumes.
+
+`litci doctor` reports catalog integrity, interrupted runs/downloads, leases,
+and reclaimable bytes without deleting data. `litci clean` uses the same
+reference graph: partial downloads are reclaimed before immutable objects,
+active leases and RunLock pins block deletion, and any catalog inconsistency
+blocks destructive collection.
+
+Repository-local persisted secrets are AES-256-GCM ciphertext in
+`.litci/secrets.vault`; the random 256-bit key exists only at mode 0600 under
+`~/.litci/vault.key`. Legacy plaintext dotenv secrets migrate atomically and
+are removed only after the encrypted vault is durable. Direct, multiline,
+standard/base64url, and percent-encoded variants are registered with the
+streaming masker before output reaches terminal logs, annotations, structured
+results, retained service logs, or errors.
+
+## Phase 9 provider and policy dataflow
+
+Runner preparation is split across backend-neutral `RunnerProvider` and
+`Snapshotter` interfaces. The OCI provider resolves and verifies the exact
+linux/amd64 manifest, config, and layer identities in the machine-wide CAS.
+Every host can pass that identity to the eager Docker snapshotter. Configured
+containerd hosts can instead use the direct tonic gRPC stargz snapshotter; no
+containerd or `ctr` subprocess participates in the product path.
+
+```text
+locked runner digest
+        |
+        v
+verified OCI manifest + layers in CAS
+        |
+        +----------> eager Docker materialization
+        |
+        `----------> direct containerd transfer
+                          |
+                 require eStargz TOC annotations
+                          |
+                 stargz remote snapshot prepare
+                          |
+             first step before all layer bytes arrive
+                          |
+             verified demand read of later content
+```
+
+The lazy path fails closed unless the stargz plugin reports linux/amd64 and
+remote snapshot annotation export. Access prioritization is an image-build
+property: likely files must be ordered into the immutable eStargz artifact
+rather than guessed from a workflow at runtime. Images without eStargz TOC
+annotations use the verified eager path.
+
+`--clean` disables Greenlit's mutable build cache, cache shim, artifact shim,
+and toolcache while retaining digest-verified immutable CAS and
+dependency-download reuse. `--hermetic` implies clean, rejects checkout of
+late mutable content during preflight, and installs a default-reject egress
+policy after the job's loopback, established traffic, internal shim, and
+private service network exceptions. External traffic and privileged
+infrastructure are recorded as evidence and cap assurance.
+
+RunLocks include the runner provider, snapshotter, architecture, kernel,
+container-runtime implementation/version, and privileged-infrastructure
+fingerprint. The executor passes the finalized runner image identity across a
+reserved internal lock boundary, so boot cannot silently fall back to a
+hardcoded runner alias.
+
+Worker concurrency is machine-wide, not merely process-local. Each foreground
+run acquires kernel-backed file-lock slots beneath
+`~/.litci/scheduler/v1/slots`; the kernel releases a crashed process's slots.
+A run may occupy at most one fewer than the machine worker count, preserving a
+slot for competing projects while per-run and matrix limits remain nested
+inside that global bound.
+
+## Phase 10 external-evidence and release boundary
+
+`litci export` reads only a completed clean run and produces a separate
+workflow. It never modifies `.github`, commits, pushes, dispatches, or sends a
+message. The exported workflow pins action commits and container digests,
+assigns deterministic names to unnamed steps, and adds one pinned
+`upload-artifact` evidence job. The evidence template carries a source
+placeholder which the GitHub job replaces with its own `GITHUB_SHA`; this
+avoids a self-referential commit identity while preserving an exact
+two-pass workflow-digest check.
+
+```text
+completed local run
+  RunLock + frozen workflow + ExecutionPlan
+                    |
+                    v
+       separate fully pinned workflow
+                    |
+             user-controlled Git operation
+                    |
+                    v
+     successful GitHub run + evidence ZIP
+                    |
+          read-only GitHub REST import
+                    |
+                    v
+ source/event/workflow/jobs/steps/artifact all match?
+          | no                         | yes
+          v                            v
+ preserve local result       classify from stored evidence
+                                      |
+                         github-confirmed only if the local
+                         run was already hermetic/supported
+```
+
+Confirmation verifies the remote run conclusion, exact source commit, event,
+workflow path and semantic digest, distinct successful job instances, ordered
+successful steps, a unique unexpired artifact, the API-provided archive
+digest, and exact canonical evidence bytes. Duplicate names cannot reuse one
+remote result, and a user job cannot impersonate the reserved evidence job.
+A matching GitHub pass cannot upgrade an unsupported, degraded, non-clean, or
+non-hermetic local result.
+
+The native Linux x86_64 CI path executes 20 unchanged warm runs and enforces
+sandbox p95 below two seconds, workflow p95 below 30 seconds, and zero
+Greenlit-controlled downloads. `tools/release-check` validates the optimized
+binary and packages all publishable workspace crates together so their
+unpublished path dependencies can be checked without publishing them. The
+private `greenlit-init` crate remains excluded. The release workflow requires
+an explicit `publish` input and the protected `release` environment; Phase 10
+does not itself publish any artifact.
+
 ## Known issues log
 
 Entries here describe upstream quirks that the implementation or dependency
 policy actively contains. They are not deferred Greenlit behavior.
+
+- **The pinned official ARC runner images are ordinary gzip OCI images, not
+  eStargz artifacts.** The configured lazy provider therefore correctly uses
+  the eager fallback for those default images. The live provider suite builds
+  a pinned eStargz fixture, proves partial materialization and verified
+  on-demand reads, and compares it with eager execution. Publishing
+  Greenlit-maintained eStargz runner artifacts requires a separately
+  authorized release channel; Greenlit never labels an ordinary gzip image as
+  lazy or infers a smaller substitute.
 
 - **`hashFiles('/…')` documentation differs from hosted-runner behavior.**
   The expressions reference describes `/src/*.js` as a repository-root
@@ -408,12 +719,11 @@ policy actively contains. They are not deferred Greenlit behavior.
   daemon (a `run:` step writes a file, a Docker action reads and appends to
   it, and a later `run:` step reads back both halves). The tradeoff: a job
   with a Docker action cannot use overlay isolation even if it would
-  otherwise qualify, and the run-scoped volume this creates is not cleaned up
-  automatically — `ContainerEngine` has no `remove_volume` operation yet, so
-  these volumes accumulate on the host until an operator prunes them
-  (`docker volume prune`); tracked here rather than silently left
-  undocumented, since automatic cleanup is a reasonable near-term follow-up
-  but was out of this task's scope.
+  otherwise qualify. **Phase 4 closed the cleanup half of this entry**: the
+  port gained `remove_volume`, and the run-scoped volume is now removed after
+  the job container's own teardown (it has to follow, because a volume still
+  bound by a running container cannot be removed). Before that it leaked one
+  volume per run until an operator pruned by hand.
 
 - **`actions/checkout` of the workflow's own repository is satisfied from the
   already-materialized isolated workspace, with no network access; checking
@@ -455,11 +765,19 @@ policy actively contains. They are not deferred Greenlit behavior.
   not attempted this wave. Nested `post` steps are *not* similarly
   simplified: they still push onto the job's shared, reverse-drained
   `PostChain` and so run at job end in the correct overall LIFO position
-  alongside every other step's post action. A Docker action referenced from
-  inside a composite action's nested steps is rejected outright with a clear
-  error rather than attempted, since a nested Docker sibling would need the
-  same shared-workspace volume design as a top-level one but composed inside
-  an already-scoped composite context — deferred rather than guessed at.
+  alongside every other step's post action. Nested `uses:` steps of *every*
+  kind now execute — originally `actions/checkout` and Docker actions nested
+  inside a composite were rejected outright; the action-fidelity wave closed
+  that. Each nested kind dispatches through the same execution module its
+  top-level counterpart does rather than a parallel implementation: a nested
+  checkout runs `crate::executor::actions::checkout` and pushes its
+  credential-cleanup post entry onto the same job-wide `PostChain`, and a
+  nested Docker action runs `crate::executor::actions::docker_action`
+  against the job's shared sibling volumes, which
+  `crate::executor::actions::resolve`'s pre-pass provisions whenever a
+  Docker action exists at *any* nesting depth — so the sibling apparatus is
+  already in place by the time composite recursion reaches it. Both are
+  pinned by `crates/greenlit-runtime/tests/actions_composite.rs`.
 
 - **A manifest's declared input `default:` value is used as a literal
   string, not evaluated as a `${{ }}` expression.** `actions/checkout`'s own
@@ -471,7 +789,25 @@ policy actively contains. They are not deferred Greenlit behavior.
   action relying on a non-literal, expression-valued `default:` would
   observe differently under this implementation (the raw text would be
   passed through, rather than evaluated). Recorded here as a known,
-  narrow fidelity gap rather than left silent.
+  narrow fidelity gap rather than left silent. **Closed by the
+  action-fidelity wave**, for both action kinds that declare inputs at all:
+  `nodejs::input_env` already evaluated a JS action's default (Phase 3);
+  `composite::composite_inputs_value` now does the same for a composite's
+  own declared inputs, evaluating each `default:` as a `${{ }}` template
+  against the *enclosing* scope that resolved the invoking step's `with:` —
+  matching `ActionManifestManager.EvaluateDefaultInput`, which runs against
+  that same invoking step's `IExecutionContext`. A nested composite's
+  defaults get that enclosing scope with full fidelity (the parent
+  composite's own already-built context, threaded straight through); a
+  *top-level* composite step's defaults fall back to a reconstructed
+  context assembled from what this crate's executor actually keeps on hand
+  for it (`composite::fallback_caller_context`) — real `github`/`vars`/
+  `secrets`/`env`/`needs`/`status`, but an empty `steps` context, since
+  nothing threads the job's `StepRecord` history into composite execution
+  today. A top-level composite input default referencing `steps.*` is
+  therefore still a narrower, separately-recorded gap rather than a revived
+  version of this one. Pinned by
+  `crates/greenlit-runtime/tests/actions_composite.rs`.
 
 - **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
   it out of the ordinary secrets chain.** GitHub secret and configuration
@@ -522,7 +858,7 @@ policy actively contains. They are not deferred Greenlit behavior.
   reproduces that: one `sh -c 'printf %s "$PATH"'` exec against the freshly
   booted (and ready) job container, seeded into `base_env` before the step
   loop starts — container-agnostic, so it works identically for the
-  convergent base image and an arbitrary user-specified
+  locked runner profile and an arbitrary user-specified
   `jobs.<id>.container`. `crates/greenlit-runtime/tests/actions_composite.rs`
   pins the regression (a `run:` step's own `GITHUB_PATH` addition must not
   break a later composite step's access to system binaries).
@@ -561,19 +897,95 @@ policy actively contains. They are not deferred Greenlit behavior.
   uses) but never creates or mounts the four command files, so a
   marketplace Docker action that writes to `$GITHUB_OUTPUT`/`$GITHUB_ENV`
   either silently loses that write or (if it does not tolerate an unset
-  variable) fails outright. `PHASE-3-actions.md`'s own "Action execution"
-  bullet for Docker actions ("pass args/entrypoint/env per spec; run as a
-  sibling container") does not name the workflow-command protocol the way
-  its JavaScript-action bullet explicitly does ("Env protocol: `INPUT_<NAME>`,
-  workflow command files, `STATE_` save-state..."), so this is treated as a
-  scoped, documented gap rather than an in-scope defect this wave fixed
-  silently — `fixtures/actions-ci`'s own Docker action deliberately proves
-  its execution through the shared workspace (a log file under
-  `$GITHUB_WORKSPACE`) instead, the same way
-  `crates/greenlit-runtime/tests/actions_docker.rs` already does. Closing
-  this gap would need the command files to live inside the job's shared
-  workspace volume (already the mechanism a Docker-sibling job uses for its
-  workspace — see the entry above) rather than the job container's own
-  ordinary, sibling-invisible temp storage, so a fix can reuse
-  `crate::executor::cmdfiles` unchanged once that plumbing exists; left for
-  a later wave.
+  variable) fails outright. **Closed by the action-fidelity wave.** The
+  Phase-3 entry here predicted the fix would put the command files inside
+  the job's shared workspace volume; the wave deliberately did not — command
+  files under `GITHUB_WORKSPACE` would be visible to `git status`, matched
+  by a `hashFiles('**')` pattern, and swept into an `upload-artifact` or
+  `actions/cache` archive, and the workspace has to stay exactly what the
+  workflow checked out. Instead a *second* run-scoped named volume is
+  mounted at the same `CMDFILES_BASE` path in the job container and in
+  every sibling, so `crate::executor::cmdfiles` is reused unchanged (the
+  paths it materializes through the job container resolve to the same bytes
+  in the sibling) — the same shape as GitHub's own runner, which mounts its
+  `_runner_file_commands` directory into every container action.
+  `cmdfiles::open_to_sibling` then widens the step's files (`0777` dir,
+  `0666` files) so an action image running as a non-root `USER` can append;
+  the widening is scoped to a run-private volume only this run's containers
+  mount. Effects are collected even when the action exits non-zero, matching
+  GitHub's handling of a failed step's files, and every step kind now folds
+  them through one function, `cmdfiles::apply_effects` — closing, in
+  passing, a latent drop where a *nested* JS action's `GITHUB_ENV`/
+  `GITHUB_PATH` writes were discarded instead of accumulated. Pinned by
+  `crates/greenlit-runtime/tests/actions_docker.rs` with a `USER
+  65534:65534` Dockerfile action writing all four files.
+
+- **The network policy is enforced inside each container's own namespace, not
+  by host `DOCKER-USER` rules.** `PHASE-4-environment.md` names the host
+  chain, but Docker exposes no API for it, so honoring that literally would
+  mean shelling out to `iptables` under `sudo` on every `litci run` — against
+  the spec's "zero prerequisites" and the never-shell-out rule. Greenlit
+  instead starts a short-lived sidecar in the workflow container's own network
+  namespace with `CAP_NET_ADMIN`, installs the rules there, and lets it exit;
+  the rules persist for the namespace's life and the capability does not. This
+  is stronger than the host chain rather than merely equivalent — the workflow
+  container never holds `NET_ADMIN`, so code inside it cannot remove the rules
+  binding it, verified by a root-in-container `iptables -F` failing with
+  "Permission denied" while the drop stayed in force.
+
+- **A Docker action's sibling container joins the job container's network
+  namespace rather than getting a network of its own.** The sibling
+  originally ran on Docker's default bridge, which could not resolve a
+  `services:` container by hostname and, worse, sat entirely outside the
+  network policy above — that policy is installed into a specific namespace
+  and a default-bridge sibling was never the namespace it was pointed at.
+  The fix reuses the netguard sidecar's own mechanism: the sibling's spec now
+  sets `network` to `container:<job-container-id>`, the same
+  `--network container:<id>` form netguard uses to bind its rules into a
+  namespace. Joining that namespace, rather than attaching to the job's
+  bridge network as a second member, buys two things from one line: the
+  sibling is guarded from its first instruction (the rules were installed
+  into that namespace before the sibling ever started, so there is no
+  per-step sidecar run and no race), and it resolves a service's id for free,
+  since Docker's embedded DNS is owned by the network namespace, not by the
+  container. The tradeoff is stated in the module docs and confined to
+  something no workflow can observe: on GitHub's own runner a Docker
+  `uses:` action gets its own IP on the job's network, with its own
+  loopback; here the sibling shares the job container's namespace outright,
+  so `127.0.0.1` inside the action is the job container's loopback rather
+  than one of its own. Every fidelity-relevant behavior — service-id
+  reachability, internet access, and the LAN/metadata block — is identical
+  either way. Pinned by
+  `crates/greenlit-runtime/tests/actions_docker.rs`'s services-and-guard
+  test.
+
+- **Blob URLs authorize themselves; the bearer token does not reach them.**
+  `@azure/storage-blob` treats a signed URL as self-authorizing and sends no
+  `Authorization` header, and `actions/cache` fetches its `archiveLocation`
+  with a bare `HttpClient`. A shim that requires a bearer header on those
+  routes returns 401, which the Azure SDK surfaces as a `RestError` with an
+  **empty** message and which `actions/cache` reports as an ordinary cache
+  miss — two failure modes that both hide the cause. Greenlit therefore does
+  what the real service does and puts a per-run signature in the URL, kept
+  distinct from the bearer token so the token never lands in a URL a client
+  might log (`actions/cache` calls `setSecret` on the download URL for exactly
+  that reason). Evidence: reproducing the upload host-side against
+  `crates/greenlit-store/examples/shim_probe.rs` and printing `error.stack`
+  rather than `error.message`.
+
+- **The artifact twirp client sends snake_case and parses camelCase.** Requests
+  are serialized with `useProtoFieldName: true`; responses are parsed without
+  it, so protobuf-JSON's default lowerCamelCase applies. Because the same call
+  passes `ignoreUnknownFields`, a snake_case *response* is not rejected but
+  silently ignored, leaving the field at its default — an empty
+  `signedUploadUrl` that fails much later and elsewhere. Pinned by
+  `crates/greenlit-store/tests/artifact_shim.rs`.
+
+- **Provisioned apt packages carry no pinned version.** The runner-images
+  toolset manifest lists a package *set* with no versions, so a provisioned
+  apt package lands at whatever the Ubuntu archive currently offers. That is
+  what the hosted runner gets from the same archive, but it is weaker than
+  `PHASE-4-environment.md`'s "at the exact versions listed", which genuinely
+  holds only for tools the manifest versions explicitly. The distinction is
+  preserved in `Recipe::pinned_version` and surfaced in the install log as
+  `distribution default` rather than papered over with an invented number.

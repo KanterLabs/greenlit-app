@@ -11,14 +11,14 @@ use crate::partial_eval::{
     FoldCtx, LocatedEvalError, PartialEvalError, StaticRoots, StepsContextSlots, extend_env_chain,
 };
 use crate::pass_through::{ContainerPlan, EnvValue, plan_container, plan_env_layer};
-use crate::planned::{Planned, plan_scalar_string, plan_template_string};
+use crate::planned::{Planned, plan_scalar_bool, plan_scalar_string, plan_template_string};
 use crate::runner::{RunnerPlan, resolve_runs_on};
 
 use super::error::retained_field_err;
 use super::error::{eval_err, located_eval_err};
 use super::job::PlanningState;
 use super::step::plan_step;
-use super::{PlanError, RetainedFieldError, RunDefaultsPlan, StepPlan};
+use super::{ConcurrencyPlan, PlanError, RetainedFieldError, RunDefaultsPlan, StepPlan};
 
 pub(super) struct PlannedInstance {
     pub(super) name: Planned<String>,
@@ -27,6 +27,7 @@ pub(super) struct PlannedInstance {
     pub(super) services: indexmap::IndexMap<String, ContainerPlan>,
     pub(super) env: indexmap::IndexMap<String, EnvValue>,
     pub(super) defaults: RunDefaultsPlan,
+    pub(super) concurrency: Option<ConcurrencyPlan>,
     pub(super) outputs: JobOutputsPlan,
     pub(super) steps: Vec<StepPlan>,
 }
@@ -89,6 +90,9 @@ pub(super) fn plan_instance(
     }
     let defaults = plan_defaults(workflow, job, &ctx, state.size_budget)
         .map_err(|error| retained_field_err(job_id, None, error))?;
+    let concurrency = plan_concurrency(job, &ctx)
+        .map_err(|source| eval_err(job_id, None, job.id.span.clone(), source))?;
+    state.size_budget.add(&concurrency, &job.id.span)?;
     let mut steps = Vec::with_capacity(job.steps.len());
     let mut steps_slots = StepsContextSlots::default();
     let mut prior_step_can_mutate_env = false;
@@ -145,9 +149,32 @@ pub(super) fn plan_instance(
         services,
         env,
         defaults,
+        concurrency,
         outputs,
         steps,
     })
+}
+
+fn plan_concurrency(
+    job: &Job,
+    ctx: &FoldCtx<'_>,
+) -> Result<Option<ConcurrencyPlan>, PartialEvalError> {
+    let Some(concurrency) = &job.concurrency else {
+        return Ok(None);
+    };
+    let group = plan_template_string(
+        &concurrency.value.group.value,
+        &concurrency.value.group.span,
+        ctx,
+    )?;
+    let cancel_in_progress = match &concurrency.value.cancel_in_progress {
+        Some(cancel) => plan_scalar_bool(cancel, ctx)?,
+        None => Planned::static_value(concurrency.span.clone(), "false".to_string(), false),
+    };
+    Ok(Some(ConcurrencyPlan {
+        group,
+        cancel_in_progress,
+    }))
 }
 
 fn step_can_execute(step: &StepPlan) -> bool {

@@ -26,6 +26,21 @@ pub(crate) fn validate_workflow(workflow: &Workflow) -> Result<(), ParseError> {
             ExpressionPolicy::RunName,
         )?;
     }
+    if let Some(concurrency) = &workflow.concurrency {
+        validate_template(
+            &concurrency.value.group.value,
+            &concurrency.value.group.span,
+            "concurrency.group",
+            ExpressionPolicy::WorkflowConcurrency,
+        )?;
+        if let Some(cancel) = &concurrency.value.cancel_in_progress {
+            validate_scalar(
+                cancel,
+                "concurrency.cancel-in-progress",
+                ExpressionPolicy::WorkflowConcurrency,
+            )?;
+        }
+    }
     for (_, value) in &workflow.env {
         validate_scalar(value, "env", ExpressionPolicy::WorkflowEnv)?;
     }
@@ -79,6 +94,21 @@ fn validate_job(job: &Job) -> Result<(), ParseError> {
     }
     if let Some(strategy) = &job.strategy {
         validate_strategy(&strategy.value, &prefix)?;
+    }
+    if let Some(concurrency) = &job.concurrency {
+        validate_template(
+            &concurrency.value.group.value,
+            &concurrency.value.group.span,
+            &format!("{prefix}.concurrency.group"),
+            ExpressionPolicy::JobConcurrency,
+        )?;
+        if let Some(cancel) = &concurrency.value.cancel_in_progress {
+            validate_scalar(
+                cancel,
+                &format!("{prefix}.concurrency.cancel-in-progress"),
+                ExpressionPolicy::JobConcurrency,
+            )?;
+        }
     }
     for (service_name, service) in &job.services {
         validate_container(

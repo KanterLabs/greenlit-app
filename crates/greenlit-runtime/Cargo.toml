@@ -25,7 +25,7 @@ thiserror = "2.0.19"
 tracing = "0.1.44"
 # Async runtime. Engine access is I/O-bound orchestration (`greenlit-v0-spec.md`
 # "Tech"); every `ContainerEngine` method is async on tokio.
-tokio = { version = "1.48.0", features = ["rt", "io-util", "time", "macros"] }
+tokio = { version = "1.48.0", features = ["rt", "io-util", "time", "macros", "sync"] }
 # `#[async_trait]` keeps `ContainerEngine` and `EngineProber` object-safe so the
 # engine can be held behind `dyn` at the port boundary and swapped for a fake in
 # tests; native `async fn` in a public trait is not dyn-compatible.
@@ -33,6 +33,15 @@ async-trait = "0.1.90"
 # Docker Engine API client. `AGENTS.md` mandates the Docker API via bollard with
 # no shelling out to `docker`.
 bollard = "0.21.0"
+# The local cache/artifact stores and the shim server that fronts them. The
+# runtime owns the job's network, so it is what binds the shim on that
+# network's gateway and hands the job the `ACTIONS_*` addresses
+# (`PHASE-4-environment.md` "Cache and artifacts").
+greenlit-store = { path = "../greenlit-store", version = "0.1.0" }
+# Reads the GitHub `runner-images` toolset manifest, which is JSON. Same
+# pinned version `greenlit-actions` and `greenlit-store` already use; the
+# workspace's chosen deserializer, so no new dependency family.
+serde_json = "1.0.145"
 # Draining bollard's streaming responses (image pull/build progress, exec output).
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 # `bollard::body_full` takes a `bytes::Bytes`; used to send the base-image build
@@ -78,6 +87,15 @@ flate2 = "1.1.9"
 # `hashFiles` digest use) at this exact version; declared directly here too
 # since this crate calls it itself.
 sha2 = "0.11.0"
+# Direct containerd gRPC transport for configured stargz snapshotter hosts.
+# Greenlit defines only the small stable message subset it uses, avoiding
+# containerd-client's build-time `protoc` prerequisite and any CLI wrapper.
+prost = "0.14.3"
+prost-types = "0.14.3"
+tonic = { version = "0.14.2", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = "0.14.2"
+tower = { version = "0.5.3", features = ["util"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 # Isolated temp directories for the action-store/node-runtime-cache unit

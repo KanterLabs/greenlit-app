@@ -111,6 +111,35 @@ pub enum RunnerError {
         #[source]
         source: PartialEvalError,
     },
+    /// A deferred runner label failed when its runtime dependencies existed.
+    #[error("{span}: could not evaluate the runtime runner label: {source}")]
+    RuntimeEval {
+        /// Where the `runs-on:` value appears.
+        span: Span,
+        /// The runtime expression failure.
+        #[source]
+        source: greenlit_expr::EvalError,
+    },
+}
+
+/// Finish a deferred runner selection against a live job context.
+pub fn materialize_runner(
+    planned: &RunnerPlan,
+    ctx: &greenlit_expr::Context,
+) -> Result<RunnerImage, RunnerError> {
+    match &planned.evaluation {
+        Evaluation::Static(image) => Ok(*image),
+        Evaluation::Deferred(deferred) => {
+            let value = greenlit_expr::evaluate(&deferred.residual, ctx).map_err(|source| {
+                RunnerError::RuntimeEval {
+                    span: planned.span.clone(),
+                    source,
+                }
+            })?;
+            let label = greenlit_expr::value::to_display_string(&value);
+            lookup_or_error(&label, &planned.span)
+        }
+    }
 }
 
 /// Resolves `runs-on:` for one job (or one matrix leg — `ctx.roots.matrix`

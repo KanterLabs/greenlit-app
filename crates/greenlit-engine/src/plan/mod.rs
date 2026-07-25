@@ -19,8 +19,8 @@ mod types;
 pub use error::PlanError;
 pub(crate) use error::RetainedFieldError;
 pub use types::{
-    ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan, PlanOptions,
-    RunDefaultsPlan, StaticSkip, StepKind, StepPlan,
+    ConcurrencyPlan, ExecutionPlan, JobPlan, LegPlan, PermissionLevelPlan, PermissionsPlan,
+    PlanOptions, RunDefaultsPlan, StaticSkip, StepKind, StepPlan,
 };
 
 use greenlit_expr::Value;
@@ -30,6 +30,7 @@ use greenlit_workflow::model::workflow::{
 };
 
 use crate::event::SyntheticEvent;
+use crate::evidence::{FeatureFinding, FindingDisposition, SupportReport};
 use crate::graph::{JobId, build_graph};
 use crate::lints::Lint;
 use crate::partial_eval::{
@@ -37,7 +38,9 @@ use crate::partial_eval::{
     build_env_chain,
 };
 use crate::pass_through::plan_env_layer;
-use crate::planned::{Evaluation, plan_scalar_string, plan_template_string};
+use crate::planned::{
+    Evaluation, Planned, plan_scalar_bool, plan_scalar_string, plan_template_string,
+};
 pub(crate) use budget::PlanSizeBudget;
 
 /// Plans `workflow` against `event`, using `options` for local variable
@@ -124,6 +127,35 @@ pub fn plan(
         .as_ref()
         .map_or(&workflow.span, |permissions| &permissions.span);
     size_budget.add(&permissions, permissions_span)?;
+    let concurrency = workflow
+        .concurrency
+        .as_ref()
+        .map(|concurrency| {
+            let group = plan_template_string(
+                &concurrency.value.group.value,
+                &concurrency.value.group.span,
+                &workflow_ctx,
+            )
+            .map_err(|source| PlanError::WorkflowEval {
+                span: concurrency.value.group.span.clone(),
+                source: Box::new(source),
+            })?;
+            let cancel_in_progress = match &concurrency.value.cancel_in_progress {
+                Some(cancel) => plan_scalar_bool(cancel, &workflow_ctx).map_err(|source| {
+                    PlanError::WorkflowEval {
+                        span: cancel.span.clone(),
+                        source: Box::new(source),
+                    }
+                })?,
+                None => Planned::static_value(concurrency.span.clone(), "false".to_string(), false),
+            };
+            Ok::<ConcurrencyPlan, PlanError>(ConcurrencyPlan {
+                group,
+                cancel_in_progress,
+            })
+        })
+        .transpose()?;
+    size_budget.add(&concurrency, &workflow.span)?;
 
     let graph = build_graph(&workflow.jobs)?;
     let reference_index =
@@ -190,11 +222,13 @@ pub fn plan(
 
     let execution_plan = ExecutionPlan {
         schema_version: 1,
+        compatibility: analyze_support(workflow),
         event_name,
         run_name,
         env,
         defaults,
         permissions,
+        concurrency,
         jobs: job_plans,
         topo_order,
         lints,
@@ -220,6 +254,73 @@ pub fn validate_v0_support(workflow: &Workflow) -> Result<(), PlanError> {
         reject_oidc_permissions(effective_permissions)?;
     }
     Ok(())
+}
+
+/// Inventories recognized workflow features whose semantics Greenlit cannot
+/// execute faithfully. The report is independent from policy: callers can
+/// persist it before [`validate_v0_support`] blocks execution.
+#[must_use]
+pub fn analyze_support(workflow: &Workflow) -> SupportReport {
+    let mut findings = Vec::new();
+    for trigger in &workflow.on {
+        if matches!(
+            trigger.value,
+            greenlit_workflow::model::trigger::Trigger::WorkflowCall(_)
+        ) {
+            findings.push(unsupported_finding(
+                "workflow.reusable_trigger",
+                "workflow.on.workflow_call",
+                "reusable workflow triggers are not implemented",
+            ));
+        }
+    }
+    for job in &workflow.jobs {
+        let scope = format!("jobs.{}", job.id.value);
+        if job.environment.is_some() {
+            findings.push(unsupported_finding(
+                "job.environment",
+                &scope,
+                "GitHub environment protection and deployments are unavailable locally",
+            ));
+        }
+        if job.reusable_call.is_some() {
+            findings.push(unsupported_finding(
+                "job.reusable_workflow",
+                &scope,
+                "reusable workflow call jobs are not implemented",
+            ));
+        }
+        let effective_permissions = job.permissions.as_ref().or(workflow.permissions.as_ref());
+        if permissions_request_oidc(effective_permissions) {
+            findings.push(unsupported_finding(
+                "github.oidc",
+                &scope,
+                "GitHub OIDC token issuance is unavailable locally",
+            ));
+        }
+    }
+    let mut report = SupportReport { findings };
+    report.canonicalize();
+    report
+}
+
+fn unsupported_finding(code: &str, scope: &str, reason: &str) -> FeatureFinding {
+    FeatureFinding {
+        code: code.to_string(),
+        disposition: FindingDisposition::Unsupported,
+        scope: scope.to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn permissions_request_oidc(permissions: Option<&greenlit_workflow::Spanned<Permissions>>) -> bool {
+    permissions.is_some_and(|permissions| match &permissions.value {
+        Permissions::All(PermissionLevelAll::WriteAll) => true,
+        Permissions::All(PermissionLevelAll::ReadAll) => false,
+        Permissions::Scoped(entries) => entries.iter().any(|(scope, level)| {
+            scope.value == "id-token" && level.value == PermissionLevel::Write
+        }),
+    })
 }
 
 fn plan_workflow_defaults(
@@ -294,12 +395,6 @@ fn plan_permissions(permissions: &greenlit_workflow::Spanned<Permissions>) -> Pe
 }
 
 fn reject_unsupported_workflow_constructs(workflow: &Workflow) -> Result<(), PlanError> {
-    if let Some(uc) = &workflow.concurrency {
-        return Err(PlanError::NotSupportedInV0 {
-            name: uc.name,
-            span: uc.location.clone(),
-        });
-    }
     for trigger in &workflow.on {
         if let greenlit_workflow::model::trigger::Trigger::WorkflowCall(uc) = &trigger.value {
             return Err(PlanError::NotSupportedInV0 {
@@ -312,7 +407,7 @@ fn reject_unsupported_workflow_constructs(workflow: &Workflow) -> Result<(), Pla
 }
 
 fn reject_unsupported_job_constructs(job: &Job) -> Result<(), PlanError> {
-    if let Some(uc) = [&job.environment, &job.concurrency, &job.reusable_call]
+    if let Some(uc) = [&job.environment, &job.reusable_call]
         .into_iter()
         .flatten()
         .next()

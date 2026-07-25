@@ -21,9 +21,13 @@
 
 mod git_ls_remote;
 mod github_api;
+mod persistent;
+mod pinned;
 
 pub use git_ls_remote::GitLsRemoteResolver;
 pub use github_api::GitHubApiResolver;
+pub use persistent::PersistentRefResolver;
+pub use pinned::PinnedRefResolver;
 
 use async_trait::async_trait;
 
@@ -118,6 +122,16 @@ pub enum ResolveError {
         git_ref: String,
         /// A description of the join failure.
         message: String,
+    },
+    /// Offline mode requires an alias that has not been resolved and stored.
+    #[error("offline content is missing: action ref {owner}/{repo}@{git_ref}")]
+    OfflineMissing {
+        /// Repository owner.
+        owner: String,
+        /// Repository name.
+        repo: String,
+        /// Missing mutable ref.
+        git_ref: String,
     },
 }
 

@@ -108,10 +108,13 @@ fn stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail() {
     sandbox.write("wf.yml", WORKFLOW);
     sandbox.init_git();
     let mut history = (0..25)
-        .map(|index| metrics_record(1, index))
+        .map(|index| metrics_record(greenlit_metrics::SCHEMA_VERSION, index))
         .collect::<Vec<_>>()
         .join("\n");
-    history.push_str("\n{\"schema_version\":1");
+    history.push_str(&format!(
+        "\n{{\"schema_version\":{}",
+        greenlit_metrics::SCHEMA_VERSION
+    ));
     write_metrics(&sandbox, &history);
 
     let output = sandbox.run(&["stats"]);
@@ -145,7 +148,10 @@ fn stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail() {
     let complete_tail = Sandbox::new();
     complete_tail.write("wf.yml", WORKFLOW);
     complete_tail.init_git();
-    write_metrics(&complete_tail, metrics_record(1, 7));
+    write_metrics(
+        &complete_tail,
+        metrics_record(greenlit_metrics::SCHEMA_VERSION, 7),
+    );
     let plan_output = complete_tail.run(&["plan", "-W", "wf.yml"]);
     assert!(
         plan_output.status.success(),
@@ -155,7 +161,10 @@ fn stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail() {
     let preserved = std::fs::read_to_string(complete_tail.metrics_file())
         .expect("metrics history must remain readable");
     assert_eq!(preserved.lines().count(), 2);
-    assert!(preserved.starts_with(&format!("{}\n", metrics_record(1, 7))));
+    assert!(preserved.starts_with(&format!(
+        "{}\n",
+        metrics_record(greenlit_metrics::SCHEMA_VERSION, 7)
+    )));
     let stats_output = complete_tail.run(&["stats"]);
     assert!(
         stats_output.status.success(),
@@ -201,7 +210,7 @@ fn stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail() {
     let oversized_tail = Sandbox::new();
     oversized_tail.write("wf.yml", WORKFLOW);
     oversized_tail.init_git();
-    let mut history = format!("{}\n", metrics_record(1, 9));
+    let mut history = format!("{}\n", metrics_record(greenlit_metrics::SCHEMA_VERSION, 9));
     history.push_str(&"x".repeat(MAX_METRICS_RECORD_BYTES + 1));
     write_metrics(&oversized_tail, history);
     let plan_output = oversized_tail.run(&["plan", "-W", "wf.yml"]);
@@ -250,8 +259,11 @@ fn stats_rejects_committed_corruption_and_unknown_schema_with_one_fix() {
     let linked = Sandbox::new();
     let external = tempfile::tempdir().expect("external metrics directory");
     let target = external.path().join("redirected.ndjson");
-    std::fs::write(&target, format!("{}\n", metrics_record(1, 77)))
-        .expect("write redirected history");
+    std::fs::write(
+        &target,
+        format!("{}\n", metrics_record(greenlit_metrics::SCHEMA_VERSION, 77)),
+    )
+    .expect("write redirected history");
     let path = linked.metrics_file();
     std::fs::create_dir_all(path.parent().expect("metrics parent")).expect("create metrics parent");
     std::os::unix::fs::symlink(&target, &path).expect("link metrics file");
@@ -303,7 +315,7 @@ fn concurrent_plans_preserve_every_record_while_repairing_one_torn_tail() {
     sandbox.write("wf.yml", WORKFLOW);
     sandbox.init_git();
 
-    let mut history = format!("{}\n", metrics_record(1, 42));
+    let mut history = format!("{}\n", metrics_record(greenlit_metrics::SCHEMA_VERSION, 42));
     history.push_str(&"x".repeat(4 * 1024 * 1024));
     write_metrics(&sandbox, history);
 
@@ -345,7 +357,7 @@ fn concurrent_plans_preserve_every_record_while_repairing_one_torn_tail() {
 fn stats_keeps_tampered_local_record_fields_on_their_renderer_lines() {
     let sandbox = Sandbox::new();
     let record = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": greenlit_metrics::SCHEMA_VERSION,
         "command": "plan\nFORGED COMMAND\t\u{202e}",
         "started_at_unix_ms": 7,
         "total_duration_ms": 1.0,

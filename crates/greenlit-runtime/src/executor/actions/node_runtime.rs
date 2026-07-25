@@ -46,8 +46,8 @@
 //! this is the source of trust for those two entries specifically, not a
 //! third party's republished digest).
 //!
-//! Do not depend on Phase 4's convergent runner-image manifest for these —
-//! action runtimes are pinned independently here, per `PHASE-3-actions.md`.
+//! Action runtimes are pinned independently from the runner profile here, per
+//! `PHASE-3-actions.md`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use greenlit_actions::manifest::NodeVersion;
 use greenlit_actions::store::FetchOutcome;
+use greenlit_store::cas::{CasError, CasStore, HttpFetch, ObjectDigest};
 use sha2::{Digest, Sha256};
 use tar::EntryType;
 
@@ -187,6 +188,13 @@ pub enum RuntimeBundleError {
         /// The underlying I/O error's message.
         message: String,
     },
+    /// The verified machine-wide content store rejected or could not fetch
+    /// the exact locked bundle.
+    #[error("could not materialize the pinned Node runtime bundle: {0}")]
+    Content(#[source] CasError),
+    /// A hard-coded pinned checksum is malformed.
+    #[error("the pinned Node runtime identity is invalid: {0}")]
+    InvalidIdentity(String),
 }
 
 /// The injected boundary that downloads one pinned bundle's raw (still
@@ -280,6 +288,8 @@ fn download_blocking(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, RuntimeB
 pub struct RuntimeStore {
     root: PathBuf,
     counters: std::sync::Arc<Counters>,
+    cas: Option<CasStore>,
+    offline: bool,
 }
 
 #[derive(Debug, Default)]
@@ -314,6 +324,20 @@ impl RuntimeStore {
         Self {
             root: root.into(),
             counters: std::sync::Arc::new(Counters::default()),
+            cas: None,
+            offline: false,
+        }
+    }
+
+    /// Uses `cas` as the verified compressed-bundle backing store while
+    /// retaining `root` for safely extracted runtime trees.
+    #[must_use]
+    pub fn with_cas(root: impl Into<PathBuf>, cas: CasStore, offline: bool) -> Self {
+        Self {
+            root: root.into(),
+            counters: std::sync::Arc::new(Counters::default()),
+            cas: Some(cas),
+            offline,
         }
     }
 
@@ -362,7 +386,11 @@ impl RuntimeStore {
             message: source.to_string(),
         })?;
 
-        let install_result = fetch_verify_extract(spec, fetcher, &tmp).await;
+        let install_result = if let Some(cas) = &self.cas {
+            fetch_from_cas_verify_extract(spec, cas, self.offline, &tmp).await
+        } else {
+            fetch_verify_extract(spec, fetcher, &tmp).await
+        };
         if let Err(error) = install_result {
             let _ = std::fs::remove_dir_all(&tmp);
             return Err(error);
@@ -388,6 +416,45 @@ impl RuntimeStore {
             }
         }
     }
+}
+
+async fn fetch_from_cas_verify_extract(
+    spec: &RuntimeBundleSpec,
+    cas: &CasStore,
+    offline: bool,
+    dest: &Path,
+) -> Result<(), RuntimeBundleError> {
+    let digest = ObjectDigest::parse(&format!("sha256:{}", spec.sha256))
+        .map_err(|error| RuntimeBundleError::InvalidIdentity(error.to_string()))?;
+    let fetch = HttpFetch {
+        url: spec.url.to_string(),
+        user_agent: concat!("greenlit-litci/", env!("CARGO_PKG_VERSION")).to_string(),
+        max_bytes: MAX_COMPRESSED_BYTES,
+        offline,
+    };
+    let store = cas.clone();
+    let digest_for_task = digest.clone();
+    tokio::task::spawn_blocking(move || store.ensure_http(&digest_for_task, &fetch))
+        .await
+        .map_err(|error| RuntimeBundleError::Download {
+            url: spec.url.to_string(),
+            message: format!("content task did not complete: {error}"),
+        })?
+        .map_err(RuntimeBundleError::Content)?;
+    let path = cas
+        .verified_path(&digest)
+        .map_err(RuntimeBundleError::Content)?
+        .ok_or_else(|| {
+            RuntimeBundleError::Content(CasError::OfflineMissing {
+                digest,
+                source_url: spec.url.to_string(),
+            })
+        })?;
+    let bytes = std::fs::read(&path).map_err(|source| RuntimeBundleError::Install {
+        path,
+        message: source.to_string(),
+    })?;
+    extract_bundle(&bytes, dest, spec.strip_top_level).map_err(RuntimeBundleError::Extract)
 }
 
 async fn fetch_verify_extract(

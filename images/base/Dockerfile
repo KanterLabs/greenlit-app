@@ -16,6 +16,14 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# Ownership marker. `litci clean` finds Greenlit's own images by this label
+# rather than by matching `greenlit/` in tag text, which any image could be
+# tagged with. A per-repo convergent image is produced by committing a
+# container started from this one, and `docker commit` carries the config
+# (labels included) forward — so converged images inherit the marker and are
+# reclaimable by the same query, without `CommitSpec` having to restate it.
+LABEL greenlit.managed="1"
+
 # The slim tool set every GitHub Ubuntu runner is expected to carry: shells,
 # git/curl/wget for checkout and downloads, jq/tar/unzip for common script
 # steps, build-essential for native compiles, ca-certificates for TLS. `sh`

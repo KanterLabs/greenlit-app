@@ -1,0 +1,66 @@
+name: release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified packages to crates.io
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: build and package release candidate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Run release verification
+        run: tools/release-check
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-app-linux-x86_64
+          path: |
+            target/release/litci
+            target/package/*.crate
+            SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: publish crates in dependency order
+    if: inputs.publish
+    needs: verify
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Publish verified dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish -p greenlit-expr
+          cargo publish -p greenlit-workflow
+          cargo publish -p greenlit-engine
+          cargo publish -p greenlit-metrics
+          cargo publish -p greenlit-store
+          cargo publish -p greenlit-actions
+          cargo publish -p greenlit-runtime
+          cargo publish -p greenlit-app

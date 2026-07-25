@@ -36,9 +36,43 @@ pub trait ActionFetcher: Send + Sync {
     ) -> Result<(), FetchError>;
 }
 
+/// Fetch boundary used for offline replay.
+///
+/// A cached action never calls this boundary. Reaching it therefore proves
+/// that the exact resolved action source is absent locally.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OfflineActionFetcher;
+
+#[async_trait]
+impl ActionFetcher for OfflineActionFetcher {
+    async fn fetch(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &CommitSha,
+        _dest: &Path,
+    ) -> Result<(), FetchError> {
+        Err(FetchError::OfflineMissing {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            sha: sha.as_str().to_string(),
+        })
+    }
+}
+
 /// A failure fetching an action's source into the store.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
+    /// Offline mode requires action source that is absent locally.
+    #[error("offline content is missing: action source {owner}/{repo}@{sha}")]
+    OfflineMissing {
+        /// Repository owner.
+        owner: String,
+        /// Repository name.
+        repo: String,
+        /// Exact missing commit.
+        sha: String,
+    },
     /// The tarball could not be downloaded (network/HTTP failure).
     #[error("could not download {owner}/{repo}@{sha}: {message}")]
     Download {

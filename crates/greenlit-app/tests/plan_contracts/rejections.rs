@@ -41,20 +41,6 @@ fn graph_failures_name_the_jobs_and_render_the_exact_span_and_fix() {
 fn every_remaining_recognized_v0_construct_fails_at_its_authored_key() {
     let rows = [
         (
-            "workflow concurrency",
-            "on: push\nconcurrency: ${{ vars.MISSING }}\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
-            "concurrency",
-            "contracts.yml:2:1",
-            Some("vars.MISSING"),
-        ),
-        (
-            "job concurrency",
-            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    concurrency: deploy\n    steps:\n      - run: echo hi\n",
-            "concurrency",
-            "contracts.yml:5:5",
-            None,
-        ),
-        (
             "environment",
             "on:\n  pull_request:\n    branches: [main]\njobs:\n  build:\n    environment: production\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
             "environment",

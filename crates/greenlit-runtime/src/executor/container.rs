@@ -19,7 +19,7 @@
 use greenlit_workflow::Span;
 use thiserror::Error;
 
-use crate::engine::{BindMount, RegistryAuth};
+use crate::engine::{BindMount, HealthCheck, PortBinding, RegistryAuth};
 
 /// A resolved (all `${{ }}` finished) job-container request, with each value's
 /// authored span retained for precise rejection messages.
@@ -146,7 +146,30 @@ pub enum ContainerRejection {
         /// The unsupported token.
         option: String,
     },
+    /// A `--health-*` option or `ports:` entry whose value could not be read.
+    ///
+    /// Named rather than ignored: a mistyped health interval would otherwise
+    /// silently produce a service with no probe, and a job that waits for a
+    /// readiness signal that never comes.
+    #[error(
+        "{span}: container {option} value {value:?} could not be read\n  fix: use a value the option accepts — a duration like `10s` for an interval, a whole number for retries, `host:container` for a port"
+    )]
+    UnreadableOptionValue {
+        /// Where the value was authored.
+        span: Span,
+        /// The option or field name.
+        option: String,
+        /// The unreadable value.
+        value: String,
+    },
 }
+
+/// Where a published service port is bound.
+///
+/// Loopback only: a service container is part of one run, and publishing it
+/// on every host interface would expose a developer's database to their whole
+/// network for the duration of a `litci run`.
+const PUBLISH_ADDRESS: &str = "127.0.0.1";
 
 /// The safe container additions distilled from a validated request: extra binds
 /// (named volumes only) to layer onto the isolation [`ContainerSpec`](crate::engine::ContainerSpec).
@@ -159,13 +182,18 @@ pub struct ContainerAdditions {
     /// Resolved `credentials:`, ready to pass the engine's
     /// `pull_image` as a [`RegistryAuth`], if the job authored any.
     pub registry_auth: Option<RegistryAuth>,
+    /// The probe distilled from any `--health-*` options, which the service
+    /// health gate waits on. `None` when none were authored.
+    pub healthcheck: Option<HealthCheck>,
+    /// Ports to publish, from `ports:`.
+    pub ports: Vec<PortBinding>,
 }
 
 /// Validate a resolved job-container request, returning the safe additions or
 /// the first containment-breaking rejection.
 ///
 /// `workspace` (the container-side `GITHUB_WORKSPACE`) and `volume_namespace`
-/// (unique per `litci run` invocation, see [`crate::RunConfig::volume_namespace`])
+/// (unique per concrete job instance)
 /// let volume validation reject a destination collision with Greenlit's own
 /// isolation paths and namespace named-volume sources so they can never target
 /// a pre-existing daemon-global volume.
@@ -182,8 +210,9 @@ pub fn validate_container(
     workspace: &str,
     volume_namespace: &str,
 ) -> Result<ContainerAdditions, ContainerRejection> {
+    let mut health = HealthCheck::default();
     if let Some((options, span)) = &container.options {
-        validate_options(options, span)?;
+        validate_options(options, span, &mut health)?;
     }
     let mut volume_binds = Vec::new();
     for (spec, span) in &container.volumes {
@@ -191,11 +220,17 @@ pub fn validate_container(
             volume_binds.push(bind);
         }
     }
-    // `ports:` on a single job container publish nothing in v0's host-LAN-free
-    // model (service networking is Phase 4); they are accepted syntactically so
-    // a workflow that lists them still runs, but map to no host publish.
+    let mut ports = Vec::new();
+    for (spec, span) in &container.ports {
+        ports.push(parse_port(spec, span)?);
+    }
+
     Ok(ContainerAdditions {
         volume_binds,
+        ports,
+        // A probe with no command is not a probe: `--health-interval` alone
+        // configures nothing to run.
+        healthcheck: (!health.test.is_empty()).then_some(health),
         env: container.env.clone(),
         registry_auth: container
             .credentials
@@ -208,8 +243,13 @@ pub fn validate_container(
 }
 
 /// Split `options` and reject any containment-breaking or unsupported flag.
-fn validate_options(options: &str, span: &Span) -> Result<(), ContainerRejection> {
-    let tokens: Vec<&str> = options.split_whitespace().collect();
+fn validate_options(
+    options: &str,
+    span: &Span,
+    health: &mut HealthCheck,
+) -> Result<(), ContainerRejection> {
+    let tokens = tokenize_options(options);
+    let tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
     let mut index = 0;
     while index < tokens.len() {
         let token = tokens[index];
@@ -219,6 +259,29 @@ fn validate_options(options: &str, span: &Span) -> Result<(), ContainerRejection
         };
         // The value for a space-separated flag is the next token.
         let next_value = || inline_value.or_else(|| tokens.get(index + 1).copied());
+
+        // The one interpreted family: `--health-*` configures the probe the
+        // service health gate waits on. Everything else keeps its existing
+        // treatment, including every containment-breaking rejection below --
+        // a service is exactly as untrusted as a job container.
+        match crate::executor::health::apply(health, flag, next_value()) {
+            Ok(true) => {
+                if inline_value.is_none() && crate::executor::health::takes_value(flag) {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                return Err(ContainerRejection::UnreadableOptionValue {
+                    span: span.clone(),
+                    option: error.flag,
+                    value: error.value,
+                });
+            }
+        }
+
         match flag {
             "--privileged" => {
                 // `--privileged` or `--privileged=true`; `=false` is harmless.
@@ -311,7 +374,8 @@ fn validate_volume(
                 // Namespaced so this source can never resolve to a
                 // pre-existing daemon-global named volume (finding: "a named
                 // source like `production_db:/loot` grants RW access to an
-                // existing volume") — see `RunConfig::volume_namespace`.
+                // existing volume") — the executor supplies a job-scoped
+                // namespace.
                 host_path: namespaced_volume_name(volume_namespace, source),
                 container_path: (*dest).to_string(),
                 read_only: false,
@@ -386,6 +450,176 @@ fn is_ancestor(ancestor: &str, other: &str) -> bool {
 /// a volume created by (and scoped to) this one `litci run` invocation.
 pub(crate) fn namespaced_volume_name(volume_namespace: &str, source: &str) -> String {
     format!("greenlit-run-{volume_namespace}-{source}")
+}
+
+/// Splits an `options:` string the way a shell would, honoring quotes.
+///
+/// Whitespace splitting is not enough. GitHub's own documented example is
+/// `--health-cmd "pg_isready -U postgres"`, and splitting that on spaces
+/// turns one option into four tokens — the validator then sees `-U` as an
+/// unknown flag and refuses a workflow that is perfectly valid on GitHub.
+/// Both quote styles are recognized, and a backslash escapes the next
+/// character outside single quotes, matching how the runner passes these
+/// through to the daemon.
+fn tokenize_options(options: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for character in options.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        match (quote, character) {
+            // A backslash escapes inside double quotes and outside quotes,
+            // but is literal inside single quotes.
+            (None | Some('"'), '\\') => escaped = true,
+            (None, '\'' | '"') => {
+                quote = Some(character);
+                started = true;
+            }
+            (Some(open), character) if character == open => quote = None,
+            (None, character) if character.is_whitespace() => {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            (_, character) => {
+                current.push(character);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Parses one `ports:` entry into a publish request.
+///
+/// GitHub accepts `<host>:<container>`, a bare `<container>` (the host port
+/// is chosen for you), and an optional `/tcp`/`/udp` suffix. Publishing is
+/// always bound to the loopback of the Greenlit bridge rather than every host
+/// interface: a service exists for the job, not for the network the developer
+/// happens to be on.
+fn parse_port(spec: &str, span: &Span) -> Result<PortBinding, ContainerRejection> {
+    let invalid = || ContainerRejection::UnreadableOptionValue {
+        span: span.clone(),
+        option: "ports".to_string(),
+        value: spec.to_string(),
+    };
+
+    let (mapping, protocol) = match spec.rsplit_once('/') {
+        Some((mapping, protocol)) if matches!(protocol, "tcp" | "udp") => (mapping, protocol),
+        _ => (spec, "tcp"),
+    };
+    let (host, container) = match mapping.split_once(':') {
+        Some((host, container)) => (Some(host), container),
+        None => (None, mapping),
+    };
+
+    Ok(PortBinding {
+        container_port: container.trim().parse().map_err(|_| invalid())?,
+        protocol: protocol.to_string(),
+        host_port: match host {
+            Some(host) => Some(host.trim().parse().map_err(|_| invalid())?),
+            None => None,
+        },
+        host_ip: Some(PUBLISH_ADDRESS.to_string()),
+    })
+}
+
+#[cfg(test)]
+mod option_tokens {
+    use super::{ResolvedContainer, tokenize_options, validate_container};
+    use greenlit_workflow::{Location, Span};
+
+    fn span() -> Span {
+        Span::new(
+            std::sync::Arc::from(".github/workflows/ci.yml"),
+            Location::new(1, 1),
+            Location::new(1, 2),
+        )
+    }
+
+    #[test]
+    fn a_quoted_option_value_stays_one_token() {
+        // GitHub's own documented example. Splitting this on whitespace turns
+        // one option into four tokens, and the validator then refuses `-U` as
+        // an unknown flag -- rejecting a workflow that is valid on GitHub.
+        assert_eq!(
+            tokenize_options(r#"--health-cmd "pg_isready -U postgres" --health-interval 10s"#),
+            vec![
+                "--health-cmd",
+                "pg_isready -U postgres",
+                "--health-interval",
+                "10s"
+            ]
+        );
+    }
+
+    #[test]
+    fn both_quote_styles_and_escapes_are_honoured() {
+        assert_eq!(
+            tokenize_options("--health-cmd 'redis-cli ping'"),
+            vec!["--health-cmd", "redis-cli ping"]
+        );
+        // A backslash escapes inside double quotes and outside them.
+        assert_eq!(
+            tokenize_options(r#"--health-cmd "say \"hi\"""#),
+            vec!["--health-cmd", r#"say "hi""#]
+        );
+        // An empty quoted value is still a token.
+        assert_eq!(
+            tokenize_options(r#"--health-cmd """#),
+            vec!["--health-cmd", ""]
+        );
+    }
+
+    #[test]
+    fn unquoted_options_split_as_before() {
+        assert_eq!(tokenize_options("--privileged"), vec!["--privileged"]);
+        assert_eq!(
+            tokenize_options("  --health-retries   5  "),
+            vec!["--health-retries", "5"]
+        );
+        assert!(tokenize_options("").is_empty());
+    }
+
+    #[test]
+    fn a_quoted_health_command_reaches_the_probe() {
+        let container = ResolvedContainer {
+            image: "postgres:16".to_string(),
+            image_span: span(),
+            credentials: None,
+            env: Vec::new(),
+            volumes: Vec::new(),
+            ports: vec![("5432:5432".to_string(), span())],
+            options: Some((
+                r#"--health-cmd "pg_isready -U postgres" --health-retries 3"#.to_string(),
+                span(),
+            )),
+        };
+        let additions = validate_container(&container, "/w", "ns").expect("valid service");
+        let health = additions.healthcheck.expect("a probe was authored");
+        assert_eq!(
+            health.test,
+            vec![
+                "CMD-SHELL".to_string(),
+                "pg_isready -U postgres".to_string()
+            ]
+        );
+        assert_eq!(health.retries, Some(3));
+        assert_eq!(additions.ports.len(), 1);
+        assert_eq!(additions.ports[0].container_port, 5432);
+        assert_eq!(additions.ports[0].host_port, Some(5432));
+    }
 }
 
 #[cfg(test)]

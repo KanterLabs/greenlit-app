@@ -2,7 +2,7 @@
 
 use crate::model::step::Step;
 use crate::model::value::{ScalarOrExpr, UnsupportedConstruct, YamlValue};
-use crate::model::workflow::{Defaults, Permissions};
+use crate::model::workflow::{Concurrency, Defaults, Permissions};
 use crate::span::{Span, Spanned};
 
 /// One entry of `jobs:`, in file order.
@@ -55,9 +55,8 @@ pub struct Job {
     /// `environment:` — recognized but rejected (deployments/environments
     /// are out of v0 scope).
     pub environment: Option<UnsupportedConstruct>,
-    /// `concurrency:` at the job level — same construct as the
-    /// workflow-level one, recognized but rejected.
-    pub concurrency: Option<UnsupportedConstruct>,
+    /// Job concurrency group and cancellation policy.
+    pub concurrency: Option<Spanned<Concurrency>>,
     /// `uses:` at the job level (a reusable-workflow call in place of
     /// `steps:`) — recognized but rejected.
     pub reusable_call: Option<UnsupportedConstruct>,

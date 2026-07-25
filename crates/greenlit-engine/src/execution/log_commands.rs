@@ -122,9 +122,11 @@ impl Masker {
             if candidate.trim().is_empty() {
                 continue;
             }
-            let candidate = candidate.to_string();
-            if !self.masks.contains(&candidate) {
-                self.masks.push(candidate);
+            let variants = encoded_variants(candidate);
+            for variant in std::iter::once(candidate.to_string()).chain(variants) {
+                if !self.masks.contains(&variant) {
+                    self.masks.push(variant);
+                }
             }
         }
         // Redact wider matches first so a full multiline secret is replaced
@@ -147,4 +149,66 @@ impl Masker {
         }
         redacted
     }
+}
+
+fn encoded_variants(value: &str) -> Vec<String> {
+    // Very short encodings are common substrings and would erase unrelated
+    // log text. GitHub recommends registering transformed secrets explicitly;
+    // Greenlit additionally covers the common transport encodings for values
+    // long enough to remain specific.
+    if value.len() < 4 {
+        return Vec::new();
+    }
+    let standard = base64(value.as_bytes(), b'+', b'/', true);
+    let url = base64(value.as_bytes(), b'-', b'_', false);
+    let percent = percent_encode(value.as_bytes());
+    let mut variants = vec![standard, url];
+    if percent != value {
+        variants.push(percent);
+    }
+    variants
+}
+
+fn base64(bytes: &[u8], char62: u8, char63: u8, padded: bool) -> String {
+    let mut alphabet = *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    alphabet[62] = char62;
+    alphabet[63] = char63;
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or_default();
+        let third = chunk.get(2).copied().unwrap_or_default();
+        encoded.push(char::from(alphabet[usize::from(first >> 2)]));
+        encoded.push(char::from(
+            alphabet[usize::from(((first & 0x03) << 4) | (second >> 4))],
+        ));
+        if chunk.len() > 1 {
+            encoded.push(char::from(
+                alphabet[usize::from(((second & 0x0f) << 2) | (third >> 6))],
+            ));
+        } else if padded {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(char::from(alphabet[usize::from(third & 0x3f)]));
+        } else if padded {
+            encoded.push('=');
+        }
+    }
+    encoded
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(*byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
 }

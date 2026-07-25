@@ -13,19 +13,23 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use greenlit_engine::execution::env::RunnerEnv;
-use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
+use greenlit_engine::{Conclusion, EventKind, MatrixValue, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
-use greenlit_runtime::{IsolationStrategy, ReadinessConfig, RunConfig, run_plan};
+use greenlit_runtime::{
+    Cancellation, IsolationStrategy, ReadinessConfig, RunConfig, run_plan, run_plan_cancellable,
+};
 
 /// How the fake engine answers the executor's readiness probe.
 #[derive(Default)]
@@ -55,6 +59,21 @@ struct ScriptedEngine {
     readiness: ReadinessScript,
     /// How many readiness polls have been answered.
     polls: AtomicUsize,
+    created_images: Mutex<Vec<String>>,
+    created_resources: Mutex<Vec<greenlit_runtime::ResourceLimits>>,
+    published_addresses: Mutex<Vec<String>>,
+    created_networks: Mutex<Vec<String>>,
+    network_gateways: Mutex<HashMap<String, String>>,
+    /// Hold container startup briefly so scheduler concurrency is observable.
+    delay_start: bool,
+    active_starts: AtomicUsize,
+    peak_starts: AtomicUsize,
+    step_started: Notify,
+    pull_started: Notify,
+    removed_containers: AtomicUsize,
+    service_unhealthy: bool,
+    service_waits: bool,
+    delay_pull: bool,
 }
 
 impl ScriptedEngine {
@@ -127,6 +146,10 @@ impl ScriptedEngine {
                 }
             } else if let Some(rest) = line.strip_prefix("ECHO ") {
                 sink.on_stdout(format!("{rest}\n").as_bytes());
+            } else if let Some(rest) = line.strip_prefix("CHUNK ") {
+                sink.on_stdout(rest.as_bytes());
+            } else if let Some(rest) = line.strip_prefix("STDERR ") {
+                sink.on_stderr(format!("{rest}\n").as_bytes());
             } else if let Some(rest) = line.strip_prefix("EXIT ") {
                 exit = rest.trim().parse().unwrap_or(1);
             }
@@ -143,6 +166,10 @@ impl ContainerEngine for ScriptedEngine {
         _auth: Option<&RegistryAuth>,
         _progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
+        if self.delay_pull {
+            self.pull_started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
@@ -166,19 +193,32 @@ impl ContainerEngine for ScriptedEngine {
     async fn commit_container(&self, _spec: &CommitSpec) -> Result<String, RuntimeError> {
         Ok("committed".to_string())
     }
-    async fn create_container(&self, _spec: &ContainerSpec) -> Result<String, RuntimeError> {
+    async fn create_container(&self, spec: &ContainerSpec) -> Result<String, RuntimeError> {
+        self.created_images.lock().unwrap().push(spec.image.clone());
+        self.created_resources.lock().unwrap().push(spec.resources);
+        self.published_addresses
+            .lock()
+            .unwrap()
+            .extend(spec.ports.iter().filter_map(|port| port.host_ip.clone()));
         Ok(format!(
             "fake-{}",
             self.counter.fetch_add(1, Ordering::Relaxed)
         ))
     }
     async fn start_container(&self, _id: &str) -> Result<(), RuntimeError> {
+        if self.delay_start {
+            let active = self.active_starts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_starts.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            self.active_starts.fetch_sub(1, Ordering::SeqCst);
+        }
         Ok(())
     }
     async fn stop_container(&self, _id: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
     async fn remove_container(&self, _id: &str) -> Result<(), RuntimeError> {
+        self.removed_containers.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn exec(
@@ -236,6 +276,10 @@ impl ContainerEngine for ScriptedEngine {
         let exit = match script_path {
             Some(path) => {
                 let script = self.read(path);
+                if script.lines().any(|line| line.trim() == "SLEEP") {
+                    self.step_started.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
                 self.interpret(&script, &spec.env, sink)
             }
             None => 0,
@@ -249,15 +293,902 @@ impl ContainerEngine for ScriptedEngine {
     ) -> Result<ExecOutput, RuntimeError> {
         Ok(ExecOutput { exit_code: 0 })
     }
+    async fn container_logs(&self, _id: &str, _max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        Ok(if self.service_unhealthy {
+            b"database secret-value failed\n".to_vec()
+        } else {
+            Vec::new()
+        })
+    }
     async fn export_path(&self, _container: &str, _path: &str) -> Result<Vec<u8>, RuntimeError> {
         Ok(Vec::new())
     }
-    async fn create_network(&self, _name: &str) -> Result<String, RuntimeError> {
+    async fn create_network(&self, name: &str) -> Result<String, RuntimeError> {
+        let mut networks = self.created_networks.lock().unwrap();
+        networks.push(name.to_string());
+        let ordinal = networks.len();
+        self.network_gateways
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), format!("10.0.{ordinal}.1"));
         Ok("net".to_string())
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+
+    async fn inspect_network(&self, name: &str) -> Result<NetworkInfo, RuntimeError> {
+        Ok(NetworkInfo {
+            gateway: self.network_gateways.lock().unwrap().get(name).cloned(),
+            subnet: Some("10.0.0.0/16".to_string()),
+        })
+    }
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: if self.service_unhealthy {
+                HealthState::Unhealthy
+            } else if self.service_waits {
+                HealthState::Starting
+            } else {
+                HealthState::None
+            },
+        })
+    }
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn independent_ready_jobs_start_concurrently_and_report_in_plan_order() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "parallel.yml",
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        ports: [5432:5432]
+    steps:
+      - run: ECHO first
+  second:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        ports: [5432:5432]
+    steps:
+      - run: ECHO second
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "parallel-jobs".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits {
+            nano_cpus: Some(1_500_000_000),
+            memory_bytes: Some(512 * 1024 * 1024),
+            pids: Some(128),
+            disk_bytes: Some(4 * 1024 * 1024 * 1024),
+        },
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+
+    assert!(
+        engine.peak_starts.load(Ordering::SeqCst) >= 2,
+        "both dependency-ready jobs must overlap"
+    );
+    let networks = engine.created_networks.lock().unwrap();
+    assert_eq!(networks.len(), 2);
+    assert_ne!(
+        networks[0], networks[1],
+        "concurrent jobs must have distinct networks"
+    );
+    drop(networks);
+    let published = engine.published_addresses.lock().unwrap();
+    assert_eq!(published.len(), 2);
+    assert_ne!(
+        published[0], published[1],
+        "identical authored host ports must bind to distinct job bridge addresses"
+    );
+    drop(published);
+    assert!(
+        engine
+            .created_resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|resources| **resources == config.resources)
+            .count()
+            >= 2,
+        "every job must receive the configured resource ceilings"
+    );
+    assert_eq!(
+        report
+            .jobs
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"],
+        "report order remains deterministic"
+    );
+}
+
+#[tokio::test]
+async fn a_case_insensitive_concurrency_group_cancels_its_in_progress_owner() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "concurrency.yml",
+        r#"
+on: push
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: Deploy
+      cancel-in-progress: true
+    steps:
+      - run: ECHO first
+  second:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy
+      cancel-in-progress: true
+    steps:
+      - run: ECHO second
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "concurrency".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+    let conclusions = report.jobs.iter().map(|job| job.result).collect::<Vec<_>>();
+    assert_eq!(
+        conclusions
+            .iter()
+            .filter(|result| **result == Conclusion::Cancelled)
+            .count(),
+        1,
+        "the newer case-insensitive group owner cancels exactly one predecessor: {conclusions:?}"
+    );
+    assert_eq!(
+        conclusions
+            .iter()
+            .filter(|result| **result == Conclusion::Success)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn matrix_max_parallel_and_fail_fast_leave_queued_legs_cancelled() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "matrix-fail-fast.yml",
+        r#"
+on: push
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        code: [1, 0, 0]
+    steps:
+      - run: EXIT ${{ matrix.code }}
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        delay_start: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "matrix-fail-fast".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("ordinary step failure stays in the report");
+
+    assert_eq!(
+        report.jobs.iter().map(|job| job.result).collect::<Vec<_>>(),
+        vec![
+            Conclusion::Failure,
+            Conclusion::Cancelled,
+            Conclusion::Cancelled
+        ]
+    );
+    assert_eq!(
+        engine.peak_starts.load(Ordering::SeqCst),
+        1,
+        "max-parallel=1 never overlaps matrix legs"
+    );
+}
+
+#[tokio::test]
+async fn dependency_outputs_materialize_a_runtime_matrix_and_runner_labels() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "runtime-matrix.yml",
+        r#"
+on: push
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.out.outputs.matrix }}
+      parallel: ${{ steps.out.outputs.parallel }}
+      runner: ${{ steps.out.outputs.runner }}
+    steps:
+      - id: out
+        run: |
+          OUT matrix={"os":["ubuntu-24.04","ubuntu-22.04"]}
+          OUT parallel=1
+          OUT runner=ubuntu-22.04
+  consumer:
+    needs: producer
+    name: leg ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      max-parallel: ${{ fromJSON(needs.producer.outputs.parallel) }}
+      matrix: ${{ fromJSON(needs.producer.outputs.matrix) }}
+    steps:
+      - run: ECHO ${{ matrix.os }}
+  direct:
+    needs: producer
+    runs-on: ${{ needs.producer.outputs.runner }}
+    steps:
+      - run: ECHO direct
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let mut execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "runtime-matrix".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("runtime matrix completes");
+
+    assert_eq!(
+        report
+            .jobs
+            .iter()
+            .map(|job| job.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["producer", "leg ubuntu-24.04", "leg ubuntu-22.04", "direct"]
+    );
+    assert!(
+        report
+            .jobs
+            .iter()
+            .all(|job| job.result == Conclusion::Success)
+    );
+
+    execution_plan
+        .jobs
+        .iter_mut()
+        .find(|job| job.id.0 == "consumer")
+        .expect("consumer job")
+        .matrix_filter = Some(indexmap::IndexMap::from([(
+        "os".to_string(),
+        MatrixValue::String("ubuntu-22.04".into()),
+    )]));
+    let selected = run_plan(
+        &ScriptedEngine::default(),
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("selected runtime matrix case completes");
+    assert_eq!(
+        selected
+            .jobs
+            .iter()
+            .map(|job| job.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["producer", "leg ubuntu-22.04", "direct"]
+    );
+}
+
+#[tokio::test]
+async fn cancellation_stops_an_active_step_and_removes_its_container_within_one_second() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "cancel.yml",
+        r#"
+on: push
+jobs:
+  active:
+    runs-on: ubuntu-latest
+    steps:
+      - run: SLEEP
+  queued:
+    runs-on: ubuntu-latest
+    needs: active
+    steps:
+      - run: ECHO must-not-run
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "cancel-active".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+    let cancellation = Cancellation::new();
+    let started = Instant::now();
+    let mut log = Vec::new();
+    let mut progress = ProgressNull;
+    let run = run_plan_cancellable(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut progress,
+        &cancellation,
+    );
+    let request = async {
+        engine.step_started.notified().await;
+        cancellation.cancel();
+    };
+    let (result, ()) = tokio::join!(run, request);
+    let report = result.expect("cancellation returns a report");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancellation acknowledgement exceeded one second"
+    );
+    assert_eq!(
+        report.jobs.iter().map(|job| job.result).collect::<Vec<_>>(),
+        vec![Conclusion::Cancelled, Conclusion::Cancelled]
+    );
+    assert!(
+        engine.removed_containers.load(Ordering::SeqCst) >= 1,
+        "the active job container must be force-removed"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_stops_service_downloads_and_health_waits_within_one_second() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "cancel-service.yml",
+        r#"
+on: push
+jobs:
+  service:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        options: --health-cmd ready
+    steps:
+      - run: ECHO must-not-run
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+
+    for engine in [
+        ScriptedEngine {
+            image_absent: true,
+            delay_pull: true,
+            ..ScriptedEngine::default()
+        },
+        ScriptedEngine {
+            service_waits: true,
+            ..ScriptedEngine::default()
+        },
+    ] {
+        let config = RunConfig {
+            repo_host_path: std::env::temp_dir(),
+            workspace: "/ws".to_string(),
+            strategy: IsolationStrategy::Auto,
+            runner_env: RunnerEnv::default(),
+            github: event.github.clone(),
+            vars: Value::object(vec![]),
+            inputs: Value::object(vec![]),
+            secrets: Value::object(vec![]),
+            initial_masks: Vec::new(),
+            volume_namespace: "cancel-service".to_string(),
+            locked_images: None,
+            write_back: false,
+            readiness: ReadinessConfig::default(),
+            actions: test_action_config(),
+            store: None,
+            resources: greenlit_runtime::ResourceLimits::default(),
+        };
+        let cancellation = Cancellation::new();
+        let started = Instant::now();
+        let mut log = Vec::new();
+        let mut progress = ProgressNull;
+        let run = run_plan_cancellable(
+            &engine,
+            &execution_plan,
+            &config,
+            &mut log,
+            &mut progress,
+            &cancellation,
+        );
+        let request = async {
+            if engine.delay_pull {
+                engine.pull_started.notified().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(run, request);
+        let report = result.expect("cancellation returns a report");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "preparation cancellation acknowledgement exceeded one second"
+        );
+        assert_eq!(report.jobs[0].result, Conclusion::Cancelled);
+        if engine.service_waits {
+            assert!(
+                engine.removed_containers.load(Ordering::SeqCst) >= 1,
+                "a service waiting on health must be removed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn unhealthy_service_failure_retains_masked_service_logs() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "service-health.yml",
+        r#"
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        options: --health-cmd pg_isready
+    steps:
+      - run: ECHO unreachable
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        service_unhealthy: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: vec!["secret-value".to_string()],
+        volume_namespace: "service-health".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits {
+            nano_cpus: Some(2_000_000_000),
+            memory_bytes: Some(256 * 1024 * 1024),
+            pids: Some(64),
+            disk_bytes: Some(2 * 1024 * 1024 * 1024),
+        },
+    };
+
+    let error = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect_err("unhealthy service blocks the job")
+    .to_string();
+
+    assert!(
+        error.contains("service `database` reported unhealthy"),
+        "{error}"
+    );
+    assert!(error.contains("database *** failed"), "{error}");
+    assert!(!error.contains("secret-value"), "{error}");
+    assert!(
+        engine.removed_containers.load(Ordering::SeqCst) >= 1,
+        "failed service is removed after its logs are retained"
+    );
+    assert!(
+        engine
+            .created_resources
+            .lock()
+            .unwrap()
+            .contains(&config.resources),
+        "service resource ceilings must be present before startup"
+    );
+}
+
+#[tokio::test]
+async fn secret_masking_covers_chunks_encodings_annotations_and_structured_results() {
+    const SECRET: &str = "s3cr3t+/ value";
+    const STANDARD_BASE64: &str = "czNjcjN0Ky8gdmFsdWU=";
+    const BASE64_URL: &str = "czNjcjN0Ky8gdmFsdWU";
+    const PERCENT: &str = "s3cr3t%2B%2F%20value";
+    let workflow = greenlit_workflow::parse_workflow(
+        "secret-output.yml",
+        r#"
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: structured s3cr3t+/ value
+        run: |
+          ECHO direct s3cr3t+/ value
+          CHUNK split s3cr3t+/
+          ECHO  value
+          ECHO standard czNjcjN0Ky8gdmFsdWU=
+          STDERR url czNjcjN0Ky8gdmFsdWU
+          ECHO percent s3cr3t%2B%2F%20value
+          ECHO ::error::annotation s3cr3t+/ value
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: vec![SECRET.to_string()],
+        volume_namespace: "secret-output".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+    let mut output = Vec::new();
+    let report = run_plan(
+        &ScriptedEngine::default(),
+        &execution_plan,
+        &config,
+        &mut output,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run succeeds");
+    let output = String::from_utf8(output).expect("UTF-8 log");
+
+    assert!(output.contains("direct ***"), "{output}");
+    assert!(output.contains("split ***"), "{output}");
+    assert!(output.contains("[error] annotation ***"), "{output}");
+    for sensitive in [SECRET, STANDARD_BASE64, BASE64_URL, PERCENT] {
+        assert!(
+            !output.contains(sensitive),
+            "{sensitive} leaked in {output}"
+        );
+        assert!(
+            report
+                .jobs
+                .iter()
+                .flat_map(|job| job.steps.iter())
+                .all(|step| !step.label.contains(sensitive)),
+            "{sensitive} leaked in the structured report"
+        );
+    }
+}
+
+#[tokio::test]
+async fn execution_uses_locked_image_identity_instead_of_mutable_alias() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "locked-image.yml",
+        r#"
+on: push
+jobs:
+  only:
+    runs-on: ubuntu-latest
+    container:
+      image: mutable.example/tool:latest
+    steps:
+      - run: ECHO locked
+  runner:
+    needs: only
+    runs-on: ubuntu-latest
+    steps:
+      - run: ECHO locked-runner
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "locked-image".to_string(),
+        locked_images: Some(std::collections::BTreeMap::from([
+            (
+                "mutable.example/tool:latest".to_string(),
+                "sha256:immutable".to_string(),
+            ),
+            (
+                "registry.k8s.io/debian-iptables@sha256:852d3c569932059bcab3a52cb6105c432d85b4b7bbd5fc93153b78010e34a783"
+                    .to_string(),
+                "sha256:netguard".to_string(),
+            ),
+            (
+                "__greenlit_runner:runner".to_string(),
+                "sha256:locked-runner".to_string(),
+            ),
+        ])),
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
+    };
+
+    run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+    let created = engine.created_images.lock().unwrap();
+    assert_eq!(
+        created.first().map(String::as_str),
+        Some("sha256:immutable")
+    );
+    assert!(
+        !created
+            .iter()
+            .any(|image| image == "mutable.example/tool:latest"),
+        "a mutable alias must never cross the container-engine boundary after locking: {created:?}"
+    );
+    assert!(created.iter().any(|image| image == "sha256:netguard"));
+    assert!(created.iter().any(|image| image == "sha256:locked-runner"));
+    assert!(
+        !created
+            .iter()
+            .any(|image| image.starts_with("ghcr.io/actions/actions-runner@")),
+        "the execution path must use the runner identity finalized in the RunLock: {created:?}"
+    );
+    assert!(!created.iter().any(|image| {
+        image
+            == "registry.k8s.io/debian-iptables@sha256:852d3c569932059bcab3a52cb6105c432d85b4b7bbd5fc93153b78010e34a783"
+    }));
 }
 
 const WORKFLOW: &str = r#"
@@ -336,9 +1267,12 @@ async fn dag_propagation_rollup_gating_and_masking() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -438,9 +1372,12 @@ async fn checkouts_post_step_runs_even_when_a_later_step_fails() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -531,10 +1468,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
     };
     let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
 
-    let engine = ScriptedEngine {
-        image_absent: true,
-        ..ScriptedEngine::default()
-    };
+    let engine = ScriptedEngine::default();
     let config = RunConfig {
         repo_host_path: std::env::temp_dir(),
         workspace: "/ws".to_string(),
@@ -546,9 +1480,12 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -559,20 +1496,13 @@ async fn preparation_progress_events_arrive_in_phase_order() {
 
     assert_eq!(
         recording.events,
-        vec![
-            "build-started",
-            "build-finished",
-            "boot-started",
-            "boot-finished",
-            "workspace-ready"
-        ],
-        "preparation phases report in order: image ensure, boot, workspace"
+        vec!["boot-started", "boot-finished", "workspace-ready"],
+        "the already-locked runner profile proceeds through boot and workspace readiness in order"
     );
 }
 
-/// A minimal `ActionRuntimeConfig` for tests that don't exercise a real
-/// `uses:` fetch/resolve: every trait-object field errors unconditionally,
-/// so a test fails loudly (not silently) if it ever reaches one.
+/// A minimal `ActionRuntimeConfig`: it resolves only the built-in checkout
+/// action identity and fails every source fetch or other action resolution.
 fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeConfig {
     use greenlit_actions::CommitSha;
     use greenlit_actions::resolve::{RefResolver, ResolveError};
@@ -584,15 +1514,25 @@ fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeCon
     use std::path::Path;
     use std::sync::Arc;
 
-    struct NeverResolves;
+    struct CheckoutOnlyResolver;
     #[async_trait::async_trait]
-    impl RefResolver for NeverResolves {
+    impl RefResolver for CheckoutOnlyResolver {
         async fn resolve(
             &self,
             owner: &str,
             repo: &str,
             git_ref: &str,
         ) -> Result<CommitSha, ResolveError> {
+            if owner == "actions" && repo == "checkout" {
+                return CommitSha::parse(&"c".repeat(40)).map_err(|error| {
+                    ResolveError::TaskFailed {
+                        owner: owner.to_string(),
+                        repo: repo.to_string(),
+                        git_ref: git_ref.to_string(),
+                        message: error.to_string(),
+                    }
+                });
+            }
             Err(ResolveError::NotFound {
                 owner: owner.to_string(),
                 repo: repo.to_string(),
@@ -630,7 +1570,7 @@ fn test_action_config() -> greenlit_runtime::executor::actions::ActionRuntimeCon
     }
 
     greenlit_runtime::executor::actions::ActionRuntimeConfig {
-        resolver: Arc::new(NeverResolves),
+        resolver: Arc::new(CheckoutOnlyResolver),
         store: ActionStore::at(std::env::temp_dir().join("greenlit-test-unused-action-store")),
         fetcher: Arc::new(NeverFetches),
         node_runtime_fetcher: Arc::new(NeverDownloads),
@@ -683,9 +1623,12 @@ async fn run_single_job(
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "fake-engine-semantics".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: tiny_readiness(),
         actions: test_action_config(),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
     let mut log: Vec<u8> = Vec::new();
     let mut recording = RecordingSink::default();

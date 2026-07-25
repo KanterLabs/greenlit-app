@@ -37,9 +37,8 @@
 //!   a basic display-name string would make nearly every realistically-named
 //!   job fail to parse; it is a zero-risk single-field addition, not new
 //!   capability.
-//! - **Job-level `concurrency:`** is recognized-but-rejected the same way
-//!   as the workflow-level one, for the same "real and common, zero
-//!   marginal cost to recognize" reasoning.
+//! - **Workflow/job `concurrency:`** is modeled in shorthand and mapping
+//!   forms so the scheduler can enforce group ownership.
 //! - **Reusable workflow call jobs** (`jobs.<id>.uses:` in place of
 //!   `steps:`) are recognized (their `name`/`needs`/`if` are still parsed)
 //!   and flagged via [`model::job::Job::reusable_call`], but not deeply

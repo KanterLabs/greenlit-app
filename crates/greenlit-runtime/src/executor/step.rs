@@ -37,10 +37,15 @@ use crate::executor::cmdfiles::{self, CommandFilePaths};
 use crate::executor::context::{ContextRoots, LiveState, build_context, resolve_env_layer};
 use crate::executor::logsink::StepLogSink;
 
+// Re-exported so callers (`crate::executor::job`) reach it through this
+// module alongside the rest of the per-job step-execution API, rather than
+// naming the small `step_ids` module directly.
+pub(crate) use crate::executor::step_ids::compute_step_action_ids;
+
 /// Per-job constants a step needs — the container, the resolved env layers, the
 /// job defaults, the run-wide context roots, and everything action execution
 /// needs beyond that (resolved actions, action/node-runtime configuration,
-/// the Docker-sibling shared workspace volume, if this job provisioned one).
+/// the Docker-sibling shared volumes, if this job provisioned them).
 pub(crate) struct JobRuntime<'a> {
     /// The container engine.
     pub engine: &'a dyn ContainerEngine,
@@ -84,10 +89,15 @@ pub(crate) struct JobRuntime<'a> {
     /// This run's volume-namespacing token
     /// (`crate::RunConfig::volume_namespace`).
     pub volume_namespace: &'a str,
-    /// The bare name of this job's shared Docker-action workspace volume,
-    /// if [`JobActionPlan::needs_docker_sibling`] provisioned one
+    /// Container aliases frozen by the RunLock.
+    pub locked_images: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// The bare names of this job's shared Docker-action volumes, if
+    /// [`JobActionPlan::needs_docker_sibling`] provisioned them
     /// (`crate::executor::actions::docker_action` module docs).
-    pub docker_workspace_volume: Option<&'a str>,
+    pub docker_volumes: Option<docker_action::SiblingVolumes>,
+    /// This job's precomputed per-step `GITHUB_ACTION` values, indexed the
+    /// same as `JobInstance::steps` (`crate::executor::step_ids::compute_step_action_ids`).
+    pub step_action_ids: &'a [String],
 }
 
 /// The job's evolving state across its steps.
@@ -184,7 +194,15 @@ pub(crate) async fn run_pre_steps(
             node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant)
                 .await?;
         let node_binary = nodejs::node_binary(job.node_mounts, node.runs.using, variant)?;
-        let full_env = layered_env(job, state, &IndexMap::new());
+        let mut full_env = layered_env(job, state, &IndexMap::new());
+        // `GITHUB_ACTION`: this step's precomputed id (`job.step_action_ids`
+        // doc comment) — a pre phase reports the same value its step's main
+        // phase will, exactly like the real runner's per-step
+        // `ExecutionContext` does across pre/main/post.
+        full_env.insert(
+            "GITHUB_ACTION".to_string(),
+            job.step_action_ids[index].clone(),
+        );
         let _ = writeln!(out, "  \u{25b6} Pre {}", step_reference(step));
         nodejs::run_phase(
             nodejs::PhaseRequest {
@@ -211,6 +229,17 @@ pub(crate) async fn run_pre_steps(
 /// regardless of the job's own final status (`PHASE-3-actions.md`: "post
 /// steps run in REVERSE order at job end REGARDLESS of failure") and
 /// returning one [`ExecutedStep`] per entry, in drain order.
+///
+/// Known gap: a post phase does not currently get `GITHUB_ACTION` set
+/// ([`run_node_post`]). `PostEntry::state_key` is a top-level step's own
+/// plan index for a top-level action, but `outer*1000+nested` for one
+/// nested inside a composite (`crate::executor::actions::composite`'s
+/// `state_key`) — the two numberings alias whenever the composite is a
+/// job's first step, so recovering "which step" from `state_key` alone
+/// isn't reliable without a change to that module, which is out of scope
+/// this change. Left absent rather than risk a wrong value for the aliased
+/// case (this task's own "absent, not invented" standard for every other
+/// runtime-unknown value).
 ///
 /// # Errors
 /// Returns an [`ExecError`] on any engine or evaluation failure.
@@ -514,7 +543,9 @@ async fn run_script_step(
         .await
         .map_err(|source| mask_command_file_error(io.masker, &source))?;
 
-    let exec_env = exec_env_vec(full_env, &paths);
+    // `GITHUB_ACTION`: this step's precomputed id
+    // (`crate::executor::step_ids` module docs).
+    let exec_env = exec_env_vec(full_env, &paths, &job.step_action_ids[index]);
     let wrapped_cmd = {
         let mut cmd = vec![
             "sh".to_string(),
@@ -545,16 +576,8 @@ async fn run_script_step(
     let effects = cmdfiles::collect(job.engine, job.container, &paths)
         .await
         .map_err(|source| mask_command_file_error(io.masker, &source))?;
-    for assignment in &effects.env {
-        state
-            .accumulated
-            .insert(assignment.name.clone(), assignment.value.clone());
-    }
-    if !effects.path_additions.is_empty() {
-        let mut merged = effects.path_additions.clone();
-        merged.append(&mut state.path_additions);
-        state.path_additions = merged;
-    }
+    let outputs =
+        cmdfiles::apply_effects(&effects, &mut state.accumulated, &mut state.path_additions);
     if !effects.summary_within_limit {
         // GitHub drops an over-cap job summary and notes it; mirror that.
         let _ = writeln!(
@@ -562,19 +585,19 @@ async fn run_script_step(
             "  [warning] {label_for_errors}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
         );
     }
-    let mut outputs = IndexMap::new();
-    for assignment in &effects.outputs {
-        outputs.insert(assignment.name.clone(), assignment.value.clone());
-    }
     Ok((exit, outputs))
 }
 
-/// Build the exec environment vector, layering in the four command-file paths.
+/// Build the exec environment vector, layering in the four command-file
+/// paths and this step's `GITHUB_ACTION` (`crate::executor::step_ids`
+/// module docs).
 fn exec_env_vec(
     full_env: &IndexMap<String, String>,
     paths: &CommandFilePaths,
+    action_id: &str,
 ) -> Vec<(String, String)> {
     let mut env = full_env.clone();
+    env.insert("GITHUB_ACTION".to_string(), action_id.to_string());
     env.insert("GITHUB_ENV".to_string(), paths.env.clone());
     env.insert("GITHUB_OUTPUT".to_string(), paths.output.clone());
     env.insert("GITHUB_PATH".to_string(), paths.path.clone());
@@ -623,7 +646,7 @@ async fn execute_uses_step(
             Ok((StepExit::Success, outcome.outputs))
         }
         ResolvedUses::Node(node) => {
-            let full_env = layered_env(job, state, &IndexMap::new());
+            let mut full_env = layered_env(job, state, &IndexMap::new());
             let ctx = build_context(
                 job.roots,
                 &LiveState {
@@ -640,6 +663,13 @@ async fn execute_uses_step(
                 node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant)
                     .await?;
             let node_binary = nodejs::node_binary(job.node_mounts, node.runs.using, variant)?;
+            // `GITHUB_ACTION` (`crate::executor::step_ids` module docs);
+            // added after `ctx` above so it does not also leak into the
+            // `env` context this step's own `${{ }}` text sees.
+            full_env.insert(
+                "GITHUB_ACTION".to_string(),
+                job.step_action_ids[index].clone(),
+            );
             let main_outcome = nodejs::run_phase(
                 nodejs::PhaseRequest {
                     engine: job.engine,
@@ -657,15 +687,17 @@ async fn execute_uses_step(
                 io.masker,
             )
             .await?;
-            for assignment in &main_outcome.env {
-                state
-                    .accumulated
-                    .insert(assignment.name.clone(), assignment.value.clone());
-            }
-            if !main_outcome.path_additions.is_empty() {
-                let mut merged = main_outcome.path_additions.clone();
-                merged.append(&mut state.path_additions);
-                state.path_additions = merged;
+            let outputs = cmdfiles::apply_effects(
+                &main_outcome.effects,
+                &mut state.accumulated,
+                &mut state.path_additions,
+            );
+            if !main_outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    io.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
             }
             let state_map = state.action_state.entry(index).or_default();
             for assignment in &main_outcome.state {
@@ -685,13 +717,22 @@ async fn execute_uses_step(
                     })),
                 });
             }
-            let mut outputs = IndexMap::new();
-            for assignment in &main_outcome.outputs {
-                outputs.insert(assignment.name.clone(), assignment.value.clone());
-            }
             Ok((main_outcome.exit, outputs))
         }
         ResolvedUses::Composite(resolved_composite) => {
+            // Composite nuance (citation-verified against the pinned
+            // runner, `actions/runner` v2.336.0:
+            // `CompositeActionHandler` never re-sets `github.action`/
+            // `GITHUB_ACTION` for a nested step — every step nested inside
+            // this composite should report *this* step's own `action_id`
+            // (`crate::executor::step_ids`), not generate one of its own.
+            // Propagating `action_id` into `composite::CompositeEnv` so its
+            // nested execution can apply it is not done by this change —
+            // `crate::executor::actions::composite` is owned by a
+            // concurrently in-flight change this session must not touch —
+            // so a nested step's `GITHUB_ACTION` is unset for now (a
+            // pre-existing gap, not a regression this change introduces).
+            let step_span = uses_span(step);
             let env = composite::CompositeEnv {
                 engine: job.engine,
                 container: job.container,
@@ -703,6 +744,12 @@ async fn execute_uses_step(
                 cmdfiles_base: job.cmdfiles_base,
                 workspace: job.workspace,
                 node_mounts: job.node_mounts,
+                runner_env: job.runner_env,
+                github_token: job.action_config.github_token.as_deref(),
+                step_span: &step_span,
+                volume_namespace: job.volume_namespace,
+                locked_images: job.locked_images,
+                docker_volumes: job.docker_volumes,
                 base_env: job.base_env,
                 workflow_env: job.workflow_env,
                 job_env: job.job_env,
@@ -722,15 +769,15 @@ async fn execute_uses_step(
             Ok((outcome.exit, outcome.outputs))
         }
         ResolvedUses::Docker(resolved_docker) => {
-            let Some(bare_volume) = job.docker_workspace_volume else {
+            let Some(volumes) = job.docker_volumes else {
                 return Err(ExecError::Infrastructure {
                     message: format!(
-                        "'{reference}' is a Docker action, but this job's shared workspace volume was not provisioned"
+                        "'{reference}' is a Docker action, but this job's shared volumes were not provisioned"
                     ),
                     fix: "internal error: report this as a Greenlit defect".to_string(),
                 });
             };
-            let full_env = layered_env(job, state, &IndexMap::new());
+            let mut full_env = layered_env(job, state, &IndexMap::new());
             let ctx = build_context(
                 job.roots,
                 &LiveState {
@@ -742,23 +789,46 @@ async fn execute_uses_step(
                     status: state.status,
                 },
             );
-            let exit = docker_action::execute(
+            // `GITHUB_ACTION` (`crate::executor::step_ids` module docs);
+            // added after `ctx` above, same reasoning as the Node arm.
+            full_env.insert(
+                "GITHUB_ACTION".to_string(),
+                job.step_action_ids[index].clone(),
+            );
+            let paths = CommandFilePaths::new(job.cmdfiles_base, index);
+            let outcome = docker_action::run_step(
                 docker_action::DockerActionRequest {
                     engine: job.engine,
+                    container: job.container,
                     resolved: resolved_docker,
                     reference: &reference,
                     with,
                     full_env: &full_env,
                     ctx: &ctx,
                     workspace: job.workspace,
-                    workspace_volume: bare_volume,
+                    cmdfiles_root: job.cmdfiles_base,
+                    cmdfiles: &paths,
+                    volumes,
                     volume_namespace: job.volume_namespace,
+                    locked_images: job.locked_images,
                 },
                 io.out,
                 io.masker,
             )
             .await?;
-            Ok((exit, IndexMap::new()))
+            let outputs = cmdfiles::apply_effects(
+                &outcome.effects,
+                &mut state.accumulated,
+                &mut state.path_additions,
+            );
+            if !outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    io.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
+            }
+            Ok((outcome.exit, outputs))
         }
     }
 }
@@ -831,7 +901,11 @@ fn uses_span(step: &StepPlan) -> greenlit_workflow::Span {
 /// e.g. a step writes a bare masked token to `GITHUB_OUTPUT` without `=`. The
 /// error is masked here, immediately, rather than left to whichever consumer
 /// eventually prints it (this crate's caller may not even hold the masker).
-fn mask_command_file_error(
+///
+/// `pub(crate)`: also used by `crate::executor::job::run_instance` for its
+/// own one-shot `write_event_file` call, which needs the identical masking
+/// treatment for the same reason.
+pub(crate) fn mask_command_file_error(
     masker: &Masker,
     source: &crate::executor::cmdfiles::CommandFileError,
 ) -> ExecError {

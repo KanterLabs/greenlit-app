@@ -5,8 +5,8 @@
 
 use std::collections::BTreeSet;
 
-use greenlit_expr::Expr;
 use greenlit_expr::value::to_display_string;
+use greenlit_expr::{Context, Expr};
 
 use super::fold::fold_expr;
 use super::{FoldCtx, Folded, PartialEvalError, TemplateFold};
@@ -87,6 +87,50 @@ fn template_memory_error() -> PartialEvalError {
         max_bytes: greenlit_expr::WORKFLOW_TEMPLATE_MAX_MEMORY_BYTES,
     }
     .into()
+}
+
+/// Fully evaluate an authored template against a runtime context.
+///
+/// Unlike [`fold_template`], this never produces a residual: every runtime
+/// dependency must now be present. A whole-expression template preserves its
+/// native value; mixed literal/expression templates stringify each argument.
+pub(crate) fn evaluate_template(
+    raw: &str,
+    ctx: &Context,
+) -> Result<greenlit_expr::Value, PartialEvalError> {
+    let parts = split_template(raw);
+    let placeholder_count = parts
+        .iter()
+        .filter(|part| matches!(part, TemplatePart::Placeholder(_)))
+        .count();
+    if placeholder_count == 0 {
+        return Ok(greenlit_expr::Value::String(raw.to_string()));
+    }
+    if placeholder_count == 1
+        && parts.len() == 1
+        && let TemplatePart::Placeholder(source) = parts[0]
+    {
+        let expression = greenlit_expr::parse(source)?;
+        return Ok(greenlit_expr::evaluate(&expression, ctx)?);
+    }
+
+    let mut budget = TemplateStringBudget::new();
+    let mut output = String::new();
+    for part in parts {
+        match part {
+            TemplatePart::Literal(literal) => {
+                budget.add_literal(literal)?;
+                output.push_str(literal);
+            }
+            TemplatePart::Placeholder(source) => {
+                let expression = greenlit_expr::parse(source)?;
+                let rendered = to_display_string(&greenlit_expr::evaluate(&expression, ctx)?);
+                budget.add_argument(&rendered)?;
+                output.push_str(&rendered);
+            }
+        }
+    }
+    Ok(greenlit_expr::Value::String(output))
 }
 
 /// Splits `raw` into literal-text and `${{ ... }}`-placeholder-source

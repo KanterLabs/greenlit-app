@@ -32,6 +32,17 @@ jobs:
       - uses: actions/checkout@v4
 ";
 
+const LATE_CHECKOUT_WORKFLOW: &str = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: another/project
+";
+
 const MIXED_WORKFLOW: &str = "\
 on: push
 jobs:
@@ -66,6 +77,19 @@ jobs:
         leg: [a, b]
     steps:
       - uses: not-a-valid-reference
+";
+
+const SELECTABLE_MATRIX_WORKFLOW: &str = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+        node: [20, 22]
+    steps:
+      - run: echo selected
 ";
 
 fn run_workflow(workflow: &str, args: &[&str]) -> std::process::Output {
@@ -109,6 +133,165 @@ fn a_well_formed_uses_reference_passes_preflight_and_reaches_engine_detection() 
 }
 
 #[test]
+fn an_exact_matrix_case_is_selected_before_engine_work() {
+    let exact = run_workflow(
+        SELECTABLE_MATRIX_WORKFLOW,
+        &[
+            "--job",
+            "build",
+            "--matrix",
+            "os=ubuntu-24.04",
+            "--matrix",
+            "node=20",
+        ],
+    );
+    let exact_stderr = support::stderr_text(&exact);
+    assert!(!exact.status.success());
+    assert!(
+        exact_stderr.contains("DOCKER_HOST"),
+        "one exact case proceeds to engine detection: {exact_stderr}"
+    );
+
+    let partial = run_workflow(
+        SELECTABLE_MATRIX_WORKFLOW,
+        &["--job", "build", "--matrix", "node=20"],
+    );
+    let partial_stderr = support::stderr_text(&partial);
+    assert!(
+        partial_stderr.contains("matched 0 cases"),
+        "a selector missing an authored property is not guessed: {partial_stderr}"
+    );
+    assert!(!partial_stderr.contains("DOCKER_HOST"), "{partial_stderr}");
+
+    let unscoped = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--matrix", "node=20"]);
+    let unscoped_stderr = support::stderr_text(&unscoped);
+    assert!(
+        unscoped_stderr.contains("`--matrix` needs one selected job"),
+        "{unscoped_stderr}"
+    );
+
+    let write_back = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--write-back"]);
+    let write_back_stderr = support::stderr_text(&write_back);
+    assert!(
+        write_back_stderr.contains("`--write-back` applies one selected job only"),
+        "{write_back_stderr}"
+    );
+}
+
+#[test]
+fn daemon_and_no_daemon_paths_persist_identical_terminal_results() {
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", SELECTABLE_MATRIX_WORKFLOW);
+    sandbox.init_git();
+
+    let direct = sandbox.run_with_daemon(&["run", "--no-daemon"], &[SSH_DOCKER_HOST]);
+    assert!(!direct.status.success());
+    assert!(!sandbox.home().join(".litci/daemon/v1.sock").exists());
+
+    let managed = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
+    assert!(!managed.status.success());
+    let status = sandbox.run(&["daemon", "--status"]);
+    assert!(
+        status.status.success(),
+        "auto-managed daemon did not become ready: {}",
+        support::stderr_text(&status)
+    );
+    let template_root = sandbox.home().join(".litci/daemon/templates/repos");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !contains_ready_template(&template_root) {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        contains_ready_template(&template_root),
+        "daemon did not publish a one-use source template"
+    );
+
+    let prepared = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
+    assert!(!prepared.status.success());
+
+    let run_directories = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("run evidence exists")
+        .map(|entry| entry.expect("run evidence entry").path())
+        .collect::<Vec<_>>();
+    let mut results = run_directories
+        .iter()
+        .map(|directory| {
+            std::fs::read(directory.join("result.json")).expect("terminal result exists")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3);
+    let expected = results.pop().expect("one result");
+    assert!(results.iter().all(|result| result == &expected));
+    assert!(
+        run_directories.iter().any(|directory| {
+            std::fs::read_to_string(directory.join("trace.ndjson"))
+                .is_ok_and(|trace| trace.contains("\"event\":\"source_template_adopted\""))
+        }),
+        "a prepared source template was published but never adopted"
+    );
+
+    let shutdown = sandbox.run(&["daemon", "--shutdown"]);
+    assert!(
+        shutdown.status.success(),
+        "daemon shutdown failed: {}",
+        support::stderr_text(&shutdown)
+    );
+}
+
+fn contains_ready_template(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ready-"))
+        {
+            return true;
+        }
+        if path.is_dir() && contains_ready_template(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn offline_resolution_names_the_exact_missing_action_ref_before_engine_work() {
+    let output = run_workflow(WELL_FORMED_USES_WORKFLOW, &["--offline", "--no-input"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("offline content is missing: action ref actions/checkout@v4"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "offline preparation must fail at the exact absent identity without trying another source: {stderr}"
+    );
+}
+
+#[test]
+fn hermetic_mode_rejects_a_late_mutable_checkout_before_engine_work() {
+    let output = run_workflow(LATE_CHECKOUT_WORKFLOW, &["--hermetic", "--no-input"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains(
+            "hermetic execution cannot resolve checkout input 'repository=another/project'"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "hermetic preflight must reject the late identity before engine detection: {stderr}"
+    );
+}
+
+#[test]
 fn a_matrix_leg_malformed_uses_step_is_rejected_before_any_engine_work() {
     let output = run_workflow(MATRIX_MALFORMED_USES_WORKFLOW, &[]);
     assert!(!output.status.success());
@@ -139,4 +322,48 @@ fn a_statically_skipped_malformed_uses_step_stays_accepted() {
         "an `if: false` uses: step never runs, so preflight must not reject it: {stderr}"
     );
     assert!(!stderr.contains("not-a-valid-reference"), "{stderr}");
+}
+
+#[test]
+fn unsupported_preflight_persists_terminal_result_and_trace() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        ".github/workflows/ci.yml",
+        "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo blocked
+",
+    );
+    sandbox.init_git();
+
+    let output = sandbox.run(&["run", "--no-input"]);
+    assert!(!output.status.success());
+    let runs = sandbox.home().join(".litci/runs");
+    let run = std::fs::read_dir(&runs)
+        .expect("run directory exists")
+        .next()
+        .expect("one run is persisted")
+        .expect("run entry is readable")
+        .path();
+    let result: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run.join("result.json")).expect("terminal result is persisted"),
+    )
+    .expect("terminal result is JSON");
+    assert_eq!(result["conclusion"], "preparation_failed");
+    assert_eq!(result["compatibility"], "unsupported");
+    assert_eq!(result["assurance"], "none");
+
+    let trace =
+        std::fs::read_to_string(run.join("trace.ndjson")).expect("append-only trace is persisted");
+    assert!(trace.contains("\"event\":\"source_locked\""), "{trace}");
+    assert!(
+        trace.contains("\"event\":\"compatibility_analyzed\""),
+        "{trace}"
+    );
+    assert!(trace.contains("\"event\":\"run_completed\""), "{trace}");
 }

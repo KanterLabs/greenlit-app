@@ -37,3 +37,10 @@ tracing = "0.1.44"
 # quantifiers differ from filesystem glob crates. The event matcher compiles
 # that grammar to anchored regular expressions.
 regex = "1.13.1"
+# Canonical source trees, locks, and result evidence use SHA-256 identities.
+# The same version is already pinned by greenlit-expr and greenlit-runtime.
+sha2 = "0.11.0"
+
+[dev-dependencies]
+# Public source-snapshot contracts use isolated Git repositories.
+tempfile = "3.27.0"

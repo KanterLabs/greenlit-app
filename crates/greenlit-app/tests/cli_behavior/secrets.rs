@@ -8,6 +8,7 @@
 
 use super::support;
 use super::support::Sandbox;
+use std::os::unix::fs::PermissionsExt;
 
 const SSH_DOCKER_HOST: (&str, &str) = ("DOCKER_HOST", "ssh://example");
 
@@ -80,12 +81,47 @@ fn cli_secret_override_reaches_engine_detection_and_never_leaks() {
 
 #[test]
 fn process_env_and_dotenv_secrets_also_reach_engine_detection() {
+    const LEGACY_SECRET: &str = "from-legacy-dotenv-migrate-7391";
     let sandbox = sandbox_with(SECRET_WORKFLOW);
-    sandbox.write(".litci/secrets", "API_TOKEN=from-dotenv\n");
+    sandbox.write(".litci/secrets", &format!("API_TOKEN={LEGACY_SECRET}\n"));
     let output = sandbox.run_with_env(&["run", "-W", "wf.yml"], &[SSH_DOCKER_HOST]);
     let stderr = support::stderr_text(&output);
     assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains("from-dotenv"), "{stderr}");
+    assert!(!stderr.contains(LEGACY_SECRET), "{stderr}");
+
+    let legacy = sandbox.root().join(".litci/secrets");
+    let vault = sandbox.root().join(".litci/secrets.vault");
+    let key = sandbox.home().join(".litci/vault.key");
+    assert!(!legacy.exists(), "plaintext legacy file survived migration");
+    let ciphertext = std::fs::read(&vault).expect("read encrypted vault");
+    assert!(ciphertext.starts_with(b"greenlit-vault-v1\0"));
+    assert!(
+        !ciphertext
+            .windows(LEGACY_SECRET.len())
+            .any(|window| window == LEGACY_SECRET.as_bytes()),
+        "vault contains the secret in plaintext"
+    );
+    assert_eq!(
+        std::fs::metadata(&vault)
+            .expect("stat encrypted vault")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(&key)
+            .expect("stat vault key")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let second = sandbox.run_with_env(&["run", "-W", "wf.yml"], &[SSH_DOCKER_HOST]);
+    let second_stderr = support::stderr_text(&second);
+    assert!(second_stderr.contains("DOCKER_HOST"), "{second_stderr}");
+    assert!(!second_stderr.contains(LEGACY_SECRET), "{second_stderr}");
 }
 
 #[test]

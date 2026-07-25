@@ -3,15 +3,14 @@
 
 use crate::model::job::Job;
 use crate::model::trigger::Trigger;
-use crate::model::value::{ScalarOrExpr, UnsupportedConstruct};
+use crate::model::value::ScalarOrExpr;
 use crate::span::{Span, Spanned};
 
 /// A fully parsed `.github/workflows/*.yml` file.
 ///
 /// Covers everything `PHASE-1-engine-core.md`'s greenlit-workflow section
 /// lists: `run-name`, `on` (all trigger forms), `env`, `defaults`,
-/// `permissions`, and `jobs`. `concurrency` is recognized but not deeply
-/// modeled (see [`UnsupportedConstruct`]).
+/// `permissions`, `concurrency`, and `jobs`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Workflow {
     /// The whole-document span.
@@ -33,11 +32,19 @@ pub struct Workflow {
     pub defaults: Option<Spanned<Defaults>>,
     /// `permissions:`.
     pub permissions: Option<Spanned<Permissions>>,
-    /// `concurrency:`, recognized but not deeply parsed — see
-    /// [`UnsupportedConstruct`].
-    pub concurrency: Option<UnsupportedConstruct>,
+    /// Workflow concurrency group and cancellation policy.
+    pub concurrency: Option<Spanned<Concurrency>>,
     /// `jobs:`, in file order.
     pub jobs: Vec<Job>,
+}
+
+/// A workflow- or job-level `concurrency:` declaration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Concurrency {
+    /// Group key, including any template expressions.
+    pub group: Spanned<String>,
+    /// Whether a newer owner cancels the current owner. Omitted means false.
+    pub cancel_in_progress: Option<Spanned<ScalarOrExpr>>,
 }
 
 /// `defaults:` (workflow- or job-level — identical shape at both levels).

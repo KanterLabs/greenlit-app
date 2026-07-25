@@ -208,6 +208,7 @@ fn runner_env(workspace: &str) -> RunnerEnv {
         runner_name: "greenlit".to_string(),
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
+        actions_service: None,
     }
 }
 
@@ -249,9 +250,12 @@ async fn node20_and_node24_actions_execute_in_the_ordinary_job_container() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "actions-nodejs-ordinary".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: fake_action_config(store_root.path()),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -320,9 +324,12 @@ async fn a_node_action_executes_in_a_custom_job_container() {
         secrets: Value::object(vec![]),
         initial_masks: Vec::new(),
         volume_namespace: "actions-nodejs-custom".to_string(),
+        locked_images: None,
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: fake_action_config(store_root.path()),
+        store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

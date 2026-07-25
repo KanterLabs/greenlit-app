@@ -13,7 +13,9 @@ mod strategy;
 
 pub use deferred::DeferredMatrixExpression;
 pub(crate) use strategy::plan_strategy;
-pub use strategy::{MatrixPlan, StrategyControl, StrategyPlan};
+pub use strategy::{
+    MatrixPlan, StrategyControl, StrategyPlan, materialize_controls, materialize_matrix,
+};
 
 use greenlit_expr::Value;
 use indexmap::IndexMap;

@@ -1,10 +1,10 @@
 //! The executor: drive a resolved [`ExecutionPlan`] to completion against a
-//! [`ContainerEngine`], one container per job, one exec per step, sequentially
-//! in DAG order.
+//! [`ContainerEngine`], one fresh container per job and one exec per step.
 //!
 //! `PHASE-2-execution.md` ("Job and step execution semantics", "Output and
 //! metrics"): one container per job; each step is an exec in that container;
-//! jobs run sequentially in topological order (parallelism is Phase 5). Every
+//! ready jobs and matrix legs run concurrently while steps remain sequential.
+//! Every
 //! GitHub-faithful rule — shell resolution, env layering, command files, the
 //! `outcome`/`conclusion` model, `needs` propagation, job outputs — is the
 //! engine's [`greenlit_engine::execution`] semantics; this module is the
@@ -21,26 +21,36 @@ pub mod actions;
 mod cmdfiles;
 pub mod container;
 mod context;
+mod dind;
+mod event_json;
+mod health;
+mod image_lock;
 mod instance;
 mod job;
 mod logsink;
+mod netguard;
 mod preflight;
 mod readiness;
 mod report;
+mod runner_lock;
+mod runner_profile;
+mod scheduler;
+mod services;
 mod step;
+mod step_ids;
+mod worker_pool;
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
 
+use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::contexts::merge_matrix_outputs;
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::execution::job_outputs::JobOutputError;
-use greenlit_engine::execution::{Masker, NeedRecord};
-use greenlit_engine::{Conclusion, EnvValue, ExecutionPlan, JobId};
+use greenlit_engine::{Conclusion, EnvValue, ExecutionPlan};
 use greenlit_expr::{EvalError, RealFs, Value};
 use greenlit_workflow::Span;
 
@@ -51,12 +61,16 @@ use crate::image::ImageError;
 use crate::isolation::IsolationStrategy;
 use crate::progress::ProgressSink;
 
+pub use actions::ActionPreflight;
 pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
-pub use preflight::reject_uses_steps;
+pub use image_lock::preflight_plan_images;
+pub use preflight::{reject_hermetic_late_inputs, reject_uses_steps};
 pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
+pub use runner_lock::preflight_plan_runners;
+pub use services::{JobNetwork, StoreConfig};
 
 /// Everything the executor needs beyond the plan and the engine.
 pub struct RunConfig {
@@ -87,12 +101,15 @@ pub struct RunConfig {
     /// GitHub's own hosted runner gives the same guarantee for free (a fresh
     /// VM per run has no pre-existing volumes to collide with); the local
     /// daemon persists across runs, so Greenlit must manufacture the
-    /// equivalent isolation. Every job/leg within one run shares this token,
-    /// so two job containers in the same run that both name `cache:/data`
-    /// still share one (run-scoped) volume, matching the "reused across
-    /// containers within one VM" behavior a workflow author would observe on
-    /// GitHub.
+    /// equivalent isolation. The executor appends a concrete job/leg key
+    /// before creating writable resources, so they cannot cross the fresh-job
+    /// boundary.
     pub volume_namespace: String,
+    /// Requested container aliases and reserved per-job runner keys mapped to
+    /// the immutable image identities finalized in the RunLock. `None` is
+    /// reserved for injected test executors that do not perform host-side
+    /// resolution.
+    pub locked_images: Option<std::collections::BTreeMap<String, String>>,
     /// Whether `--write-back` was requested. When `true`, a ran job's
     /// container is kept alive (not torn down) so its overlay upper can be
     /// exported after the whole run finishes (`JobReport::container_id`);
@@ -103,6 +120,61 @@ pub struct RunConfig {
     /// Action resolution/fetch/runtime configuration for `uses:` steps
     /// (`PHASE-3-actions.md` "Action execution").
     pub actions: actions::ActionRuntimeConfig,
+    /// Where the local cache, artifact, and toolcache stores live, when this
+    /// run serves them. `None` runs with no cache service at all.
+    pub store: Option<StoreConfig>,
+    /// Host-enforced ceilings applied to every job and service container.
+    pub resources: crate::ResourceLimits,
+}
+
+impl RunConfig {
+    fn locked_image(&self, requested: &str) -> Result<String, ExecError> {
+        resolve_locked_image(self.locked_images.as_ref(), requested)
+    }
+
+    fn locked_runner(
+        &self,
+        job: &str,
+        matrix_index: usize,
+        fallback: &str,
+    ) -> Result<String, ExecError> {
+        let Some(locks) = self.locked_images.as_ref() else {
+            return Ok(fallback.to_string());
+        };
+        const PREFIX: &str = "__greenlit_runner:";
+        if !locks.keys().any(|key| key.starts_with(PREFIX)) {
+            return Ok(fallback.to_string());
+        }
+        let matrix_key = format!("{PREFIX}{job}[{matrix_index}]");
+        let job_key = format!("{PREFIX}{job}");
+        locks
+            .get(&matrix_key)
+            .or_else(|| locks.get(&job_key))
+            .cloned()
+            .ok_or_else(|| ExecError::Infrastructure {
+                message: format!("runner for job '{job}' is absent from the finalized RunLock"),
+                fix: "preserve the run directory and file a Greenlit defect".to_string(),
+            })
+    }
+}
+
+fn resolve_locked_image(
+    locks: Option<&std::collections::BTreeMap<String, String>>,
+    requested: &str,
+) -> Result<String, ExecError> {
+    let Some(locks) = locks else {
+        return Ok(requested.to_string());
+    };
+    locks
+        .get(requested)
+        .cloned()
+        .ok_or_else(|| ExecError::Infrastructure {
+            message: format!(
+                "container image '{requested}' is absent from the finalized RunLock"
+            ),
+            fix: "select a statically resolvable image or preserve the run directory and file a Greenlit defect"
+                .to_string(),
+        })
 }
 
 /// A failure during execution. Detection-time engine conditions never travel
@@ -180,6 +252,17 @@ pub enum ExecError {
         #[source]
         source: greenlit_actions::UsesRefError,
     },
+    /// Hermetic execution encountered a checkout identity that would only be
+    /// learned by contacting GitHub after the lock was finalized.
+    #[error(
+        "{span}: hermetic execution cannot resolve checkout input '{input}' before the first step\n  fix: checkout the frozen current repository, or run without `--hermetic`"
+    )]
+    HermeticLateInput {
+        /// Input name and authored value.
+        input: String,
+        /// Where the checkout action was authored.
+        span: Span,
+    },
     /// Resolving a `uses:` ref (tag/branch/SHA) to a commit SHA failed.
     ///
     /// Boxed: `greenlit_actions::resolve::ResolveError` is large enough that
@@ -231,23 +314,23 @@ pub enum ExecError {
         /// The repository that was requested.
         repository: String,
     },
-    /// A matrix that only materializes from runtime dependency outputs was
-    /// reached. Expanding it requires mid-run data v0's sequential executor
-    /// does not model.
+    /// Runtime matrix materialization failed after dependency outputs existed.
     #[error(
-        "{span}: this job's matrix expands from another job's outputs, which `litci run` does not execute in v0\n  fix: use a statically-defined `strategy.matrix`, or inspect the plan with `litci plan`"
+        "could not materialize a runtime matrix: {source}\n  fix: make the producing job emit the documented JSON matrix and scheduling-control types"
     )]
-    DeferredMatrix {
-        /// Where the matrix was authored.
-        span: Span,
+    MatrixRuntime {
+        /// The matrix expression, shape, type, or size failure.
+        #[source]
+        source: greenlit_engine::MatrixError,
     },
-    /// A `runs-on:` label that only resolves from runtime data was reached.
+    /// A runtime-derived runner label failed evaluation or support validation.
     #[error(
-        "{span}: this job's `runs-on:` label depends on runtime data, which `litci run` does not resolve in v0\n  fix: use a literal `runs-on:` label or `${{{{ matrix.* }}}}`"
+        "could not materialize a runtime runner label: {source}\n  fix: emit one of ubuntu-latest, ubuntu-24.04, or ubuntu-22.04"
     )]
-    DeferredRunner {
-        /// Where `runs-on:` was authored.
-        span: Span,
+    RunnerRuntime {
+        /// The runner-label failure.
+        #[source]
+        source: greenlit_engine::RunnerError,
     },
     /// A container-side setup step (helper staging, readiness) failed in a way
     /// that is neither a daemon error nor a step failure.
@@ -277,17 +360,18 @@ impl ExecError {
 }
 
 /// A completed job's aggregate result and its merged outputs, for dependents.
-struct CompletedJob {
-    result: Conclusion,
-    outputs: IndexMap<String, String>,
+#[derive(Clone)]
+pub(crate) struct CompletedJob {
+    pub(crate) result: Conclusion,
+    pub(crate) outputs: IndexMap<String, String>,
     /// Whether this job or any job in its own ancestor chain failed
     /// (transitively) — GitHub: "If you have a chain of dependent jobs,
     /// failure() returns true if any ancestor job fails."
     /// <https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#status-check-functions>
-    chain_failed: bool,
+    pub(crate) chain_failed: bool,
     /// Whether this job or any ancestor was cancelled (transitively), mirroring
     /// `chain_failed`'s propagation for `cancelled()`.
-    chain_cancelled: bool,
+    pub(crate) chain_cancelled: bool,
 }
 
 /// The run-wide, immutable context every job instance shares.
@@ -300,6 +384,10 @@ pub(crate) struct Shared<'a> {
     pub roots: &'a ContextRoots,
     /// The workflow-level `env:` plan (resolved per job).
     pub workflow_env: &'a IndexMap<String, EnvValue>,
+    /// Cooperative cancellation for this invocation.
+    pub cancellation: &'a crate::Cancellation,
+    /// Resource namespace for this run or concrete job instance.
+    pub namespace: &'a str,
 }
 
 /// Open a timed stage span captured by `greenlit-metrics`'s timing layer.
@@ -327,6 +415,30 @@ pub async fn run_plan(
     out: &mut (dyn Write + Send),
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<RunReport, ExecError> {
+    run_plan_cancellable(
+        engine,
+        plan,
+        config,
+        out,
+        progress,
+        &crate::Cancellation::new(),
+    )
+    .await
+}
+
+/// Execute a plan with a cooperative cancellation signal.
+///
+/// Cancellation stops queued work and tears down active job containers,
+/// services, sidecars, volumes, and networks before returning a cancelled
+/// report.
+pub async fn run_plan_cancellable(
+    engine: &dyn ContainerEngine,
+    plan: &ExecutionPlan,
+    config: &RunConfig,
+    out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
+    cancellation: &crate::Cancellation,
+) -> Result<RunReport, ExecError> {
     let mut masker = Masker::new();
     for value in &config.initial_masks {
         masker.add(value);
@@ -346,77 +458,11 @@ pub async fn run_plan(
         config,
         roots: &roots,
         workflow_env: &plan.env,
+        cancellation,
+        namespace: &config.volume_namespace,
     };
 
-    let mut job_reports: Vec<JobReport> = Vec::new();
-    let mut completed: HashMap<String, CompletedJob> = HashMap::new();
-
-    for group in &groups {
-        let mut instance_results: Vec<(Conclusion, IndexMap<String, String>)> = Vec::new();
-        for instance in &group.instances {
-            let needs = needs_records(instance.needs, &completed);
-            let report = job::run_instance(
-                &shared,
-                &mut masker,
-                instance,
-                &group.id,
-                &needs,
-                out,
-                progress,
-            )
-            .await?;
-            instance_results.push((report.result, report.outputs.clone()));
-            job_reports.push(report);
-        }
-        // The group's own ancestor-chain flags combine its own aggregate
-        // result with every direct dependency's already-computed chain
-        // flags, so a failure (or cancellation) keeps propagating downstream
-        // even through an intermediate job that itself only *skipped*
-        // because of it (finding: transitive `failure()` across ancestors).
-        let aggregated = aggregate(&instance_results);
-        let ancestors_failed = group
-            .needs
-            .iter()
-            .any(|need| completed.get(&need.0).is_some_and(|done| done.chain_failed));
-        let ancestors_cancelled = group.needs.iter().any(|need| {
-            completed
-                .get(&need.0)
-                .is_some_and(|done| done.chain_cancelled)
-        });
-        let chain_failed = ancestors_failed || matches!(aggregated.0, Conclusion::Failure);
-        let chain_cancelled = ancestors_cancelled || matches!(aggregated.0, Conclusion::Cancelled);
-        completed.insert(
-            group.id.0.clone(),
-            CompletedJob {
-                result: aggregated.0,
-                outputs: aggregated.1,
-                chain_failed,
-                chain_cancelled,
-            },
-        );
-    }
-
-    let overall = RunReport::overall_of(&job_reports);
-    Ok(RunReport {
-        jobs: job_reports,
-        overall,
-    })
-}
-
-/// Build the `needs` records for one instance from the completed dependencies.
-fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> Vec<NeedRecord> {
-    needs
-        .iter()
-        .filter_map(|need| {
-            completed.get(&need.0).map(|done| NeedRecord {
-                job: need.clone(),
-                result: done.result,
-                outputs: done.outputs.clone(),
-                chain_failed: done.chain_failed,
-                chain_cancelled: done.chain_cancelled,
-            })
-        })
-        .collect()
+    scheduler::run(&shared, &groups, &masker, out, progress).await
 }
 
 /// Aggregate a job's per-leg results into the single result and merged output
@@ -425,7 +471,7 @@ fn needs_records(needs: &[JobId], completed: &HashMap<String, CompletedJob>) -> 
 /// GitHub reports a matrix job's `needs.<id>.result` as the worst leg outcome
 /// (a single failed leg fails the dependency) and merges leg outputs, the last
 /// writer winning per key (`greenlit_engine::execution::contexts`).
-fn aggregate(
+pub(crate) fn aggregate(
     results: &[(Conclusion, IndexMap<String, String>)],
 ) -> (Conclusion, IndexMap<String, String>) {
     let result = if results.is_empty() {

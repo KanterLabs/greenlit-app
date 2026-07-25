@@ -16,7 +16,7 @@ use std::time::Duration;
 pub struct Canned {
     pub status: u16,
     pub reason: &'static str,
-    pub body: String,
+    pub body: Vec<u8>,
 }
 
 impl Canned {
@@ -24,7 +24,15 @@ impl Canned {
         Canned {
             status,
             reason,
-            body: body.into(),
+            body: body.into().into_bytes(),
+        }
+    }
+
+    pub fn bytes(status: u16, reason: &'static str, body: Vec<u8>) -> Self {
+        Canned {
+            status,
+            reason,
+            body,
         }
     }
 }
@@ -55,15 +63,17 @@ impl FakeGitHub {
                 let (mut stream, _) = self.listener.accept().expect("accept");
                 paths.push(read_request_line(&mut stream));
                 let response = format!(
-                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     canned.status,
                     canned.reason,
-                    canned.body.len(),
-                    canned.body
+                    canned.body.len()
                 );
                 stream
                     .write_all(response.as_bytes())
                     .expect("write fake GitHub response");
+                stream
+                    .write_all(&canned.body)
+                    .expect("write fake GitHub body");
             }
             paths
         })
