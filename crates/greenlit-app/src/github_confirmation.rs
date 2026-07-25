@@ -20,6 +20,7 @@ const ARTIFACT_NAME: &str = "greenlit-evidence-v1";
 const ARTIFACT_FILE: &str = "greenlit-evidence-v1.json";
 const EXPORTED_WORKFLOW: &str = "greenlit-confirmation.yml";
 const EXPORT_MARKER: &str = "# greenlit-confirmation-evidence-v1";
+const SOURCE_COMMIT_PLACEHOLDER: &str = "__GREENLIT_GITHUB_SHA__";
 const UPLOAD_ARTIFACT_COMMIT: &str = "ea165f8d65b6e75b540449e92b4886f43607fa02";
 const MAX_API_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
@@ -401,7 +402,7 @@ fn replace_container_ref(requested: &str, digest: &str) -> String {
 fn append_evidence_job(
     pinned: &str,
     evidence: &GithubEvidenceV1,
-    evidence_bytes: &[u8],
+    _evidence_bytes: &[u8],
 ) -> anyhow::Result<String> {
     let needs = evidence
         .jobs
@@ -411,7 +412,13 @@ fn append_evidence_job(
         .into_iter()
         .collect::<Vec<_>>()
         .join(", ");
-    let encoded = base64_encode(evidence_bytes);
+    let mut workflow_evidence = evidence.clone();
+    workflow_evidence.source_commit = SOURCE_COMMIT_PLACEHOLDER.to_string();
+    let encoded = base64_encode(&workflow_evidence.canonical_json().map_err(|error| {
+        anyhow::anyhow!(
+            "could not serialize the exported evidence template: {error}\n  fix: preserve the run directory and file a Greenlit defect"
+        )
+    })?);
     let input_checks = evidence
         .inputs
         .iter()
@@ -424,7 +431,7 @@ fn append_evidence_job(
         })
         .collect::<String>();
     Ok(format!(
-        "{pinned}{EXPORT_MARKER}\n  greenlit_confirmation:\n    name: Greenlit evidence\n    needs: [{needs}]\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n    steps:\n{input_checks}      - name: Write Greenlit evidence\n        shell: bash\n        run: printf '%s' '{encoded}' | base64 --decode > {ARTIFACT_FILE}\n      - name: Upload Greenlit evidence\n        uses: actions/upload-artifact@{UPLOAD_ARTIFACT_COMMIT}\n        with:\n          name: {ARTIFACT_NAME}\n          path: {ARTIFACT_FILE}\n          if-no-files-found: error\n          retention-days: 7\n"
+        "{pinned}{EXPORT_MARKER}\n  greenlit_confirmation:\n    name: Greenlit evidence\n    needs: [{needs}]\n    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n    steps:\n{input_checks}      - name: Write Greenlit evidence\n        shell: bash\n        run: |\n          printf '%s' '{encoded}' | base64 --decode > {ARTIFACT_FILE}\n          sed -i \"s/{SOURCE_COMMIT_PLACEHOLDER}/$GITHUB_SHA/\" {ARTIFACT_FILE}\n      - name: Upload Greenlit evidence\n        uses: actions/upload-artifact@{UPLOAD_ARTIFACT_COMMIT}\n        with:\n          name: {ARTIFACT_NAME}\n          path: {ARTIFACT_FILE}\n          if-no-files-found: error\n          retention-days: 7\n"
     ))
 }
 

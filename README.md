@@ -224,7 +224,11 @@ litci clean [-y]
 **`export`** writes a separate, fully pinned GitHub workflow and
 `greenlit-evidence-v1.json`. It never edits your workflows, commits, pushes,
 dispatches, or sends a message. Commit and trigger that separate file through
-your ordinary review process.
+your ordinary review process. The safe first-use sequence is: export, add the
+separate workflow to the commit you intend to test, rerun Greenlit at that
+clean commit, export that new run, verify the workflow file is unchanged, and
+then push or dispatch it. The evidence job fills in GitHub's actual commit at
+runtime, so the exported workflow has no self-referential commit hash.
 
 **`confirm`** performs read-only GitHub API calls. It upgrades an eligible
 hermetic result only after the source, event and inputs, pinned workflow bytes,
