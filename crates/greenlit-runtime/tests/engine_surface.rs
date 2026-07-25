@@ -11,8 +11,8 @@
 use async_trait::async_trait;
 
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use greenlit_runtime::error::RuntimeError;
 use greenlit_runtime::progress::ProgressSink;
@@ -106,6 +106,37 @@ impl ContainerEngine for FakeEngine {
     }
 
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
+        Ok(NetworkInfo {
+            gateway: Some("10.0.0.1".to_string()),
+            subnet: Some("10.0.0.0/16".to_string()),
+        })
+    }
+
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: HealthState::None,
+        })
+    }
+
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
 }

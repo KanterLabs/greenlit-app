@@ -21,7 +21,12 @@ fn stats_reads_only_the_retained_tail_and_caps_aggregate_record_bytes() {
     file.write_all(b"\n")
         .expect("terminate sparse old-history record");
     for index in 0..25 {
-        writeln!(file, "{}", metrics_record(1, index)).expect("write recent record");
+        writeln!(
+            file,
+            "{}",
+            metrics_record(greenlit_metrics::SCHEMA_VERSION, index)
+        )
+        .expect("write recent record");
     }
     drop(file);
 
@@ -59,7 +64,10 @@ fn append_never_truncates_without_a_bounded_known_newline_boundary() {
     let sandbox = Sandbox::new();
     sandbox.write("wf.yml", WORKFLOW);
     sandbox.init_git();
-    write_metrics(&sandbox, format!("{}\n", metrics_record(1, 8)));
+    write_metrics(
+        &sandbox,
+        format!("{}\n", metrics_record(greenlit_metrics::SCHEMA_VERSION, 8)),
+    );
 
     let path = sandbox.metrics_file();
     let file = OpenOptions::new()
@@ -87,9 +95,10 @@ fn append_never_truncates_without_a_bounded_known_newline_boundary() {
 }
 
 fn write_padded_record(file: &mut File, started_at: u128, padding_bytes: usize) {
+    let schema = greenlit_metrics::SCHEMA_VERSION;
     write!(
         file,
-        "{{\"schema_version\":1,\"command\":\"plan\",\"started_at_unix_ms\":{started_at},\"total_duration_ms\":1.0,\"stages\":[],\"steps\":[],\"hit_miss\":[],\"padding\":\""
+        "{{\"schema_version\":{schema},\"command\":\"plan\",\"started_at_unix_ms\":{started_at},\"total_duration_ms\":1.0,\"stages\":[],\"steps\":[],\"hit_miss\":[],\"padding\":\""
     )
     .expect("write large record prefix");
     let mut padding = std::io::repeat(b'x').take(padding_bytes as u64);

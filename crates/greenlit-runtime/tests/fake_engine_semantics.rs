@@ -20,8 +20,8 @@ use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
 use greenlit_expr::Value;
 use greenlit_runtime::engine::{
-    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ExecOutput, ExecOutputSink, ExecSpec,
-    RegistryAuth,
+    BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
+    ExecOutputSink, ExecSpec, HealthState, ImageSummary, NetworkInfo, RegistryAuth,
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
@@ -258,6 +258,32 @@ impl ContainerEngine for ScriptedEngine {
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
         Ok(())
     }
+
+    async fn inspect_network(&self, _name: &str) -> Result<NetworkInfo, RuntimeError> {
+        Ok(NetworkInfo {
+            gateway: Some("10.0.0.1".to_string()),
+            subnet: Some("10.0.0.0/16".to_string()),
+        })
+    }
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerState, RuntimeError> {
+        Ok(ContainerState {
+            running: true,
+            exit_code: None,
+            health: HealthState::None,
+        })
+    }
+    async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn remove_volume(&self, _name: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
+    async fn list_images(&self, _label: &str) -> Result<Vec<ImageSummary>, RuntimeError> {
+        Ok(Vec::new())
+    }
+    async fn remove_image(&self, _image: &str) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 const WORKFLOW: &str = r#"
@@ -339,6 +365,7 @@ async fn dag_propagation_rollup_gating_and_masking() {
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -441,6 +468,7 @@ async fn checkouts_post_step_runs_even_when_a_later_step_fails() {
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -549,6 +577,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
+        store: None,
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -686,6 +715,7 @@ async fn run_single_job(
         write_back: false,
         readiness: tiny_readiness(),
         actions: test_action_config(),
+        store: None,
     };
     let mut log: Vec<u8> = Vec::new();
     let mut recording = RecordingSink::default();

@@ -39,7 +39,9 @@
 //! namespacing applies here too), writable, sibling-shareable workspace.
 //! Jobs with no Docker action are entirely unaffected (they keep the
 //! default overlay-preferring strategy). The volume is created and removed
-//! per job, namespaced to the run exactly like a workflow-authored
+//! per job (removal follows the job container's own teardown in
+//! `crate::executor::job`, since a volume still bound by a running container
+//! cannot be removed), namespaced to the run exactly like a workflow-authored
 //! `volumes:` entry, so it can never resolve to a pre-existing daemon-global
 //! volume.
 //!
@@ -205,6 +207,10 @@ pub(crate) async fn execute(
             read_only: false,
         }],
         name: None,
+        // A Docker action gets no capabilities, no published ports, no health
+        // probe, and no network alias: it is a sibling that shares only the
+        // job's workspace volume.
+        ..ContainerSpec::default()
     };
 
     let id = engine.create_container(&spec).await?;

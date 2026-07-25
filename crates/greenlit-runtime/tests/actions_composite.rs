@@ -61,6 +61,7 @@ fn runner_env(workspace: &str) -> RunnerEnv {
         runner_name: "greenlit".to_string(),
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
+        actions_service: None,
     }
 }
 
@@ -145,6 +146,7 @@ async fn a_composite_step_sees_job_env_layers_a_live_path_and_maps_its_output() 
         write_back: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
+        store: None,
     };
 
     let mut log: Vec<u8> = Vec::new();

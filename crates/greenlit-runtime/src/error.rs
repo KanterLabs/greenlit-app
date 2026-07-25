@@ -115,6 +115,18 @@ pub enum Operation {
     CreateNetwork,
     /// Removing a network.
     RemoveNetwork,
+    /// Inspecting a network for its gateway.
+    InspectNetwork,
+    /// Inspecting a container for its state, including health.
+    InspectContainer,
+    /// Creating a named volume.
+    CreateVolume,
+    /// Removing a named volume.
+    RemoveVolume,
+    /// Listing images, filtered by Greenlit's ownership label.
+    ListImages,
+    /// Removing an image.
+    RemoveImage,
 }
 
 impl fmt::Display for Operation {
@@ -135,6 +147,12 @@ impl fmt::Display for Operation {
             Operation::InspectExec => "inspect exec",
             Operation::CreateNetwork => "create network",
             Operation::RemoveNetwork => "remove network",
+            Operation::InspectNetwork => "inspect network",
+            Operation::InspectContainer => "inspect container",
+            Operation::CreateVolume => "create volume",
+            Operation::RemoveVolume => "remove volume",
+            Operation::ListImages => "list images",
+            Operation::RemoveImage => "remove image",
         };
         f.write_str(name)
     }

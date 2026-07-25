@@ -103,6 +103,32 @@ pub struct RunnerEnv {
     pub runner_temp: String,
     /// `RUNNER_TOOL_CACHE`: the persistent toolcache directory.
     pub runner_tool_cache: String,
+    /// `ACTIONS_CACHE_URL`, `ACTIONS_RESULTS_URL`, and
+    /// `ACTIONS_RUNTIME_TOKEN`, when a run serves the local shim.
+    ///
+    /// These are the addresses `actions/cache` and `upload-artifact` reach
+    /// their service at. They are `None` for `litci plan`, which starts no
+    /// shim, and for any run whose store could not be opened -- an absent
+    /// variable makes those actions fail the way they do on a runner with no
+    /// cache service, which is honest, rather than pointing them at a URL
+    /// nothing is listening on.
+    pub actions_service: Option<ActionsService>,
+}
+
+/// Where the workflow-facing shim is, and the token that opens it.
+///
+/// The URLs carry the port the shim actually bound and the address the job
+/// container reaches the host at, so they are only knowable once the run's
+/// network exists -- which is why this is set per job rather than built with
+/// the rest of the environment.
+#[derive(Debug, Clone, Default)]
+pub struct ActionsService {
+    /// `ACTIONS_CACHE_URL`. Must end in `/`: the client concatenates onto it.
+    pub cache_url: String,
+    /// `ACTIONS_RESULTS_URL`, the artifact service's base.
+    pub results_url: String,
+    /// `ACTIONS_RUNTIME_TOKEN`, this run's bearer token.
+    pub runtime_token: String,
 }
 
 impl RunnerEnv {
@@ -143,6 +169,11 @@ impl RunnerEnv {
         set("RUNNER_NAME", self.runner_name);
         set("RUNNER_TEMP", self.runner_temp);
         set("RUNNER_TOOL_CACHE", self.runner_tool_cache);
+        if let Some(service) = self.actions_service {
+            set("ACTIONS_CACHE_URL", service.cache_url);
+            set("ACTIONS_RESULTS_URL", service.results_url);
+            set("ACTIONS_RUNTIME_TOKEN", service.runtime_token);
+        }
         env
     }
 }

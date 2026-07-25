@@ -27,9 +27,13 @@ use crate::executor::container::{
 use crate::executor::context::{
     CaptureSink, ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
 };
+use crate::executor::dind;
 use crate::executor::instance::JobInstance;
+use crate::executor::netguard;
+use crate::executor::provision;
 use crate::executor::readiness::{self, READY_MARKER};
 use crate::executor::report::{JobReport, StepReport};
+use crate::executor::services;
 use crate::executor::step::{
     JobRuntime, StepLoopState, execute_step, run_post_steps, run_pre_steps,
 };
@@ -42,12 +46,39 @@ use crate::progress::{ProgressEvent, ProgressSink};
 /// Base directory for per-step command files inside a container.
 const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
 
+/// Cap on the `PATH` read back from an untrusted job image.
+///
+/// Generous next to any real `PATH` (a stock Ubuntu image is well under 100
+/// bytes), while bounding what a hostile image can make the host hold.
+const MAX_PATH_BYTES: usize = 32 * 1024;
+
 /// The bare (pre-namespacing) name of the run-scoped named volume backing a
 /// job's shared workspace when it contains a Docker action
 /// (`crate::executor::actions::docker_action` module docs) — namespaced the
 /// same way a workflow-authored `volumes:` entry is
 /// (`crate::executor::container::namespaced_volume_name`).
 const DOCKER_SIBLING_WORKSPACE_VOLUME: &str = "workspace";
+
+/// What `resolve_image` settled on for this job.
+struct ResolvedImage {
+    /// The image the container actually starts from — this repository's
+    /// converged image when one exists, else the base.
+    tag: String,
+    /// The *base* image the convergence is anchored to.
+    ///
+    /// Kept separate from `tag` because the converged tag is hashed over it:
+    /// hashing over `tag` instead would produce a new tag every time a
+    /// converged image was itself converged, so a repository would never
+    /// reuse one. `None` for a user-declared `container:`, which never
+    /// converges.
+    base: Option<String>,
+    /// Whether this is a user-declared `container:`.
+    in_container: bool,
+    /// Whether `bash` is known to be present.
+    bash_available: bool,
+    /// Validated job-container additions.
+    additions: ContainerAdditions,
+}
 
 /// The resolved per-job env layers and defaults threaded into the step loop,
 /// plus everything action execution needs beyond that.
@@ -85,6 +116,19 @@ pub(crate) async fn run_instance(
     let mut runner_env = shared.config.runner_env.clone();
     runner_env.job = job_id.0.clone();
     runner_env.workspace = shared.config.workspace.clone();
+
+    // The job's own bridge: the shim binds on its gateway and, from the next
+    // task group, services attach to it. Created before the container so the
+    // container can be attached at creation time, and torn down after it --
+    // a network with an attached container cannot be removed.
+    let network_name = format!(
+        "greenlit-run-{}-{}",
+        shared.config.volume_namespace, job_id.0
+    );
+    let job_network =
+        services::create(shared.engine, &network_name, shared.config.store.as_ref()).await?;
+    runner_env.actions_service = job_network.actions_service().cloned();
+
     let mut base_env = runner_env.clone().into_map();
     let runner_ctx = runner_context(&runner_env);
 
@@ -154,7 +198,43 @@ pub(crate) async fn run_instance(
     let mut extra_binds = action_plan.binds.clone();
     extra_binds.extend(node_binds);
 
-    let (image_tag, in_container, bash_available, additions) = resolve_image(
+    // Services start before the job container, exactly as GitHub starts them
+    // before the job: a first step that connects to `postgres:5432` must find
+    // it already listening, not race it.
+    //
+    // Both halves unwind the network on failure. The executor has no
+    // `Drop`-based cleanup registry, so anything created before the container
+    // has to be released on every path out — a rejected service definition
+    // leaked an empty network until this was folded into one place.
+    let services_started =
+        match resolve_services(shared, masker, &runner_ctx, instance, &base_env, needs) {
+            Ok(resolved) => {
+                match services::start(
+                    shared.engine,
+                    job_network.name(),
+                    job_network.policy(),
+                    &resolved,
+                    progress,
+                )
+                .await
+                {
+                    Ok(started) => started,
+                    Err(failure) => {
+                        // Some may already be running; stop them before removing
+                        // the network they are attached to.
+                        services::stop(shared.engine, &failure.started).await;
+                        job_network.teardown(shared.engine).await;
+                        return Err(failure.cause);
+                    }
+                }
+            }
+            Err(error) => {
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        };
+
+    let resolved_image = resolve_image(
         shared,
         masker,
         &runner_ctx,
@@ -164,17 +244,139 @@ pub(crate) async fn run_instance(
         progress,
     )
     .await?;
+    let ResolvedImage {
+        tag: image_tag,
+        base: base_image_tag,
+        in_container,
+        bash_available,
+        additions,
+    } = resolved_image;
 
     let container = boot_container(
         shared,
-        &image_tag,
-        in_container,
-        &additions,
-        &extra_binds,
-        action_plan.needs_docker_sibling,
+        &BootRequest {
+            image: &image_tag,
+            in_container,
+            additions: &additions,
+            extra_binds: &extra_binds,
+            needs_docker_sibling: action_plan.needs_docker_sibling,
+            network: job_network.name(),
+        },
         progress,
     )
     .await?;
+
+    // The network policy goes on before readiness, and therefore before any
+    // workflow code runs: a container that has executed even one step under
+    // an unrestricted network has already had its chance to reach the LAN.
+    if let Err(error) =
+        netguard::apply(shared.engine, &container, job_network.policy(), progress).await
+    {
+        let _ = shared.engine.remove_container(&container).await;
+        services::stop(shared.engine, &services_started).await;
+        job_network.teardown(shared.engine).await;
+        return Err(error.into());
+    }
+
+    // Docker-in-Docker, only when the job's own scripts call `docker`.
+    // Starting a privileged daemon for every job would cost seconds and a
+    // privileged container for a capability most workflows never use.
+    let dind = if dind::job_uses_docker(instance.steps.iter().filter_map(step_script)) {
+        match dind::start(shared.engine, job_network.name(), progress).await {
+            Ok(sidecar) => Some(sidecar),
+            Err(error) => {
+                let _ = shared.engine.remove_container(&container).await;
+                services::stop(shared.engine, &services_started).await;
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if dind.is_some() {
+        // The wrapper is installed before any step runs, so the very first
+        // `docker` invocation already reaches the sidecar -- the brief is
+        // explicit that a missing daemon must never be discovered by
+        // rerunning the user's step.
+        let install = ExecSpec {
+            cmd: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                dind::install_wrapper_script(),
+            ],
+            env: Vec::new(),
+            working_dir: None,
+        };
+        if let Err(error) = shared
+            .engine
+            .exec(&container, &install, &mut crate::engine::SinkNull)
+            .await
+        {
+            let _ = shared.engine.remove_container(&container).await;
+            services::stop(shared.engine, &services_started).await;
+            job_network.teardown(shared.engine).await;
+            return Err(error.into());
+        }
+    }
+
+    // Set when this job is eligible to converge -- a Greenlit runner image
+    // with a store to cache the manifest in.
+    let mut converged_target: Option<String> = None;
+    // The manifest and base image this job converged against, kept so the
+    // converged image can be built from a clean base container at teardown.
+    let mut converged_source: Option<(provision::manifest::Manifest, String)> = None;
+
+    // Lazy provisioning, for Greenlit runner images only. A user-declared
+    // `container:` is left exactly as authored: a command missing from that
+    // image must fail the way it fails in the same job container on GitHub
+    // (`PHASE-4-environment.md`: "Never inject host-runner tools or
+    // convergence layers into a user-declared job container").
+    if !in_container && let Some(store) = shared.config.store.as_ref() {
+        let version = match instance.runner {
+            RunnerImage::Ubuntu2404 => "24.04",
+            RunnerImage::Ubuntu2204 => "22.04",
+        };
+        let label = instance.runner.image_identifier();
+        if let Some(base) = base_image_tag.as_deref() {
+            converged_target = Some(provision::converged_tag(
+                &shared.config.repo_host_path,
+                base,
+                label,
+            ));
+        }
+        // A manifest that cannot be reached costs provisioning, not the run:
+        // the job proceeds against the slim base, and a genuinely missing
+        // command still fails at the step with its own message.
+        match provision::fetch::load(&store.toolcache_root_parent(), version)
+            .instrument(stage_span("manifest"))
+            .await
+        {
+            Ok(manifest) => {
+                let wanted =
+                    provision::mentioned_commands(instance.steps.iter().filter_map(step_script));
+                if let Some(base) = base_image_tag.clone() {
+                    converged_source = Some((manifest.clone(), base));
+                }
+                if let Err(error) =
+                    provision::install_shims(shared.engine, &container, &manifest, &wanted, label)
+                        .instrument(stage_span("provision"))
+                        .await
+                {
+                    tracing::debug!(
+                        target: "greenlit_runtime::provision",
+                        %error,
+                        "could not install provisioning shims; continuing without them"
+                    );
+                }
+            }
+            Err(error) => tracing::debug!(
+                target: "greenlit_runtime::provision",
+                %error,
+                "could not load the runner-images manifest; continuing without provisioning"
+            ),
+        }
+    }
 
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than
@@ -228,9 +430,40 @@ pub(crate) async fn run_instance(
     // job. Otherwise, best-effort teardown here and now: a leaked container
     // is not a run failure, and it must not mask the job's real result or
     // error.
+    // Convergence happens only for a green job on a Greenlit runner image:
+    // committing a container whose steps failed would bake a half-installed
+    // state into the image every later run starts from.
+    if !in_container
+        && matches!(&outcome, Ok((_, _, Conclusion::Success)))
+        && let Some(tag) = &converged_target
+        && let Some((manifest, base_image)) = &converged_source
+    {
+        let installed = provision::provisioned_commands(shared.engine, &container).await;
+        provision::build_converged(shared.engine, base_image, manifest, &installed, tag).await;
+    }
+
     if !shared.config.write_back {
         let _ = shared.engine.remove_container(&container).await;
+        // The Docker-sibling workspace volume outlives the container that
+        // bound it, so removing the container is not enough. Before
+        // `remove_volume` existed on the port these accumulated on the host
+        // until an operator ran `docker volume prune` -- the module doc in
+        // `actions::docker_action` already described a per-job removal that
+        // no code performed. Removal must follow the container, because a
+        // volume still in use cannot be removed.
+        if let Some(source) = docker_workspace_volume {
+            let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
+            let _ = shared.engine.remove_volume(&volume).await;
+        }
     }
+    // After the container, before the network: services and the DinD sidecar
+    // hold attachments too, and a network with any attachment cannot be
+    // removed.
+    if let Some(sidecar) = &dind {
+        let _ = shared.engine.remove_container(sidecar.container()).await;
+    }
+    services::stop(shared.engine, &services_started).await;
+    job_network.teardown(shared.engine).await;
 
     let (step_reports, outputs, result) = outcome?;
     Ok(JobReport {
@@ -446,7 +679,7 @@ async fn resolve_image(
     base_env: &IndexMap<String, String>,
     needs: &[NeedRecord],
     progress: &mut (dyn ProgressSink + Send),
-) -> Result<(String, bool, bool, ContainerAdditions), ExecError> {
+) -> Result<ResolvedImage, ExecError> {
     match instance.container {
         Some(container_plan) => {
             let ctx = env_ctx(
@@ -497,17 +730,48 @@ async fn resolve_image(
             ensure.instrument(stage_span("image-ensure")).await?;
             // A job container image is not guaranteed to ship bash; GitHub
             // defaults such jobs to `sh`.
-            Ok((resolved.image, true, false, additions))
+            Ok(ResolvedImage {
+                tag: resolved.image,
+                base: None,
+                in_container: true,
+                bash_available: false,
+                additions,
+            })
         }
         None => {
             let release = match instance.runner {
                 RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
                 RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
             };
-            let tag = ensure_base_image(shared.engine, release, progress)
+            let base_tag = ensure_base_image(shared.engine, release, progress)
                 .instrument(stage_span("image-ensure"))
                 .await?;
-            Ok((tag, false, true, ContainerAdditions::default()))
+            // A previous run of this checkout may already have installed the
+            // tools its workflows use; starting from that image is what makes
+            // convergence pay off (`PHASE-4-environment.md`: "subsequent runs
+            // start from it").
+            let converged = provision::converged_tag(
+                &shared.config.repo_host_path,
+                &base_tag,
+                instance.runner.image_identifier(),
+            );
+            let tag = if shared
+                .engine
+                .image_exists(&converged)
+                .await
+                .unwrap_or(false)
+            {
+                converged
+            } else {
+                base_tag.clone()
+            };
+            Ok(ResolvedImage {
+                tag,
+                base: Some(base_tag),
+                in_container: false,
+                bash_available: true,
+                additions: ContainerAdditions::default(),
+            })
         }
     }
 }
@@ -640,9 +904,29 @@ async fn seed_container_path(
     let mut sink = CaptureSink::default();
     let output = engine.exec(container, &spec, &mut sink).await?;
     if output.exit_code == 0 {
-        let path = sink.text();
+        let mut path = sink.text();
+        // The image is untrusted, and this read was previously unbounded --
+        // every HTTP path in the codebase caps its body read for the same
+        // reason. A `PATH` longer than this is not a real one.
+        if path.len() > MAX_PATH_BYTES {
+            path.truncate(MAX_PATH_BYTES);
+            // Truncation can land mid-entry; drop the partial tail rather
+            // than leaving a directory name that means something else.
+            if let Some(last) = path.rfind(':') {
+                path.truncate(last);
+            }
+        }
         if !path.is_empty() {
-            base_env.insert("PATH".to_string(), path);
+            // Wrappers first, provisioning shims last. The managed `docker`
+            // wrapper has to beat a CLI the job image already ships (a
+            // `docker:27-cli` job container has one at `/usr/local/bin`);
+            // a provisioning shim must lose to a real tool the workflow
+            // installs, because `apply_path_additions` only ever prepends
+            // and treats this whole string as one opaque tail segment.
+            base_env.insert(
+                "PATH".to_string(),
+                format!("{}:{path}:{}", dind::WRAPPER_DIR, dind::SHIM_DIR),
+            );
         }
     }
     Ok(())
@@ -658,15 +942,37 @@ async fn seed_container_path(
 /// itself needs no change: its copy-in populate step fills whatever is
 /// already bind-mounted at the workspace path, oblivious to whether that is
 /// container-local storage or a named volume.
+/// Everything that shapes the job container, gathered so the boot call keeps
+/// one argument per *concern* rather than one per field.
+struct BootRequest<'a> {
+    /// The resolved image reference.
+    image: &'a str,
+    /// Whether this is a user-declared `container:` rather than a Greenlit
+    /// runner image — the flag that gates every convergence behavior.
+    in_container: bool,
+    /// Job-container `env:`/`volumes:`/credentials, already validated.
+    additions: &'a ContainerAdditions,
+    /// Read-only binds the job's `uses:` steps need.
+    extra_binds: &'a [BindMount],
+    /// Whether a Docker action forces the shared-workspace volume.
+    needs_docker_sibling: bool,
+    /// The job's own bridge network.
+    network: &'a str,
+}
+
 async fn boot_container(
     shared: &Shared<'_>,
-    image: &str,
-    in_container: bool,
-    additions: &ContainerAdditions,
-    extra_binds: &[BindMount],
-    needs_docker_sibling: bool,
+    request: &BootRequest<'_>,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<String, ExecError> {
+    let BootRequest {
+        image,
+        in_container,
+        additions,
+        extra_binds,
+        needs_docker_sibling,
+        network,
+    } = *request;
     let repo = shared.config.repo_host_path.to_string_lossy().into_owned();
     let idle = vec![
         "sh".to_string(),
@@ -707,6 +1013,25 @@ async fn boot_container(
     spec.binds.extend(additions.volume_binds.iter().cloned());
     spec.binds.extend(extra_binds.iter().cloned());
     spec.env = additions.env.clone();
+    spec.network = Some(network.to_string());
+    // The persistent toolcache: a writable Greenlit-owned host directory, so a
+    // `setup-*` action finds what a previous run installed instead of
+    // downloading it again (`PHASE-4-environment.md`: "mount
+    // `~/.litci/toolcache` at `RUNNER_TOOL_CACHE`"). A failure to create it
+    // means no toolcache this run, not a failed run.
+    if let Some(store) = shared.config.store.as_ref() {
+        match services::toolcache_bind(
+            &store.toolcache_root,
+            &shared.config.runner_env.runner_tool_cache,
+        ) {
+            Ok(bind) => spec.binds.push(bind),
+            Err(error) => tracing::debug!(
+                target: "greenlit_runtime::services",
+                %error,
+                "could not prepare the toolcache; running without it"
+            ),
+        }
+    }
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
 
     let engine = shared.engine;
@@ -778,5 +1103,83 @@ fn skipped_report(job_id: &JobId, display: String, started: Instant) -> JobRepor
         outputs: IndexMap::new(),
         duration: started.elapsed(),
         container_id: None,
+    }
+}
+
+/// Resolves every `services:` entry against the job's contexts and validates
+/// it exactly as a job container is validated.
+///
+/// A service is as untrusted as a job container: it goes through the same
+/// option and volume gates, so `--privileged` on a service is refused for the
+/// same reason it is refused on `container:`. Credentials are masked before
+/// validation so a pull failure cannot echo them.
+fn resolve_services(
+    shared: &Shared<'_>,
+    masker: &mut Masker,
+    runner_ctx: &Value,
+    instance: &JobInstance<'_>,
+    base_env: &IndexMap<String, String>,
+    needs: &[NeedRecord],
+) -> Result<Vec<(String, services::ResolvedService)>, ExecError> {
+    if instance.services.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ctx = env_ctx(
+        shared.roots,
+        runner_ctx,
+        &instance.matrix,
+        base_env,
+        needs,
+        needs_status(needs),
+    );
+
+    let mut resolved = Vec::new();
+    for (id, plan) in instance.services {
+        let request = resolve_container(plan, &ctx)?;
+        if let Some(credentials) = &request.credentials {
+            masker.add(&credentials.password);
+        }
+        let additions = validate_container(
+            &request,
+            &shared.config.workspace,
+            &shared.config.volume_namespace,
+        )
+        .map_err(|rejection| ExecError::Infrastructure {
+            message: format!("service `{id}`: {rejection}"),
+            fix: "correct the service definition in the workflow".to_string(),
+        })?;
+
+        resolved.push((
+            id.clone(),
+            services::ResolvedService {
+                image: request.image.clone(),
+                env: additions.env,
+                ports: additions.ports,
+                volume_binds: additions.volume_binds,
+                healthcheck: additions.healthcheck,
+                registry_auth: additions.registry_auth,
+            },
+        ));
+    }
+    Ok(resolved)
+}
+
+/// A `run:` step's script text, as far as planning resolved it.
+///
+/// A script whose body is still deferred contributes its authored source, so
+/// a `docker` call behind an expression is still detected — over-detecting
+/// costs one container, under-detecting costs a confusing failure.
+fn step_script(step: &greenlit_engine::StepPlan) -> Option<String> {
+    match &step.kind {
+        greenlit_engine::StepKind::Run { script, .. } => {
+            let planned = script.as_ref();
+            Some(match &planned.evaluation {
+                greenlit_engine::Evaluation::Static(value) => value.clone(),
+                // Still deferred: scan the authored source instead, so a
+                // `docker` call behind an expression is not missed.
+                greenlit_engine::Evaluation::Deferred(_) => planned.source.clone(),
+            })
+        }
+        greenlit_engine::StepKind::Uses { .. } => None,
     }
 }
