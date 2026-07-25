@@ -6,6 +6,7 @@
 //! and an image index is resolved to one platform manifest before execution.
 //! See <https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pull>.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -37,6 +38,9 @@ pub struct ResolvedImage {
     /// Whether verified manifest/config bytes came entirely from the CAS
     /// after the registry's zero-body alias recheck.
     pub cache_hit: bool,
+    /// Whether every filesystem layer carries a verified eStargz TOC
+    /// annotation and can therefore be mounted and chunk-verified lazily.
+    pub lazy_compatible: bool,
 }
 
 /// Registry parsing, authentication, protocol, or verification failure.
@@ -181,6 +185,7 @@ impl RegistryResolver {
                 reference: reference.to_string(),
                 message: error.to_string(),
             })?;
+        let lazy_compatible = manifest.lazy_compatible();
         let config_digest =
             ObjectDigest::parse(&manifest.config.digest).map_err(|error| OciError::Metadata {
                 reference: reference.to_string(),
@@ -223,6 +228,7 @@ impl RegistryResolver {
             os: image_config.os,
             architecture: image_config.architecture,
             cache_hit: false,
+            lazy_compatible,
         })
     }
 
@@ -262,6 +268,7 @@ impl RegistryResolver {
                 reference: requested.to_string(),
                 message: error.to_string(),
             })?;
+        let lazy_compatible = manifest.lazy_compatible();
         let config_digest =
             ObjectDigest::parse(&manifest.config.digest).map_err(|error| OciError::Metadata {
                 reference: requested.to_string(),
@@ -282,6 +289,7 @@ impl RegistryResolver {
             os: image_config.os,
             architecture: image_config.architecture,
             cache_hit: true,
+            lazy_compatible,
         }))
     }
 
@@ -718,6 +726,8 @@ struct Descriptor {
     digest: String,
     size: u64,
     platform: Option<Platform>,
+    #[serde(default)]
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -729,6 +739,20 @@ struct Platform {
 #[derive(Debug, Deserialize)]
 struct ImageManifest {
     config: Descriptor,
+    #[serde(default)]
+    layers: Vec<Descriptor>,
+}
+
+impl ImageManifest {
+    fn lazy_compatible(&self) -> bool {
+        !self.layers.is_empty()
+            && self.layers.iter().all(|layer| {
+                layer
+                    .annotations
+                    .get("containerd.io/snapshot/stargz/toc.digest")
+                    .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71)
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -121,6 +121,16 @@ pub struct RunLockV1 {
     /// Whether Greenlit preparation was restricted to verified local content.
     #[serde(default)]
     pub offline: bool,
+    /// Whether transparent Greenlit mutable caches were disabled.
+    #[serde(default)]
+    pub clean: bool,
+    /// Whether workflow external networking and late mutable inputs were
+    /// forbidden.
+    #[serde(default)]
+    pub hermetic: bool,
+    /// Host/runtime facts that contribute to the environment fingerprint.
+    #[serde(default)]
+    pub runtime: BTreeMap<String, String>,
     /// Runner identities by concrete job.
     pub runners: BTreeMap<String, RunnerLockV1>,
     /// Action requested refs mapped to resolved commits.
@@ -147,6 +157,9 @@ impl RunLockV1 {
             selected_job: None,
             selected_matrix: BTreeMap::new(),
             offline: false,
+            clean: false,
+            hermetic: false,
+            runtime: BTreeMap::new(),
             runners: BTreeMap::new(),
             actions: BTreeMap::new(),
             containers: BTreeMap::new(),

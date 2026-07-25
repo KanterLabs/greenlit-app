@@ -65,7 +65,7 @@ pub use container::{
     ContainerAdditions, ContainerRejection as JobContainerRejection, ResolvedContainer,
 };
 pub use image_lock::preflight_plan_images;
-pub use preflight::reject_uses_steps;
+pub use preflight::{reject_hermetic_late_inputs, reject_uses_steps};
 pub use readiness::ReadinessConfig;
 pub use report::{JobReport, RunReport, StepReport};
 pub use runner_lock::preflight_plan_runners;
@@ -224,6 +224,17 @@ pub enum ExecError {
         /// The parse failure.
         #[source]
         source: greenlit_actions::UsesRefError,
+    },
+    /// Hermetic execution encountered a checkout identity that would only be
+    /// learned by contacting GitHub after the lock was finalized.
+    #[error(
+        "{span}: hermetic execution cannot resolve checkout input '{input}' before the first step\n  fix: checkout the frozen current repository, or run without `--hermetic`"
+    )]
+    HermeticLateInput {
+        /// Input name and authored value.
+        input: String,
+        /// Where the checkout action was authored.
+        span: Span,
     },
     /// Resolving a `uses:` ref (tag/branch/SHA) to a commit SHA failed.
     ///

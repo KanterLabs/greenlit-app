@@ -81,6 +81,21 @@ pub struct ImageIdentity {
     pub architecture: String,
 }
 
+/// Stable runtime facts included in environment and assurance evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFingerprint {
+    /// Runtime implementation, such as `docker` or `podman`.
+    pub implementation: String,
+    /// Runtime server version when exposed by the backend.
+    pub version: String,
+    /// Host kernel release shared by workflow containers.
+    pub kernel: String,
+    /// Snapshotter/storage driver used for runner filesystems.
+    pub snapshotter: String,
+    /// Privileged infrastructure Greenlit itself needed for containment.
+    pub privileged_infrastructure: Vec<String>,
+}
+
 /// A host-directory bind into the container.
 ///
 /// Greenlit's only sanctioned host bind is the repository checkout, mounted

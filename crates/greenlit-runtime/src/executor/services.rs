@@ -57,6 +57,13 @@ pub struct StoreConfig {
     /// Greenlit-owned dependency download caches. Installs still run; only
     /// immutable/downloaded package material is reused.
     pub package_cache_root: PathBuf,
+    /// Whether the cache shim, artifact store, and writable toolcache are
+    /// available to this run. Clean verification disables these transparent
+    /// mutable stores without discarding immutable CAS content.
+    pub serve_mutable_caches: bool,
+    /// Whether workflow traffic may leave the job/service network. Hermetic
+    /// verification sets this false and the in-namespace guard fails closed.
+    pub allow_external_network: bool,
     /// The bearer token this run's shim requires on its API routes.
     pub runtime_token: String,
     /// The per-run signature blob URLs carry in place of a bearer header.
@@ -148,9 +155,10 @@ pub async fn create(
         gateway: info.gateway.clone(),
         subnet: info.subnet.clone(),
         shim_port: None,
+        allow_external: store.is_none_or(|config| config.allow_external_network),
     };
 
-    let Some(store) = store else {
+    let Some(store) = store.filter(|config| config.serve_mutable_caches) else {
         return Ok(JobNetwork {
             name: name.to_string(),
             shim: None,

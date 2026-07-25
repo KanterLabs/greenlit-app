@@ -149,6 +149,16 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) offline: bool,
 
+    /// Disable Greenlit's transparent mutable cache and toolcache reuse while
+    /// retaining verified immutable content from the machine-wide CAS.
+    #[arg(long)]
+    pub(crate) clean: bool,
+
+    /// Block workflow access to external networks and reject inputs whose
+    /// immutable identity cannot be finalized before the first step.
+    #[arg(long)]
+    pub(crate) hermetic: bool,
+
     /// Run through the identical in-process path without contacting or
     /// auto-starting the optional preparation daemon.
     #[arg(long)]

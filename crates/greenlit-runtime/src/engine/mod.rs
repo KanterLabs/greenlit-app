@@ -22,7 +22,7 @@ use crate::progress::ProgressSink;
 pub use spec::{
     BindMount, BuildSpec, CommitSpec, ContainerSpec, ContainerState, ExecOutput, ExecSpec,
     HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
-    ResourceLimits,
+    ResourceLimits, RuntimeFingerprint,
 };
 
 /// Receives an exec's stdout/stderr as the daemon streams it.
@@ -55,6 +55,18 @@ impl ExecOutputSink for SinkNull {
 /// to the `docker` binary (`AGENTS.md`).
 #[async_trait]
 pub trait ContainerEngine: Send + Sync {
+    /// Returns runtime/kernel/snapshotter facts that affect equivalence.
+    async fn runtime_fingerprint(&self) -> Result<RuntimeFingerprint, RuntimeError> {
+        Ok(RuntimeFingerprint {
+            implementation: "unknown".to_string(),
+            version: "unknown".to_string(),
+            kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map_or_else(|_| "unknown".to_string(), |value| value.trim().to_string()),
+            snapshotter: "unknown".to_string(),
+            privileged_infrastructure: vec!["network-policy-sidecar:CAP_NET_ADMIN".to_string()],
+        })
+    }
+
     /// Pull an image by `name:tag` reference so it is present locally,
     /// reporting layer progress to `progress` as the daemon streams it.
     ///

@@ -5,11 +5,14 @@ use std::collections::BTreeMap;
 use greenlit_engine::planned::Evaluation;
 use greenlit_engine::{ExecutionPlan, RunnerLockV1};
 use greenlit_store::cas::CasStore;
-use greenlit_store::oci::RegistryResolver;
 
 use crate::ContainerEngine;
 use crate::executor::ExecError;
 use crate::progress::ProgressSink;
+use crate::runner::{
+    ContainerdStargzSnapshotter, EagerDockerSnapshotter, OciRunnerProvider, RunnerProvider,
+    Snapshotter,
+};
 
 use super::runner_profile;
 
@@ -47,96 +50,49 @@ pub async fn preflight_plan_runners(
         }
     }
 
-    let resolver = RegistryResolver::new(content_store.clone());
+    let provider = OciRunnerProvider::new(content_store.clone(), offline);
+    let snapshotter = EagerDockerSnapshotter::new(offline);
+    let lazy_snapshotter = (!offline)
+        .then(crate::runner::containerd::StargzConfig::from_environment)
+        .flatten()
+        .map(|config| {
+            ContainerdStargzSnapshotter::new(
+                config,
+                vec![
+                    "/bin/sh".to_string(),
+                    "/bin/bash".to_string(),
+                    "/usr/bin/env".to_string(),
+                    "/usr/local/bin/node".to_string(),
+                    "/home/runner/externals".to_string(),
+                ],
+            )
+        });
     let mut materialized = BTreeMap::new();
     for (image, _) in selected.values() {
         if materialized.contains_key(image.image_identifier()) {
             continue;
         }
         let profile = runner_profile::for_runner(*image);
-        let resolver = resolver.clone();
-        let reference_for_task = profile.image.to_string();
-        let resolved = tokio::task::spawn_blocking(move || {
-            if offline {
-                resolver.resolve_linux_amd64_offline(&reference_for_task)
-            } else {
-                resolver.resolve_linux_amd64(&reference_for_task)
-            }
-        })
-        .await
-        .map_err(|error| ExecError::Infrastructure {
-            message: format!(
-                "runner profile resolution task for '{}' did not complete: {error}",
-                profile.image
-            ),
-            fix: "retry; if this repeats, preserve the run directory and file a Greenlit defect"
-                .to_string(),
-        })?
-        .map_err(|error| ExecError::Infrastructure {
-            message: format!(
-                "could not resolve runner profile '{}': {error}",
-                profile.image
-            ),
-            fix: if offline {
-                "run once without `--offline` to fetch and verify this exact runner profile"
-                    .to_string()
-            } else {
-                "check registry connectivity, then retry".to_string()
-            },
-        })?;
-        if resolved.digest.as_str() != profile.digest {
-            return Err(ExecError::Infrastructure {
-                message: format!(
-                    "runner profile '{}' resolved as {}, but its locked identity is {}",
-                    profile.image, resolved.digest, profile.digest
-                ),
-                fix: "preserve the run directory and file a Greenlit defect".to_string(),
-            });
-        }
-        progress.on_progress(crate::ProgressEvent::ContentResolved {
-            item: format!("runner {}", image.image_identifier()),
-            identity: profile.digest.to_string(),
-            cache_hit: resolved.cache_hit,
-        });
-        if offline {
-            if !engine.image_exists(&resolved.pull_reference).await? {
-                return Err(ExecError::Infrastructure {
-                    message: format!(
-                        "offline content is missing: runner profile {}",
-                        resolved.pull_reference
-                    ),
-                    fix: "run once without `--offline` to fetch this exact runner profile"
-                        .to_string(),
-                });
+        let manifest = provider.resolve(profile.image, profile.digest).await?;
+        let prepared = if let Some(lazy) = &lazy_snapshotter {
+            match lazy.prepare(engine, &manifest, progress).await {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "greenlit_runtime::runner",
+                        %error,
+                        "configured lazy provider is unavailable; using verified eager fallback"
+                    );
+                    snapshotter.prepare(engine, &manifest, progress).await?
+                }
             }
         } else {
-            engine
-                .pull_image(&resolved.pull_reference, None, progress)
-                .await?;
-        }
-        let identity = engine
-            .image_identity(&resolved.pull_reference)
-            .await?
-            .ok_or_else(|| ExecError::Infrastructure {
-                message: format!(
-                    "runner profile '{}' has no immutable identity after materialization",
-                    resolved.pull_reference
-                ),
-                fix: "run `litci doctor`; if inspection remains unavailable, use the supported Docker backend"
-                    .to_string(),
-            })?;
-        if identity.digest != profile.digest {
-            return Err(ExecError::Infrastructure {
-                message: format!(
-                    "container engine materialized runner profile '{}' as {}, but the lock requires {}",
-                    resolved.pull_reference, identity.digest, profile.digest
-                ),
-                fix: "remove the conflicting local image and retry the exact locked digest"
-                    .to_string(),
-            });
-        }
+            snapshotter.prepare(engine, &manifest, progress).await?
+        };
+        let provider_identity = prepared.provider;
+        let identity = prepared.identity;
         validate_platform(
-            &resolved.pull_reference,
+            &manifest.pull_reference,
             &identity.os,
             &identity.architecture,
         )?;
@@ -145,8 +101,8 @@ pub async fn preflight_plan_runners(
             RunnerLockV1 {
                 requested_label: String::new(),
                 resolved_label: image.image_identifier().to_string(),
-                provider: format!("github-arc/{}", profile.image_os),
-                image_reference: resolved.pull_reference,
+                provider: format!("github-arc/{};{provider_identity}", profile.image_os),
+                image_reference: manifest.pull_reference,
                 image_digest: identity.digest,
                 os: identity.os,
                 architecture: identity.architecture,

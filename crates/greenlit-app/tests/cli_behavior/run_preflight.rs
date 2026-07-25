@@ -32,6 +32,17 @@ jobs:
       - uses: actions/checkout@v4
 ";
 
+const LATE_CHECKOUT_WORKFLOW: &str = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: another/project
+";
+
 const MIXED_WORKFLOW: &str = "\
 on: push
 jobs:
@@ -260,6 +271,23 @@ fn offline_resolution_names_the_exact_missing_action_ref_before_engine_work() {
     assert!(
         !stderr.contains("DOCKER_HOST"),
         "offline preparation must fail at the exact absent identity without trying another source: {stderr}"
+    );
+}
+
+#[test]
+fn hermetic_mode_rejects_a_late_mutable_checkout_before_engine_work() {
+    let output = run_workflow(LATE_CHECKOUT_WORKFLOW, &["--hermetic", "--no-input"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains(
+            "hermetic execution cannot resolve checkout input 'repository=another/project'"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "hermetic preflight must reject the late identity before engine detection: {stderr}"
     );
 }
 

@@ -32,6 +32,7 @@ use crate::detect::{DockerHostRejection, Endpoint, reject_docker_host};
 use crate::engine::{
     BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
     ExecOutputSink, ExecSpec, HealthState, ImageIdentity, ImageSummary, NetworkInfo, RegistryAuth,
+    RuntimeFingerprint,
 };
 use crate::error::{Operation, RuntimeError};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -280,6 +281,35 @@ fn fold_pull_progress(
 
 #[async_trait]
 impl ContainerEngine for DockerEngine {
+    async fn runtime_fingerprint(&self) -> Result<RuntimeFingerprint, RuntimeError> {
+        let version = self
+            .docker
+            .version()
+            .await
+            .map_err(|error| RuntimeError::api(Operation::InspectRuntime, error))?;
+        let info = self
+            .docker
+            .info()
+            .await
+            .map_err(|error| RuntimeError::api(Operation::InspectRuntime, error))?;
+        let implementation = version
+            .platform
+            .as_ref()
+            .map(|platform| platform.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "docker".to_string());
+        Ok(RuntimeFingerprint {
+            implementation,
+            version: version.version.unwrap_or_else(|| "unknown".to_string()),
+            kernel: version.kernel_version.unwrap_or_else(|| {
+                std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .map_or_else(|_| "unknown".to_string(), |value| value.trim().to_string())
+            }),
+            snapshotter: info.driver.unwrap_or_else(|| "unknown".to_string()),
+            privileged_infrastructure: vec!["network-policy-sidecar:CAP_NET_ADMIN".to_string()],
+        })
+    }
+
     async fn pull_image(
         &self,
         image: &str,

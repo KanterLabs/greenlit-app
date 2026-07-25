@@ -52,10 +52,10 @@ use crate::error::RuntimeError;
 
 /// The image the sidecar runs.
 ///
-/// Alpine is used because it is small and its `iptables` package speaks the
-/// `nf_tables` backend modern hosts use. It is pulled once and cached like
-/// any other image.
-pub(crate) const NETGUARD_IMAGE: &str = "alpine:3.20";
+/// Kubernetes' immutable Debian iptables image carries both legacy and nft
+/// backends. Using the tool-bearing image directly avoids an `apk add` network
+/// download in every disposable sidecar.
+pub(crate) const NETGUARD_IMAGE: &str = "registry.k8s.io/debian-iptables@sha256:852d3c569932059bcab3a52cb6105c432d85b4b7bbd5fc93153b78010e34a783";
 
 /// Private ranges a workflow container must not reach.
 ///
@@ -78,6 +78,8 @@ pub struct Policy {
     pub subnet: Option<String>,
     /// The port the shim bound, if one is running.
     pub shim_port: Option<u16>,
+    /// Whether destinations outside the run subnet may be reached.
+    pub allow_external: bool,
 }
 
 /// Applies the policy inside `container`'s network namespace.
@@ -144,7 +146,6 @@ pub async fn apply(
 fn script(policy: &Policy) -> String {
     let mut lines = vec![
         "set -e".to_string(),
-        "apk add --no-cache iptables >/dev/null 2>&1 || true".to_string(),
         // 1 and 2: the container's own loopback and its own replies.
         "iptables -A OUTPUT -o lo -j ACCEPT".to_string(),
         "iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT".to_string(),
@@ -170,6 +171,9 @@ fn script(policy: &Policy) -> String {
     for range in PRIVATE_RANGES {
         lines.push(format!("iptables -A OUTPUT -d {range} -j DROP"));
     }
+    if !policy.allow_external {
+        lines.push("iptables -A OUTPUT -j REJECT".to_string());
+    }
 
     // 7 is the absence of a rule: the policy is ACCEPT, so the public
     // internet stays reachable.
@@ -185,6 +189,7 @@ mod tests {
             gateway: Some("172.18.0.1".to_string()),
             subnet: Some("172.18.0.0/16".to_string()),
             shim_port: Some(43111),
+            allow_external: true,
         })
         .lines()
         .map(str::to_string)
@@ -243,8 +248,8 @@ mod tests {
     #[test]
     fn replies_and_own_loopback_are_allowed_first() {
         let rules = rules();
-        assert!(rules[2].contains("-o lo -j ACCEPT"));
-        assert!(rules[3].contains("ESTABLISHED,RELATED"));
+        assert!(rules[1].contains("-o lo -j ACCEPT"));
+        assert!(rules[2].contains("ESTABLISHED,RELATED"));
     }
 
     #[test]
@@ -253,11 +258,27 @@ mod tests {
             gateway: Some("172.18.0.1".to_string()),
             subnet: Some("172.18.0.0/16".to_string()),
             shim_port: None,
+            allow_external: true,
         });
         assert!(!rules.contains("--dport"), "no shim, no pinhole");
         assert!(
             rules.contains("-d 172.18.0.1/32 -j DROP"),
             "the host is still unreachable"
+        );
+    }
+
+    #[test]
+    fn hermetic_policy_rejects_every_destination_after_internal_exceptions() {
+        let rules = script(&Policy {
+            gateway: Some("172.18.0.1".to_string()),
+            subnet: Some("172.18.0.0/16".to_string()),
+            shim_port: Some(43111),
+            allow_external: false,
+        });
+        assert_eq!(
+            rules.lines().last(),
+            Some("iptables -A OUTPUT -j REJECT"),
+            "hermetic policy must fail closed after loopback, reply, shim, and service rules"
         );
     }
 }

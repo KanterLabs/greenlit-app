@@ -24,7 +24,8 @@ use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
     Cancellation, ContainerEngine, DockerEngine, EngineState, InteractiveConfirm,
     IsolationStrategy, RunConfig, RunReport, StepReport, SystemProber, WriteBackOutcome, detect,
-    reject_uses_steps, run_plan_cancellable, run_write_back, validate_host, validate_request,
+    reject_hermetic_late_inputs, reject_uses_steps, run_plan_cancellable, run_write_back,
+    validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -62,6 +63,7 @@ fn resolved_strategy(isolation: IsolationArg, write_back: bool) -> IsolationStra
 }
 
 fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> {
+    let clean = args.clean || args.hermetic;
     validate_host().map_err(|host| anyhow::anyhow!("{host}\n  fix: {}", host.fix()))?;
     validate_request(args.write_back, args.no_input).map_err(|error| anyhow::anyhow!("{error}"))?;
     if !args.matrix.is_empty() && args.job.is_none() {
@@ -93,6 +95,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let evidence = invocation.time_stage("source-freeze", || {
         crate::run_evidence::RunEvidence::capture(&repo_root)
     })?;
+    evidence.apply_execution_policy(clean, args.hermetic)?;
     let frozen_repo_root = evidence.source.root.clone();
     let frozen_workflow_path = frozen_repo_root.join(&workflow_path.source_name);
 
@@ -215,6 +218,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // would otherwise surface only after image ensure, container boot, and a
     // potentially long workspace copy.
     reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
+    if args.hermetic {
+        reject_hermetic_late_inputs(&execution_plan, &git.repository)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    }
     if references_token && !github_token.is_empty() {
         let effective_permissions: Vec<Option<&greenlit_engine::PermissionsPlan>> = execution_plan
             .jobs
@@ -287,6 +294,13 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         }
     }
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
+    let runtime_fingerprint = runtime
+        .block_on(engine.runtime_fingerprint())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not fingerprint the container runtime: {error}\n  fix: restart the local container daemon, then retry"
+            )
+        })?;
     let content_store = open_content_store()?;
     let mut progress = render::progress::renderer_for_stderr();
     let container_locks = invocation
@@ -319,6 +333,9 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         selected_job: args.job.as_deref(),
         selected_matrix: &args.matrix,
         offline: args.offline,
+        clean,
+        hermetic: args.hermetic,
+        runtime: &runtime_fingerprint,
         plan: &execution_plan,
         secrets: &all_secrets,
         actions: action_preflight.actions,
@@ -331,7 +348,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // resolved simply runs without them -- `actions/cache` then behaves as it
     // does on a runner with no cache service, which is an honest miss rather
     // than a broken run.
-    let store_config = build_store_config();
+    let store_config = build_store_config(clean, args.hermetic);
 
     let config = RunConfig {
         repo_host_path: frozen_repo_root,
@@ -455,7 +472,12 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     } else {
         ExecutionConclusion::Passed
     };
-    let result = evidence.write_result(conclusion, run_lock.compatibility.clone())?;
+    let result = evidence.write_result(
+        conclusion,
+        run_lock.compatibility.clone(),
+        clean,
+        args.hermetic,
+    )?;
     writeln!(
         io::stderr(),
         "evidence: {} ({:?}/{:?}/{:?})",
@@ -677,7 +699,7 @@ pub(crate) fn build_action_runtime_config(
 /// The runtime token is per-run and never leaves the machine: it exists so a
 /// container other than this run's cannot read this run's cache through the
 /// shim, which is reachable from the job network.
-fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
+fn build_store_config(clean: bool, hermetic: bool) -> Option<greenlit_runtime::StoreConfig> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
     if !home.is_absolute() {
         return None;
@@ -692,6 +714,8 @@ fn build_store_config() -> Option<greenlit_runtime::StoreConfig> {
         ),
         toolcache_root: home.join(".litci").join("toolcache"),
         package_cache_root: home.join(".litci").join("package-cache"),
+        serve_mutable_caches: !clean,
+        allow_external_network: !hermetic,
         runtime_token: minted.value,
         url_signature: minted.url_signature,
     })

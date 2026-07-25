@@ -85,6 +85,8 @@ impl RuntimeError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Operation {
+    /// Reading daemon version, kernel, and storage-driver facts.
+    InspectRuntime,
     /// Pulling an image.
     PullImage,
     /// Inspecting an image to test for its presence.
@@ -134,6 +136,7 @@ pub enum Operation {
 impl fmt::Display for Operation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            Operation::InspectRuntime => "inspect runtime",
             Operation::PullImage => "pull image",
             Operation::InspectImage => "inspect image",
             Operation::BuildImage => "build image",

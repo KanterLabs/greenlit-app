@@ -331,7 +331,7 @@ fn registry_index_resolution_selects_and_verifies_the_linux_amd64_manifest() {
     let config = br#"{"architecture":"amd64","os":"linux"}"#;
     let config_digest = digest(config);
     let manifest = format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":{},"digest":"{}"}},"layers":[]}}"#,
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":{},"digest":"{}"}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","size":1,"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","annotations":{{"containerd.io/snapshot/stargz/toc.digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}]}}"#,
         config.len(),
         config_digest
     );
@@ -443,6 +443,10 @@ fn registry_index_resolution_selects_and_verifies_the_linux_amd64_manifest() {
     );
     assert_eq!(resolved.os, "linux");
     assert_eq!(resolved.architecture, "amd64");
+    assert!(
+        resolved.lazy_compatible,
+        "verified eStargz TOC annotations qualify the manifest for lazy reads"
+    );
     assert_eq!(
         store
             .read_verified(&resolved.digest)

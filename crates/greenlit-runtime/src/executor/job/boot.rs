@@ -329,16 +329,18 @@ pub(crate) async fn boot_container(
     // `~/.litci/toolcache` at `RUNNER_TOOL_CACHE`"). A failure to create it
     // means no toolcache this run, not a failed run.
     if let Some(store) = shared.config.store.as_ref() {
-        match services::toolcache_bind(
-            &store.toolcache_root,
-            &shared.config.runner_env.runner_tool_cache,
-        ) {
-            Ok(bind) => spec.binds.push(bind),
-            Err(error) => tracing::debug!(
-                target: "greenlit_runtime::services",
-                %error,
-                "could not prepare the toolcache; running without it"
-            ),
+        if store.serve_mutable_caches {
+            match services::toolcache_bind(
+                &store.toolcache_root,
+                &shared.config.runner_env.runner_tool_cache,
+            ) {
+                Ok(bind) => spec.binds.push(bind),
+                Err(error) => tracing::debug!(
+                    target: "greenlit_runtime::services",
+                    %error,
+                    "could not prepare the toolcache; running without it"
+                ),
+            }
         }
         match services::cargo_download_binds(&store.package_cache_root) {
             Ok(binds) => spec.binds.extend(binds),

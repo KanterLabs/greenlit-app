@@ -32,6 +32,9 @@ pub(crate) struct LockInputs<'a> {
     pub(crate) selected_job: Option<&'a str>,
     pub(crate) selected_matrix: &'a [(String, String)],
     pub(crate) offline: bool,
+    pub(crate) clean: bool,
+    pub(crate) hermetic: bool,
+    pub(crate) runtime: &'a greenlit_runtime::RuntimeFingerprint,
     pub(crate) plan: &'a ExecutionPlan,
     pub(crate) secrets: &'a [(String, String)],
     pub(crate) actions: BTreeMap<String, String>,
@@ -156,6 +159,41 @@ impl RunEvidence {
         )
     }
 
+    pub(crate) fn apply_execution_policy(&self, clean: bool, hermetic: bool) -> anyhow::Result<()> {
+        {
+            let mut support = self.support.borrow_mut();
+            if hermetic {
+                support
+                    .findings
+                    .retain(|finding| finding.code != "network.external_uncaptured");
+                support.findings.push(FeatureFinding {
+                    code: "network.external_blocked".to_string(),
+                    disposition: FindingDisposition::Supported,
+                    scope: "run".to_string(),
+                    reason: "workflow external traffic is blocked by the job namespace policy"
+                        .to_string(),
+                });
+            }
+            if clean {
+                support.findings.push(FeatureFinding {
+                    code: "cache.greenlit_mutable_disabled".to_string(),
+                    disposition: FindingDisposition::Supported,
+                    scope: "run".to_string(),
+                    reason: "transparent Greenlit cache, artifact, and toolcache reuse is disabled"
+                        .to_string(),
+                });
+            }
+            support.canonicalize();
+        }
+        self.append_trace(
+            "execution_policy_selected",
+            BTreeMap::from([
+                ("clean".to_string(), clean.to_string()),
+                ("hermetic".to_string(), hermetic.to_string()),
+            ]),
+        )
+    }
+
     pub(crate) fn lock(&self, inputs: LockInputs<'_>) -> anyhow::Result<RunLockV1> {
         let LockInputs {
             workflow_path,
@@ -164,6 +202,9 @@ impl RunEvidence {
             selected_job,
             selected_matrix,
             offline,
+            clean,
+            hermetic,
+            runtime,
             plan,
             secrets,
             actions,
@@ -194,6 +235,18 @@ impl RunEvidence {
         lock.selected_job = selected_job.map(str::to_string);
         lock.selected_matrix = selected_matrix.iter().cloned().collect();
         lock.offline = offline;
+        lock.clean = clean;
+        lock.hermetic = hermetic;
+        lock.runtime = BTreeMap::from([
+            ("implementation".to_string(), runtime.implementation.clone()),
+            ("version".to_string(), runtime.version.clone()),
+            ("kernel".to_string(), runtime.kernel.clone()),
+            ("snapshotter".to_string(), runtime.snapshotter.clone()),
+            (
+                "privileged_infrastructure".to_string(),
+                runtime.privileged_infrastructure.join(","),
+            ),
+        ]);
         lock.runners = runners;
         lock.secret_revisions = secrets
             .iter()
@@ -228,6 +281,21 @@ impl RunEvidence {
             BTreeMap::from([
                 ("digest".to_string(), lock_digest),
                 ("offline".to_string(), lock.offline.to_string()),
+                ("clean".to_string(), lock.clean.to_string()),
+                ("hermetic".to_string(), lock.hermetic.to_string()),
+            ]),
+        )?;
+        self.append_trace(
+            "runtime_fingerprinted",
+            BTreeMap::from([
+                ("implementation".to_string(), runtime.implementation.clone()),
+                ("version".to_string(), runtime.version.clone()),
+                ("kernel".to_string(), runtime.kernel.clone()),
+                ("snapshotter".to_string(), runtime.snapshotter.clone()),
+                (
+                    "privileged_infrastructure".to_string(),
+                    runtime.privileged_infrastructure.join(","),
+                ),
             ]),
         )?;
         Ok(lock)
@@ -237,12 +305,14 @@ impl RunEvidence {
         &self,
         conclusion: ExecutionConclusion,
         support: SupportReport,
+        clean: bool,
+        hermetic: bool,
     ) -> anyhow::Result<ExecutionResultV1> {
         let result = ExecutionResultV1::classify(&ResultEvidence {
             conclusion,
             support,
-            clean: false,
-            hermetic: false,
+            clean,
+            hermetic,
             github_confirmed: false,
         });
         write_json_atomic(&self.directory.join("result.json"), &result)?;
@@ -368,6 +438,8 @@ impl Drop for RunEvidence {
         let _ = self.write_result(
             ExecutionConclusion::PreparationFailed,
             self.support.borrow().clone(),
+            false,
+            false,
         );
     }
 }
@@ -453,8 +525,12 @@ fn runner_fingerprint(run_lock: &RunLockV1, key: &str) -> String {
         |runner| {
             opaque_revision(
                 format!(
-                    "runner:{}:{}:{}:{}",
-                    runner.provider, runner.image_digest, runner.os, runner.architecture
+                    "runner:{}:{}:{}:{};runtime:{:?}",
+                    runner.provider,
+                    runner.image_digest,
+                    runner.os,
+                    runner.architecture,
+                    run_lock.runtime
                 )
                 .as_bytes(),
             )
