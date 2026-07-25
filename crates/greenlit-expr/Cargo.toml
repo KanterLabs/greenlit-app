@@ -25,7 +25,7 @@ rustix = { version = "1.1.4", features = ["fs"] }
 # Newtonsoft accepts unquoted object keys using .NET's Char.IsLetterOrDigit
 # (Unicode General Categories L*/Nd), which Rust's broader `is_alphanumeric`
 # cannot reproduce exactly. The 0.6 line pins Unicode 15.0, matching .NET 8.
-unicode-general-category = "0.6.0"
+unicode-general-category = "1.1.0"
 
 [dev-dependencies]
 criterion = "0.8.2"
