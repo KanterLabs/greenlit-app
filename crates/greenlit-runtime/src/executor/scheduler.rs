@@ -137,6 +137,7 @@ async fn run_group(
     worker_limit: Arc<Semaphore>,
 ) -> Result<GroupResult, ExecError> {
     let needs = Arc::new(needs_records(group.needs, completed));
+    let materialized = super::instance::materialize(group, shared.roots, needs.as_slice())?;
     let mut running = FuturesUnordered::new();
     let make_leg = |index, instance| {
         let mut masker = baseline_masker.clone();
@@ -168,21 +169,21 @@ async fn run_group(
             result.map(|report| (index, report))
         }
     };
-    let mut pending = group.instances.iter().enumerate();
-    for _ in 0..group.max_parallel.max(1) {
+    let mut pending = materialized.instances.iter().enumerate();
+    for _ in 0..materialized.max_parallel.max(1) {
         let Some((index, instance)) = pending.next() else {
             break;
         };
         running.push(make_leg(index, instance));
     }
 
-    let mut indexed = Vec::with_capacity(group.instances.len());
+    let mut indexed = Vec::with_capacity(materialized.instances.len());
     let mut first_error = None;
     let mut fail_fast_triggered = false;
     while let Some(result) = running.next().await {
         match result {
             Ok(report) => {
-                fail_fast_triggered |= group.fail_fast
+                fail_fast_triggered |= materialized.fail_fast
                     && matches!(report.1.result, Conclusion::Failure | Conclusion::Cancelled);
                 indexed.push(report);
             }
@@ -207,12 +208,12 @@ async fn run_group(
             )
         }));
     }
+    let instance_results = indexed
+        .iter()
+        .map(|(_, report)| (report.result, report.outputs.clone()))
+        .collect::<Vec<_>>();
     indexed.sort_by_key(|(index, _)| *index);
     let reports: Vec<JobReport> = indexed.into_iter().map(|(_, report)| report).collect();
-    let instance_results = reports
-        .iter()
-        .map(|report| (report.result, report.outputs.clone()))
-        .collect::<Vec<_>>();
     let aggregated = aggregate(&instance_results);
     let ancestors_failed = group
         .needs

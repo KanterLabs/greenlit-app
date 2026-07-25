@@ -33,7 +33,7 @@ mod template;
 pub(crate) use env::{EnvChain, build_env_chain, extend_env_chain};
 pub(crate) use fold::fold_expr;
 pub(crate) use printer::{pretty_print, value_to_literal_expr};
-pub(crate) use template::fold_template;
+pub(crate) use template::{evaluate_template, fold_template};
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;

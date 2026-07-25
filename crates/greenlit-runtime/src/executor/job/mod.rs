@@ -183,12 +183,20 @@ pub(crate) async fn run_instance(
         needs,
         needs_run_status,
     );
+    let display_ctx = env_ctx(
+        shared.roots,
+        &runner_ctx,
+        &instance.matrix,
+        &base_env,
+        needs,
+        needs_run_status,
+    );
     // Masked before any print/report, same reasoning as a step's `name:`
     // (`crate::executor::step::execute_step`): a job's display name can
     // interpolate `${{ needs.<id>.outputs.* }}`, and an upstream job may have
     // masked that value via `::add-mask::`.
     let display =
-        masker.apply(&resolve_string(instance.display, &activation_ctx).map_err(ExecError::eval)?);
+        masker.apply(&resolve_string(instance.display, &display_ctx).map_err(ExecError::eval)?);
 
     if !job_activates(instance, needs, &activation_ctx)? {
         let _ = writeln!(out, "\n\u{2022} job {display}: skipped");

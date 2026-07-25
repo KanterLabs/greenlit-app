@@ -65,7 +65,8 @@ pub use graph::{DependencyCycle, GraphError, JobId};
 pub use lints::{Lint, LintKind};
 pub use matrix::{
     DEFAULT_MAX_MATRIX_LEGS, DeferredMatrixExpression, LegOrigin, MatrixError, MatrixKey,
-    MatrixLeg, MatrixPlan, MatrixValue, StrategyControl, StrategyPlan,
+    MatrixLeg, MatrixPlan, MatrixValue, StrategyControl, StrategyPlan, materialize_controls,
+    materialize_matrix,
 };
 pub use outputs::{JobOutputsPlan, PlannedOutput, PlannedValue};
 pub use pass_through::{ContainerCredentials, ContainerPlan, EnvValue};
@@ -75,6 +76,7 @@ pub use plan::{
 };
 pub use planned::{Evaluation, Planned};
 pub use runner::{
-    RunnerError, RunnerImage, RunnerPlan, SUPPORTED_RUNNER_LABELS, resolve_runner_label,
+    RunnerError, RunnerImage, RunnerPlan, SUPPORTED_RUNNER_LABELS, materialize_runner,
+    resolve_runner_label,
 };
 pub use source::{SourceEntry, SourceEntryKind, SourceSnapshot, SourceSnapshotError};

@@ -276,16 +276,6 @@ pub enum ExecError {
         /// The repository that was requested.
         repository: String,
     },
-    /// A matrix that only materializes from runtime dependency outputs was
-    /// reached. Expanding it requires mid-run data v0's sequential executor
-    /// does not model.
-    #[error(
-        "{span}: this job's matrix expands from another job's outputs, which `litci run` does not execute in v0\n  fix: use a statically-defined `strategy.matrix`, or inspect the plan with `litci plan`"
-    )]
-    DeferredMatrix {
-        /// Where the matrix was authored.
-        span: Span,
-    },
     /// A `runs-on:` label that only resolves from runtime data was reached.
     #[error(
         "{span}: this job's `runs-on:` label depends on runtime data, which `litci run` does not resolve in v0\n  fix: use a literal `runs-on:` label or `${{{{ matrix.* }}}}`"
@@ -293,6 +283,24 @@ pub enum ExecError {
     DeferredRunner {
         /// Where `runs-on:` was authored.
         span: Span,
+    },
+    /// Runtime matrix materialization failed after dependency outputs existed.
+    #[error(
+        "could not materialize a runtime matrix: {source}\n  fix: make the producing job emit the documented JSON matrix and scheduling-control types"
+    )]
+    MatrixRuntime {
+        /// The matrix expression, shape, type, or size failure.
+        #[source]
+        source: greenlit_engine::MatrixError,
+    },
+    /// A runtime-derived runner label failed evaluation or support validation.
+    #[error(
+        "could not materialize a runtime runner label: {source}\n  fix: emit one of ubuntu-latest, ubuntu-24.04, or ubuntu-22.04"
+    )]
+    RunnerRuntime {
+        /// The runner-label failure.
+        #[source]
+        source: greenlit_engine::RunnerError,
     },
     /// A container-side setup step (helper staging, readiness) failed in a way
     /// that is neither a daemon error nor a step failure.

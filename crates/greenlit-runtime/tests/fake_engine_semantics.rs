@@ -450,6 +450,90 @@ jobs:
 }
 
 #[tokio::test]
+async fn dependency_outputs_materialize_a_runtime_matrix_and_runner_labels() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "runtime-matrix.yml",
+        r#"
+on: push
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.out.outputs.matrix }}
+      parallel: ${{ steps.out.outputs.parallel }}
+    steps:
+      - id: out
+        run: |
+          OUT matrix={"os":["ubuntu-24.04","ubuntu-22.04"]}
+          OUT parallel=1
+  consumer:
+    needs: producer
+    name: leg ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      max-parallel: ${{ fromJSON(needs.producer.outputs.parallel) }}
+      matrix: ${{ fromJSON(needs.producer.outputs.matrix) }}
+    steps:
+      - run: ECHO ${{ matrix.os }}
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "runtime-matrix".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect("runtime matrix completes");
+
+    assert_eq!(
+        report
+            .jobs
+            .iter()
+            .map(|job| job.display.as_str())
+            .collect::<Vec<_>>(),
+        vec!["producer", "leg ubuntu-24.04", "leg ubuntu-22.04"]
+    );
+    assert!(
+        report
+            .jobs
+            .iter()
+            .all(|job| job.result == Conclusion::Success)
+    );
+}
+
+#[tokio::test]
 async fn execution_uses_locked_image_identity_instead_of_mutable_alias() {
     let workflow = greenlit_workflow::parse_workflow(
         "locked-image.yml",
