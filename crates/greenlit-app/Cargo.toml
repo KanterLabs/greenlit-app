@@ -32,7 +32,7 @@ greenlit-runtime = { path = "../greenlit-runtime", version = "0.1.0" }
 greenlit-store = { path = "../greenlit-store", version = "0.1.0" }
 # Async runtime for `litci run`/`litci setup`: the executor and engine detection
 # are async; the CLI drives them on a current-thread runtime via `block_on`.
-tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time"] }
+tokio = { version = "1.48.0", features = ["rt", "macros", "io-util", "time", "signal"] }
 # CLI argument parsing (derive API) -- the one new user-facing-flags
 # dependency this crate adds.
 clap = { version = "4.6.3", features = ["derive"] }

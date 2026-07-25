@@ -1,7 +1,7 @@
 //! `litci run`: resolve the execution plan (as `litci plan` does), detect the
 //! container engine, then execute the plan in isolated containers — one per
-//! job, one exec per step, sequentially in DAG order — streaming live logs and
-//! printing an end-of-run table.
+//! job, one exec per step, with dependency-ready jobs running concurrently —
+//! streaming live logs and printing an end-of-run table.
 //!
 //! `PHASE-2-execution.md` objective: "`litci run` executes a shell-only
 //! workflow green, end to end." Planning/evaluation semantics are the engine's;
@@ -22,9 +22,9 @@ use greenlit_engine::{
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
-    ContainerEngine, DockerEngine, EngineState, InteractiveConfirm, IsolationStrategy, RunConfig,
-    RunReport, StepReport, SystemProber, WriteBackOutcome, detect, reject_uses_steps, run_plan,
-    run_write_back, validate_host, validate_request,
+    Cancellation, ContainerEngine, DockerEngine, EngineState, InteractiveConfirm,
+    IsolationStrategy, RunConfig, RunReport, StepReport, SystemProber, WriteBackOutcome, detect,
+    reject_uses_steps, run_plan_cancellable, run_write_back, validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -351,14 +351,36 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // requires; each write still locks internally. Phase progress renders on
     // stderr so this stream stays the machine-parseable run log.
     let mut out = io::stdout();
+    let cancellation = Cancellation::new();
     let report = runtime
-        .block_on(run_plan(
-            &engine,
-            &execution_plan,
-            &config,
-            &mut out,
-            &mut progress,
-        ))
+        .block_on(async {
+            let execution = run_plan_cancellable(
+                &engine,
+                &execution_plan,
+                &config,
+                &mut out,
+                &mut progress,
+                &cancellation,
+            );
+            tokio::pin!(execution);
+            tokio::select! {
+                result = &mut execution => result,
+                signal = tokio::signal::ctrl_c() => {
+                    cancellation.cancel();
+                    let result = execution.await;
+                    match signal {
+                        Ok(()) => result,
+                        Err(error) => {
+                            result?;
+                            Err(greenlit_runtime::ExecError::Infrastructure {
+                                message: format!("could not listen for cancellation: {error}"),
+                                fix: "retry the run".to_string(),
+                            })
+                        }
+                    }
+                }
+            }
+        })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
 
     for job in &report.jobs {

@@ -20,8 +20,9 @@ pub(super) async fn teardown(
     dind: Option<&dind::Dind>,
     services_started: &[services::StartedService],
     job_network: services::JobNetwork,
+    keep_container: bool,
 ) {
-    if !shared.config.write_back {
+    if !keep_container {
         let _ = shared.engine.remove_container(container).await;
         // The Docker-sibling volumes outlive the container that bound them,
         // so removing the container is not enough. Before `remove_volume`

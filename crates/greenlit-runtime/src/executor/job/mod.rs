@@ -98,6 +98,13 @@ pub(crate) async fn run_instance(
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<JobReport, ExecError> {
     let started = Instant::now();
+    if shared.cancellation.is_cancelled() {
+        return Ok(cancelled_report(
+            job_id,
+            masker.apply(&instance.display.source),
+            started,
+        ));
+    }
 
     let mut runner_env = shared.config.runner_env.clone();
     runner_env.job = job_id.0.clone();
@@ -156,6 +163,7 @@ pub(crate) async fn run_instance(
         config: shared.config,
         roots: &job_roots,
         workflow_env: shared.workflow_env,
+        cancellation: shared.cancellation,
     };
     let shared = &job_shared;
 
@@ -393,56 +401,65 @@ pub(crate) async fn run_instance(
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than
     // returning early and leaking the container.
-    let ready = readiness::wait_for_ready(
-        shared.engine,
-        &container,
-        &shared.config.readiness,
-        progress,
-    )
-    .instrument(stage_span("overlay-setup"))
-    .await;
     let docker_volumes = action_plan
         .needs_docker_sibling
         .then_some(DOCKER_SIBLING_VOLUMES);
-    let outcome = match ready {
-        Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
-            Ok(()) => match cmdfiles::write_event_file(
-                shared.engine,
-                &container,
-                CMDFILES_BASE,
-                &event_json_text,
-            )
-            .await
-            {
-                Ok(()) => {
-                    run_job_body(
-                        shared,
-                        masker,
-                        instance,
-                        RunnerLayers {
-                            runner_ctx: &runner_ctx,
-                            base_env: &base_env,
-                            workflow_env: &job_env.workflow_env,
-                            job_env: &job_env.job_env,
-                            default_shell: job_env.default_shell.as_deref(),
-                            default_wd: job_env.default_wd.as_deref(),
-                            in_container,
-                            bash_available,
-                            action_plan: &action_plan,
-                            node_mounts: &node_mounts,
-                            docker_volumes,
-                        },
-                        (&container, &runner_env),
-                        needs,
-                        out,
-                    )
-                    .await
-                }
-                Err(error) => Err(mask_command_file_error(masker, &error)),
+    let job_work = async {
+        let ready = readiness::wait_for_ready(
+            shared.engine,
+            &container,
+            &shared.config.readiness,
+            progress,
+        )
+        .instrument(stage_span("overlay-setup"))
+        .await;
+        match ready {
+            Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
+                Ok(()) => match cmdfiles::write_event_file(
+                    shared.engine,
+                    &container,
+                    CMDFILES_BASE,
+                    &event_json_text,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        run_job_body(
+                            shared,
+                            masker,
+                            instance,
+                            RunnerLayers {
+                                runner_ctx: &runner_ctx,
+                                base_env: &base_env,
+                                workflow_env: &job_env.workflow_env,
+                                job_env: &job_env.job_env,
+                                default_shell: job_env.default_shell.as_deref(),
+                                default_wd: job_env.default_wd.as_deref(),
+                                in_container,
+                                bash_available,
+                                action_plan: &action_plan,
+                                node_mounts: &node_mounts,
+                                docker_volumes,
+                            },
+                            (&container, &runner_env),
+                            needs,
+                            out,
+                        )
+                        .await
+                    }
+                    Err(error) => Err(mask_command_file_error(masker, &error)),
+                },
+                Err(error) => Err(error),
             },
             Err(error) => Err(error),
-        },
-        Err(error) => Err(error),
+        }
+    };
+    let (outcome, cancelled) = tokio::select! {
+        outcome = job_work => (outcome, false),
+        () = shared.cancellation.cancelled() => (
+            Ok((Vec::new(), IndexMap::new(), Conclusion::Cancelled)),
+            true,
+        ),
     };
 
     teardown::teardown(
@@ -452,6 +469,7 @@ pub(crate) async fn run_instance(
         dind.as_ref(),
         &services_started,
         job_network,
+        shared.config.write_back && !cancelled,
     )
     .await;
 
@@ -748,6 +766,18 @@ fn skipped_report(job_id: &JobId, display: String, started: Instant) -> JobRepor
         id: job_id.0.clone(),
         display,
         result: Conclusion::Skipped,
+        steps: Vec::new(),
+        outputs: IndexMap::new(),
+        duration: started.elapsed(),
+        container_id: None,
+    }
+}
+
+fn cancelled_report(job_id: &JobId, display: String, started: Instant) -> JobReport {
+    JobReport {
+        id: job_id.0.clone(),
+        display,
+        result: Conclusion::Cancelled,
         steps: Vec::new(),
         outputs: IndexMap::new(),
         duration: started.elapsed(),

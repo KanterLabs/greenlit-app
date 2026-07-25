@@ -145,16 +145,21 @@ async fn run_group(
         let mut instance_progress = progress.clone();
         let workers = Arc::clone(&worker_limit);
         let instance_needs = Arc::clone(&needs);
+        let cancellation = shared.cancellation.clone();
         async move {
-            let worker_permit =
-                workers
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ExecError::Infrastructure {
+            let worker_permit = tokio::select! {
+                permit = workers.acquire_owned() => permit.map_err(|_| ExecError::Infrastructure {
                         message: "the run worker pool closed before a ready job started"
                             .to_string(),
                         fix: "retry the run".to_string(),
-                    })?;
+                    })?,
+                () = cancellation.cancelled() => {
+                    return Ok((
+                        index,
+                        cancelled_report(&group.id, instance, &masker),
+                    ));
+                }
+            };
             let result = job::run_instance(
                 shared,
                 &mut masker,

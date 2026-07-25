@@ -13,8 +13,10 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
 
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::{Conclusion, EventKind, PlanOptions, SyntheticEvent, plan};
@@ -25,7 +27,9 @@ use greenlit_runtime::engine::{
 };
 use greenlit_runtime::error::{Operation, RuntimeError};
 use greenlit_runtime::progress::{ProgressEvent, ProgressNull, ProgressSink, WorkspaceProgress};
-use greenlit_runtime::{IsolationStrategy, ReadinessConfig, RunConfig, run_plan};
+use greenlit_runtime::{
+    Cancellation, IsolationStrategy, ReadinessConfig, RunConfig, run_plan, run_plan_cancellable,
+};
 
 /// How the fake engine answers the executor's readiness probe.
 #[derive(Default)]
@@ -60,6 +64,8 @@ struct ScriptedEngine {
     delay_start: bool,
     active_starts: AtomicUsize,
     peak_starts: AtomicUsize,
+    step_started: Notify,
+    removed_containers: AtomicUsize,
 }
 
 impl ScriptedEngine {
@@ -191,6 +197,7 @@ impl ContainerEngine for ScriptedEngine {
         Ok(())
     }
     async fn remove_container(&self, _id: &str) -> Result<(), RuntimeError> {
+        self.removed_containers.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn exec(
@@ -248,6 +255,10 @@ impl ContainerEngine for ScriptedEngine {
         let exit = match script_path {
             Some(path) => {
                 let script = self.read(path);
+                if script.lines().any(|line| line.trim() == "SLEEP") {
+                    self.step_started.notify_one();
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
                 self.interpret(&script, &spec.env, sink)
             }
             None => 0,
@@ -530,6 +541,86 @@ jobs:
             .jobs
             .iter()
             .all(|job| job.result == Conclusion::Success)
+    );
+}
+
+#[tokio::test]
+async fn cancellation_stops_an_active_step_and_removes_its_container_within_one_second() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "cancel.yml",
+        r#"
+on: push
+jobs:
+  active:
+    runs-on: ubuntu-latest
+    steps:
+      - run: SLEEP
+  queued:
+    runs-on: ubuntu-latest
+    needs: active
+    steps:
+      - run: ECHO must-not-run
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine::default();
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "cancel-active".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+    let cancellation = Cancellation::new();
+    let started = Instant::now();
+    let mut log = Vec::new();
+    let mut progress = ProgressNull;
+    let run = run_plan_cancellable(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut progress,
+        &cancellation,
+    );
+    let request = async {
+        engine.step_started.notified().await;
+        cancellation.cancel();
+    };
+    let (result, ()) = tokio::join!(run, request);
+    let report = result.expect("cancellation returns a report");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancellation acknowledgement exceeded one second"
+    );
+    assert_eq!(
+        report.jobs.iter().map(|job| job.result).collect::<Vec<_>>(),
+        vec![Conclusion::Cancelled, Conclusion::Cancelled]
+    );
+    assert!(
+        engine.removed_containers.load(Ordering::SeqCst) >= 1,
+        "the active job container must be force-removed"
     );
 }
 

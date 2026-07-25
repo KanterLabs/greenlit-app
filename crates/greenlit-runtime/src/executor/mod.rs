@@ -354,6 +354,8 @@ pub(crate) struct Shared<'a> {
     pub roots: &'a ContextRoots,
     /// The workflow-level `env:` plan (resolved per job).
     pub workflow_env: &'a IndexMap<String, EnvValue>,
+    /// Cooperative cancellation for this invocation.
+    pub cancellation: &'a crate::Cancellation,
 }
 
 /// Open a timed stage span captured by `greenlit-metrics`'s timing layer.
@@ -381,6 +383,30 @@ pub async fn run_plan(
     out: &mut (dyn Write + Send),
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<RunReport, ExecError> {
+    run_plan_cancellable(
+        engine,
+        plan,
+        config,
+        out,
+        progress,
+        &crate::Cancellation::new(),
+    )
+    .await
+}
+
+/// Execute a plan with a cooperative cancellation signal.
+///
+/// Cancellation stops queued work and tears down active job containers,
+/// services, sidecars, volumes, and networks before returning a cancelled
+/// report.
+pub async fn run_plan_cancellable(
+    engine: &dyn ContainerEngine,
+    plan: &ExecutionPlan,
+    config: &RunConfig,
+    out: &mut (dyn Write + Send),
+    progress: &mut (dyn ProgressSink + Send),
+    cancellation: &crate::Cancellation,
+) -> Result<RunReport, ExecError> {
     let mut masker = Masker::new();
     for value in &config.initial_masks {
         masker.add(value);
@@ -400,6 +426,7 @@ pub async fn run_plan(
         config,
         roots: &roots,
         workflow_env: &plan.env,
+        cancellation,
     };
 
     scheduler::run(&shared, &groups, &masker, out, progress).await
