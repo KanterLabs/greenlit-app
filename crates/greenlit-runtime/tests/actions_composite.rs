@@ -176,3 +176,168 @@ async fn a_composite_step_sees_job_env_layers_a_live_path_and_maps_its_output() 
         );
     }
 }
+
+/// `uses:` steps *nested inside a composite action* now support
+/// `actions/checkout` and Docker actions
+/// (`crate::executor::actions::composite::run_nested_uses`'s
+/// `ResolvedUses::Checkout`/`ResolvedUses::Docker` arms) — previously both
+/// errored "not supported in v0". This drives one composite action whose own
+/// steps are, in order: a nested self-checkout, a nested Dockerfile-built
+/// Docker action that writes a marker into the shared workspace and sets a
+/// `GITHUB_OUTPUT`, and a nested `run:` step that reads both the marker
+/// (workspace visibility from the sibling container) and a file the
+/// self-checkout's workspace already carries. The composite's own
+/// `outputs:` maps the Docker action's output up, and a later top-level
+/// `run:` step reads it back through `steps.<composite-id>.outputs` —
+/// proving the round trip survives two layers of nesting. It also asserts
+/// the nested checkout's post entry lands on the job-wide LIFO post chain
+/// (`crate::executor::actions::post_chain`) exactly like a top-level
+/// checkout's does, the same signal `fake_engine_semantics.rs`'s
+/// `checkouts_post_step_runs_even_when_a_later_step_fails` asserts on.
+#[tokio::test]
+async fn a_composites_nested_checkout_and_docker_action_share_the_job_workspace_and_output() {
+    let Some(engine) = engine_if_reachable().await else {
+        notice_no_daemon(
+            "a_composites_nested_checkout_and_docker_action_share_the_job_workspace_and_output",
+        );
+        return;
+    };
+
+    let repo_root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repo_root.path().join("README.md"),
+        b"nested checkout canary\n",
+    )
+    .unwrap();
+
+    let docker_action_dir = repo_root.path().join(".github/actions/docker-echo-nested");
+    std::fs::create_dir_all(&docker_action_dir).unwrap();
+    std::fs::write(
+        docker_action_dir.join("action.yml"),
+        "name: docker echo nested\n\
+         runs:\n\
+         \x20\x20using: docker\n\
+         \x20\x20image: Dockerfile\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docker_action_dir.join("Dockerfile"),
+        "FROM alpine:3.19\n\
+         ENTRYPOINT [\"sh\", \"-c\", \"echo hello-from-docker > $GITHUB_WORKSPACE/docker-marker.txt && echo marker=hello-from-docker >> $GITHUB_OUTPUT\"]\n",
+    )
+    .unwrap();
+
+    let composite_dir = repo_root.path().join(".github/actions/nested-uses-demo");
+    std::fs::create_dir_all(&composite_dir).unwrap();
+    std::fs::write(
+        composite_dir.join("action.yml"),
+        "name: nested uses demo\n\
+         outputs:\n\
+         \x20\x20x:\n\
+         \x20\x20\x20\x20value: ${{ steps.docker-step.outputs.marker }}\n\
+         runs:\n\
+         \x20\x20using: composite\n\
+         \x20\x20steps:\n\
+         \x20\x20\x20\x20- uses: actions/checkout@v4\n\
+         \x20\x20\x20\x20- id: docker-step\n\
+         \x20\x20\x20\x20\x20\x20uses: ./.github/actions/docker-echo-nested\n\
+         \x20\x20\x20\x20- shell: bash\n\
+         \x20\x20\x20\x20\x20\x20run: |\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20test -f \"$GITHUB_WORKSPACE/docker-marker.txt\"\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20grep -q hello-from-docker \"$GITHUB_WORKSPACE/docker-marker.txt\"\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20test -f \"$GITHUB_WORKSPACE/README.md\"\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20grep -q \"nested checkout canary\" \"$GITHUB_WORKSPACE/README.md\"\n",
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(repo_root.path().join(".github/workflows")).unwrap();
+    std::fs::write(
+        repo_root.path().join(".github/workflows/ci.yml"),
+        "on: push\n\
+         jobs:\n\
+         \x20\x20build:\n\
+         \x20\x20\x20\x20runs-on: ubuntu-latest\n\
+         \x20\x20\x20\x20steps:\n\
+         \x20\x20\x20\x20\x20\x20- id: composite\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20uses: ./.github/actions/nested-uses-demo\n\
+         \x20\x20\x20\x20\x20\x20- name: consume the composite's output\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20run: |\n\
+         \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20test \"${{ steps.composite.outputs.x }}\" = \"hello-from-docker\"\n",
+    )
+    .unwrap();
+
+    let workflow = greenlit_workflow::parse_workflow_file_with_name(
+        repo_root.path().join(".github/workflows/ci.yml"),
+        "ci.yml",
+    )
+    .expect("parse");
+    let event = synthetic_push_event();
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+
+    let workspace = "/home/runner/work/actions-composite/actions-composite".to_string();
+    let config = RunConfig {
+        repo_host_path: repo_root.path().to_path_buf(),
+        workspace: workspace.clone(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: runner_env(&workspace),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: Vec::new(),
+        volume_namespace: "actions-composite-nested".to_string(),
+        write_back: false,
+        readiness: greenlit_runtime::ReadinessConfig::default(),
+        actions: dockerkit::test_action_config(),
+        store: None,
+    };
+
+    let mut log: Vec<u8> = Vec::new();
+    let report = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut log,
+        &mut ProgressNull,
+    )
+    .await
+    .expect("run completes");
+    let log = String::from_utf8_lossy(&log);
+
+    assert_eq!(
+        report.overall,
+        Conclusion::Success,
+        "the nested-uses job is green\n--- log ---\n{log}"
+    );
+    let build = &report.jobs[0];
+    for step in &build.steps {
+        assert_eq!(
+            step.conclusion,
+            Conclusion::Success,
+            "step '{}' must succeed\n--- log ---\n{log}",
+            step.label
+        );
+    }
+
+    // The nested checkout registered its post entry on the same job-wide
+    // LIFO chain a top-level checkout uses
+    // (`composite::run_nested_uses`'s `ResolvedUses::Checkout` arm), so it
+    // must still appear — and run — at job end, same as a top-level
+    // checkout's post does.
+    let post_step = build
+        .steps
+        .iter()
+        .find(|step| step.label == "Post actions/checkout@v4")
+        .unwrap_or_else(|| {
+            panic!("the nested checkout's post step must appear in the report\n--- log ---\n{log}")
+        });
+    assert!(
+        post_step.ran,
+        "the nested checkout's post step must run\n--- log ---\n{log}"
+    );
+    assert_eq!(
+        build.steps.last().map(|step| step.label.as_str()),
+        Some("Post actions/checkout@v4"),
+        "post steps run at job end, after every ordinary step\n--- log ---\n{log}"
+    );
+}

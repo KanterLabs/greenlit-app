@@ -32,7 +32,20 @@
 //!   (`CompositeState::job_accumulated`/`job_path_additions`), rather than
 //!   keeping a separate copy.
 //!
-//! # Scope decision: nested-action pre timing and Docker actions
+//! # Nested action kinds
+//!
+//! Every kind a top-level `uses:` step can be, a nested one can be too:
+//! JavaScript (`super::nodejs`), another composite (this module,
+//! recursively), `actions/checkout` (`super::checkout`), and a Docker
+//! action (`super::docker_action`). Each nested step runs through the *same*
+//! execution module its top-level counterpart does rather than a parallel
+//! implementation — a nested checkout registers its post entry on the same
+//! job-wide chain, and a nested Docker action mounts the same run-scoped
+//! volumes, because [`super::resolve::JobActionPlan::needs_docker_sibling`]
+//! already accounts for Docker actions *at any nesting depth* when the job
+//! container boots.
+//!
+//! # Scope decision: nested-action pre timing
 //!
 //! GitHub hoists every action's `pre:` script — including ones nested
 //! inside a composite — to run before the job's very first step
@@ -44,12 +57,7 @@
 //! composite's position in the job's step order — a documented, deliberate
 //! simplification; **post ordering is not affected** (every nested post
 //! still pushes onto the same job-wide LIFO stack `super::post_chain`
-//! drains at job end, matching GitHub exactly). A Docker action nested
-//! inside a composite is out of scope for this wave (fails with a clear,
-//! honest message rather than attempting a partial sibling-container setup
-//! that would need the whole job's Docker-sibling apparatus threaded
-//! through composite recursion); a job-level Docker action (directly under
-//! `jobs.<id>.steps`) is fully supported (`super::docker_action`).
+//! drains at job end, matching GitHub exactly).
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -58,7 +66,7 @@ use std::sync::Arc;
 use greenlit_actions::manifest::{ActionInput, CompositeStep};
 use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::contexts::{NeedRecord, StepRecord, build_steps_context};
-use greenlit_engine::execution::env::{EnvLayers, apply_path_additions, layer_step_env};
+use greenlit_engine::execution::env::{EnvLayers, RunnerEnv, apply_path_additions, layer_step_env};
 use greenlit_engine::execution::outcome::{StepExit, step_result_from_exit};
 use greenlit_expr::{Context, RunStatus, Value};
 use indexmap::IndexMap;
@@ -73,7 +81,7 @@ use super::node_runtime::{self, NodeVariant};
 use super::nodejs::{self, NodeRuntimeMounts};
 use super::post_chain::{NodePostEntry, PostAction, PostChain, PostEntry};
 use super::resolve::{ResolvedComposite, ResolvedCompositeStep, ResolvedUses};
-use super::template;
+use super::{checkout, docker_action, template};
 
 /// Everything composite (and its own nested composite) execution needs from
 /// the enclosing job, independent of any one step.
@@ -88,6 +96,26 @@ pub(crate) struct CompositeEnv<'a> {
     pub cmdfiles_base: &'a str,
     pub workspace: &'a str,
     pub node_mounts: &'a NodeRuntimeMounts,
+    /// The runner/`github` env this instance resolved from, which a nested
+    /// `actions/checkout` reads `repository`/`sha`/`ref_full` from exactly
+    /// as a top-level one does (`super::checkout`).
+    pub runner_env: &'a RunnerEnv,
+    /// The run's configured token, for a nested checkout of a *different*
+    /// repository (a self-checkout needs none).
+    pub github_token: Option<&'a str>,
+    /// The enclosing workflow step's own `uses:` span. A `CompositeStep`
+    /// carries no span of its own in this crate's model (`super::resolve`),
+    /// so an error raised by a nested step points at the workflow text the
+    /// author can actually edit — the step that referenced this composite.
+    pub step_span: &'a greenlit_workflow::Span,
+    /// This run's volume-namespacing token, for a nested Docker action's
+    /// sibling container.
+    pub volume_namespace: &'a str,
+    /// The job's shared Docker-action volumes, if the pre-pass provisioned
+    /// them (`super::docker_action` module docs). Present whenever the job
+    /// contains a Docker action at *any* nesting depth, which is exactly
+    /// when a nested one can be reached.
+    pub docker_volumes: Option<docker_action::SiblingVolumes>,
     /// The job's runner/base defaults (`crate::executor::step::layered_env`'s
     /// `base` layer — includes the container's own live `PATH`, seeded by
     /// `crate::executor::job::seed_container_path`). A nested step is
@@ -142,9 +170,7 @@ struct NestedStepResult {
 /// for every nested action instance's `STATE_`/pre-post bookkeeping.
 ///
 /// # Errors
-/// Returns [`ExecError`] on any nested engine/evaluation failure, or if a
-/// nested step references `actions/checkout` or a Docker action (both out
-/// of scope nested inside a composite for this wave — see module docs).
+/// Returns [`ExecError`] on any nested engine or evaluation failure.
 pub(crate) async fn execute(
     env: &CompositeEnv<'_>,
     state: &mut CompositeState<'_>,
@@ -253,18 +279,8 @@ async fn run_nested_step(
     action_path: &str,
     state_key: usize,
 ) -> Result<NestedStepResult, ExecError> {
-    if let Some(uses) = &step.uses {
-        let reference = step.source.uses.as_deref().unwrap_or("nested action");
-        return run_nested_uses(
-            env,
-            state,
-            uses,
-            reference,
-            &step.source.with,
-            ctx,
-            state_key,
-        )
-        .await;
+    if step.uses.is_some() {
+        return run_nested_uses(env, state, step, ctx, state_key).await;
     }
     let Some(script_raw) = &step.source.run else {
         return Err(ExecError::Infrastructure {
@@ -298,21 +314,7 @@ async fn run_nested_step(
         source,
     })?;
 
-    let mut step_env = IndexMap::new();
-    for (name, value) in &step.source.env {
-        step_env.insert(
-            name.clone(),
-            template::resolve_template(value, ctx).map_err(ExecError::template_eval)?,
-        );
-    }
-    let mut full_env = layer_step_env(EnvLayers {
-        base: env.base_env,
-        workflow: env.workflow_env,
-        job: env.job_env,
-        accumulated: state.job_accumulated,
-        step: &step_env,
-    });
-    apply_path_additions(&mut full_env, state.job_path_additions);
+    let full_env = nested_full_env(env, state, &step.source, ctx)?;
 
     cmdfiles::prepare(env.engine, env.container, &paths, &script)
         .await
@@ -353,55 +355,156 @@ async fn run_nested_step(
     let effects = cmdfiles::collect(env.engine, env.container, &paths)
         .await
         .map_err(|source| ExecError::CommandFile(state.masker.apply(&source.to_string())))?;
-    for assignment in &effects.env {
-        state
-            .job_accumulated
-            .insert(assignment.name.clone(), assignment.value.clone());
-    }
-    if !effects.path_additions.is_empty() {
-        let mut merged = effects.path_additions.clone();
-        merged.append(state.job_path_additions);
-        *state.job_path_additions = merged;
-    }
-    let mut outputs = IndexMap::new();
-    for assignment in &effects.outputs {
-        outputs.insert(assignment.name.clone(), assignment.value.clone());
-    }
+    let outputs =
+        cmdfiles::apply_effects(&effects, state.job_accumulated, state.job_path_additions);
     Ok(NestedStepResult { exit, outputs })
+}
+
+/// The fully-layered environment for one nested step: the job's own
+/// base/workflow/job layers plus its `GITHUB_ENV` accumulation (module docs:
+/// env accumulation is job-wide, not composite-scoped) with this step's own
+/// `env:` on top, and `GITHUB_PATH` additions applied.
+fn nested_full_env(
+    env: &CompositeEnv<'_>,
+    state: &CompositeState<'_>,
+    step: &CompositeStep,
+    ctx: &Context,
+) -> Result<IndexMap<String, String>, ExecError> {
+    let mut step_env = IndexMap::new();
+    for (name, value) in &step.env {
+        step_env.insert(
+            name.clone(),
+            template::resolve_template(value, ctx).map_err(ExecError::template_eval)?,
+        );
+    }
+    let mut full_env = layer_step_env(EnvLayers {
+        base: env.base_env,
+        workflow: env.workflow_env,
+        job: env.job_env,
+        accumulated: state.job_accumulated,
+        step: &step_env,
+    });
+    apply_path_additions(&mut full_env, state.job_path_additions);
+    Ok(full_env)
+}
+
+/// Evaluates a nested step's still-raw `with:` text against the enclosing
+/// composite's context.
+fn resolve_with(
+    with_raw: &IndexMap<String, String>,
+    ctx: &Context,
+) -> Result<IndexMap<String, String>, ExecError> {
+    with_raw
+        .iter()
+        .map(|(key, value)| template::resolve_template(value, ctx).map(|v| (key.clone(), v)))
+        .collect::<Result<_, template::TemplateError>>()
+        .map_err(ExecError::template_eval)
 }
 
 /// Runs a nested `uses:` step's main phase (dispatching by kind), running
 /// its `pre:` immediately beforehand and registering its `post:` onto the
 /// shared job-wide chain — see module docs' "Scope decision". `ctx` is the
 /// *enclosing* composite's context (its `inputs`/`steps`/blocked `secrets`),
-/// against which `with_raw` (this nested step's own, still-raw `with:`
-/// text) is evaluated.
+/// against which this nested step's own still-raw `with:` text is evaluated.
+///
+/// # Errors
+/// Returns [`ExecError`] on any nested engine or evaluation failure, or if
+/// the step is somehow reached without a resolved `uses:` (defensive; the
+/// caller already checked).
 async fn run_nested_uses(
     env: &CompositeEnv<'_>,
     state: &mut CompositeState<'_>,
-    uses: &ResolvedUses,
-    reference: &str,
-    with_raw: &IndexMap<String, String>,
+    step: &ResolvedCompositeStep,
     ctx: &Context,
     state_key: usize,
 ) -> Result<NestedStepResult, ExecError> {
-    match uses {
-        ResolvedUses::Checkout => Err(ExecError::Infrastructure {
-            message: "actions/checkout nested inside a composite action is not supported in v0"
-                .to_string(),
-            fix: "check out the repository as a top-level job step instead".to_string(),
-        }),
-        ResolvedUses::Docker(_) => Err(ExecError::Infrastructure {
-            message: "a Docker action nested inside a composite action is not supported in v0"
-                .to_string(),
-            fix: "move this Docker action to a top-level job step".to_string(),
-        }),
+    let Some(uses) = &step.uses else {
+        return Err(ExecError::Infrastructure {
+            message: "composite step dispatched as `uses:` without a resolved action".to_string(),
+            fix: "internal error: report this as a Greenlit defect".to_string(),
+        });
+    };
+    let reference = step.source.uses.as_deref().unwrap_or("nested action");
+    let with_raw = &step.source.with;
+    match &**uses {
+        ResolvedUses::Checkout => {
+            let with = resolve_with(with_raw, ctx)?;
+            let outcome = checkout::execute(
+                checkout::CheckoutRequest {
+                    engine: env.engine,
+                    container: env.container,
+                    step_span: env.step_span,
+                    with: &with,
+                    runner_env: env.runner_env,
+                    workspace: env.workspace,
+                    github_token: env.github_token,
+                },
+                state.masker,
+            )
+            .await?;
+            // Onto the same job-wide LIFO chain a top-level checkout uses,
+            // so its credential cleanup runs at job end in reverse order
+            // with every other post step (`super::post_chain`).
+            state.post_chain.push(PostEntry {
+                label: format!("Post {reference}"),
+                action: PostAction::Checkout(outcome.post),
+            });
+            Ok(NestedStepResult {
+                exit: StepExit::Success,
+                outputs: outcome.outputs,
+            })
+        }
+        ResolvedUses::Docker(docker) => {
+            let Some(volumes) = env.docker_volumes else {
+                return Err(ExecError::Infrastructure {
+                    message: format!(
+                        "'{reference}' is a Docker action, but this job's shared volumes were not provisioned"
+                    ),
+                    fix: "internal error: report this as a Greenlit defect".to_string(),
+                });
+            };
+            let with = resolve_with(with_raw, ctx)?;
+            let full_env = nested_full_env(env, state, &step.source, ctx)?;
+            let paths =
+                CommandFilePaths::new(&nested_cmdfiles_dir(env.cmdfiles_base, state_key), 0);
+            let outcome = docker_action::run_step(
+                docker_action::DockerActionRequest {
+                    engine: env.engine,
+                    container: env.container,
+                    resolved: docker,
+                    reference,
+                    with: &with,
+                    full_env: &full_env,
+                    ctx,
+                    workspace: env.workspace,
+                    cmdfiles_root: env.cmdfiles_base,
+                    cmdfiles: &paths,
+                    volumes,
+                    volume_namespace: env.volume_namespace,
+                },
+                state.out,
+                state.masker,
+            )
+            .await?;
+            let outputs = cmdfiles::apply_effects(
+                &outcome.effects,
+                state.job_accumulated,
+                state.job_path_additions,
+            );
+            if !outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    state.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
+            }
+            Ok(NestedStepResult {
+                exit: outcome.exit,
+                outputs,
+            })
+        }
         ResolvedUses::Composite(nested) => {
-            let with: IndexMap<String, String> = with_raw
-                .iter()
-                .map(|(k, v)| template::resolve_template(v, ctx).map(|value| (k.clone(), value)))
-                .collect::<Result<_, crate::executor::actions::template::TemplateError>>()
-                .map_err(ExecError::template_eval)?;
+            let with = resolve_with(with_raw, ctx)?;
             let outcome = Box::pin(execute(env, state, nested, &with, state_key)).await?;
             Ok(NestedStepResult {
                 exit: outcome.exit,
@@ -409,11 +512,7 @@ async fn run_nested_uses(
             })
         }
         ResolvedUses::Node(node) => {
-            let with: IndexMap<String, String> = with_raw
-                .iter()
-                .map(|(k, v)| template::resolve_template(v, ctx).map(|value| (k.clone(), value)))
-                .collect::<Result<_, crate::executor::actions::template::TemplateError>>()
-                .map_err(ExecError::template_eval)?;
+            let with = resolve_with(with_raw, ctx)?;
             let input_env = nodejs::input_env(reference, &node.inputs, &with, ctx)?;
             let variant =
                 node_runtime::ensure_variant(env.engine, env.container, state.node_variant).await?;
@@ -458,6 +557,24 @@ async fn run_nested_uses(
                 state.masker,
             )
             .await?;
+            // Fold the phase's command files into the *job's* accumulation —
+            // env and PATH are job-wide, not composite-scoped (module docs).
+            // Before `apply_effects` unified this, the nested branch dropped
+            // `env`/`path_additions` on the floor while the top-level JS
+            // branch merged them: a nested JS action's `GITHUB_ENV` export
+            // silently vanished.
+            let outputs = cmdfiles::apply_effects(
+                &main_outcome.effects,
+                state.job_accumulated,
+                state.job_path_additions,
+            );
+            if !main_outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    state.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
+            }
             let state_map = state.action_state.entry(state_key).or_default();
             for assignment in &main_outcome.state {
                 state_map.insert(assignment.name.clone(), assignment.value.clone());
@@ -475,10 +592,6 @@ async fn run_nested_uses(
                         state_key,
                     })),
                 });
-            }
-            let mut outputs = IndexMap::new();
-            for assignment in &main_outcome.outputs {
-                outputs.insert(assignment.name.clone(), assignment.value.clone());
             }
             Ok(NestedStepResult {
                 exit: main_outcome.exit,

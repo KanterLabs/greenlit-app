@@ -69,4 +69,5 @@ jobs:
           test -n "${{ steps.setup.outputs.node-version }}"
           test "${{ steps.composite.outputs.greeting }}" = "hello-from-workflow-composite"
           test "$(cat "$GITHUB_WORKSPACE/docker-action.log")" = "hi-from-docker"
+          test "${{ steps.docker.outputs.echoed }}" = "hi-from-docker-docker"
           echo "all checks passed"

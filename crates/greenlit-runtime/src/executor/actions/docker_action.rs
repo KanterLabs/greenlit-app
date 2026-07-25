@@ -45,6 +45,28 @@
 //! `volumes:` entry, so it can never resolve to a pre-existing daemon-global
 //! volume.
 //!
+//! # Design: the command files a sibling can write
+//!
+//! A step's `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
+//! files normally live under [`crate::executor::job`]'s `CMDFILES_BASE`,
+//! which is ordinary container-local storage — invisible to a sibling, and
+//! therefore unusable by a Docker action. That is why a Docker action's
+//! outputs went nowhere before this: the action ran, wrote to a variable
+//! that was never set, and every downstream `steps.<id>.outputs.*` silently
+//! read empty.
+//!
+//! The fix mirrors the workspace decision above: a *second* run-scoped named
+//! volume, mounted at the **same** `CMDFILES_BASE` path in the job container
+//! and in every sibling, so [`crate::executor::cmdfiles`] is reused
+//! unchanged — it still materializes and reads the files through the job
+//! container, and the paths it hands the sibling resolve to the same bytes.
+//!
+//! A second volume rather than a subdirectory of the workspace one: command
+//! files under `GITHUB_WORKSPACE` would be visible to `git status`, matched
+//! by a `hashFiles('**')` pattern, and swept into an `upload-artifact` or an
+//! `actions/cache` archive. The workspace has to stay exactly what the
+//! workflow checked out.
+//!
 //! # Inputs
 //!
 //! Docker actions receive `with:` the same way JS actions do — one
@@ -67,6 +89,7 @@ use indexmap::IndexMap;
 
 use crate::engine::{BindMount, ContainerEngine, ContainerSpec};
 use crate::executor::ExecError;
+use crate::executor::cmdfiles::{self, CommandFileEffects, CommandFilePaths};
 use crate::executor::container::namespaced_volume_name;
 use crate::executor::logsink::StepLogSink;
 
@@ -127,10 +150,29 @@ async fn ensure_image(
     }
 }
 
-/// Everything one Docker action run needs, bundled so [`execute`] takes one
-/// parameter instead of an unwieldy positional list.
+/// The bare (pre-namespacing) names of the two run-scoped named volumes a
+/// job containing a Docker action provisions: the shared workspace, and the
+/// per-step command files (see module docs). Both are created and removed
+/// with the job by [`crate::executor::job`], which owns the names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SiblingVolumes {
+    /// Backs `GITHUB_WORKSPACE`, so a `run:` step's write and a Docker
+    /// action's write are both visible to every later step.
+    pub workspace: &'static str,
+    /// Backs the command-file base, so a Docker action can set outputs,
+    /// export env, extend `PATH`, and write a step summary.
+    pub cmdfiles: &'static str,
+}
+
+/// Everything one Docker action step needs, bundled so [`run_step`] takes
+/// one parameter instead of an unwieldy positional list.
 pub(crate) struct DockerActionRequest<'a> {
     pub engine: &'a dyn ContainerEngine,
+    /// The *job* container. The action itself runs in a sibling, but this
+    /// step's command files are materialized and read back through the job
+    /// container exactly as every other step kind's are — they are only
+    /// reachable from the sibling because both mount the same volume.
+    pub container: &'a str,
     pub resolved: &'a ResolvedDocker,
     pub reference: &'a str,
     /// This step's already-resolved `with:`.
@@ -140,33 +182,51 @@ pub(crate) struct DockerActionRequest<'a> {
     pub full_env: &'a IndexMap<String, String>,
     pub ctx: &'a Context,
     pub workspace: &'a str,
-    /// The run-scoped named volume backing this job's shared workspace (see
-    /// module docs) — the caller only invokes [`execute`] for a job where
+    /// Mount point of the shared command-file volume — identical in the job
+    /// container and in every sibling, which is what makes the paths in
+    /// `cmdfiles` mean the same thing on both sides.
+    pub cmdfiles_root: &'a str,
+    /// This step's own command files, under `cmdfiles_root`.
+    pub cmdfiles: &'a CommandFilePaths,
+    /// The run-scoped named volumes backing both (see module docs) — the
+    /// caller only invokes [`run_step`] for a job where
     /// [`super::resolve::JobActionPlan::needs_docker_sibling`] was true, so
-    /// a volume always exists by the time this runs.
-    pub workspace_volume: &'a str,
+    /// they always exist by the time this runs.
+    pub volumes: SiblingVolumes,
     pub volume_namespace: &'a str,
 }
 
-/// Runs a resolved Docker action's sibling container to completion.
+/// What one Docker action step produced: how it exited, and whatever it
+/// wrote to its command files.
+pub(crate) struct DockerActionOutcome {
+    pub exit: StepExit,
+    pub effects: CommandFileEffects,
+}
+
+/// Runs a resolved Docker action as a sibling container, with the same
+/// command-file protocol every other step kind gets.
 ///
 /// # Errors
 /// Returns an [`ExecError`] on any engine failure (image ensure, sibling
-/// create/run/remove) or expression-evaluation failure.
-pub(crate) async fn execute(
+/// create/run/remove), an expression-evaluation failure, or a malformed
+/// command file.
+pub(crate) async fn run_step(
     request: DockerActionRequest<'_>,
     out: &mut (dyn Write + Send),
     masker: &mut Masker,
-) -> Result<StepExit, ExecError> {
+) -> Result<DockerActionOutcome, ExecError> {
     let DockerActionRequest {
         engine,
+        container,
         resolved,
         reference,
         with,
         full_env,
         ctx,
         workspace,
-        workspace_volume,
+        cmdfiles_root,
+        cmdfiles: paths,
+        volumes,
         volume_namespace,
     } = request;
     let image = ensure_image(engine, &resolved.source, ctx).await?;
@@ -190,6 +250,21 @@ pub(crate) async fn execute(
         env.insert(key.clone(), value);
     }
 
+    // Materialized through the job container, onto the volume the sibling is
+    // about to mount. The empty script argument is deliberate: a Docker
+    // action has an entrypoint, not a shell script, so `paths.script` exists
+    // (`prepare` writes all of them or none) and is simply never read.
+    cmdfiles::prepare(engine, container, paths, "")
+        .await
+        .map_err(|source| ExecError::CommandFile(masker.apply(&source.to_string())))?;
+    cmdfiles::open_to_sibling(engine, container, paths)
+        .await
+        .map_err(|source| ExecError::CommandFile(masker.apply(&source.to_string())))?;
+    env.insert("GITHUB_ENV".to_string(), paths.env.clone());
+    env.insert("GITHUB_OUTPUT".to_string(), paths.output.clone());
+    env.insert("GITHUB_PATH".to_string(), paths.path.clone());
+    env.insert("GITHUB_STEP_SUMMARY".to_string(), paths.summary.clone());
+
     let spec = ContainerSpec {
         image,
         entrypoint,
@@ -201,15 +276,22 @@ pub(crate) async fn execute(
             ("greenlit.managed".to_string(), "1".to_string()),
             ("greenlit.docker-action".to_string(), "1".to_string()),
         ],
-        binds: vec![BindMount {
-            host_path: namespaced_volume_name(volume_namespace, workspace_volume),
-            container_path: workspace.to_string(),
-            read_only: false,
-        }],
+        binds: vec![
+            BindMount {
+                host_path: namespaced_volume_name(volume_namespace, volumes.workspace),
+                container_path: workspace.to_string(),
+                read_only: false,
+            },
+            BindMount {
+                host_path: namespaced_volume_name(volume_namespace, volumes.cmdfiles),
+                container_path: cmdfiles_root.to_string(),
+                read_only: false,
+            },
+        ],
         name: None,
         // A Docker action gets no capabilities, no published ports, no health
         // probe, and no network alias: it is a sibling that shares only the
-        // job's workspace volume.
+        // job's workspace and command-file volumes.
         ..ContainerSpec::default()
     };
 
@@ -222,10 +304,19 @@ pub(crate) async fn execute(
     // step failure and a silent resource leak.
     let _ = engine.remove_container(&id).await;
     let output = run_result?;
-    Ok(if output.exit_code == 0 {
-        StepExit::Success
-    } else {
-        StepExit::Failed
+    // Collected even when the action failed: GitHub reads a failed step's
+    // command files too, and an action that sets an output and *then* exits
+    // non-zero (with `continue-on-error`, say) still published that output.
+    let effects = cmdfiles::collect(engine, container, paths)
+        .await
+        .map_err(|source| ExecError::CommandFile(masker.apply(&source.to_string())))?;
+    Ok(DockerActionOutcome {
+        exit: if output.exit_code == 0 {
+            StepExit::Success
+        } else {
+            StepExit::Failed
+        },
+        effects,
     })
 }
 

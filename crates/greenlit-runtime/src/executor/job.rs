@@ -17,6 +17,7 @@ use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
 use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::{BindMount, ContainerEngine, ExecSpec};
+use crate::executor::actions::docker_action;
 use crate::executor::actions::node_runtime;
 use crate::executor::actions::nodejs::NodeRuntimeMounts;
 use crate::executor::actions::resolve::{JobActionPlan, resolve_job_actions};
@@ -52,12 +53,15 @@ const CMDFILES_BASE: &str = "/greenlit/cmdfiles";
 /// bytes), while bounding what a hostile image can make the host hold.
 const MAX_PATH_BYTES: usize = 32 * 1024;
 
-/// The bare (pre-namespacing) name of the run-scoped named volume backing a
-/// job's shared workspace when it contains a Docker action
-/// (`crate::executor::actions::docker_action` module docs) — namespaced the
-/// same way a workflow-authored `volumes:` entry is
+/// The bare (pre-namespacing) names of the run-scoped named volumes backing
+/// a job's shared workspace and command files when it contains a Docker
+/// action (`crate::executor::actions::docker_action` module docs) — each
+/// namespaced the same way a workflow-authored `volumes:` entry is
 /// (`crate::executor::container::namespaced_volume_name`).
-const DOCKER_SIBLING_WORKSPACE_VOLUME: &str = "workspace";
+const DOCKER_SIBLING_VOLUMES: docker_action::SiblingVolumes = docker_action::SiblingVolumes {
+    workspace: "workspace",
+    cmdfiles: "cmdfiles",
+};
 
 /// What `resolve_image` settled on for this job.
 struct ResolvedImage {
@@ -93,7 +97,7 @@ struct RunnerLayers<'a> {
     bash_available: bool,
     action_plan: &'a JobActionPlan,
     node_mounts: &'a NodeRuntimeMounts,
-    docker_workspace_volume: Option<&'a str>,
+    docker_volumes: Option<docker_action::SiblingVolumes>,
 }
 
 /// Run one job instance and produce its report.
@@ -389,9 +393,9 @@ pub(crate) async fn run_instance(
     )
     .instrument(stage_span("overlay-setup"))
     .await;
-    let docker_workspace_volume = action_plan
+    let docker_volumes = action_plan
         .needs_docker_sibling
-        .then_some(DOCKER_SIBLING_WORKSPACE_VOLUME);
+        .then_some(DOCKER_SIBLING_VOLUMES);
     let outcome = match ready {
         Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
             Ok(()) => {
@@ -410,7 +414,7 @@ pub(crate) async fn run_instance(
                         bash_available,
                         action_plan: &action_plan,
                         node_mounts: &node_mounts,
-                        docker_workspace_volume,
+                        docker_volumes,
                     },
                     (&container, &runner_env),
                     needs,
@@ -444,16 +448,18 @@ pub(crate) async fn run_instance(
 
     if !shared.config.write_back {
         let _ = shared.engine.remove_container(&container).await;
-        // The Docker-sibling workspace volume outlives the container that
-        // bound it, so removing the container is not enough. Before
-        // `remove_volume` existed on the port these accumulated on the host
-        // until an operator ran `docker volume prune` -- the module doc in
+        // The Docker-sibling volumes outlive the container that bound them,
+        // so removing the container is not enough. Before `remove_volume`
+        // existed on the port these accumulated on the host until an
+        // operator ran `docker volume prune` -- the module doc in
         // `actions::docker_action` already described a per-job removal that
         // no code performed. Removal must follow the container, because a
         // volume still in use cannot be removed.
-        if let Some(source) = docker_workspace_volume {
-            let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
-            let _ = shared.engine.remove_volume(&volume).await;
+        if let Some(volumes) = docker_volumes {
+            for source in [volumes.workspace, volumes.cmdfiles] {
+                let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
+                let _ = shared.engine.remove_volume(&volume).await;
+            }
         }
     }
     // After the container, before the network: services and the DinD sidecar
@@ -507,7 +513,7 @@ async fn run_job_body(
         action_config: &shared.config.actions,
         node_mounts: layers.node_mounts,
         volume_namespace: &shared.config.volume_namespace,
-        docker_workspace_volume: layers.docker_workspace_volume,
+        docker_volumes: layers.docker_volumes,
     };
 
     let mut state = StepLoopState::new();
@@ -935,10 +941,12 @@ async fn seed_container_path(
 /// Create and start the isolated job container, returning its id.
 ///
 /// `needs_docker_sibling` forces this job's workspace isolation to copy-in
-/// (regardless of the run's requested strategy) and binds a run-scoped named
-/// volume at the workspace path instead of leaving it container-local, so a
-/// Docker action's sibling container can mount the *same* volume
-/// (`crate::executor::actions::docker_action` module docs) — `greenlit-init`
+/// (regardless of the run's requested strategy) and binds two run-scoped
+/// named volumes — one at the workspace path instead of leaving it
+/// container-local, one at [`CMDFILES_BASE`] — so a Docker action's sibling
+/// container can mount the *same* volumes and share both the checkout and
+/// the step's command files
+/// (`crate::executor::actions::docker_action` module docs). `greenlit-init`
 /// itself needs no change: its copy-in populate step fills whatever is
 /// already bind-mounted at the workspace path, oblivious to whether that is
 /// container-local storage or a named volume.
@@ -1001,14 +1009,19 @@ async fn boot_container(
         });
     }
     if needs_docker_sibling {
-        spec.binds.push(BindMount {
-            host_path: namespaced_volume_name(
-                &shared.config.volume_namespace,
-                DOCKER_SIBLING_WORKSPACE_VOLUME,
+        for (source, mount_point) in [
+            (
+                DOCKER_SIBLING_VOLUMES.workspace,
+                shared.config.workspace.clone(),
             ),
-            container_path: shared.config.workspace.clone(),
-            read_only: false,
-        });
+            (DOCKER_SIBLING_VOLUMES.cmdfiles, CMDFILES_BASE.to_string()),
+        ] {
+            spec.binds.push(BindMount {
+                host_path: namespaced_volume_name(&shared.config.volume_namespace, source),
+                container_path: mount_point,
+                read_only: false,
+            });
+        }
     }
     spec.binds.extend(additions.volume_binds.iter().cloned());
     spec.binds.extend(extra_binds.iter().cloned());

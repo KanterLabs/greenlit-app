@@ -497,11 +497,19 @@ policy actively contains. They are not deferred Greenlit behavior.
   not attempted this wave. Nested `post` steps are *not* similarly
   simplified: they still push onto the job's shared, reverse-drained
   `PostChain` and so run at job end in the correct overall LIFO position
-  alongside every other step's post action. A Docker action referenced from
-  inside a composite action's nested steps is rejected outright with a clear
-  error rather than attempted, since a nested Docker sibling would need the
-  same shared-workspace volume design as a top-level one but composed inside
-  an already-scoped composite context — deferred rather than guessed at.
+  alongside every other step's post action. Nested `uses:` steps of *every*
+  kind now execute — originally `actions/checkout` and Docker actions nested
+  inside a composite were rejected outright; the action-fidelity wave closed
+  that. Each nested kind dispatches through the same execution module its
+  top-level counterpart does rather than a parallel implementation: a nested
+  checkout runs `crate::executor::actions::checkout` and pushes its
+  credential-cleanup post entry onto the same job-wide `PostChain`, and a
+  nested Docker action runs `crate::executor::actions::docker_action`
+  against the job's shared sibling volumes, which
+  `crate::executor::actions::resolve`'s pre-pass provisions whenever a
+  Docker action exists at *any* nesting depth — so the sibling apparatus is
+  already in place by the time composite recursion reaches it. Both are
+  pinned by `crates/greenlit-runtime/tests/actions_composite.rs`.
 
 - **A manifest's declared input `default:` value is used as a literal
   string, not evaluated as a `${{ }}` expression.** `actions/checkout`'s own
@@ -603,22 +611,28 @@ policy actively contains. They are not deferred Greenlit behavior.
   uses) but never creates or mounts the four command files, so a
   marketplace Docker action that writes to `$GITHUB_OUTPUT`/`$GITHUB_ENV`
   either silently loses that write or (if it does not tolerate an unset
-  variable) fails outright. `PHASE-3-actions.md`'s own "Action execution"
-  bullet for Docker actions ("pass args/entrypoint/env per spec; run as a
-  sibling container") does not name the workflow-command protocol the way
-  its JavaScript-action bullet explicitly does ("Env protocol: `INPUT_<NAME>`,
-  workflow command files, `STATE_` save-state..."), so this is treated as a
-  scoped, documented gap rather than an in-scope defect this wave fixed
-  silently — `fixtures/actions-ci`'s own Docker action deliberately proves
-  its execution through the shared workspace (a log file under
-  `$GITHUB_WORKSPACE`) instead, the same way
-  `crates/greenlit-runtime/tests/actions_docker.rs` already does. Closing
-  this gap would need the command files to live inside the job's shared
-  workspace volume (already the mechanism a Docker-sibling job uses for its
-  workspace — see the entry above) rather than the job container's own
-  ordinary, sibling-invisible temp storage, so a fix can reuse
-  `crate::executor::cmdfiles` unchanged once that plumbing exists; left for
-  a later wave.
+  variable) fails outright. **Closed by the action-fidelity wave.** The
+  Phase-3 entry here predicted the fix would put the command files inside
+  the job's shared workspace volume; the wave deliberately did not — command
+  files under `GITHUB_WORKSPACE` would be visible to `git status`, matched
+  by a `hashFiles('**')` pattern, and swept into an `upload-artifact` or
+  `actions/cache` archive, and the workspace has to stay exactly what the
+  workflow checked out. Instead a *second* run-scoped named volume is
+  mounted at the same `CMDFILES_BASE` path in the job container and in
+  every sibling, so `crate::executor::cmdfiles` is reused unchanged (the
+  paths it materializes through the job container resolve to the same bytes
+  in the sibling) — the same shape as GitHub's own runner, which mounts its
+  `_runner_file_commands` directory into every container action.
+  `cmdfiles::open_to_sibling` then widens the step's files (`0777` dir,
+  `0666` files) so an action image running as a non-root `USER` can append;
+  the widening is scoped to a run-private volume only this run's containers
+  mount. Effects are collected even when the action exits non-zero, matching
+  GitHub's handling of a failed step's files, and every step kind now folds
+  them through one function, `cmdfiles::apply_effects` — closing, in
+  passing, a latent drop where a *nested* JS action's `GITHUB_ENV`/
+  `GITHUB_PATH` writes were discarded instead of accumulated. Pinned by
+  `crates/greenlit-runtime/tests/actions_docker.rs` with a `USER
+  65534:65534` Dockerfile action writing all four files.
 
 - **The network policy is enforced inside each container's own namespace, not
   by host `DOCKER-USER` rules.** `PHASE-4-environment.md` names the host

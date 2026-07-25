@@ -55,7 +55,7 @@ use indexmap::IndexMap;
 use crate::engine::{ContainerEngine, ExecSpec};
 use crate::error::RuntimeError;
 use crate::executor::ExecError;
-use crate::executor::cmdfiles::{self, CommandFilePaths};
+use crate::executor::cmdfiles::{self, CommandFileEffects, CommandFilePaths};
 use crate::executor::logsink::StepLogSink;
 
 use super::node_runtime::NodeVariant;
@@ -166,9 +166,10 @@ pub(crate) fn node_binary(
 /// The result of running one JS action phase (pre, main, or post).
 pub(crate) struct PhaseOutcome {
     pub exit: StepExit,
-    pub env: Vec<Assignment>,
-    pub path_additions: Vec<String>,
-    pub outputs: Vec<Assignment>,
+    /// What the phase wrote to its four command files, still unapplied —
+    /// the caller folds them via [`cmdfiles::apply_effects`].
+    pub effects: CommandFileEffects,
+    /// `GITHUB_STATE` assignments, the fifth file only action phases get.
     pub state: Vec<Assignment>,
 }
 
@@ -265,9 +266,7 @@ pub(crate) async fn run_phase(
 
     Ok(PhaseOutcome {
         exit,
-        env: effects.env,
-        path_additions: effects.path_additions,
-        outputs: effects.outputs,
+        effects,
         state,
     })
 }

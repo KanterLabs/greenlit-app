@@ -8,6 +8,9 @@ inputs:
   message:
     description: Message text to record into the shared workspace.
     default: hi
+outputs:
+  echoed:
+    description: The input message, suffixed by the Docker action's own entrypoint.
 runs:
   using: docker
   image: Dockerfile

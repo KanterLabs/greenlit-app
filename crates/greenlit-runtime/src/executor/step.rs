@@ -40,7 +40,7 @@ use crate::executor::logsink::StepLogSink;
 /// Per-job constants a step needs — the container, the resolved env layers, the
 /// job defaults, the run-wide context roots, and everything action execution
 /// needs beyond that (resolved actions, action/node-runtime configuration,
-/// the Docker-sibling shared workspace volume, if this job provisioned one).
+/// the Docker-sibling shared volumes, if this job provisioned them).
 pub(crate) struct JobRuntime<'a> {
     /// The container engine.
     pub engine: &'a dyn ContainerEngine,
@@ -84,10 +84,10 @@ pub(crate) struct JobRuntime<'a> {
     /// This run's volume-namespacing token
     /// (`crate::RunConfig::volume_namespace`).
     pub volume_namespace: &'a str,
-    /// The bare name of this job's shared Docker-action workspace volume,
-    /// if [`JobActionPlan::needs_docker_sibling`] provisioned one
+    /// The bare names of this job's shared Docker-action volumes, if
+    /// [`JobActionPlan::needs_docker_sibling`] provisioned them
     /// (`crate::executor::actions::docker_action` module docs).
-    pub docker_workspace_volume: Option<&'a str>,
+    pub docker_volumes: Option<docker_action::SiblingVolumes>,
 }
 
 /// The job's evolving state across its steps.
@@ -545,26 +545,14 @@ async fn run_script_step(
     let effects = cmdfiles::collect(job.engine, job.container, &paths)
         .await
         .map_err(|source| mask_command_file_error(io.masker, &source))?;
-    for assignment in &effects.env {
-        state
-            .accumulated
-            .insert(assignment.name.clone(), assignment.value.clone());
-    }
-    if !effects.path_additions.is_empty() {
-        let mut merged = effects.path_additions.clone();
-        merged.append(&mut state.path_additions);
-        state.path_additions = merged;
-    }
+    let outputs =
+        cmdfiles::apply_effects(&effects, &mut state.accumulated, &mut state.path_additions);
     if !effects.summary_within_limit {
         // GitHub drops an over-cap job summary and notes it; mirror that.
         let _ = writeln!(
             io.out,
             "  [warning] {label_for_errors}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
         );
-    }
-    let mut outputs = IndexMap::new();
-    for assignment in &effects.outputs {
-        outputs.insert(assignment.name.clone(), assignment.value.clone());
     }
     Ok((exit, outputs))
 }
@@ -657,15 +645,17 @@ async fn execute_uses_step(
                 io.masker,
             )
             .await?;
-            for assignment in &main_outcome.env {
-                state
-                    .accumulated
-                    .insert(assignment.name.clone(), assignment.value.clone());
-            }
-            if !main_outcome.path_additions.is_empty() {
-                let mut merged = main_outcome.path_additions.clone();
-                merged.append(&mut state.path_additions);
-                state.path_additions = merged;
+            let outputs = cmdfiles::apply_effects(
+                &main_outcome.effects,
+                &mut state.accumulated,
+                &mut state.path_additions,
+            );
+            if !main_outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    io.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
             }
             let state_map = state.action_state.entry(index).or_default();
             for assignment in &main_outcome.state {
@@ -685,13 +675,10 @@ async fn execute_uses_step(
                     })),
                 });
             }
-            let mut outputs = IndexMap::new();
-            for assignment in &main_outcome.outputs {
-                outputs.insert(assignment.name.clone(), assignment.value.clone());
-            }
             Ok((main_outcome.exit, outputs))
         }
         ResolvedUses::Composite(resolved_composite) => {
+            let step_span = uses_span(step);
             let env = composite::CompositeEnv {
                 engine: job.engine,
                 container: job.container,
@@ -703,6 +690,11 @@ async fn execute_uses_step(
                 cmdfiles_base: job.cmdfiles_base,
                 workspace: job.workspace,
                 node_mounts: job.node_mounts,
+                runner_env: job.runner_env,
+                github_token: job.action_config.github_token.as_deref(),
+                step_span: &step_span,
+                volume_namespace: job.volume_namespace,
+                docker_volumes: job.docker_volumes,
                 base_env: job.base_env,
                 workflow_env: job.workflow_env,
                 job_env: job.job_env,
@@ -722,10 +714,10 @@ async fn execute_uses_step(
             Ok((outcome.exit, outcome.outputs))
         }
         ResolvedUses::Docker(resolved_docker) => {
-            let Some(bare_volume) = job.docker_workspace_volume else {
+            let Some(volumes) = job.docker_volumes else {
                 return Err(ExecError::Infrastructure {
                     message: format!(
-                        "'{reference}' is a Docker action, but this job's shared workspace volume was not provisioned"
+                        "'{reference}' is a Docker action, but this job's shared volumes were not provisioned"
                     ),
                     fix: "internal error: report this as a Greenlit defect".to_string(),
                 });
@@ -742,23 +734,39 @@ async fn execute_uses_step(
                     status: state.status,
                 },
             );
-            let exit = docker_action::execute(
+            let paths = CommandFilePaths::new(job.cmdfiles_base, index);
+            let outcome = docker_action::run_step(
                 docker_action::DockerActionRequest {
                     engine: job.engine,
+                    container: job.container,
                     resolved: resolved_docker,
                     reference: &reference,
                     with,
                     full_env: &full_env,
                     ctx: &ctx,
                     workspace: job.workspace,
-                    workspace_volume: bare_volume,
+                    cmdfiles_root: job.cmdfiles_base,
+                    cmdfiles: &paths,
+                    volumes,
                     volume_namespace: job.volume_namespace,
                 },
                 io.out,
                 io.masker,
             )
             .await?;
-            Ok((exit, IndexMap::new()))
+            let outputs = cmdfiles::apply_effects(
+                &outcome.effects,
+                &mut state.accumulated,
+                &mut state.path_additions,
+            );
+            if !outcome.effects.summary_within_limit {
+                // GitHub drops an over-cap job summary and notes it; mirror that.
+                let _ = writeln!(
+                    io.out,
+                    "  [warning] {reference}: GITHUB_STEP_SUMMARY exceeded the 1 MiB limit and was dropped"
+                );
+            }
+            Ok((outcome.exit, outputs))
         }
     }
 }

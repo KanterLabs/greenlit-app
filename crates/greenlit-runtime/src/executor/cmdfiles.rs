@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use greenlit_engine::execution::command_files::{
     Assignment, EnvFileError, accept_step_summary, parse_env_file, parse_path_file,
 };
+use indexmap::IndexMap;
 
 use crate::engine::{ContainerEngine, ExecSpec};
 use crate::error::RuntimeError;
@@ -134,6 +135,81 @@ pub(crate) async fn prepare(
         });
     }
     Ok(())
+}
+
+/// Widen this step's command files so a *sibling* container can write them.
+///
+/// Every other step kind writes its command files from inside the job
+/// container, as the same user that [`prepare`] created them as. A Docker
+/// action does not: it runs in a second container, as whatever user its own
+/// image declares — frequently not root (`USER node` is a common last line
+/// of an action's Dockerfile). Without this, such an action's very first
+/// `>> "$GITHUB_OUTPUT"` fails with a permission error that has nothing to
+/// do with the workflow.
+///
+/// The widened files sit on a run-scoped named volume that only this run's
+/// own containers mount, and are removed with it
+/// (`crate::executor::actions::docker_action` module docs), so this is a
+/// per-step relaxation inside an already-isolated boundary rather than a
+/// widening of anything the host can see.
+///
+/// # Errors
+///
+/// Returns [`CommandFileError`] if the exec fails or exits non-zero.
+pub(crate) async fn open_to_sibling(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    paths: &CommandFilePaths,
+) -> Result<(), CommandFileError> {
+    let program = format!(
+        "chmod 0777 {dir} && chmod 0666 {env} {output} {path} {summary}",
+        dir = paths.dir,
+        env = paths.env,
+        output = paths.output,
+        path = paths.path,
+        summary = paths.summary,
+    );
+    let spec = ExecSpec {
+        cmd: vec!["sh".to_string(), "-c".to_string(), program],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code != 0 {
+        return Err(CommandFileError::Prepare {
+            exit_code: output.exit_code,
+        });
+    }
+    Ok(())
+}
+
+/// Fold a step's collected effects into the job's live state, returning the
+/// step's own `outputs` map.
+///
+/// `GITHUB_ENV` assignments override the job's accumulation in file order;
+/// `GITHUB_PATH` additions are prepended ahead of everything already there
+/// (highest priority first, which is why this is a prepend and not a push).
+/// Every step kind that has command files applies them identically — this is
+/// that one rule, in one place.
+pub(crate) fn apply_effects(
+    effects: &CommandFileEffects,
+    accumulated: &mut IndexMap<String, String>,
+    path_additions: &mut Vec<String>,
+) -> IndexMap<String, String> {
+    for assignment in &effects.env {
+        accumulated.insert(assignment.name.clone(), assignment.value.clone());
+    }
+    if !effects.path_additions.is_empty() {
+        let mut merged = effects.path_additions.clone();
+        merged.append(path_additions);
+        *path_additions = merged;
+    }
+    effects
+        .outputs
+        .iter()
+        .map(|assignment| (assignment.name.clone(), assignment.value.clone()))
+        .collect()
 }
 
 /// Read and parse a step's four command files after it ran.
