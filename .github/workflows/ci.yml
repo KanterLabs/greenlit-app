@@ -59,6 +59,7 @@ jobs:
       # Provision the exact locked profile up front: once execution begins,
       # Greenlit correctly refuses to replace a missing locked image.
       - name: Prepare pinned runner profile for real-daemon tests
+        if: ${{ vars.GREENLIT_DOGFOOD != 'true' }}
         run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
 
       # 5. cargo test --workspace (oracle + integration + invariant)
@@ -86,6 +87,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # Pull-request checkouts are detached merge commits. A synthetic manual
+      # dispatch still has a selected ref, so give that exact SHA a local
+      # branch instead of asking Greenlit to invent one.
+      - name: Prepare branch-backed source identity
+        run: git switch -C greenlit-ci "$GITHUB_SHA"
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -140,4 +147,4 @@ jobs:
       - name: Run ci.yml under Greenlit
         env:
           CARGO_TARGET_DIR: /tmp/dogfood-target
-        run: ./target/release/litci run -W .github/workflows/ci.yml -j ci -e workflow_dispatch --no-input
+        run: ./target/release/litci run -W .github/workflows/ci.yml -j ci -e workflow_dispatch --var GREENLIT_DOGFOOD=true --no-input
