@@ -229,6 +229,14 @@ pub trait ContainerEngine: Send + Sync {
         sink: &mut (dyn ExecOutputSink + Send),
     ) -> Result<ExecOutput, RuntimeError>;
 
+    /// Read a bounded tail of a container's combined stdout/stderr logs.
+    ///
+    /// Used to retain service diagnostics when health gating fails. Backends
+    /// without log access return an empty buffer.
+    async fn container_logs(&self, _id: &str, _max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        Ok(Vec::new())
+    }
+
     /// Best-effort termination of a still-running exec whose process wrote its
     /// own PID to `pid_file` at start (see `crate::executor::step`'s
     /// timeout-wrapper).

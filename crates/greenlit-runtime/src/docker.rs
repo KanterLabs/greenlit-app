@@ -618,6 +618,32 @@ impl ContainerEngine for DockerEngine {
         Ok(ExecOutput { exit_code })
     }
 
+    async fn container_logs(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        let options = LogsOptionsBuilder::new()
+            .follow(false)
+            .stdout(true)
+            .stderr(true)
+            .tail("200")
+            .build();
+        let mut stream = self.docker.logs(id, Some(options));
+        let mut output = Vec::new();
+        while let Some(item) = stream.next().await {
+            let message =
+                match item.map_err(|error| RuntimeError::api(Operation::ContainerLogs, error))? {
+                    LogOutput::StdOut { message }
+                    | LogOutput::StdErr { message }
+                    | LogOutput::Console { message } => message,
+                    LogOutput::StdIn { .. } => continue,
+                };
+            output.extend_from_slice(&message);
+            if output.len() > max_bytes {
+                let excess = output.len() - max_bytes;
+                output.drain(..excess);
+            }
+        }
+        Ok(output)
+    }
+
     async fn export_path(&self, container: &str, path: &str) -> Result<Vec<u8>, RuntimeError> {
         let options = DownloadFromContainerOptionsBuilder::new()
             .path(path)

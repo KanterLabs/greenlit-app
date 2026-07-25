@@ -27,6 +27,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::env::ActionsService;
 use greenlit_store::{ArtifactStore, CacheStore, ShimState};
 
@@ -265,6 +266,7 @@ pub async fn start(
     network: &str,
     policy: &crate::executor::netguard::Policy,
     services: &[(String, ResolvedService)],
+    masker: &Masker,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<Vec<StartedService>, ServiceStartFailure> {
     let mut started = Vec::new();
@@ -356,7 +358,7 @@ pub async fn start(
             )
             .await
         );
-        bail!(wait_healthy(engine, &container, id).await);
+        bail!(wait_healthy(engine, &container, id, masker).await);
         progress.on_progress(ProgressEvent::ServiceReady {
             service: id.clone(),
         });
@@ -373,6 +375,7 @@ async fn wait_healthy(
     engine: &dyn ContainerEngine,
     container: &str,
     id: &str,
+    masker: &Masker,
 ) -> Result<(), ExecError> {
     let deadline = Instant::now() + HEALTH_DEADLINE;
     loop {
@@ -381,31 +384,83 @@ async fn wait_healthy(
             HealthState::None if state.running => return Ok(()),
             HealthState::Healthy => return Ok(()),
             HealthState::Unhealthy => {
-                return Err(ExecError::Infrastructure {
-                    message: format!("service `{id}` reported unhealthy"),
-                    fix: format!(
-                        "check the service image and its `--health-cmd`; run `docker logs` against the `greenlit.service={id}` container to see why the probe failed"
-                    ),
-                });
+                return Err(service_health_failure(
+                    engine,
+                    container,
+                    id,
+                    "reported unhealthy",
+                    "check the service image and its `--health-cmd`",
+                    masker,
+                )
+                .await);
             }
             _ if !state.running => {
-                return Err(ExecError::Infrastructure {
-                    message: format!("service `{id}` exited before becoming ready"),
-                    fix: "check the service image's own configuration — a service that exits immediately usually needs `env:` it was not given".to_string(),
-                });
+                return Err(service_health_failure(
+                    engine,
+                    container,
+                    id,
+                    "exited before becoming ready",
+                    "check the service image's configuration and required `env:` values",
+                    masker,
+                )
+                .await);
             }
             _ => {}
         }
         if Instant::now() >= deadline {
-            return Err(ExecError::Infrastructure {
-                message: format!(
-                    "service `{id}` did not become healthy within {}s",
+            return Err(service_health_failure(
+                engine,
+                container,
+                id,
+                &format!(
+                    "did not become healthy within {}s",
                     HEALTH_DEADLINE.as_secs()
                 ),
-                fix: "raise `--health-start-period`/`--health-retries`, or check that the probe command is right for the image".to_string(),
-            });
+                "raise `--health-start-period`/`--health-retries`, or correct the probe command",
+                masker,
+            )
+            .await);
         }
         tokio::time::sleep(HEALTH_POLL).await;
+    }
+}
+
+async fn service_health_failure(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    id: &str,
+    reason: &str,
+    fix: &str,
+    masker: &Masker,
+) -> ExecError {
+    const MAX_SERVICE_LOG_BYTES: usize = 64 * 1024;
+    let logs = engine
+        .container_logs(container, MAX_SERVICE_LOG_BYTES)
+        .await
+        .unwrap_or_default();
+    let text = String::from_utf8_lossy(&logs);
+    let safe = text
+        .chars()
+        .map(|character| {
+            if character == '\n' || character == '\t' || !character.is_control() {
+                character
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect::<String>();
+    let safe = masker.apply(safe.trim_end());
+    let retained = if safe.is_empty() {
+        "    (no service logs were emitted)".to_string()
+    } else {
+        safe.lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    ExecError::Infrastructure {
+        message: format!("service `{id}` {reason}\n  retained service logs:\n{retained}"),
+        fix: fix.to_string(),
     }
 }
 

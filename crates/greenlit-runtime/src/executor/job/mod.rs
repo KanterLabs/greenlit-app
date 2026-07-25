@@ -273,6 +273,7 @@ pub(crate) async fn run_instance(
                     job_network.name(),
                     job_network.policy(),
                     &resolved,
+                    masker,
                     progress,
                 )
                 .await

@@ -66,6 +66,7 @@ struct ScriptedEngine {
     peak_starts: AtomicUsize,
     step_started: Notify,
     removed_containers: AtomicUsize,
+    service_unhealthy: bool,
 }
 
 impl ScriptedEngine {
@@ -272,6 +273,13 @@ impl ContainerEngine for ScriptedEngine {
     ) -> Result<ExecOutput, RuntimeError> {
         Ok(ExecOutput { exit_code: 0 })
     }
+    async fn container_logs(&self, _id: &str, _max_bytes: usize) -> Result<Vec<u8>, RuntimeError> {
+        Ok(if self.service_unhealthy {
+            b"database secret-value failed\n".to_vec()
+        } else {
+            Vec::new()
+        })
+    }
     async fn export_path(&self, _container: &str, _path: &str) -> Result<Vec<u8>, RuntimeError> {
         Ok(Vec::new())
     }
@@ -292,7 +300,11 @@ impl ContainerEngine for ScriptedEngine {
         Ok(ContainerState {
             running: true,
             exit_code: None,
-            health: HealthState::None,
+            health: if self.service_unhealthy {
+                HealthState::Unhealthy
+            } else {
+                HealthState::None
+            },
         })
     }
     async fn create_volume(&self, _name: &str) -> Result<(), RuntimeError> {
@@ -621,6 +633,79 @@ jobs:
     assert!(
         engine.removed_containers.load(Ordering::SeqCst) >= 1,
         "the active job container must be force-removed"
+    );
+}
+
+#[tokio::test]
+async fn unhealthy_service_failure_retains_masked_service_logs() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "service-health.yml",
+        r#"
+on: push
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        options: --health-cmd pg_isready
+    steps:
+      - run: ECHO unreachable
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+    let engine = ScriptedEngine {
+        service_unhealthy: true,
+        ..ScriptedEngine::default()
+    };
+    let config = RunConfig {
+        repo_host_path: std::env::temp_dir(),
+        workspace: "/ws".to_string(),
+        strategy: IsolationStrategy::Auto,
+        runner_env: RunnerEnv::default(),
+        github: event.github.clone(),
+        vars: Value::object(vec![]),
+        inputs: Value::object(vec![]),
+        secrets: Value::object(vec![]),
+        initial_masks: vec!["secret-value".to_string()],
+        volume_namespace: "service-health".to_string(),
+        locked_images: None,
+        write_back: false,
+        readiness: ReadinessConfig::default(),
+        actions: test_action_config(),
+        store: None,
+    };
+
+    let error = run_plan(
+        &engine,
+        &execution_plan,
+        &config,
+        &mut Vec::new(),
+        &mut ProgressNull,
+    )
+    .await
+    .expect_err("unhealthy service blocks the job")
+    .to_string();
+
+    assert!(
+        error.contains("service `database` reported unhealthy"),
+        "{error}"
+    );
+    assert!(error.contains("database *** failed"), "{error}");
+    assert!(!error.contains("secret-value"), "{error}");
+    assert!(
+        engine.removed_containers.load(Ordering::SeqCst) >= 1,
+        "failed service is removed after its logs are retained"
     );
 }
 
