@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo build --release -p greenlit-app
+
+for package in \
+  greenlit-expr \
+  greenlit-workflow \
+  greenlit-engine \
+  greenlit-metrics \
+  greenlit-store \
+  greenlit-actions \
+  greenlit-runtime \
+  greenlit-app
+do
+  cargo package -p "$package" --no-verify
+done
+
+sha256sum target/release/litci target/package/*.crate > SHA256SUMS
