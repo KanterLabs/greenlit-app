@@ -55,6 +55,11 @@ pub(crate) fn export(args: ExportArgs) -> anyhow::Result<()> {
             "the workflow already has a job named greenlit_confirmation\n  fix: rename that job, rerun locally, then export again"
         );
     }
+    if jobs.iter().any(|job| job.name == "Greenlit evidence") {
+        anyhow::bail!(
+            "the workflow already has a job displayed as 'Greenlit evidence'\n  fix: rename that job, rerun locally, then export again"
+        );
+    }
     let named = name_unnamed_steps(&original, &lock.source.workflow_path)?;
     let pinned = pin_workflow(&named, &lock)?;
     let semantic_digest = sha256_identity(pinned.as_bytes());
@@ -454,11 +459,17 @@ fn verify_jobs(expected: &[GithubJobEvidenceV1], remote: &RemoteJobs) -> anyhow:
             "GitHub run has more than 100 jobs and evidence pagination is incomplete\n  fix: reduce the exported matrix below 100 jobs"
         );
     }
+    let mut used_jobs = BTreeSet::new();
     for expected_job in expected {
         let job = remote
             .jobs
             .iter()
-            .find(|job| job.name == expected_job.name)
+            .enumerate()
+            .find(|(index, job)| !used_jobs.contains(index) && job.name == expected_job.name)
+            .map(|(index, job)| {
+                used_jobs.insert(index);
+                job
+            })
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "GitHub run lacks expected job '{}'\n  fix: use the exact exported workflow run",
@@ -471,10 +482,9 @@ fn verify_jobs(expected: &[GithubJobEvidenceV1], remote: &RemoteJobs) -> anyhow:
                 job.name
             );
         }
+        let mut remote_steps = job.steps.iter();
         for expected_step in &expected_job.steps {
-            let step = job
-                .steps
-                .iter()
+            let step = remote_steps
                 .find(|step| step.name == expected_step.name)
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -495,7 +505,9 @@ fn verify_jobs(expected: &[GithubJobEvidenceV1], remote: &RemoteJobs) -> anyhow:
     let evidence_job = remote
         .jobs
         .iter()
-        .find(|job| job.name == "Greenlit evidence");
+        .enumerate()
+        .find(|(index, job)| !used_jobs.contains(index) && job.name == "Greenlit evidence")
+        .map(|(_, job)| job);
     if evidence_job.and_then(|job| job.conclusion.as_deref()) != Some("success") {
         anyhow::bail!(
             "the Greenlit evidence job did not pass\n  fix: wait for the exported workflow to complete successfully"

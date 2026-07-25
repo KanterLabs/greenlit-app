@@ -142,6 +142,51 @@ fn a_matching_github_artifact_upgrades_only_an_eligible_local_result() {
     assert_eq!(result["assurance"], "github_confirmed");
 }
 
+#[test]
+fn one_remote_job_cannot_satisfy_two_locked_jobs_with_the_same_display_name() {
+    let sandbox = Sandbox::new();
+    seed_completed_run(&sandbox, true);
+    sandbox.write_home(
+        &format!(".litci/runs/{RUN_ID}/execution-plan.json"),
+        r#"{"jobs":[{"id":"first","name":{"evaluation":"static","value":"duplicate"},"legs":[],"steps":[{"id":null,"name":{"evaluation":"static","value":"Pass"},"kind":{"kind":"run","script":{"evaluation":"static","value":"echo pass"}}}]},{"id":"second","name":{"evaluation":"static","value":"duplicate"},"legs":[],"steps":[{"id":null,"name":{"evaluation":"static","value":"Pass"},"kind":{"kind":"run","script":{"evaluation":"static","value":"echo pass"}}}]}]}"#,
+    );
+    let exported = sandbox.run(&["export", RUN_ID, "--output", "exported"]);
+    assert!(exported.status.success(), "{}", stderr_text(&exported));
+    let workflow =
+        std::fs::read(sandbox.root().join("exported/greenlit-confirmation.yml")).unwrap();
+    let fake = FakeGitHub::bind();
+    let base = fake.base_url();
+    let server = fake.serve(vec![
+        Canned::json(
+            200,
+            "OK",
+            format!(
+                r#"{{"head_sha":"{COMMIT}","path":".github/workflows/greenlit-confirmation.yml@main","event":"push","conclusion":"success"}}"#
+            ),
+        ),
+        Canned::bytes(200, "OK", workflow),
+        Canned::json(
+            200,
+            "OK",
+            r#"{"total_count":2,"jobs":[{"name":"duplicate","conclusion":"success","steps":[{"name":"Pass","conclusion":"success"}]},{"name":"Greenlit evidence","conclusion":"success","steps":[]}]}"#,
+        ),
+    ]);
+    let rejected = sandbox.run_with_env(
+        &[
+            "confirm",
+            RUN_ID,
+            "--repository",
+            "owner/repo",
+            "--github-run",
+            "42",
+        ],
+        &[("LITCI_TEST_GITHUB_CONFIRM_API_BASE", &base)],
+    );
+    assert!(!rejected.status.success());
+    assert!(stderr_text(&rejected).contains("lacks expected job 'duplicate'"));
+    assert_eq!(server.join().unwrap().len(), 3);
+}
+
 fn evidence_zip(evidence: &[u8]) -> Vec<u8> {
     let cursor = std::io::Cursor::new(Vec::new());
     let mut archive = zip::ZipWriter::new(cursor);
