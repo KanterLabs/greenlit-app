@@ -484,11 +484,13 @@ jobs:
     outputs:
       matrix: ${{ steps.out.outputs.matrix }}
       parallel: ${{ steps.out.outputs.parallel }}
+      runner: ${{ steps.out.outputs.runner }}
     steps:
       - id: out
         run: |
           OUT matrix={"os":["ubuntu-24.04","ubuntu-22.04"]}
           OUT parallel=1
+          OUT runner=ubuntu-22.04
   consumer:
     needs: producer
     name: leg ${{ matrix.os }}
@@ -498,6 +500,11 @@ jobs:
       matrix: ${{ fromJSON(needs.producer.outputs.matrix) }}
     steps:
       - run: ECHO ${{ matrix.os }}
+  direct:
+    needs: producer
+    runs-on: ${{ needs.producer.outputs.runner }}
+    steps:
+      - run: ECHO direct
 "#,
     )
     .expect("parse");
@@ -546,7 +553,7 @@ jobs:
             .iter()
             .map(|job| job.display.as_str())
             .collect::<Vec<_>>(),
-        vec!["producer", "leg ubuntu-24.04", "leg ubuntu-22.04"]
+        vec!["producer", "leg ubuntu-24.04", "leg ubuntu-22.04", "direct"]
     );
     assert!(
         report

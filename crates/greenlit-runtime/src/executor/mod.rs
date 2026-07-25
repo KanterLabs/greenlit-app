@@ -276,14 +276,6 @@ pub enum ExecError {
         /// The repository that was requested.
         repository: String,
     },
-    /// A `runs-on:` label that only resolves from runtime data was reached.
-    #[error(
-        "{span}: this job's `runs-on:` label depends on runtime data, which `litci run` does not resolve in v0\n  fix: use a literal `runs-on:` label or `${{{{ matrix.* }}}}`"
-    )]
-    DeferredRunner {
-        /// Where `runs-on:` was authored.
-        span: Span,
-    },
     /// Runtime matrix materialization failed after dependency outputs existed.
     #[error(
         "could not materialize a runtime matrix: {source}\n  fix: make the producing job emit the documented JSON matrix and scheduling-control types"
