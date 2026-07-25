@@ -112,9 +112,10 @@ jobs:
   # from Phase 4 onward. A CI tool whose repo can't run its own CI locally has
   # failed its founding premise."
   #
-  # It runs the real gates, not a shell-only subset -- the cheaper subset would
-  # not have caught either of the provisioning defects the capstone surfaced
-  # (`cargo fmt` missing its subcommands, `python3` having no recipe).
+  # The dedicated workflow supplies its repository-declared Rust toolchain
+  # through an immutable job container. The locked ARC runner profile is
+  # intentionally not inferred to contain GitHub-hosted runner toolcache
+  # contents such as rustup.
   dogfood:
     name: this repo's own gates, under litci
     runs-on: ubuntu-latest
@@ -137,14 +138,10 @@ jobs:
       - name: Build litci
         run: cargo build --release -p greenlit-app
 
-      # `-j ci` is load-bearing. Without it litci runs *every* job in this
-      # file -- including this one -- which would build litci and invoke it
-      # again, forever.
-      #
       # A separate target dir keeps the inner run's build off the outer one:
       # the host repo's `target/` is in the read-only lower layer, and
       # building over it fights stale fingerprints.
-      - name: Run ci.yml under Greenlit
+      - name: Run repository gates under Greenlit
         env:
           CARGO_TARGET_DIR: /tmp/dogfood-target
-        run: ./target/release/litci run -W .github/workflows/ci.yml -j ci -e workflow_dispatch --var GREENLIT_DOGFOOD=true --no-input
+        run: ./target/release/litci run -W .github/workflows/dogfood.yml -e workflow_dispatch --no-input
