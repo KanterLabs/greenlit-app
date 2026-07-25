@@ -154,6 +154,7 @@ async fn a_composite_step_sees_job_env_layers_a_live_path_and_maps_its_output() 
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -298,6 +299,7 @@ async fn a_composites_nested_checkout_and_docker_action_share_the_job_workspace_
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -429,6 +431,7 @@ async fn a_composite_inputs_default_is_evaluated_as_a_template_not_a_literal() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -535,6 +538,7 @@ async fn a_failed_nested_step_gates_later_steps_by_the_composites_own_rolling_st
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -690,6 +694,7 @@ async fn a_nested_js_actions_pre_and_main_phases_see_the_jobs_full_env_layers() 
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: env_probe_action_config(store_root.path()),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

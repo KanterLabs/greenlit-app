@@ -345,6 +345,12 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: actions_config,
         store: store_config.clone(),
+        resources: greenlit_runtime::ResourceLimits {
+            nano_cpus: args.cpus,
+            memory_bytes: args.memory,
+            pids: args.pids_limit,
+            disk_bytes: args.disk_limit,
+        },
     };
 
     // `Stdout` (not a lock guard) is `Send`, which the executor's streaming sink

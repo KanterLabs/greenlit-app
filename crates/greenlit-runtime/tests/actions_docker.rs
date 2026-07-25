@@ -123,6 +123,7 @@ async fn a_docker_action_shares_the_live_workspace_with_the_job_container() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -274,6 +275,7 @@ async fn a_non_root_docker_action_gets_the_full_command_file_protocol() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -398,6 +400,7 @@ async fn a_docker_action_sibling_resolves_services_and_is_blocked_from_link_loca
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -519,6 +522,7 @@ async fn a_docker_actions_sibling_keeps_the_action_images_own_path() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

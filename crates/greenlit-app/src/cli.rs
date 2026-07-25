@@ -120,6 +120,43 @@ pub(crate) struct RunArgs {
     /// verified locked content already present on this machine.
     #[arg(long)]
     pub(crate) offline: bool,
+
+    /// Maximum CPUs available to each job and service container.
+    #[arg(long, value_name = "COUNT", value_parser = parse_cpus)]
+    pub(crate) cpus: Option<i64>,
+
+    /// Maximum memory available to each job and service container, in bytes.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_i64)]
+    pub(crate) memory: Option<i64>,
+
+    /// Maximum processes available to each job and service container.
+    #[arg(long, value_name = "COUNT", value_parser = parse_positive_i64)]
+    pub(crate) pids_limit: Option<i64>,
+
+    /// Maximum writable container-layer size, in bytes.
+    #[arg(long, value_name = "BYTES", value_parser = parse_positive_i64)]
+    pub(crate) disk_limit: Option<i64>,
+}
+
+fn parse_positive_i64(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|parsed| *parsed > 0)
+        .ok_or_else(|| "value must be a positive integer".to_string())
+}
+
+fn parse_cpus(value: &str) -> Result<i64, String> {
+    let cpus = value
+        .parse::<f64>()
+        .ok()
+        .filter(|parsed| parsed.is_finite() && *parsed > 0.0)
+        .ok_or_else(|| "CPU count must be a positive number".to_string())?;
+    let nano = cpus * 1_000_000_000.0;
+    if nano > i64::MAX as f64 {
+        return Err("CPU count is too large".to_string());
+    }
+    Ok(nano.round() as i64)
 }
 
 #[derive(Debug, clap::Args)]

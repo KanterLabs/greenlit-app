@@ -46,7 +46,7 @@ pub use docker::DockerEngine;
 pub use engine::{
     BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
     ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo,
-    PortBinding, RegistryAuth, SinkNull,
+    PortBinding, RegistryAuth, ResourceLimits, SinkNull,
 };
 pub use error::{Operation, RuntimeError};
 pub use executor::{

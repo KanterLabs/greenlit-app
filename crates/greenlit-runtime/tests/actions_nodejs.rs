@@ -255,6 +255,7 @@ async fn node20_and_node24_actions_execute_in_the_ordinary_job_container() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: fake_action_config(store_root.path()),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -328,6 +329,7 @@ async fn a_node_action_executes_in_a_custom_job_container() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: fake_action_config(store_root.path()),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

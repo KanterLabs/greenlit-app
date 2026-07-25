@@ -131,6 +131,7 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: dockerkit::test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

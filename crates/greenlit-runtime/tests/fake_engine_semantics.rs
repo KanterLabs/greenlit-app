@@ -60,14 +60,18 @@ struct ScriptedEngine {
     /// How many readiness polls have been answered.
     polls: AtomicUsize,
     created_images: Mutex<Vec<String>>,
+    created_resources: Mutex<Vec<greenlit_runtime::ResourceLimits>>,
     created_networks: Mutex<Vec<String>>,
     /// Hold container startup briefly so scheduler concurrency is observable.
     delay_start: bool,
     active_starts: AtomicUsize,
     peak_starts: AtomicUsize,
     step_started: Notify,
+    pull_started: Notify,
     removed_containers: AtomicUsize,
     service_unhealthy: bool,
+    service_waits: bool,
+    delay_pull: bool,
 }
 
 impl ScriptedEngine {
@@ -156,6 +160,10 @@ impl ContainerEngine for ScriptedEngine {
         _auth: Option<&RegistryAuth>,
         _progress: &mut (dyn ProgressSink + Send),
     ) -> Result<(), RuntimeError> {
+        if self.delay_pull {
+            self.pull_started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
         Ok(())
     }
     async fn image_exists(&self, _image: &str) -> Result<bool, RuntimeError> {
@@ -181,6 +189,7 @@ impl ContainerEngine for ScriptedEngine {
     }
     async fn create_container(&self, spec: &ContainerSpec) -> Result<String, RuntimeError> {
         self.created_images.lock().unwrap().push(spec.image.clone());
+        self.created_resources.lock().unwrap().push(spec.resources);
         Ok(format!(
             "fake-{}",
             self.counter.fetch_add(1, Ordering::Relaxed)
@@ -304,6 +313,8 @@ impl ContainerEngine for ScriptedEngine {
             exit_code: None,
             health: if self.service_unhealthy {
                 HealthState::Unhealthy
+            } else if self.service_waits {
+                HealthState::Starting
             } else {
                 HealthState::None
             },
@@ -371,6 +382,12 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits {
+            nano_cpus: Some(1_500_000_000),
+            memory_bytes: Some(512 * 1024 * 1024),
+            pids: Some(128),
+            disk_bytes: Some(4 * 1024 * 1024 * 1024),
+        },
     };
 
     let report = run_plan(
@@ -394,6 +411,17 @@ jobs:
         "concurrent jobs must have distinct networks"
     );
     drop(networks);
+    assert!(
+        engine
+            .created_resources
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|resources| **resources == config.resources)
+            .count()
+            >= 2,
+        "every job must receive the configured resource ceilings"
+    );
     assert_eq!(
         report
             .jobs
@@ -454,6 +482,7 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let report = run_plan(
@@ -544,6 +573,7 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let report = run_plan(
@@ -618,6 +648,7 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
     let cancellation = Cancellation::new();
     let started = Instant::now();
@@ -650,6 +681,101 @@ jobs:
         engine.removed_containers.load(Ordering::SeqCst) >= 1,
         "the active job container must be force-removed"
     );
+}
+
+#[tokio::test]
+async fn cancellation_stops_service_downloads_and_health_waits_within_one_second() {
+    let workflow = greenlit_workflow::parse_workflow(
+        "cancel-service.yml",
+        r#"
+on: push
+jobs:
+  service:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+        options: --health-cmd ready
+    steps:
+      - run: ECHO must-not-run
+"#,
+    )
+    .expect("parse");
+    let event = SyntheticEvent {
+        kind: EventKind::Push,
+        github: Value::object(vec![(
+            "event_name".to_string(),
+            Value::String("push".to_string()),
+        )]),
+        inputs: Value::object(vec![]),
+        deferred_github_properties: std::collections::BTreeSet::new(),
+    };
+    let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
+
+    for engine in [
+        ScriptedEngine {
+            image_absent: true,
+            delay_pull: true,
+            ..ScriptedEngine::default()
+        },
+        ScriptedEngine {
+            service_waits: true,
+            ..ScriptedEngine::default()
+        },
+    ] {
+        let config = RunConfig {
+            repo_host_path: std::env::temp_dir(),
+            workspace: "/ws".to_string(),
+            strategy: IsolationStrategy::Auto,
+            runner_env: RunnerEnv::default(),
+            github: event.github.clone(),
+            vars: Value::object(vec![]),
+            inputs: Value::object(vec![]),
+            secrets: Value::object(vec![]),
+            initial_masks: Vec::new(),
+            volume_namespace: "cancel-service".to_string(),
+            locked_images: None,
+            write_back: false,
+            readiness: ReadinessConfig::default(),
+            actions: test_action_config(),
+            store: None,
+            resources: greenlit_runtime::ResourceLimits::default(),
+        };
+        let cancellation = Cancellation::new();
+        let started = Instant::now();
+        let mut log = Vec::new();
+        let mut progress = ProgressNull;
+        let run = run_plan_cancellable(
+            &engine,
+            &execution_plan,
+            &config,
+            &mut log,
+            &mut progress,
+            &cancellation,
+        );
+        let request = async {
+            if engine.delay_pull {
+                engine.pull_started.notified().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(run, request);
+        let report = result.expect("cancellation returns a report");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "preparation cancellation acknowledgement exceeded one second"
+        );
+        assert_eq!(report.jobs[0].result, Conclusion::Cancelled);
+        if engine.service_waits {
+            assert!(
+                engine.removed_containers.load(Ordering::SeqCst) >= 1,
+                "a service waiting on health must be removed"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -700,6 +826,12 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits {
+            nano_cpus: Some(2_000_000_000),
+            memory_bytes: Some(256 * 1024 * 1024),
+            pids: Some(64),
+            disk_bytes: Some(2 * 1024 * 1024 * 1024),
+        },
     };
 
     let error = run_plan(
@@ -722,6 +854,14 @@ jobs:
     assert!(
         engine.removed_containers.load(Ordering::SeqCst) >= 1,
         "failed service is removed after its logs are retained"
+    );
+    assert!(
+        engine
+            .created_resources
+            .lock()
+            .unwrap()
+            .contains(&config.resources),
+        "service resource ceilings must be present before startup"
     );
 }
 
@@ -774,6 +914,7 @@ jobs:
         readiness: ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     run_plan(
@@ -881,6 +1022,7 @@ async fn dag_propagation_rollup_gating_and_masking() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -985,6 +1127,7 @@ async fn checkouts_post_step_runs_even_when_a_later_step_fails() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -1092,6 +1235,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();
@@ -1234,6 +1378,7 @@ async fn run_single_job(
         readiness: tiny_readiness(),
         actions: test_action_config(),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
     let mut log: Vec<u8> = Vec::new();
     let mut recording = RecordingSink::default();

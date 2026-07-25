@@ -121,6 +121,8 @@ pub struct RunConfig {
     /// Where the local cache, artifact, and toolcache stores live, when this
     /// run serves them. `None` runs with no cache service at all.
     pub store: Option<StoreConfig>,
+    /// Host-enforced ceilings applied to every job and service container.
+    pub resources: crate::ResourceLimits,
 }
 
 impl RunConfig {

@@ -236,6 +236,8 @@ pub struct ServiceStartFailure {
     pub cause: ExecError,
     /// Services that started before the failure.
     pub started: Vec<StartedService>,
+    /// Whether cooperative run cancellation caused the failure.
+    pub cancelled: bool,
 }
 
 /// One started service container.
@@ -244,6 +246,14 @@ pub struct StartedService {
     pub id: String,
     /// The container id, for teardown.
     pub container: String,
+}
+
+/// Job-scoped inputs shared by every service startup.
+pub(crate) struct ServiceRuntime<'a> {
+    pub(crate) config: &'a crate::executor::RunConfig,
+    pub(crate) network: &'a str,
+    pub(crate) policy: &'a crate::executor::netguard::Policy,
+    pub(crate) cancellation: &'a crate::Cancellation,
 }
 
 /// Starts `services` on `network`, waiting for each to report healthy.
@@ -262,13 +272,17 @@ pub struct StartedService {
 /// to stop them before it can remove the network they are attached to.
 pub async fn start(
     engine: &dyn ContainerEngine,
-    config: &crate::executor::RunConfig,
-    network: &str,
-    policy: &crate::executor::netguard::Policy,
+    runtime: &ServiceRuntime<'_>,
     services: &[(String, ResolvedService)],
     masker: &Masker,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<Vec<StartedService>, ServiceStartFailure> {
+    let ServiceRuntime {
+        config,
+        network,
+        policy,
+        cancellation,
+    } = runtime;
     let mut started = Vec::new();
     for (id, service) in services {
         progress.on_progress(ProgressEvent::ServiceStarting {
@@ -283,6 +297,7 @@ pub async fn start(
                         return Err(ServiceStartFailure {
                             cause: cause.into(),
                             started,
+                            cancelled: false,
                         });
                     }
                 }
@@ -290,7 +305,11 @@ pub async fn start(
         }
 
         let image = bail!(config.locked_image(&service.image));
-        if !bail!(engine.image_exists(&image).await) {
+        let exists = tokio::select! {
+            result = engine.image_exists(&image) => bail!(result),
+            () = cancellation.cancelled() => return Err(cancelled_start(started)),
+        };
+        if !exists {
             if config.locked_images.is_some() {
                 return Err(ServiceStartFailure {
                     cause: crate::executor::ExecError::Infrastructure {
@@ -301,13 +320,14 @@ pub async fn start(
                             .to_string(),
                     },
                     started,
+                    cancelled: false,
                 });
             }
-            bail!(
-                engine
-                    .pull_image(&image, service.registry_auth.as_ref(), progress)
-                    .await
-            );
+            let pulled = tokio::select! {
+                result = engine.pull_image(&image, service.registry_auth.as_ref(), progress) => result,
+                () = cancellation.cancelled() => return Err(cancelled_start(started)),
+            };
+            bail!(pulled);
         }
 
         let spec = ContainerSpec {
@@ -324,6 +344,7 @@ pub async fn start(
                 ("greenlit.managed".to_string(), "1".to_string()),
                 ("greenlit.service".to_string(), id.clone()),
             ],
+            resources: config.resources,
             ..ContainerSpec::default()
         };
 
@@ -332,11 +353,21 @@ pub async fn start(
             id: id.clone(),
             container: container.clone(),
         });
-        bail!(engine.start_container(&container).await);
+        let start = tokio::select! {
+            result = engine.start_container(&container) => result,
+            () = cancellation.cancelled() => {
+                return Err(cancelled_start(started));
+            }
+        };
+        bail!(start);
         // A service is untrusted code too, and it is on the same bridge as
         // the job -- so it is contained by the same policy.
         let netguard_image = bail!(config.locked_image(crate::executor::netguard::NETGUARD_IMAGE));
-        if config.locked_images.is_some() && !bail!(engine.image_exists(&netguard_image).await) {
+        let netguard_exists = tokio::select! {
+            result = engine.image_exists(&netguard_image) => bail!(result),
+            () = cancellation.cancelled() => return Err(cancelled_start(started)),
+        };
+        if config.locked_images.is_some() && !netguard_exists {
             return Err(ServiceStartFailure {
                 cause: crate::executor::ExecError::Infrastructure {
                     message: format!(
@@ -346,24 +377,54 @@ pub async fn start(
                         .to_string(),
                 },
                 started,
+                cancelled: false,
             });
         }
-        bail!(
-            crate::executor::netguard::apply(
+        let guarded = tokio::select! {
+            result = crate::executor::netguard::apply(
                 engine,
                 &container,
                 policy,
                 &netguard_image,
                 progress,
-            )
-            .await
-        );
-        bail!(wait_healthy(engine, &container, id, masker).await);
+            ) => result,
+            () = cancellation.cancelled() => {
+                return Err(cancelled_start(started));
+            }
+        };
+        bail!(guarded);
+        match wait_healthy(engine, &container, id, masker, cancellation).await {
+            Ok(()) => {}
+            Err(HealthWaitFailure::Execution(cause)) => {
+                return Err(ServiceStartFailure {
+                    cause,
+                    started,
+                    cancelled: false,
+                });
+            }
+            Err(HealthWaitFailure::Cancelled) => return Err(cancelled_start(started)),
+        }
         progress.on_progress(ProgressEvent::ServiceReady {
             service: id.clone(),
         });
     }
     Ok(started)
+}
+
+fn cancelled_start(started: Vec<StartedService>) -> ServiceStartFailure {
+    ServiceStartFailure {
+        cause: ExecError::Infrastructure {
+            message: "service preparation was cancelled".to_string(),
+            fix: "retry the run when ready".to_string(),
+        },
+        started,
+        cancelled: true,
+    }
+}
+
+enum HealthWaitFailure {
+    Execution(ExecError),
+    Cancelled,
 }
 
 /// Polls until the service reports healthy, or fails with a message naming it.
@@ -376,39 +437,49 @@ async fn wait_healthy(
     container: &str,
     id: &str,
     masker: &Masker,
-) -> Result<(), ExecError> {
+    cancellation: &crate::Cancellation,
+) -> Result<(), HealthWaitFailure> {
     let deadline = Instant::now() + HEALTH_DEADLINE;
     loop {
-        let state = engine.inspect_container(container).await?;
+        let state = tokio::select! {
+            result = engine.inspect_container(container) => {
+                result.map_err(ExecError::from).map_err(HealthWaitFailure::Execution)?
+            }
+            () = cancellation.cancelled() => return Err(HealthWaitFailure::Cancelled),
+        };
         match state.health {
             HealthState::None if state.running => return Ok(()),
             HealthState::Healthy => return Ok(()),
             HealthState::Unhealthy => {
-                return Err(service_health_failure(
-                    engine,
-                    container,
-                    id,
-                    "reported unhealthy",
-                    "check the service image and its `--health-cmd`",
-                    masker,
-                )
-                .await);
+                return Err(HealthWaitFailure::Execution(
+                    service_health_failure(
+                        engine,
+                        container,
+                        id,
+                        "reported unhealthy",
+                        "check the service image and its `--health-cmd`",
+                        masker,
+                    )
+                    .await,
+                ));
             }
             _ if !state.running => {
-                return Err(service_health_failure(
-                    engine,
-                    container,
-                    id,
-                    "exited before becoming ready",
-                    "check the service image's configuration and required `env:` values",
-                    masker,
-                )
-                .await);
+                return Err(HealthWaitFailure::Execution(
+                    service_health_failure(
+                        engine,
+                        container,
+                        id,
+                        "exited before becoming ready",
+                        "check the service image's configuration and required `env:` values",
+                        masker,
+                    )
+                    .await,
+                ));
             }
             _ => {}
         }
         if Instant::now() >= deadline {
-            return Err(service_health_failure(
+            return Err(HealthWaitFailure::Execution(service_health_failure(
                 engine,
                 container,
                 id,
@@ -419,9 +490,12 @@ async fn wait_healthy(
                 "raise `--health-start-period`/`--health-retries`, or correct the probe command",
                 masker,
             )
-            .await);
+            .await));
         }
-        tokio::time::sleep(HEALTH_POLL).await;
+        tokio::select! {
+            () = tokio::time::sleep(HEALTH_POLL) => {}
+            () = cancellation.cancelled() => return Err(HealthWaitFailure::Cancelled),
+        }
     }
 }
 

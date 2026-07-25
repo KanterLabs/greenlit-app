@@ -347,13 +347,22 @@ impl ContainerEngine for DockerEngine {
             || !binds.is_empty()
             || !spec.cap_add.is_empty()
             || !port_bindings.is_empty()
-            || spec.privileged;
+            || spec.privileged
+            || spec.resources != crate::engine::ResourceLimits::default();
+        let storage_opt = spec
+            .resources
+            .disk_bytes
+            .map(|bytes| HashMap::from([("size".to_string(), bytes.to_string())]));
         let host_config = needs_host_config.then(|| HostConfig {
             network_mode: spec.network.clone(),
             binds: (!binds.is_empty()).then_some(binds),
             privileged: spec.privileged.then_some(true),
             cap_add: (!spec.cap_add.is_empty()).then(|| spec.cap_add.clone()),
             port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+            nano_cpus: spec.resources.nano_cpus,
+            memory: spec.resources.memory_bytes,
+            pids_limit: spec.resources.pids,
+            storage_opt,
             ..Default::default()
         });
 

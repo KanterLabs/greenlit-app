@@ -262,7 +262,7 @@ pub(crate) async fn boot_container(
     shared: &Shared<'_>,
     request: &BootRequest<'_>,
     progress: &mut (dyn ProgressSink + Send),
-) -> Result<String, ExecError> {
+) -> Result<Option<String>, ExecError> {
     let BootRequest {
         image,
         in_container,
@@ -350,17 +350,35 @@ pub(crate) async fn boot_container(
         }
     }
     spec.labels = vec![("greenlit.managed".to_string(), "1".to_string())];
+    spec.resources = shared.config.resources;
 
     let engine = shared.engine;
     progress.on_progress(ProgressEvent::BootStarted);
     let boot = async {
         let id = engine.create_container(&spec).await?;
-        engine.start_container(&id).await?;
-        Ok::<_, ExecError>(id)
+        if shared.cancellation.is_cancelled() {
+            let _ = engine.remove_container(&id).await;
+            return Ok(None);
+        }
+        let started = tokio::select! {
+            result = engine.start_container(&id) => result,
+            () = shared.cancellation.cancelled() => {
+                let _ = engine.remove_container(&id).await;
+                return Ok(None);
+            }
+        };
+        if let Err(error) = started {
+            let _ = engine.remove_container(&id).await;
+            return Err(error.into());
+        }
+        Ok::<_, ExecError>(Some(id))
     };
     let id = boot.instrument(stage_span("container-boot")).await?;
+    let Some(id) = id else {
+        return Ok(None);
+    };
     progress.on_progress(ProgressEvent::BootFinished);
-    Ok(id)
+    Ok(Some(id))
 }
 
 /// Write the embedded `greenlit-init` bytes to a host temp file (mode 0755) so

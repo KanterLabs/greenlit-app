@@ -189,6 +189,7 @@ async fn a_real_node20_action_runs_with_the_real_pinned_bundle() {
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: real_action_config(store_root.path()),
         store: None,
+        resources: greenlit_runtime::ResourceLimits::default(),
     };
 
     let mut log: Vec<u8> = Vec::new();

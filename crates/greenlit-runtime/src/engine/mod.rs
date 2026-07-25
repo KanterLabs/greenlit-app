@@ -22,6 +22,7 @@ use crate::progress::ProgressSink;
 pub use spec::{
     BindMount, BuildSpec, CommitSpec, ContainerSpec, ContainerState, ExecOutput, ExecSpec,
     HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo, PortBinding, RegistryAuth,
+    ResourceLimits,
 };
 
 /// Receives an exec's stdout/stderr as the daemon streams it.

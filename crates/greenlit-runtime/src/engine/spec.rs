@@ -222,6 +222,21 @@ pub struct ContainerSpec {
     /// isolation. A relative `host_path` names a managed volume instead, which
     /// is how the run-scoped workspace volume reaches a Docker-action sibling.
     pub binds: Vec<BindMount>,
+    /// Host-enforced resource ceilings applied before the container starts.
+    pub resources: ResourceLimits,
+}
+
+/// Optional host-enforced resource ceilings for one container.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// CPU quota in billionths of one CPU, matching Docker's `NanoCpus`.
+    pub nano_cpus: Option<i64>,
+    /// Maximum resident memory in bytes.
+    pub memory_bytes: Option<i64>,
+    /// Maximum number of processes in the container's PID namespace.
+    pub pids: Option<i64>,
+    /// Maximum writable container layer size in bytes.
+    pub disk_bytes: Option<i64>,
 }
 
 /// A single `exec` inside an already-running container — one workflow step.

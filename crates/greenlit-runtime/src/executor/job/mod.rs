@@ -234,28 +234,50 @@ pub(crate) async fn run_instance(
     // whether the job needs a Docker-action sibling — which decides the
     // workspace isolation strategy below — must be known at container-create
     // time (`crate::executor::actions` module docs).
-    let action_plan = resolve_job_actions(
-        instance.steps,
-        &shared.config.actions,
-        &shared.config.repo_host_path,
-        &shared.config.workspace,
-    )
-    .await?;
+    let action_plan = tokio::select! {
+        result = resolve_job_actions(
+            instance.steps,
+            &shared.config.actions,
+            &shared.config.repo_host_path,
+            &shared.config.workspace,
+        ) => match result {
+            Ok(plan) => plan,
+            Err(error) => {
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        },
+        () = shared.cancellation.cancelled() => {
+            job_network.teardown(shared.engine).await;
+            return Ok(cancelled_report(identity.id, display, started));
+        }
+    };
     let (node_binds, node_mounts) = if action_plan.needs_node20 || action_plan.needs_node24 {
         progress.on_progress(ProgressEvent::ActionRuntimeEnsureStarted);
-        let ensured = node_runtime::ensure_mounts(
+        let ensure = node_runtime::ensure_mounts(
             &shared.config.actions.node_runtime_store,
             shared.config.actions.node_runtime_fetcher.as_ref(),
             shared.config.actions.node_runtime_specs.as_ref(),
             action_plan.needs_node20,
             action_plan.needs_node24,
         )
-        .instrument(stage_span("action-runtime-ensure"))
-        .await
-        .map_err(|source| ExecError::Infrastructure {
-            message: format!("could not prepare a pinned Node action runtime: {source}"),
-            fix: "check network connectivity and retry".to_string(),
-        })?;
+        .instrument(stage_span("action-runtime-ensure"));
+        let ensured = tokio::select! {
+            result = ensure => match result {
+                Ok(mounts) => mounts,
+                Err(source) => {
+                    job_network.teardown(shared.engine).await;
+                    return Err(ExecError::Infrastructure {
+                        message: format!("could not prepare a pinned Node action runtime: {source}"),
+                        fix: "check network connectivity and retry".to_string(),
+                    });
+                }
+            },
+            () = shared.cancellation.cancelled() => {
+                job_network.teardown(shared.engine).await;
+                return Ok(cancelled_report(identity.id, display, started));
+            }
+        };
         progress.on_progress(ProgressEvent::ActionRuntimeEnsureFinished);
         ensured
     } else {
@@ -277,9 +299,12 @@ pub(crate) async fn run_instance(
             Ok(resolved) => {
                 match services::start(
                     shared.engine,
-                    shared.config,
-                    job_network.name(),
-                    job_network.policy(),
+                    &services::ServiceRuntime {
+                        config: shared.config,
+                        network: job_network.name(),
+                        policy: job_network.policy(),
+                        cancellation: shared.cancellation,
+                    },
                     &resolved,
                     masker,
                     progress,
@@ -292,6 +317,9 @@ pub(crate) async fn run_instance(
                         // the network they are attached to.
                         services::stop(shared.engine, &failure.started).await;
                         job_network.teardown(shared.engine).await;
+                        if failure.cancelled {
+                            return Ok(cancelled_report(identity.id, display, started));
+                        }
                         return Err(failure.cause);
                     }
                 }
@@ -302,16 +330,29 @@ pub(crate) async fn run_instance(
             }
         };
 
-    let resolved_image = boot::resolve_image(
-        shared,
-        masker,
-        &runner_ctx,
-        instance,
-        &base_env,
-        needs,
-        progress,
-    )
-    .await?;
+    let resolved_image = tokio::select! {
+        result = boot::resolve_image(
+            shared,
+            masker,
+            &runner_ctx,
+            instance,
+            &base_env,
+            needs,
+            progress,
+        ) => match result {
+            Ok(image) => image,
+            Err(error) => {
+                services::stop(shared.engine, &services_started).await;
+                job_network.teardown(shared.engine).await;
+                return Err(error);
+            }
+        },
+        () = shared.cancellation.cancelled() => {
+            services::stop(shared.engine, &services_started).await;
+            job_network.teardown(shared.engine).await;
+            return Ok(cancelled_report(identity.id, display, started));
+        }
+    };
     let boot::ResolvedImage {
         tag: image_tag,
         in_container,
@@ -331,7 +372,20 @@ pub(crate) async fn run_instance(
         },
         progress,
     )
-    .await?;
+    .await;
+    let container = match container {
+        Ok(Some(container)) => container,
+        Ok(None) => {
+            services::stop(shared.engine, &services_started).await;
+            job_network.teardown(shared.engine).await;
+            return Ok(cancelled_report(identity.id, display, started));
+        }
+        Err(error) => {
+            services::stop(shared.engine, &services_started).await;
+            job_network.teardown(shared.engine).await;
+            return Err(error);
+        }
+    };
 
     // The network policy goes on before readiness, and therefore before any
     // workflow code runs: a container that has executed even one step under
@@ -350,28 +404,46 @@ pub(crate) async fn run_instance(
                 .to_string(),
         });
     }
-    if let Err(error) = netguard::apply(
-        shared.engine,
-        &container,
-        job_network.policy(),
-        &netguard_image,
-        progress,
-    )
-    .await
-    {
+    let netguard_result = tokio::select! {
+        result = netguard::apply(
+            shared.engine,
+            &container,
+            job_network.policy(),
+            &netguard_image,
+            progress,
+        ) => result.map_err(ExecError::from),
+        () = shared.cancellation.cancelled() => Ok(()),
+    };
+    if shared.cancellation.is_cancelled() {
         let _ = shared.engine.remove_container(&container).await;
         services::stop(shared.engine, &services_started).await;
         job_network.teardown(shared.engine).await;
-        return Err(error.into());
+        return Ok(cancelled_report(identity.id, display, started));
+    }
+    if let Err(error) = netguard_result {
+        let _ = shared.engine.remove_container(&container).await;
+        services::stop(shared.engine, &services_started).await;
+        job_network.teardown(shared.engine).await;
+        return Err(error);
     }
 
     // Docker-in-Docker, only when the job's own scripts call `docker`.
     // Starting a privileged daemon for every job would cost seconds and a
     // privileged container for a capability most workflows never use.
     let dind = if dind::job_uses_docker(instance.steps.iter().filter_map(step_script)) {
-        match dind::start(shared.engine, job_network.name(), progress).await {
-            Ok(sidecar) => Some(sidecar),
-            Err(error) => {
+        let dind_start = tokio::select! {
+            result = dind::start(shared.engine, job_network.name(), progress) => Some(result),
+            () = shared.cancellation.cancelled() => None,
+        };
+        match dind_start {
+            None => {
+                let _ = shared.engine.remove_container(&container).await;
+                services::stop(shared.engine, &services_started).await;
+                job_network.teardown(shared.engine).await;
+                return Ok(cancelled_report(identity.id, display, started));
+            }
+            Some(Ok(sidecar)) => Some(sidecar),
+            Some(Err(error)) => {
                 let _ = shared.engine.remove_container(&container).await;
                 services::stop(shared.engine, &services_started).await;
                 job_network.teardown(shared.engine).await;
