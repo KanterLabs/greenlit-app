@@ -46,6 +46,11 @@ tokio = { version = "1.48.0", features = [
     "io-util",
     "sync",
 ] }
+# Immutable content identities and verification.
+sha2 = "0.11.0"
+# Machine-wide object/reference/lease metadata. `bundled` gives Greenlit one
+# reproducible SQLite implementation on every supported Linux host.
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 
 [dev-dependencies]
 # Every store test runs against an isolated temp root rather than the real

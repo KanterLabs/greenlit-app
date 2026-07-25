@@ -159,11 +159,6 @@ fn capture_once(
         message: format!("could not serialize source manifest: {error}"),
     })?;
     let digest = sha256_identity(&manifest);
-    let manifest_path = destination.join(".litci-source-manifest.json");
-    let mut output = create_new_file(&manifest_path)?;
-    output
-        .write_all(&manifest)
-        .map_err(|error| io_error(&manifest_path, error))?;
     Ok(SourceSnapshot {
         commit: commit_before,
         dirty,

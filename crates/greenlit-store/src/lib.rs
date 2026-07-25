@@ -27,6 +27,7 @@
 
 pub mod artifacts;
 pub mod cache;
+pub mod cas;
 pub mod error;
 mod layout;
 pub mod server;

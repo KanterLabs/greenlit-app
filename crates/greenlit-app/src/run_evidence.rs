@@ -85,6 +85,8 @@ impl RunEvidence {
         let source = SourceSnapshot::capture(repo_root, &source_root).map_err(|error| {
             anyhow::anyhow!("{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry")
         })?;
+        write_json_atomic(&directory.join("source-manifest.json"), &source.entries)?;
+        ingest_source(&home, &source)?;
         Ok(Self {
             run_id,
             directory,
@@ -207,6 +209,64 @@ impl RunEvidence {
         }
         Ok(())
     }
+}
+
+fn ingest_source(home: &Path, source: &SourceSnapshot) -> anyhow::Result<()> {
+    use greenlit_store::cas::{CasStore, ObjectDigest};
+
+    let store = CasStore::open(CasStore::default_path_under(home)).map_err(|error| {
+        anyhow::anyhow!(
+            "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
+        )
+    })?;
+    for entry in &source.entries {
+        let digest = ObjectDigest::parse(&entry.digest).map_err(|error| {
+            anyhow::anyhow!(
+                "source manifest contains invalid identity {}: {error}\n  fix: preserve the run directory and file a Greenlit defect",
+                entry.digest
+            )
+        })?;
+        let path = source.root.join(&entry.path);
+        match entry.kind {
+            greenlit_engine::SourceEntryKind::File => {
+                store
+                    .put_file_verified(&digest, &path)
+                    .map_err(|error| content_error(&entry.path, error))?;
+            }
+            greenlit_engine::SourceEntryKind::Symlink => {
+                let target = fs::read_link(&path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not ingest source symlink {}: {error}\n  fix: stop concurrent source edits and retry",
+                        entry.path
+                    )
+                })?;
+                store
+                    .put_verified(&digest, target.as_os_str().as_encoded_bytes())
+                    .map_err(|error| content_error(&entry.path, error))?;
+            }
+        }
+    }
+    let manifest = serde_json::to_vec(&source.entries).map_err(|error| {
+        anyhow::anyhow!(
+            "could not serialize the source CAS manifest: {error}\n  fix: preserve the run directory and file a Greenlit defect"
+        )
+    })?;
+    let manifest_digest = ObjectDigest::parse(&source.digest).map_err(|error| {
+        anyhow::anyhow!(
+            "source tree has invalid identity {}: {error}\n  fix: preserve the run directory and file a Greenlit defect",
+            source.digest
+        )
+    })?;
+    store
+        .put_verified(&manifest_digest, &manifest)
+        .map_err(|error| content_error("source-manifest.json", error))?;
+    Ok(())
+}
+
+fn content_error(path: &str, error: greenlit_store::cas::CasError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "could not publish verified source content {path}: {error}\n  fix: run `litci doctor`; corrupted content will be quarantined automatically"
+    )
 }
 
 fn runner_fingerprint(run_lock: &RunLockV1, key: &str) -> String {
