@@ -33,7 +33,7 @@ pub(super) async fn teardown(
         // volume still in use cannot be removed.
         if let Some(volumes) = docker_volumes {
             for source in [volumes.workspace, volumes.cmdfiles] {
-                let volume = namespaced_volume_name(&shared.config.volume_namespace, source);
+                let volume = namespaced_volume_name(shared.namespace, source);
                 let _ = shared.engine.remove_volume(&volume).await;
             }
         }

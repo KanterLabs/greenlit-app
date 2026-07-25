@@ -60,6 +60,7 @@ struct ScriptedEngine {
     /// How many readiness polls have been answered.
     polls: AtomicUsize,
     created_images: Mutex<Vec<String>>,
+    created_networks: Mutex<Vec<String>>,
     /// Hold container startup briefly so scheduler concurrency is observable.
     delay_start: bool,
     active_starts: AtomicUsize,
@@ -283,7 +284,8 @@ impl ContainerEngine for ScriptedEngine {
     async fn export_path(&self, _container: &str, _path: &str) -> Result<Vec<u8>, RuntimeError> {
         Ok(Vec::new())
     }
-    async fn create_network(&self, _name: &str) -> Result<String, RuntimeError> {
+    async fn create_network(&self, name: &str) -> Result<String, RuntimeError> {
+        self.created_networks.lock().unwrap().push(name.to_string());
         Ok("net".to_string())
     }
     async fn remove_network(&self, _name: &str) -> Result<(), RuntimeError> {
@@ -385,6 +387,13 @@ jobs:
         engine.peak_starts.load(Ordering::SeqCst) >= 2,
         "both dependency-ready jobs must overlap"
     );
+    let networks = engine.created_networks.lock().unwrap();
+    assert_eq!(networks.len(), 2);
+    assert_ne!(
+        networks[0], networks[1],
+        "concurrent jobs must have distinct networks"
+    );
+    drop(networks);
     assert_eq!(
         report
             .jobs

@@ -146,6 +146,7 @@ async fn run_group(
         let workers = Arc::clone(&worker_limit);
         let instance_needs = Arc::clone(&needs);
         let cancellation = shared.cancellation.clone();
+        let instance_key = format!("{}-{index:03}", group.id.0);
         async move {
             let worker_permit = tokio::select! {
                 permit = workers.acquire_owned() => permit.map_err(|_| ExecError::Infrastructure {
@@ -164,7 +165,10 @@ async fn run_group(
                 shared,
                 &mut masker,
                 instance,
-                &group.id,
+                job::JobIdentity {
+                    id: &group.id,
+                    instance_key: &instance_key,
+                },
                 instance_needs.as_slice(),
                 &mut instance_writer,
                 &mut instance_progress,

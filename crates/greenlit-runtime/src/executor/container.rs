@@ -193,7 +193,7 @@ pub struct ContainerAdditions {
 /// the first containment-breaking rejection.
 ///
 /// `workspace` (the container-side `GITHUB_WORKSPACE`) and `volume_namespace`
-/// (unique per `litci run` invocation, see [`crate::RunConfig::volume_namespace`])
+/// (unique per concrete job instance)
 /// let volume validation reject a destination collision with Greenlit's own
 /// isolation paths and namespace named-volume sources so they can never target
 /// a pre-existing daemon-global volume.
@@ -374,7 +374,8 @@ fn validate_volume(
                 // Namespaced so this source can never resolve to a
                 // pre-existing daemon-global named volume (finding: "a named
                 // source like `production_db:/loot` grants RW access to an
-                // existing volume") — see `RunConfig::volume_namespace`.
+                // existing volume") — the executor supplies a job-scoped
+                // namespace.
                 host_path: namespaced_volume_name(volume_namespace, source),
                 container_path: (*dest).to_string(),
                 read_only: false,

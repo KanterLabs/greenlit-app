@@ -68,11 +68,8 @@ pub(super) async fn resolve_image(
                 masker.add(&credentials.username);
                 masker.add(&credentials.password);
             }
-            let additions = validate_container(
-                &resolved,
-                &shared.config.workspace,
-                &shared.config.volume_namespace,
-            )?;
+            let additions =
+                validate_container(&resolved, &shared.config.workspace, shared.namespace)?;
             let locked_image = shared.config.locked_image(&resolved.image)?;
             // Pull only when absent, so a present image (and an offline host)
             // still runs, and re-runs skip the registry round-trip. The image
@@ -316,7 +313,7 @@ pub(crate) async fn boot_container(
             ),
         ] {
             spec.binds.push(BindMount {
-                host_path: namespaced_volume_name(&shared.config.volume_namespace, source),
+                host_path: namespaced_volume_name(shared.namespace, source),
                 container_path: mount_point,
                 read_only: false,
             });

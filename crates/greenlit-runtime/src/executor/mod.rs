@@ -100,11 +100,9 @@ pub struct RunConfig {
     /// GitHub's own hosted runner gives the same guarantee for free (a fresh
     /// VM per run has no pre-existing volumes to collide with); the local
     /// daemon persists across runs, so Greenlit must manufacture the
-    /// equivalent isolation. Every job/leg within one run shares this token,
-    /// so two job containers in the same run that both name `cache:/data`
-    /// still share one (run-scoped) volume, matching the "reused across
-    /// containers within one VM" behavior a workflow author would observe on
-    /// GitHub.
+    /// equivalent isolation. The executor appends a concrete job/leg key
+    /// before creating writable resources, so they cannot cross the fresh-job
+    /// boundary.
     pub volume_namespace: String,
     /// Requested container aliases mapped to the immutable image identities
     /// finalized in the RunLock. `None` is reserved for injected test
@@ -348,6 +346,8 @@ pub(crate) struct Shared<'a> {
     pub workflow_env: &'a IndexMap<String, EnvValue>,
     /// Cooperative cancellation for this invocation.
     pub cancellation: &'a crate::Cancellation,
+    /// Resource namespace for this run or concrete job instance.
+    pub namespace: &'a str,
 }
 
 /// Open a timed stage span captured by `greenlit-metrics`'s timing layer.
@@ -419,6 +419,7 @@ pub async fn run_plan_cancellable(
         roots: &roots,
         workflow_env: &plan.env,
         cancellation,
+        namespace: &config.volume_namespace,
     };
 
     scheduler::run(&shared, &groups, &masker, out, progress).await

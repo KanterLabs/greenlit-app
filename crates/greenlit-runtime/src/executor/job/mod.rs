@@ -82,6 +82,12 @@ struct RunnerLayers<'a> {
     docker_volumes: Option<docker_action::SiblingVolumes>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct JobIdentity<'a> {
+    pub(crate) id: &'a JobId,
+    pub(crate) instance_key: &'a str,
+}
+
 /// Run one job instance and produce its report.
 ///
 /// # Errors
@@ -92,7 +98,7 @@ pub(crate) async fn run_instance(
     shared: &Shared<'_>,
     masker: &mut Masker,
     instance: &JobInstance<'_>,
-    job_id: &JobId,
+    identity: JobIdentity<'_>,
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
     progress: &mut (dyn ProgressSink + Send),
@@ -100,24 +106,25 @@ pub(crate) async fn run_instance(
     let started = Instant::now();
     if shared.cancellation.is_cancelled() {
         return Ok(cancelled_report(
-            job_id,
+            identity.id,
             masker.apply(&instance.display.source),
             started,
         ));
     }
 
     let mut runner_env = shared.config.runner_env.clone();
-    runner_env.job = job_id.0.clone();
+    runner_env.job = identity.id.0.clone();
     runner_env.workspace = shared.config.workspace.clone();
 
     // The job's own bridge: the shim binds on its gateway and, from the next
     // task group, services attach to it. Created before the container so the
     // container can be attached at creation time, and torn down after it --
     // a network with an attached container cannot be removed.
-    let network_name = format!(
-        "greenlit-run-{}-{}",
-        shared.config.volume_namespace, job_id.0
+    let job_namespace = format!(
+        "{}-{}",
+        shared.config.volume_namespace, identity.instance_key
     );
+    let network_name = format!("greenlit-run-{job_namespace}");
     let job_network =
         services::create(shared.engine, &network_name, shared.config.store.as_ref()).await?;
     runner_env.actions_service = job_network.actions_service().cloned();
@@ -164,6 +171,7 @@ pub(crate) async fn run_instance(
         roots: &job_roots,
         workflow_env: shared.workflow_env,
         cancellation: shared.cancellation,
+        namespace: &job_namespace,
     };
     let shared = &job_shared;
 
@@ -208,7 +216,7 @@ pub(crate) async fn run_instance(
 
     if !job_activates(instance, needs, &activation_ctx)? {
         let _ = writeln!(out, "\n\u{2022} job {display}: skipped");
-        return Ok(skipped_report(job_id, display, started));
+        return Ok(skipped_report(identity.id, display, started));
     }
     let _ = writeln!(out, "\n\u{2022} job {display}");
 
@@ -476,7 +484,7 @@ pub(crate) async fn run_instance(
 
     let (step_reports, outputs, result) = outcome?;
     Ok(JobReport {
-        id: job_id.0.clone(),
+        id: identity.id.0.clone(),
         display,
         result,
         steps: step_reports,
@@ -520,7 +528,7 @@ async fn run_job_body(
         action_plan: layers.action_plan,
         action_config: &shared.config.actions,
         node_mounts: layers.node_mounts,
-        volume_namespace: &shared.config.volume_namespace,
+        volume_namespace: shared.namespace,
         locked_images: shared.config.locked_images.as_ref(),
         docker_volumes: layers.docker_volumes,
         step_action_ids: &step_action_ids,
@@ -819,15 +827,11 @@ fn resolve_services(
         if let Some(credentials) = &request.credentials {
             masker.add(&credentials.password);
         }
-        let additions = validate_container(
-            &request,
-            &shared.config.workspace,
-            &shared.config.volume_namespace,
-        )
-        .map_err(|rejection| ExecError::Infrastructure {
-            message: format!("service `{id}`: {rejection}"),
-            fix: "correct the service definition in the workflow".to_string(),
-        })?;
+        let additions = validate_container(&request, &shared.config.workspace, shared.namespace)
+            .map_err(|rejection| ExecError::Infrastructure {
+                message: format!("service `{id}`: {rejection}"),
+                fix: "correct the service definition in the workflow".to_string(),
+            })?;
 
         resolved.push((
             id.clone(),
