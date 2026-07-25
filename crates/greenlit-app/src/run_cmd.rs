@@ -118,14 +118,24 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
 
     let dotenv_vars =
         vars::read_dotenv_vars(&repo_root).map_err(|message| anyhow::anyhow!(message))?;
-    let vars_outcome = vars::resolve_vars_with_remote(
-        &extraction,
-        &args.vars,
-        dotenv_vars.as_deref().unwrap_or_default(),
-        dotenv_vars.is_some(),
-        &git.repository_owner,
-        &repo_leaf,
-    );
+    let vars_outcome = if args.offline {
+        vars::resolve_vars(
+            &extraction,
+            &args.vars,
+            dotenv_vars.as_deref().unwrap_or_default(),
+            dotenv_vars.is_some(),
+        )
+        .map_or_else(vars::VarsOutcome::LocalError, vars::VarsOutcome::Resolved)
+    } else {
+        vars::resolve_vars_with_remote(
+            &extraction,
+            &args.vars,
+            dotenv_vars.as_deref().unwrap_or_default(),
+            dotenv_vars.is_some(),
+            &git.repository_owner,
+            &repo_leaf,
+        )
+    };
     let vars_value = errors::vars_outcome(vars_outcome)?;
 
     // Secrets are collected next, before engine detection and well before
@@ -227,8 +237,8 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // `github.token` (host-side action fetching is not workflow-token
     // injection).
     let action_token = auth::current_token().ok().flatten();
-    let (actions_config, pinned_resolver) =
-        build_action_runtime_config(action_token).map_err(|message| anyhow::anyhow!(message))?;
+    let (actions_config, pinned_resolver) = build_action_runtime_config(action_token, args.offline)
+        .map_err(|message| anyhow::anyhow!(message))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -279,6 +289,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
                 &execution_plan,
                 &action_preflight.container_images,
                 &content_store,
+                args.offline,
                 &mut progress,
             ))
         })
@@ -288,6 +299,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             runtime.block_on(greenlit_runtime::preflight_plan_runners(
                 &engine,
                 &execution_plan,
+                args.offline,
                 &mut progress,
             ))
         })
@@ -297,6 +309,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         event_name: event_kind.event_name(),
         inputs: &args.inputs,
         selected_job: args.job.as_deref(),
+        offline: args.offline,
         plan: &execution_plan,
         secrets: &all_secrets,
         actions: action_preflight.actions,
@@ -560,6 +573,7 @@ async fn connect_engine() -> anyhow::Result<DockerEngine> {
 /// user home directory cannot be determined.
 fn build_action_runtime_config(
     token: Option<String>,
+    offline: bool,
 ) -> Result<
     (
         greenlit_runtime::ActionRuntimeConfig,
@@ -568,18 +582,17 @@ fn build_action_runtime_config(
     String,
 > {
     use greenlit_actions::resolve::{
-        GitHubApiResolver, GitLsRemoteResolver, PinnedRefResolver, RefResolver,
+        GitHubApiResolver, GitLsRemoteResolver, PersistentRefResolver, PinnedRefResolver,
+        RefResolver,
     };
     use greenlit_actions::store::{
-        ActionFetcher, ActionStore, FallbackFetcher, GitCloneFetcher, TarballFetcher,
+        ActionFetcher, ActionStore, FallbackFetcher, GitCloneFetcher, OfflineActionFetcher,
+        TarballFetcher,
     };
     use greenlit_runtime::HttpRuntimeBundleFetcher;
     use greenlit_runtime::executor::actions::node_runtime::{PinnedNodeBundleSpecs, RuntimeStore};
     use std::sync::Arc;
 
-    let store = ActionStore::open_default().map_err(|error| {
-        format!("could not open the local action store: {error}\n  fix: ensure $HOME is set and writable")
-    })?;
     let home = std::env::var_os("HOME").ok_or_else(|| {
         "could not determine the user home directory (HOME is not set)\n  fix: set HOME, then retry"
             .to_string()
@@ -593,24 +606,28 @@ fn build_action_runtime_config(
             "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
         )
     })?;
+    let store = ActionStore::with_cas(ActionStore::default_path_under(home), cas.clone());
     let node_runtime_store =
-        RuntimeStore::with_cas(RuntimeStore::default_path_under(home), cas, false);
+        RuntimeStore::with_cas(RuntimeStore::default_path_under(home), cas.clone(), offline);
 
-    let (inner_resolver, fetcher): (Arc<dyn RefResolver>, Arc<dyn ActionFetcher>) = match &token {
-        Some(t) => (
-            Arc::new(GitHubApiResolver::new(t.clone())),
-            Arc::new(FallbackFetcher::new(
+    let inner_resolver: Arc<dyn RefResolver> = match &token {
+        Some(t) => Arc::new(GitHubApiResolver::new(t.clone())),
+        None => Arc::new(GitLsRemoteResolver::new()),
+    };
+    let inner_resolver = Arc::new(PersistentRefResolver::new(inner_resolver, cas, offline));
+    let fetcher: Arc<dyn ActionFetcher> = if offline {
+        Arc::new(OfflineActionFetcher)
+    } else {
+        match &token {
+            Some(t) => Arc::new(FallbackFetcher::new(
                 TarballFetcher::with_token(t.clone()),
                 GitCloneFetcher::new(),
-            )),
-        ),
-        None => (
-            Arc::new(GitLsRemoteResolver::new()),
-            Arc::new(FallbackFetcher::new(
+            )) as Arc<dyn ActionFetcher>,
+            None => Arc::new(FallbackFetcher::new(
                 TarballFetcher::new(),
                 GitCloneFetcher::new(),
             )),
-        ),
+        }
     };
     let resolver = Arc::new(PinnedRefResolver::new(inner_resolver));
 

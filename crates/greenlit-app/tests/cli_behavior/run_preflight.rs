@@ -109,6 +109,21 @@ fn a_well_formed_uses_reference_passes_preflight_and_reaches_engine_detection() 
 }
 
 #[test]
+fn offline_resolution_names_the_exact_missing_action_ref_before_engine_work() {
+    let output = run_workflow(WELL_FORMED_USES_WORKFLOW, &["--offline", "--no-input"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("offline content is missing: action ref actions/checkout@v4"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "offline preparation must fail at the exact absent identity without trying another source: {stderr}"
+    );
+}
+
+#[test]
 fn a_matrix_leg_malformed_uses_step_is_rejected_before_any_engine_work() {
     let output = run_workflow(MATRIX_MALFORMED_USES_WORKFLOW, &[]);
     assert!(!output.status.success());

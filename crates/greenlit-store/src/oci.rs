@@ -93,6 +93,12 @@ pub enum OciError {
     /// Verified CAS failed.
     #[error(transparent)]
     Content(#[from] CasError),
+    /// Offline mode requires registry metadata absent from the CAS.
+    #[error("offline content is missing: OCI image {reference}")]
+    OfflineMissing {
+        /// Missing locked image reference.
+        reference: String,
+    },
 }
 
 /// Resolves image aliases through a registry and publishes metadata objects
@@ -218,6 +224,22 @@ impl RegistryResolver {
             architecture: image_config.architecture,
             cache_hit: false,
         })
+    }
+
+    /// Resolves a previously verified Linux amd64 image without making a
+    /// registry request.
+    pub fn resolve_linux_amd64_offline(&self, reference: &str) -> Result<ResolvedImage, OciError> {
+        let parsed = RegistryReference::parse(reference)?;
+        let top = self
+            .store
+            .resolve_alias("oci-top", reference)?
+            .ok_or_else(|| OciError::OfflineMissing {
+                reference: reference.to_string(),
+            })?;
+        self.cached_resolution(&parsed, reference, &top)?
+            .ok_or_else(|| OciError::OfflineMissing {
+                reference: reference.to_string(),
+            })
     }
 
     fn cached_resolution(

@@ -346,6 +346,26 @@ impl CasStore {
         self.catalog.resolve_alias(kind, requested)
     }
 
+    /// Records a metadata alias whose resolved value is not a SHA-256 object,
+    /// such as a Git commit identity.
+    pub fn record_text_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+        resolved: &str,
+    ) -> Result<(), CasError> {
+        self.catalog.record_text_alias(kind, requested, resolved)
+    }
+
+    /// Resolves a metadata alias recorded by [`Self::record_text_alias`].
+    pub fn resolve_text_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+    ) -> Result<Option<String>, CasError> {
+        self.catalog.resolve_text_alias(kind, requested)
+    }
+
     /// Ingests a directory as a canonical tree whose file and symlink
     /// payloads are separate verified CAS objects.
     pub fn put_tree(&self, root: &Path) -> Result<ObjectDigest, CasError> {

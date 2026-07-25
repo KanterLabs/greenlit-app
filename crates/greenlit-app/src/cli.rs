@@ -115,6 +115,11 @@ pub(crate) struct RunArgs {
     /// Disable every interactive prompt. Conflicts with `--write-back`.
     #[arg(long = "no-input")]
     pub(crate) no_input: bool,
+
+    /// Forbid Greenlit-controlled network access and use only previously
+    /// verified locked content already present on this machine.
+    #[arg(long)]
+    pub(crate) offline: bool,
 }
 
 #[derive(Debug, clap::Args)]

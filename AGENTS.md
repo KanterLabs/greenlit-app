@@ -121,6 +121,7 @@ Phase 1 creates `greenlit-app`, `greenlit-workflow`, `greenlit-expr`, `greenlit-
 - **Host filesystem evaluation:** `hashFiles` never reads outside its supplied workspace root or opens special filesystem nodes; directory enumeration state is proportional to traversal depth, the exact canonical-directory alias registry has fixed entry and retained-path-byte ceilings, symbolic-link alias graphs stay bounded, and evaluation returns at the runner-compatible fixed deadline, with abandoned workers held within a fixed live-worker bound (see ARCHITECTURE.md known issues).
 - **UX:** every error maps to a state plus the one action that fixes it. No raw stack traces, no "cannot connect to Docker daemon".
 - **Performance budgets** (enforced at Phase 10): < 2s from `litci run` to first step executing on the warm native-Linux profile; < 30s warm re-run of a typical test workflow. Earlier replacement phases record regressions without taking semantic shortcuts to meet them.
+- **Offline replay:** `litci run --offline` performs no Greenlit-controlled network access. It uses only exact, previously verified identities and names the first missing identity without substituting another version.
 - v0 hosts are Linux x86_64. All engine access goes through the `ContainerEngine` trait in `greenlit-runtime` so other platforms and architectures remain ports.
 
 ## Quality bar

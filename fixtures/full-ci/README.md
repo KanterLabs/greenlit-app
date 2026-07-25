@@ -14,8 +14,10 @@ exercises, end to end:
   dependent job, proving an artifact survives the job boundary intact;
 - all of it on the job's own bridge network, behind the run's network policy.
 
-`crates/greenlit-app/tests/full_ci_smoke.rs` drives it twice against one
+`crates/greenlit-app/tests/full_ci_smoke.rs` drives it twice online and once
+offline against one
 sandbox `$HOME`, because the cache, the toolcache and the converged image
-only prove anything if they survive between runs.
+only prove anything if they survive between runs, and Phase 6's verified
+content only proves offline replay when the exact cached lock succeeds.
 
 `litci run` completes this workflow green.

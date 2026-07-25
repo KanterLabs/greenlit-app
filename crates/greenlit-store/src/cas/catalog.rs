@@ -157,6 +157,26 @@ impl Catalog {
         Ok(())
     }
 
+    pub(super) fn record_text_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+        resolved: &str,
+    ) -> Result<(), CasError> {
+        let now = unix_seconds()?;
+        self.connection()?
+            .execute(
+                "INSERT INTO aliases(kind,requested,resolved,checked_at)
+                 VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(kind,requested) DO UPDATE SET
+                   resolved=excluded.resolved,
+                   checked_at=excluded.checked_at",
+                params![kind, requested, resolved, now],
+            )
+            .map_err(CasError::Catalog)?;
+        Ok(())
+    }
+
     pub(super) fn resolve_alias(
         &self,
         kind: &str,
@@ -182,6 +202,25 @@ impl Catalog {
                 })
             })
             .transpose()
+    }
+
+    pub(super) fn resolve_text_alias(
+        &self,
+        kind: &str,
+        requested: &str,
+    ) -> Result<Option<String>, CasError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT resolved FROM aliases WHERE kind=?1 AND requested=?2")
+            .map_err(CasError::Catalog)?;
+        let mut rows = statement
+            .query(params![kind, requested])
+            .map_err(CasError::Catalog)?;
+        rows.next()
+            .map_err(CasError::Catalog)?
+            .map(|row| row.get(0))
+            .transpose()
+            .map_err(CasError::Catalog)
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, CasError> {

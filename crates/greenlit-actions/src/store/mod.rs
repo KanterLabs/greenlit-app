@@ -27,7 +27,7 @@ mod git_clone;
 mod tarball;
 
 pub use fallback::FallbackFetcher;
-pub use fetcher::{ActionFetcher, FetchError};
+pub use fetcher::{ActionFetcher, FetchError, OfflineActionFetcher};
 pub use git_clone::GitCloneFetcher;
 pub use tarball::TarballFetcher;
 

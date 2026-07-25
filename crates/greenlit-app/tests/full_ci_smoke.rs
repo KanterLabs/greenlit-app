@@ -1,4 +1,5 @@
-//! `fixtures/full-ci` run twice, end to end, against a real daemon.
+//! `fixtures/full-ci` run warm and then offline, end to end, against a real
+//! daemon.
 //!
 //! `docs/PHASE-4-environment.md` exit criterion 1: "workflow with a postgres
 //! service, `actions/cache` (miss → save → hit across two runs), artifact
@@ -10,7 +11,9 @@
 //!
 //! Every claim here is about state *surviving between runs*. A cache that
 //! saves is worth nothing if the next run does not restore it; a converged
-//! image is worth nothing if the next run reinstalls anyway. `Sandbox` gives
+//! image is worth nothing if the next run reinstalls anyway, and verified
+//! immutable setup content is incomplete if the third run cannot replay it
+//! offline. `Sandbox` gives
 //! one isolated `$HOME`, reused across both invocations, which is the only
 //! reason `~/.litci/cache` and the per-repo image are visible to the second
 //! run at all.
@@ -159,8 +162,32 @@ fn full_ci_fixture_is_green_twice_and_reuses_what_it_built() {
         "the run record reports cache activity: {second_err}"
     );
 
-    // Nothing in either run leaks the run's own credentials.
-    for output in [&first_out, &first_err, &second_out, &second_err] {
+    // ---- Run 3: exact verified setup content only ----
+    let offline = sandbox.run(&["run", "--offline", "--no-input"]);
+    let offline_out = support::stdout_text(&offline);
+    let offline_err = support::stderr_text(&offline);
+    assert!(
+        offline.status.success(),
+        "fully cached offline run failed\nstdout:\n{offline_out}\nstderr:\n{offline_err}"
+    );
+    assert!(
+        offline_err.contains("(CAS hit)"),
+        "offline preparation must report verified CAS reuse: {offline_err}"
+    );
+    assert!(
+        !offline_err.contains("pulling "),
+        "offline preparation must not start an image download: {offline_err}"
+    );
+
+    // Nothing in any run leaks the run's own credentials.
+    for output in [
+        &first_out,
+        &first_err,
+        &second_out,
+        &second_err,
+        &offline_out,
+        &offline_err,
+    ] {
         assert!(
             !output.contains("ACTIONS_RUNTIME_TOKEN="),
             "the runtime token must never be echoed"

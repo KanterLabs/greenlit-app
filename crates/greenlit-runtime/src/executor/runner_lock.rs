@@ -7,7 +7,7 @@ use greenlit_engine::{ExecutionPlan, RunnerImage, RunnerLockV1};
 
 use crate::ContainerEngine;
 use crate::executor::ExecError;
-use crate::image::ensure_base_image;
+use crate::image::{ensure_base_image, plan_base_image};
 use crate::platform::UbuntuRelease;
 use crate::progress::ProgressSink;
 
@@ -21,6 +21,7 @@ use crate::progress::ProgressSink;
 pub async fn preflight_plan_runners(
     engine: &dyn ContainerEngine,
     plan: &ExecutionPlan,
+    offline: bool,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<BTreeMap<String, RunnerLockV1>, ExecError> {
     let mut selected = BTreeMap::new();
@@ -47,7 +48,19 @@ pub async fn preflight_plan_runners(
         if materialized.contains_key(image.image_identifier()) {
             continue;
         }
-        let reference = ensure_base_image(engine, release_for(*image), progress).await?;
+        let reference = if offline {
+            let plan = plan_base_image(release_for(*image))?;
+            if !engine.image_exists(&plan.tag).await? {
+                return Err(ExecError::Infrastructure {
+                    message: format!("offline content is missing: runner image {}", plan.tag),
+                    fix: "run once without `--offline` to prepare this exact runner image"
+                        .to_string(),
+                });
+            }
+            plan.tag
+        } else {
+            ensure_base_image(engine, release_for(*image), progress).await?
+        };
         let identity = engine.image_identity(&reference).await?.ok_or_else(|| {
             ExecError::Infrastructure {
                 message: format!(

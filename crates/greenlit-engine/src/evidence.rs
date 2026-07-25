@@ -115,6 +115,9 @@ pub struct RunLockV1 {
     pub inputs: BTreeMap<String, String>,
     /// Requested job filter, if any.
     pub selected_job: Option<String>,
+    /// Whether Greenlit preparation was restricted to verified local content.
+    #[serde(default)]
+    pub offline: bool,
     /// Runner identities by concrete job.
     pub runners: BTreeMap<String, RunnerLockV1>,
     /// Action requested refs mapped to resolved commits.
@@ -139,6 +142,7 @@ impl RunLockV1 {
             event: event.into(),
             inputs: BTreeMap::new(),
             selected_job: None,
+            offline: false,
             runners: BTreeMap::new(),
             actions: BTreeMap::new(),
             containers: BTreeMap::new(),

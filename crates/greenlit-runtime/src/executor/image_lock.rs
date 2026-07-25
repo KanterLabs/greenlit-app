@@ -23,6 +23,7 @@ pub async fn preflight_plan_images(
     plan: &ExecutionPlan,
     additional_references: &[String],
     content_store: &CasStore,
+    offline: bool,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<BTreeMap<String, String>, ExecError> {
     let mut references = BTreeSet::new();
@@ -47,30 +48,50 @@ pub async fn preflight_plan_images(
     for reference in references {
         let resolver = resolver.clone();
         let reference_for_task = reference.clone();
-        let resolved =
-            tokio::task::spawn_blocking(move || resolver.resolve_linux_amd64(&reference_for_task))
-                .await
-                .map_err(|error| {
-                    ExecError::Infrastructure {
+        let resolved = tokio::task::spawn_blocking(move || {
+            if offline {
+                resolver.resolve_linux_amd64_offline(&reference_for_task)
+            } else {
+                resolver.resolve_linux_amd64(&reference_for_task)
+            }
+        })
+        .await
+        .map_err(|error| ExecError::Infrastructure {
             message: format!(
                 "container image resolution task for '{reference}' did not complete: {error}"
             ),
             fix: "retry; if this repeats, preserve the run directory and file a Greenlit defect"
                 .to_string(),
-        }
-                })?
-                .map_err(|error| ExecError::Infrastructure {
-                    message: format!("could not resolve container image '{reference}': {error}"),
-                    fix: "check registry connectivity and credentials, then retry".to_string(),
-                })?;
+        })?
+        .map_err(|error| ExecError::Infrastructure {
+            message: format!("could not resolve container image '{reference}': {error}"),
+            fix: if offline {
+                "run once without `--offline` to fetch and verify this exact image".to_string()
+            } else {
+                "check registry connectivity and credentials, then retry".to_string()
+            },
+        })?;
         progress.on_progress(crate::ProgressEvent::ContentResolved {
             item: reference.clone(),
             identity: resolved.digest.to_string(),
             cache_hit: resolved.cache_hit,
         });
-        engine
-            .pull_image(&resolved.pull_reference, None, progress)
-            .await?;
+        if offline {
+            if !engine.image_exists(&resolved.pull_reference).await? {
+                return Err(ExecError::Infrastructure {
+                    message: format!(
+                        "offline content is missing: container image {}",
+                        resolved.pull_reference
+                    ),
+                    fix: "run once without `--offline` to fetch this exact locked image"
+                        .to_string(),
+                });
+            }
+        } else {
+            engine
+                .pull_image(&resolved.pull_reference, None, progress)
+                .await?;
+        }
         let identity = engine
             .image_identity(&resolved.pull_reference)
             .await?

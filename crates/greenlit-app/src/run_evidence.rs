@@ -27,6 +27,7 @@ pub(crate) struct LockInputs<'a> {
     pub(crate) event_name: &'a str,
     pub(crate) inputs: &'a [(String, String)],
     pub(crate) selected_job: Option<&'a str>,
+    pub(crate) offline: bool,
     pub(crate) plan: &'a ExecutionPlan,
     pub(crate) secrets: &'a [(String, String)],
     pub(crate) actions: BTreeMap<String, String>,
@@ -134,6 +135,7 @@ impl RunEvidence {
             event_name,
             inputs,
             selected_job,
+            offline,
             plan,
             secrets,
             actions,
@@ -162,6 +164,7 @@ impl RunEvidence {
         let mut lock = RunLockV1::new(source, event_name);
         lock.inputs = inputs.iter().cloned().collect();
         lock.selected_job = selected_job.map(str::to_string);
+        lock.offline = offline;
         lock.runners = runners;
         lock.secret_revisions = secrets
             .iter()
@@ -175,14 +178,17 @@ impl RunEvidence {
         self.write_job_locks(plan, &lock)?;
         self.append_trace(
             "run_lock_finalized",
-            BTreeMap::from([(
-                "digest".to_string(),
-                lock.digest().map_err(|error| {
-                    anyhow::anyhow!(
-                        "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
-                    )
-                })?,
-            )]),
+            BTreeMap::from([
+                (
+                    "digest".to_string(),
+                    lock.digest().map_err(|error| {
+                        anyhow::anyhow!(
+                            "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
+                        )
+                    })?,
+                ),
+                ("offline".to_string(), lock.offline.to_string()),
+            ]),
         )?;
         Ok(lock)
     }
