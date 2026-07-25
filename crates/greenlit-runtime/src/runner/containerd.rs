@@ -68,11 +68,7 @@ impl StargzClient {
     /// remote snapshotter. containerd returns when the remote snapshot is
     /// mountable; individual eStargz chunks remain demand-fetched and
     /// independently verified by the snapshotter.
-    pub async fn prepare(
-        &self,
-        reference: &str,
-        access_profile: &[String],
-    ) -> Result<(), StargzError> {
+    pub async fn prepare(&self, reference: &str) -> Result<(), StargzError> {
         let source = OciRegistry {
             reference: reference.to_string(),
             resolver: Some(RegistryResolver::default()),
@@ -83,16 +79,9 @@ impl StargzClient {
             variant: String::new(),
             os_version: String::new(),
         };
-        let mut labels = HashMap::new();
-        if !access_profile.is_empty() {
-            labels.insert(
-                "greenlit.io/stargz-access-profile".to_string(),
-                access_profile.join("\n"),
-            );
-        }
         let destination = ImageStore {
             name: reference.to_string(),
-            labels,
+            labels: HashMap::new(),
             platforms: vec![platform.clone()],
             all_metadata: false,
             manifest_limit: 1,
@@ -142,16 +131,35 @@ impl StargzClient {
             .await
             .map_err(StargzError::Rpc)?
             .into_inner();
-        let found = response.plugins.into_iter().any(|plugin| {
-            plugin.r#type == SNAPSHOT_PLUGIN_TYPE && plugin.id == self.config.snapshotter
-        });
-        if found {
-            Ok(())
-        } else {
-            Err(StargzError::SnapshotterUnavailable {
-                snapshotter: self.config.snapshotter.clone(),
+        let plugin = response
+            .plugins
+            .into_iter()
+            .find(|plugin| {
+                plugin.r#type == SNAPSHOT_PLUGIN_TYPE && plugin.id == self.config.snapshotter
             })
+            .ok_or_else(|| StargzError::SnapshotterUnavailable {
+                snapshotter: self.config.snapshotter.clone(),
+            })?;
+        if plugin
+            .exports
+            .get("enable_remote_snapshot_annotations")
+            .is_none_or(|value| value != "true")
+        {
+            return Err(StargzError::RemoteAnnotationsDisabled {
+                snapshotter: self.config.snapshotter.clone(),
+            });
         }
+        let supports_linux_amd64 = plugin.platforms.is_empty()
+            || plugin
+                .platforms
+                .iter()
+                .any(|platform| platform.os == "linux" && platform.architecture == "amd64");
+        if !supports_linux_amd64 {
+            return Err(StargzError::PlatformUnavailable {
+                snapshotter: self.config.snapshotter.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +216,19 @@ pub enum StargzError {
         /// Requested plugin id.
         snapshotter: String,
     },
+    /// The proxy plugin does not expose the annotations required for remote
+    /// snapshots through containerd's transfer service.
+    #[error("containerd snapshotter '{snapshotter}' does not enable remote snapshot annotations")]
+    RemoteAnnotationsDisabled {
+        /// Requested plugin id.
+        snapshotter: String,
+    },
+    /// The selected snapshotter cannot serve the v0 Linux amd64 platform.
+    #[error("containerd snapshotter '{snapshotter}' does not support linux/amd64")]
+    PlatformUnavailable {
+        /// Requested plugin id.
+        snapshotter: String,
+    },
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -231,6 +252,10 @@ struct Plugin {
     r#type: String,
     #[prost(string, tag = "2")]
     id: String,
+    #[prost(message, repeated, tag = "4")]
+    platforms: Vec<Platform>,
+    #[prost(map = "string, string", tag = "5")]
+    exports: HashMap<String, String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -315,39 +340,4 @@ struct Platform {
     variant: String,
     #[prost(string, tag = "4")]
     os_version: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn transfer_messages_encode_the_snapshotter_and_access_profile() {
-        let destination = ImageStore {
-            name: "example.invalid/runner@sha256:abc".to_string(),
-            labels: HashMap::from([(
-                "greenlit.io/stargz-access-profile".to_string(),
-                "/bin/bash\n/opt/hostedtoolcache".to_string(),
-            )]),
-            platforms: vec![Platform {
-                os: "linux".to_string(),
-                architecture: "amd64".to_string(),
-                variant: String::new(),
-                os_version: String::new(),
-            }],
-            all_metadata: false,
-            manifest_limit: 1,
-            unpacks: vec![UnpackConfiguration {
-                platform: None,
-                snapshotter: "stargz".to_string(),
-            }],
-        };
-        let encoded = destination.encode_to_vec();
-        let decoded = ImageStore::decode(encoded.as_slice()).expect("valid protobuf");
-        assert_eq!(decoded.unpacks[0].snapshotter, "stargz");
-        assert_eq!(
-            decoded.labels["greenlit.io/stargz-access-profile"],
-            "/bin/bash\n/opt/hostedtoolcache"
-        );
-    }
 }

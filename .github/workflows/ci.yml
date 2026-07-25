@@ -69,6 +69,31 @@ jobs:
       - name: Criterion benchmarks (record only)
         run: cargo bench --workspace
 
+  # TESTING.md snapshotter-path coverage forbids capability self-skips. This
+  # job provisions a real, isolated containerd/stargz stack and runs the direct
+  # provider acceptance plus live clean/hermetic policy acceptance.
+  provider-and-policy:
+    name: configured stargz provider and policy modes
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Direct containerd/stargz provider
+        run: tools/test-stargz-provider
+
+      - name: Clean and hermetic policy modes
+        env:
+          LITCI_TEST_LIVE_FULL_CI: "1"
+        run: cargo test -p greenlit-app --test cli_behavior policy_modes -- --nocapture
+
   # TESTING.md "Dogfood clause": "from Phase 2 onward this repo's own workflow
   # must run green under Greenlit itself, and that run is a required CI step
   # from Phase 4 onward. A CI tool whose repo can't run its own CI locally has

@@ -55,18 +55,7 @@ pub async fn preflight_plan_runners(
     let lazy_snapshotter = (!offline)
         .then(crate::runner::containerd::StargzConfig::from_environment)
         .flatten()
-        .map(|config| {
-            ContainerdStargzSnapshotter::new(
-                config,
-                vec![
-                    "/bin/sh".to_string(),
-                    "/bin/bash".to_string(),
-                    "/usr/bin/env".to_string(),
-                    "/usr/local/bin/node".to_string(),
-                    "/home/runner/externals".to_string(),
-                ],
-            )
-        });
+        .map(ContainerdStargzSnapshotter::new);
     let mut materialized = BTreeMap::new();
     for (image, _) in selected.values() {
         if materialized.contains_key(image.image_identifier()) {

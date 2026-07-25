@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Real containerd/stargz provider acceptance required by TESTING.md.
+#
+# The stack is isolated in one privileged throwaway container. It never
+# reconfigures the host containerd or Docker daemon and never uses a CLI
+# wrapper in Greenlit product code; ctr is used here only as an independent
+# external oracle for the remote snapshot prepared by Greenlit's direct gRPC
+# client.
+set -euo pipefail
+
+readonly ubuntu_image='ubuntu@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90'
+readonly stargz_version='v0.18.2'
+readonly stargz_archive_sha256='515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9'
+readonly fixture='ghcr.io/stargz-containers/ubuntu@sha256:8ae89e93cf60d297da92e0e1649261401b5d173746d285e3c91de73546f3b9d4'
+readonly container_name="greenlit-stargz-provider-test-$$"
+state_dir="$(mktemp -d -p /tmp greenlit-stargz-provider.XXXXXX)"
+
+cleanup() {
+  docker rm --force "${container_name}" >/dev/null 2>&1 || true
+  case "${state_dir}" in
+    /tmp/greenlit-stargz-provider.*) rm -rf "${state_dir}" ;;
+    *) printf 'refusing to remove unexpected provider-test path: %s\n' "${state_dir}" >&2 ;;
+  esac
+}
+trap cleanup EXIT
+
+docker run --detach --privileged --cgroupns host \
+  --name "${container_name}" \
+  --device /dev/fuse \
+  --mount "type=bind,src=${state_dir},dst=/shared" \
+  --tmpfs /var/lib/containerd-stargz-grpc:rw,exec,size=512m \
+  "${ubuntu_image}" \
+  bash -lc "
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates containerd curl fuse3 jq runc
+curl --fail --location --output /tmp/stargz.tar.gz \
+  https://github.com/containerd/stargz-snapshotter/releases/download/${stargz_version}/stargz-snapshotter-${stargz_version}-linux-amd64.tar.gz
+printf '%s  %s\n' '${stargz_archive_sha256}' /tmp/stargz.tar.gz | sha256sum --check
+tar -C /usr/local/bin -xzf /tmp/stargz.tar.gz containerd-stargz-grpc ctr-remote
+mkdir -p /etc/containerd /etc/containerd-stargz-grpc /run/containerd-stargz-grpc /shared/containerd
+chmod 0777 /shared/containerd
+printf '%s\n' 'no_background_fetch = true' > /etc/containerd-stargz-grpc/config.toml
+printf '%s\n' \
+  'version = 2' \
+  'root = \"/var/lib/containerd\"' \
+  'state = \"/run/containerd\"' \
+  '[grpc]' \
+  '  address = \"/shared/containerd/containerd.sock\"' \
+  '[[plugins.\"io.containerd.transfer.v1.local\".unpack_config]]' \
+  '  platform = \"linux/amd64\"' \
+  '  snapshotter = \"stargz\"' \
+  '[proxy_plugins]' \
+  '  [proxy_plugins.stargz]' \
+  '    type = \"snapshot\"' \
+  '    address = \"/run/containerd-stargz-grpc/containerd-stargz-grpc.sock\"' \
+  '  [proxy_plugins.stargz.exports]' \
+  '    root = \"/var/lib/containerd-stargz-grpc/\"' \
+  '    enable_remote_snapshot_annotations = \"true\"' \
+  > /etc/containerd/config.toml
+containerd-stargz-grpc \
+  --config /etc/containerd-stargz-grpc/config.toml \
+  > /shared/stargz.log 2>&1 &
+for attempt in \$(seq 1 60); do
+  test -S /run/containerd-stargz-grpc/containerd-stargz-grpc.sock && break
+  sleep 1
+done
+containerd --config=/etc/containerd/config.toml > /shared/containerd.log 2>&1 &
+for attempt in \$(seq 1 60); do
+  if test -S /shared/containerd/containerd.sock; then
+    chmod 0666 /shared/containerd/containerd.sock
+    touch /shared/ready
+    break
+  fi
+  sleep 1
+done
+test -f /shared/ready
+sleep infinity
+" >/dev/null
+
+for attempt in $(seq 1 180); do
+  test -f "${state_dir}/ready" && break
+  if ! docker inspect "${container_name}" >/dev/null 2>&1; then
+    printf 'isolated stargz provider stack exited during setup\n' >&2
+    exit 1
+  fi
+  sleep 1
+done
+test -f "${state_dir}/ready"
+
+LITCI_TEST_LIVE_STARGZ="${state_dir}/containerd/containerd.sock" \
+  cargo test -p greenlit-runtime --test stargz_provider_live -- --nocapture
+
+lazy_output="$(
+  docker exec "${container_name}" bash -lc "
+set -euo pipefail
+mkdir -p /mnt/greenlit-lazy
+mount -t overlay overlay /mnt/greenlit-lazy \
+  -o lowerdir=/var/lib/containerd-stargz-grpc/snapshotter/snapshots/3/fs:/var/lib/containerd-stargz-grpc/snapshotter/snapshots/2/fs:/var/lib/containerd-stargz-grpc/snapshotter/snapshots/1/fs
+before=\$(cat /mnt/greenlit-lazy/.stargz-snapshotter/* | jq -s 'map(.fetchedSize) | add')
+logical=\$(cat /mnt/greenlit-lazy/.stargz-snapshotter/* | jq -s 'map(.size) | add')
+test \"\${before}\" -lt \"\${logical}\"
+chroot /mnt/greenlit-lazy /bin/sh -c 'printf first-step-started'
+digest=\$(sha256sum /mnt/greenlit-lazy/usr/bin/perl5.30.0 | cut -d ' ' -f 1)
+after=\$(cat /mnt/greenlit-lazy/.stargz-snapshotter/* | jq -s 'map(.fetchedSize) | add')
+test \"\${after}\" -gt \"\${before}\"
+printf '|%s' \"\${digest}\"
+umount /mnt/greenlit-lazy
+"
+)"
+
+eager_output="$(
+  docker run --rm "${fixture}" sh -lc \
+    "printf first-step-started; printf '|'; sha256sum /usr/bin/perl5.30.0 | cut -d ' ' -f 1"
+)"
+test "${lazy_output}" = "${eager_output}"
+printf 'stargz provider acceptance passed: lazy start, verified demand read, eager parity\n'

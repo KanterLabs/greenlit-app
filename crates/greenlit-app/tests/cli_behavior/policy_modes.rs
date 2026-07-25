@@ -45,13 +45,10 @@ fn clean_and_hermetic_modes_change_runtime_state_and_evidence() {
         );
         return;
     }
-    if !docker_daemon_reachable() {
-        eprintln!(
-            "clean_and_hermetic_modes_change_runtime_state_and_evidence: \
-             no Docker daemon reachable; skipping"
-        );
-        return;
-    }
+    assert!(
+        docker_daemon_reachable(),
+        "{LIVE_ENV_VAR} requires the owning test job to provide a reachable Docker daemon"
+    );
 
     let sandbox = Sandbox::new();
     sandbox.write_home(".litci/toolcache/greenlit-clean-sentinel", "mutable");

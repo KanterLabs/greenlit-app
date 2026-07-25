@@ -161,18 +161,15 @@ pub struct EagerDockerSnapshotter {
 #[derive(Debug, Clone)]
 pub struct ContainerdStargzSnapshotter {
     config: containerd::StargzConfig,
-    access_profile: Vec<String>,
 }
 
 impl ContainerdStargzSnapshotter {
-    /// Creates a lazy snapshotter with advisory paths to prefetch. Missing
-    /// paths remain demand-fetched by stargz and are never treated as absent.
+    /// Creates a lazy snapshotter for eStargz images. Prioritized-file access
+    /// profiles are part of the immutable eStargz image itself; runtime path
+    /// guesses are deliberately not presented as a working prefetch policy.
     #[must_use]
-    pub fn new(config: containerd::StargzConfig, access_profile: Vec<String>) -> Self {
-        Self {
-            config,
-            access_profile,
-        }
+    pub fn new(config: containerd::StargzConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -203,7 +200,7 @@ impl Snapshotter for ContainerdStargzSnapshotter {
             .await
             .map_err(stargz_error)?;
         client
-            .prepare(&manifest.pull_reference, &self.access_profile)
+            .prepare(&manifest.pull_reference)
             .await
             .map_err(stargz_error)?;
         let identity = engine
