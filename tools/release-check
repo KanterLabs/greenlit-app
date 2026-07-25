@@ -7,17 +7,7 @@ cargo test --workspace
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo build --release -p greenlit-app
 
-for package in \
-  greenlit-expr \
-  greenlit-workflow \
-  greenlit-engine \
-  greenlit-metrics \
-  greenlit-store \
-  greenlit-actions \
-  greenlit-runtime \
-  greenlit-app
-do
-  cargo package -p "$package" --no-verify
-done
+find target/package -maxdepth 1 -type f -name 'greenlit-*.crate' -delete 2>/dev/null || true
+cargo package --workspace --exclude greenlit-init --no-verify
 
 sha256sum target/release/litci target/package/*.crate > SHA256SUMS

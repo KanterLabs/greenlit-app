@@ -128,6 +128,10 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
     sandbox_ms.sort_by(f64::total_cmp);
     workflow_ms.sort_by(f64::total_cmp);
     let percentile_index = (WARM_SAMPLES * 95).div_ceil(100) - 1;
+    eprintln!(
+        "warm budgets: sandbox p95 {:.2} ms; workflow p95 {:.2} ms; Greenlit setup downloads 0",
+        sandbox_ms[percentile_index], workflow_ms[percentile_index]
+    );
     assert!(
         sandbox_ms[percentile_index] < 2_000.0,
         "warm sandbox p95 was {:.2} ms, budget is < 2000 ms",
