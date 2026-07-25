@@ -1,13 +1,12 @@
 //! Getting the job container running: settling on the image it starts from
-//! (a converged Greenlit runner image, its slim base, or a validated
-//! user-declared `container:`), creating and starting the container with its
+//! (an immutable Greenlit runner profile or a validated user-declared
+//! `container:`), creating and starting the container with its
 //! binds/env/network, and seeding its live `PATH` before the step loop
 //! begins.
 
 use indexmap::IndexMap;
 use tracing::Instrument;
 
-use greenlit_engine::RunnerImage;
 use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::NeedRecord;
 use greenlit_expr::{RunStatus, Value};
@@ -17,28 +16,18 @@ use crate::executor::container::{ContainerAdditions, namespaced_volume_name, val
 use crate::executor::context::CaptureSink;
 use crate::executor::dind;
 use crate::executor::instance::JobInstance;
-use crate::executor::provision;
 use crate::executor::readiness::READY_MARKER;
+use crate::executor::runner_profile;
 use crate::executor::services;
 use crate::executor::{ExecError, Shared, stage_span};
-use crate::image::{INIT_IN_IMAGE_PATH, ensure_base_image, init_binary};
+use crate::image::{INIT_IN_IMAGE_PATH, init_binary};
 use crate::isolation::{IsolationStrategy, isolation_container_spec};
-use crate::platform::UbuntuRelease;
 use crate::progress::{ProgressEvent, ProgressSink};
 
 /// What `resolve_image` settled on for this job.
 pub(super) struct ResolvedImage {
-    /// The image the container actually starts from — this repository's
-    /// converged image when one exists, else the base.
+    /// The exact immutable image the container starts from.
     pub(super) tag: String,
-    /// The *base* image the convergence is anchored to.
-    ///
-    /// Kept separate from `tag` because the converged tag is hashed over it:
-    /// hashing over `tag` instead would produce a new tag every time a
-    /// converged image was itself converged, so a repository would never
-    /// reuse one. `None` for a user-declared `container:`, which never
-    /// converges.
-    pub(super) base: Option<String>,
     /// Whether this is a user-declared `container:`.
     pub(super) in_container: bool,
     /// Whether `bash` is known to be present.
@@ -117,42 +106,26 @@ pub(super) async fn resolve_image(
             // defaults such jobs to `sh`.
             Ok(ResolvedImage {
                 tag: locked_image,
-                base: None,
                 in_container: true,
                 bash_available: false,
                 additions,
             })
         }
         None => {
-            let release = match instance.runner {
-                RunnerImage::Ubuntu2404 => UbuntuRelease::Noble2404,
-                RunnerImage::Ubuntu2204 => UbuntuRelease::Jammy2204,
-            };
-            let base_tag = ensure_base_image(shared.engine, release, progress)
-                .instrument(stage_span("image-ensure"))
-                .await?;
-            // A previous run of this checkout may already have installed the
-            // tools its workflows use; starting from that image is what makes
-            // convergence pay off (`PHASE-4-environment.md`: "subsequent runs
-            // start from it").
-            let converged = provision::converged_tag(
-                &shared.config.repo_host_path,
-                &base_tag,
-                instance.runner.image_identifier(),
-            );
-            let tag = if shared
-                .engine
-                .image_exists(&converged)
-                .await
-                .unwrap_or(false)
-            {
-                converged
-            } else {
-                base_tag.clone()
-            };
+            let tag = runner_profile::for_runner(instance.runner)
+                .image
+                .to_string();
+            if !shared.engine.image_exists(&tag).await? {
+                return Err(ExecError::Infrastructure {
+                    message: format!(
+                        "locked runner profile '{tag}' disappeared before job startup"
+                    ),
+                    fix: "retry to prepare the exact runner profile again; do not prune Docker images during an active run"
+                        .to_string(),
+                });
+            }
             Ok(ResolvedImage {
                 tag,
-                base: Some(base_tag),
                 in_container: false,
                 bash_available: true,
                 additions: ContainerAdditions::default(),
@@ -211,7 +184,7 @@ impl ProgressSink for MaskedPullSink<'_> {
 /// which `core.addPath` only ever prepends onto. Querying the booted
 /// container's own `PATH` once, up front, and seeding it into `base_env`
 /// gives Greenlit's layering that same explicit, always-current baseline —
-/// container-agnostic, so it works identically for the convergent base image
+/// container-agnostic, so it works identically for a locked runner profile
 /// and an arbitrary user-specified `jobs.<id>.container`.
 ///
 /// # Errors
@@ -250,16 +223,10 @@ pub(crate) async fn seed_container_path(
             }
         }
         if !path.is_empty() {
-            // Wrappers first, provisioning shims last. The managed `docker`
-            // wrapper has to beat a CLI the job image already ships (a
-            // `docker:27-cli` job container has one at `/usr/local/bin`);
-            // a provisioning shim must lose to a real tool the workflow
-            // installs, because `apply_path_additions` only ever prepends
-            // and treats this whole string as one opaque tail segment.
-            base_env.insert(
-                "PATH".to_string(),
-                format!("{}:{path}:{}", dind::WRAPPER_DIR, dind::SHIM_DIR),
-            );
+            // The managed `docker` wrapper has to beat a CLI the job image
+            // already ships (a `docker:27-cli` job container has one at
+            // `/usr/local/bin`).
+            base_env.insert("PATH".to_string(), format!("{}:{path}", dind::WRAPPER_DIR));
         }
     }
     Ok(())
@@ -282,8 +249,7 @@ pub(crate) async fn seed_container_path(
 pub(crate) struct BootRequest<'a> {
     /// The resolved image reference.
     pub(super) image: &'a str,
-    /// Whether this is a user-declared `container:` rather than a Greenlit
-    /// runner image — the flag that gates every convergence behavior.
+    /// Whether this is a user-authored job container.
     pub(super) in_container: bool,
     /// Job-container `env:`/`volumes:`/credentials, already validated.
     pub(super) additions: &'a ContainerAdditions,
@@ -326,15 +292,18 @@ pub(crate) async fn boot_container(
         strategy,
         idle,
     );
-    // A job container image does not ship the helper; inject it read-only.
-    if in_container {
-        let helper = write_helper_binary()?;
-        spec.binds.push(BindMount {
-            host_path: helper,
-            container_path: INIT_IN_IMAGE_PATH.to_string(),
-            read_only: true,
-        });
+    if !in_container {
+        spec.user = Some("0:0".to_string());
     }
+    // Runner profiles and job-container images are immutable external OCI
+    // content. Inject the private helper read-only rather than rebuilding or
+    // mutating either image.
+    let helper = write_helper_binary()?;
+    spec.binds.push(BindMount {
+        host_path: helper,
+        container_path: INIT_IN_IMAGE_PATH.to_string(),
+        read_only: true,
+    });
     if needs_docker_sibling {
         for (source, mount_point) in [
             (

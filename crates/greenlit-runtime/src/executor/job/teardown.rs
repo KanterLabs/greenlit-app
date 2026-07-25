@@ -1,46 +1,11 @@
-//! Winding a job instance down after its outcome is known: committing a
-//! converged image for a green run on a Greenlit runner image, then
-//! releasing the container, its Docker-sibling volumes, the DinD sidecar,
-//! started services, and finally the job's own network.
+//! Winding a job instance down: release the container, Docker-sibling
+//! volumes, DinD sidecar, services, and finally the job's own network.
 
-use indexmap::IndexMap;
-
-use greenlit_engine::Conclusion;
-
+use crate::executor::Shared;
 use crate::executor::actions::docker_action;
 use crate::executor::container::namespaced_volume_name;
 use crate::executor::dind;
-use crate::executor::provision;
-use crate::executor::report::StepReport;
 use crate::executor::services;
-use crate::executor::{ExecError, Shared};
-
-/// Commit the job's container into a converged image when this run is
-/// eligible.
-///
-/// Convergence happens only for a green job on a Greenlit runner image:
-/// committing a container whose steps failed would bake a half-installed
-/// state into the image every later run starts from.
-// The outcome type mirrors `run_job_body`'s return type verbatim; boxing or
-// aliasing it would be a bigger footprint than one lint allow.
-#[allow(clippy::type_complexity)]
-pub(super) async fn converge(
-    shared: &Shared<'_>,
-    container: &str,
-    in_container: bool,
-    outcome: &Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError>,
-    converged_target: &Option<String>,
-    converged_source: &Option<(provision::manifest::Manifest, String)>,
-) {
-    if !in_container
-        && matches!(outcome, Ok((_, _, Conclusion::Success)))
-        && let Some(tag) = converged_target
-        && let Some((manifest, base_image)) = converged_source
-    {
-        let installed = provision::provisioned_commands(shared.engine, container).await;
-        provision::build_converged(shared.engine, base_image, manifest, &installed, tag).await;
-    }
-}
 
 /// `--write-back` needs the container (and its overlay upper) reachable
 /// after the run to export the diff (`PHASE-2-execution.md` "Overlay

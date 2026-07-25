@@ -155,11 +155,14 @@ path before it reaches a host resource:
   NDJSON record is bounded to 8 MiB. No Phase 1 dependency provides network or
   telemetry transport.
 
-## Phase 4 dataflow
+## Job environment dataflow
 
-Everything Phase 4 added hangs off one resource created per job — the job's
-own bridge network — and the ordering below is load-bearing rather than
-incidental:
+Everything around one job hangs off its own bridge network, and the ordering
+below is load-bearing rather than incidental. Phase 6 removed Phase 4's
+runtime apt convergence and command shims: a runner now starts only from an
+official GitHub ARC image pinned to its Linux amd64 platform-manifest digest.
+The support report explicitly calls this a self-hosted profile rather than a
+complete GitHub-hosted runner image.
 
 ```text
                     create job network
@@ -170,18 +173,13 @@ incidental:
                             |
      start services on the bridge, gated on their health probes
                             |
-                     boot the job container
+       boot the exact locked runner profile or job container
                             |
        apply the network policy *before* any workflow code runs
                             |
-        install provisioning shims (Greenlit runner images only)
-                            |
-         seed PATH: wrappers first, provisioning shims last
+             seed the image's actual PATH once
                             |
                         run the steps
-                            |
-     on success, converge: replay the installs in a clean base
-     container and commit that as this repo's per-repo image
                             |
    tear down container, then DinD, then services, then the network
 ```
@@ -192,6 +190,14 @@ gateway address has to be discovered rather than assumed. The policy is
 applied before readiness because a container that has executed even one step
 unrestricted has already had its chance to reach the LAN. Teardown runs in
 reverse because a network holding any attachment cannot be removed.
+
+Runner profiles are fixed in `executor::runner_profile`: Ubuntu 24.04 uses
+the official ARC runner 2.336.0 image and Ubuntu 22.04 uses 2.321.0, each by
+its exact amd64 manifest digest. Registry manifests/configs are verified in
+the machine-wide CAS, Docker materializes only the digest reference, and
+offline replay requires both the CAS metadata and exact daemon image.
+Greenlit's private init helper is injected read-only; the profile is never
+rebuilt or mutated. Legacy `greenlit/converged-*` images are not consulted.
 
 ## Phase 5 immutable-resolution dataflow
 
@@ -635,7 +641,7 @@ policy actively contains. They are not deferred Greenlit behavior.
   reproduces that: one `sh -c 'printf %s "$PATH"'` exec against the freshly
   booted (and ready) job container, seeded into `base_env` before the step
   loop starts — container-agnostic, so it works identically for the
-  convergent base image and an arbitrary user-specified
+  locked runner profile and an arbitrary user-specified
   `jobs.<id>.container`. `crates/greenlit-runtime/tests/actions_composite.rs`
   pins the regression (a `run:` step's own `GITHUB_PATH` addition must not
   break a later composite step's access to system binaries).

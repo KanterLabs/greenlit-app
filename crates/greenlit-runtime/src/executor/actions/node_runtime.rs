@@ -46,8 +46,8 @@
 //! this is the source of trust for those two entries specifically, not a
 //! third party's republished digest).
 //!
-//! Do not depend on Phase 4's convergent runner-image manifest for these —
-//! action runtimes are pinned independently here, per `PHASE-3-actions.md`.
+//! Action runtimes are pinned independently from the runner profile here, per
+//! `PHASE-3-actions.md`.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};

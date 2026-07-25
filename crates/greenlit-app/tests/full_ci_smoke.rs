@@ -3,15 +3,14 @@
 //!
 //! `docs/PHASE-4-environment.md` exit criterion 1: "workflow with a postgres
 //! service, `actions/cache` (miss → save → hit across two runs), artifact
-//! upload + download across jobs, and a dynamically selected tool absent from
-//! the slim base — `litci run` green twice; second run shows cache hit and
-//! converged-image reuse."
+//! upload + download across jobs, and a tool supplied by the immutable runner
+//! profile — `litci run` green twice, then from verified local setup content
+//! with `--offline`."
 //!
 //! # Why twice, and why one sandbox
 //!
 //! Every claim here is about state *surviving between runs*. A cache that
-//! saves is worth nothing if the next run does not restore it; a converged
-//! image is worth nothing if the next run reinstalls anyway, and verified
+//! saves is worth nothing if the next run does not restore it, and verified
 //! immutable setup content is incomplete if the third run cannot replay it
 //! offline. `Sandbox` gives
 //! one isolated `$HOME`, reused across both invocations, which is the only
@@ -83,17 +82,17 @@ fn docker_daemon_reachable() -> bool {
 }
 
 #[test]
-fn full_ci_fixture_is_green_twice_and_reuses_what_it_built() {
+fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     if std::env::var_os(LIVE_ENV_VAR).is_none() {
         eprintln!(
-            "full_ci_fixture_is_green_twice_and_reuses_what_it_built: skipped \
+            "full_ci_fixture_is_green_warm_and_replays_verified_setup_offline: skipped \
              (set {LIVE_ENV_VAR}=1 to run the real-daemon full-ci smoke test)"
         );
         return;
     }
     if !docker_daemon_reachable() {
         eprintln!(
-            "full_ci_fixture_is_green_twice_and_reuses_what_it_built: \
+            "full_ci_fixture_is_green_warm_and_replays_verified_setup_offline: \
              no Docker daemon reachable; skipping"
         );
         return;
@@ -120,8 +119,8 @@ fn full_ci_fixture_is_green_twice_and_reuses_what_it_built() {
         "run 1 must be a genuine cache miss: {first_out}"
     );
     assert!(
-        first_out.contains("greenlit: installed"),
-        "run 1 provisions the tool the slim base lacks: {first_out}"
+        first_out.contains("profile tool ok"),
+        "the locked runner profile must expose its declared toolset immediately: {first_out}"
     );
     assert!(
         first_out.contains("all checks passed"),
@@ -145,10 +144,7 @@ fn full_ci_fixture_is_green_twice_and_reuses_what_it_built() {
         second_out.contains("cache-hit=true"),
         "and the action must report it as a hit, which is what a workflow branches on: {second_out}"
     );
-    assert!(
-        !second_out.contains("greenlit: installed"),
-        "run 2 must start from the converged image, not reinstall: {second_out}"
-    );
+    assert!(!second_out.contains("greenlit: installing"), "{second_out}");
     assert!(
         second_out.contains("all checks passed"),
         "artifacts still cross the job boundary on the second run: {second_out}"

@@ -376,6 +376,7 @@ impl ContainerEngine for DockerEngine {
         let body = ContainerCreateBody {
             image: Some(spec.image.clone()),
             hostname: spec.hostname.clone(),
+            user: spec.user.clone(),
             entrypoint: (!spec.entrypoint.is_empty()).then(|| spec.entrypoint.clone()),
             cmd: (!spec.cmd.is_empty()).then(|| spec.cmd.clone()),
             env: (!env.is_empty()).then_some(env),

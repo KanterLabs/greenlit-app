@@ -17,7 +17,7 @@ use greenlit_engine::execution::job_outputs::finalize_outputs;
 use greenlit_engine::execution::outcome::{advance_status, job_result_from_status, needs_status};
 use greenlit_engine::execution::resolve::{resolve_condition, resolve_string};
 use greenlit_engine::execution::{Masker, NeedRecord};
-use greenlit_engine::{Conclusion, ContainerPlan, JobId, RunnerImage};
+use greenlit_engine::{Conclusion, ContainerPlan, JobId};
 use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::ExecSpec;
@@ -35,7 +35,6 @@ use crate::executor::dind;
 use crate::executor::event_json;
 use crate::executor::instance::JobInstance;
 use crate::executor::netguard;
-use crate::executor::provision;
 use crate::executor::readiness;
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
@@ -290,7 +289,6 @@ pub(crate) async fn run_instance(
     .await?;
     let boot::ResolvedImage {
         tag: image_tag,
-        base: base_image_tag,
         in_container,
         bash_available,
         additions,
@@ -384,64 +382,6 @@ pub(crate) async fn run_instance(
         }
     }
 
-    // Set when this job is eligible to converge -- a Greenlit runner image
-    // with a store to cache the manifest in.
-    let mut converged_target: Option<String> = None;
-    // The manifest and base image this job converged against, kept so the
-    // converged image can be built from a clean base container at teardown.
-    let mut converged_source: Option<(provision::manifest::Manifest, String)> = None;
-
-    // Lazy provisioning, for Greenlit runner images only. A user-declared
-    // `container:` is left exactly as authored: a command missing from that
-    // image must fail the way it fails in the same job container on GitHub
-    // (`PHASE-4-environment.md`: "Never inject host-runner tools or
-    // convergence layers into a user-declared job container").
-    if !in_container && let Some(store) = shared.config.store.as_ref() {
-        let version = match instance.runner {
-            RunnerImage::Ubuntu2404 => "24.04",
-            RunnerImage::Ubuntu2204 => "22.04",
-        };
-        let label = instance.runner.image_identifier();
-        if let Some(base) = base_image_tag.as_deref() {
-            converged_target = Some(provision::converged_tag(
-                &shared.config.repo_host_path,
-                base,
-                label,
-            ));
-        }
-        // A manifest that cannot be reached costs provisioning, not the run:
-        // the job proceeds against the slim base, and a genuinely missing
-        // command still fails at the step with its own message.
-        match provision::fetch::load(&store.toolcache_root_parent(), version)
-            .instrument(stage_span("manifest"))
-            .await
-        {
-            Ok(manifest) => {
-                let wanted =
-                    provision::mentioned_commands(instance.steps.iter().filter_map(step_script));
-                if let Some(base) = base_image_tag.clone() {
-                    converged_source = Some((manifest.clone(), base));
-                }
-                if let Err(error) =
-                    provision::install_shims(shared.engine, &container, &manifest, &wanted, label)
-                        .instrument(stage_span("provision"))
-                        .await
-                {
-                    tracing::debug!(
-                        target: "greenlit_runtime::provision",
-                        %error,
-                        "could not install provisioning shims; continuing without them"
-                    );
-                }
-            }
-            Err(error) => tracing::debug!(
-                target: "greenlit_runtime::provision",
-                %error,
-                "could not load the runner-images manifest; continuing without provisioning"
-            ),
-        }
-    }
-
     // Readiness runs against the freshly booted container, before the step
     // loop; its error still flows through the teardown below rather than
     // returning early and leaking the container.
@@ -497,15 +437,6 @@ pub(crate) async fn run_instance(
         Err(error) => Err(error),
     };
 
-    teardown::converge(
-        shared,
-        &container,
-        in_container,
-        &outcome,
-        &converged_target,
-        &converged_source,
-    )
-    .await;
     teardown::teardown(
         shared,
         &container,

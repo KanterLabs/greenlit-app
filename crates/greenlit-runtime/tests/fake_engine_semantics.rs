@@ -638,10 +638,7 @@ async fn preparation_progress_events_arrive_in_phase_order() {
     };
     let execution_plan = plan(&workflow, &event, &PlanOptions::default()).expect("plan");
 
-    let engine = ScriptedEngine {
-        image_absent: true,
-        ..ScriptedEngine::default()
-    };
+    let engine = ScriptedEngine::default();
     let config = RunConfig {
         repo_host_path: std::env::temp_dir(),
         workspace: "/ws".to_string(),
@@ -668,14 +665,8 @@ async fn preparation_progress_events_arrive_in_phase_order() {
 
     assert_eq!(
         recording.events,
-        vec![
-            "build-started",
-            "build-finished",
-            "boot-started",
-            "boot-finished",
-            "workspace-ready"
-        ],
-        "preparation phases report in order: image ensure, boot, workspace"
+        vec!["boot-started", "boot-finished", "workspace-ready"],
+        "the already-locked runner profile proceeds through boot and workspace readiness in order"
     );
 }
 

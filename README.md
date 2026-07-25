@@ -300,17 +300,21 @@ Every `plan` and `run` appends one record to `~/.litci/metrics/runs.ndjson`: sta
 
 ## Where it is today
 
-Greenlit is **pre-release**, built in six phases. Three are done.
+Greenlit is **pre-release**. The first five implementation phases are
+complete; verified-content work is active.
 
 Working now: full workflow parsing with source-located errors, the complete expression evaluator, `needs` DAG and matrix planning, `litci plan` and `litci plan --json`, real container-backed execution of `run:` steps with GitHub's shell, env-layering, command-file and masking semantics, job containers, read-only-plus-overlay isolation, JavaScript / composite / Docker actions, the secrets and variables chains, and `litci auth`. Greenlit runs this repository's own formatting, lint, stub-check and test gates under itself — inside a `rust:1.96.0` job container, green, in about 70 seconds.
 
-Coming in the remaining phases:
+Working now also includes `actions/cache`, artifacts, service containers,
+network containment, immutable action/container/runner resolution, a
+machine-wide verified CAS, and exact cached `--offline` replay. Runner jobs
+use GitHub's official ARC images pinned by Linux amd64 manifest digest; the
+result evidence clearly degrades them because an ARC self-hosted image is not
+the complete GitHub-hosted environment.
 
-- **Phase 4 — environment.** `actions/cache`, artifacts, running `services:` containers, per-repo convergent images that install exactly the tools your workflow uses at the versions the real runner has, a network policy that blocks your LAN while allowing the internet, and a Docker-in-Docker sidecar.
-- **Phase 5 — speed.** Parallel jobs and matrix fan-out, prefetch pipelining, and warm container reuse — with the spec's budgets (first step executing in under 2 s, warm re-run under 30 s) enforced by CI rather than asserted here.
-- **Phase 6 — parity.** The real proof: run ~50 popular repositories' workflows on GitHub and on Greenlit and diff every step outcome, published raw and live, with a public issue for every defect it finds.
-
-Two honest caveats until Phase 4 lands. `services:` **parses and appears in `litci plan` output but nothing starts it** — a workflow with a postgres service will plan cleanly and then fail when a step tries to connect. And the base image carries only bash, git, curl, wget, jq, tar, unzip, and build-essential; a workflow needing a language toolchain won't find one yet.
+Still coming: background preparation, lazy runner materialization, durable
+daemon recovery and lease-aware garbage collection, and matching GitHub-run
+evidence for Parity Confirmed.
 
 Deliberately out of scope for v0, and rejected at plan time with a location and a fix rather than silently misbehaving: `concurrency`, reusable workflows (`workflow_call`), environments and deployments, OIDC, runner labels other than `ubuntu-latest` / `ubuntu-24.04` / `ubuntu-22.04`, the `cmd` / `powershell` / `pwsh` shells, privileged and host-namespace container options, and macOS, Windows, or non-x86_64 hosts.
 

@@ -56,10 +56,6 @@ const DIND_HOST: &str = "docker";
 /// The plain-TCP port `docker:dind` serves when TLS is disabled.
 const DIND_PORT: u16 = 2375;
 
-/// Where lazily-provisioned tools land. **Last** on `PATH`, so a real tool a
-/// workflow installs always beats a Greenlit shim.
-pub(crate) const SHIM_DIR: &str = "/greenlit/shims";
-
 /// Where the managed `docker` wrapper lives. **First** on `PATH`, so it
 /// intercepts the image's own CLI — see the module docs.
 ///
@@ -265,14 +261,6 @@ mod tests {
             script.contains("exec \"$real\" \"$@\""),
             "the original argv is exec'd, so the step is never replayed"
         );
-    }
-
-    #[test]
-    fn the_wrapper_lives_apart_from_the_provisioning_shims() {
-        // They go on opposite ends of PATH: this one intercepts the image's
-        // own CLI, provisioning shims must never intercept anything.
-        assert_ne!(super::WRAPPER_DIR, super::SHIM_DIR);
-        assert!(install_wrapper_script().contains(super::WRAPPER_DIR));
     }
 
     #[test]

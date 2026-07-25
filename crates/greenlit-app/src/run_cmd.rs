@@ -299,6 +299,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             runtime.block_on(greenlit_runtime::preflight_plan_runners(
                 &engine,
                 &execution_plan,
+                &content_store,
                 args.offline,
                 &mut progress,
             ))

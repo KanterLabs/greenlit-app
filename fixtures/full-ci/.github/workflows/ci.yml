@@ -15,12 +15,12 @@ jobs:
           --health-timeout 3s
           --health-retries 15
     steps:
-      # A tool the GitHub runner image carries but Greenlit's slim base does
-      # not. Run 1 provisions it; run 2 finds it in the converged image.
-      - name: a provisioned tool is usable
+      # A tool included in the immutable runner profile is immediately
+      # available without a runtime package install or command shim.
+      - name: a locked profile tool is usable
         run: |
-          zip --version | head -1
-          echo "zip ok"
+          python3 --version
+          echo "profile tool ok"
 
       # The service is reachable at its service id, exactly as on GitHub.
       - name: the postgres service answers

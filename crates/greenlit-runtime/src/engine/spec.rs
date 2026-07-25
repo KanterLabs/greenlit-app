@@ -156,6 +156,12 @@ pub struct ContainerSpec {
     pub image: String,
     /// Optional explicit container name.
     pub name: Option<String>,
+    /// Optional user override (`name`, UID, or `UID:GID`).
+    ///
+    /// Greenlit runner profiles start their private init as root so it can
+    /// establish the job-private overlay. User-authored job containers leave
+    /// this unset and retain the image's declared user.
+    pub user: Option<String>,
     /// Entrypoint override; empty means the image default.
     pub entrypoint: Vec<String>,
     /// Command / args; empty means the image default.

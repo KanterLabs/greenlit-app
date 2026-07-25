@@ -400,6 +400,18 @@ fn local_support_report() -> SupportReport {
                 scope: "run".to_string(),
                 reason: "external network responses are not captured".to_string(),
             },
+            FeatureFinding {
+                code: "runner.profile_self_hosted".to_string(),
+                disposition: FindingDisposition::Degraded,
+                scope: "run".to_string(),
+                reason: "the locked runner profile is GitHub's official self-hosted ARC image, not the complete GitHub-hosted runner image".to_string(),
+            },
+            FeatureFinding {
+                code: "runner.user_root".to_string(),
+                disposition: FindingDisposition::Degraded,
+                scope: "run".to_string(),
+                reason: "Greenlit runner-profile steps execute as root while GitHub-hosted Ubuntu steps execute as the runner user".to_string(),
+            },
         ],
     };
     report.canonicalize();
