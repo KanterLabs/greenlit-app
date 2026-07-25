@@ -2,8 +2,7 @@
 
 This document records the architecture as implemented. It is updated with
 each phase summary; crates and runtime paths appear as the phase that builds
-them lands. Phases 2 and 3 appended only to the known-issues log; Phase 4 adds
-a crate, so the boundary table and a second dataflow arrive with it.
+them lands.
 
 ## Crate boundaries
 
@@ -193,6 +192,52 @@ gateway address has to be discovered rather than assumed. The policy is
 applied before readiness because a container that has executed even one step
 unrestricted has already had its chance to reach the LAN. Teardown runs in
 reverse because a network holding any attachment cannot be removed.
+
+## Phase 5 immutable-resolution dataflow
+
+Execution no longer reads mutable project or registry state after its lock is
+finalized:
+
+```text
+live repository
+      |
+      v
+canonical source snapshot -----> machine-wide SHA-256 CAS
+      |
+      v
+workflow parse + compatibility inventory
+      |
+      v
+resolve and recheck mutable action/container aliases
+      |
+      v
+RunLock + per-job JobLocks
+      |
+      +----> ~/.litci/runs/<run-id>/run-lock.json
+      +----> ~/.litci/runs/<run-id>/support-report.json
+      |
+      v
+fresh job execution from frozen source + locked identities
+      |
+      v
+append-only trace.ndjson + terminal result.json
+```
+
+The RunLock names the frozen source tree, workflow, runner provider and image,
+architecture, runner version, action commits, container digests, toolchain
+artifacts, secret revision digests, and compatibility findings. The engine
+boundary receives immutable container identities; a mutable tag cannot be
+passed to job, service, Docker-action, or internal sidecar creation. Result
+classification keeps execution outcome, compatibility, and assurance
+independent, so a locally successful run with an unsupported construct is
+still blocked from every green classification.
+
+The CAS root is `~/.litci/cas/`. Objects are verified before atomic
+publication, corrupt entries are quarantined, and an SQLite-WAL catalog tracks
+objects, trees, aliases, references, downloads, leases, runs, and runtime
+resources. Phase 5 ingests frozen source objects and establishes the package
+download-cache fast path. Phase 6 moves action, Node runtime, runner, and OCI
+content from their legacy stores into this verified boundary.
 
 ## Known issues log
 

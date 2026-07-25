@@ -88,8 +88,8 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 2 — Execution | `docs/PHASE-2-execution.md` | completed |
 | 3 — Actions | `docs/PHASE-3-actions.md` | completed |
 | 4 — Environment | `docs/PHASE-4-environment.md` | completed |
-| 5 — Resolution evidence | `docs/PHASE-5-speed.md` | in progress |
-| 6 — Verified content | `docs/PHASE-6-parity-launch.md` | not started |
+| 5 — Resolution evidence | `docs/PHASE-5-speed.md` | completed |
+| 6 — Verified content | `docs/PHASE-6-parity-launch.md` | in progress |
 | 7 — Fresh execution | `docs/PHASE-7-fresh-execution.md` | not started |
 | 8 — Daemon & recovery | `docs/PHASE-8-daemon-recovery.md` | not started |
 | 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | not started |
