@@ -88,12 +88,6 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Pull-request checkouts are detached merge commits. A synthetic manual
-      # dispatch still has a selected ref, so give that exact SHA a local
-      # branch instead of asking Greenlit to invent one.
-      - name: Prepare branch-backed source identity
-        run: git switch -C greenlit-ci "$GITHUB_SHA"
-
       - name: Provision pinned Rust toolchain
         run: rustup show
 
@@ -127,6 +121,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # Pull-request checkouts are detached merge commits. A synthetic manual
+      # dispatch still has a selected ref, so give that exact SHA a local
+      # branch instead of asking Greenlit to invent one.
+      - name: Prepare branch-backed source identity
+        run: git switch -C greenlit-ci "$GITHUB_SHA"
 
       - name: Provision pinned Rust toolchain
         run: rustup show
