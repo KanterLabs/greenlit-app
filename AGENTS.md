@@ -87,8 +87,8 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 1 — Engine core | `docs/PHASE-1-engine-core.md` | completed |
 | 2 — Execution | `docs/PHASE-2-execution.md` | completed |
 | 3 — Actions | `docs/PHASE-3-actions.md` | completed |
-| 4 — Environment | `docs/PHASE-4-environment.md` | in progress |
-| 5 — Speed | `docs/PHASE-5-speed.md` | not started |
+| 4 — Environment | `docs/PHASE-4-environment.md` | completed |
+| 5 — Speed | `docs/PHASE-5-speed.md` | in progress |
 | 6 — Parity & launch | `docs/PHASE-6-parity-launch.md` | not started |
 
 ## Target workspace layout
