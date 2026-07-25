@@ -594,7 +594,7 @@ async fn connect_engine() -> anyhow::Result<DockerEngine> {
 /// # Errors
 /// Returns a message (with a fix, per `AGENTS.md`'s UX invariant) if the
 /// user home directory cannot be determined.
-fn build_action_runtime_config(
+pub(crate) fn build_action_runtime_config(
     token: Option<String>,
     offline: bool,
 ) -> Result<

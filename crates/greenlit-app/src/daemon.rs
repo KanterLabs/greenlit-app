@@ -7,13 +7,15 @@
 //! on daemon availability.
 
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use greenlit_engine::{SourceEntry, SourceSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -24,6 +26,7 @@ const PROTOCOL_VERSION: u32 = 1;
 const MAX_MESSAGE_BYTES: u64 = 64 * 1024;
 const START_WAIT: Duration = Duration::from_secs(2);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const WATCH_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_WATCH_ENTRIES: usize = 20_000;
 const MAX_WATCH_BYTES: usize = 64 * 1024 * 1024;
 
@@ -51,6 +54,20 @@ struct Response {
     ok: bool,
     changed: bool,
     message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PreparedSnapshot {
+    commit: String,
+    dirty: bool,
+    digest: String,
+    entries: Vec<SourceEntry>,
+}
+
+struct WatchedRepository {
+    fingerprint: String,
+    generation: u64,
+    preparation: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Notify the optional daemon about one repository without making it part of
@@ -143,7 +160,13 @@ async fn serve_async() -> anyhow::Result<()> {
         .map_err(|error| anyhow::anyhow!("could not bind daemon socket: {error}"))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .map_err(|error| anyhow::anyhow!("could not secure daemon socket: {error}"))?;
-    let _socket_guard = SocketGuard(socket);
+    let socket_metadata = fs::metadata(&socket)
+        .map_err(|error| anyhow::anyhow!("could not inspect daemon socket: {error}"))?;
+    let _socket_guard = SocketGuard {
+        path: socket,
+        device: socket_metadata.dev(),
+        inode: socket_metadata.ino(),
+    };
     crate::doctor_cmd::reconcile_interrupted_runs(
         parent
             .parent()
@@ -155,19 +178,33 @@ async fn serve_async() -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("daemon state directory has no Greenlit root"))?,
     )
     .await;
+    let home = parent
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("daemon directory has no user home"))?;
     let mut watched = BTreeMap::new();
+    let mut interval = tokio::time::interval(WATCH_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
-        let accepted = tokio::time::timeout(IDLE_TIMEOUT, listener.accept()).await;
-        let Ok(accepted) = accepted else {
-            return Ok(());
-        };
-        let (stream, _) =
-            accepted.map_err(|error| anyhow::anyhow!("could not accept daemon client: {error}"))?;
-        if !same_user(&stream)? {
-            continue;
-        }
-        if handle(stream, &mut watched).await? {
-            return Ok(());
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted
+                    .map_err(|error| anyhow::anyhow!("could not accept daemon client: {error}"))?;
+                if !same_user(&stream)? {
+                    continue;
+                }
+                if handle(stream, &mut watched, &home).await? {
+                    return Ok(());
+                }
+                idle.as_mut().reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
+            }
+            _ = interval.tick() => {
+                refresh_watched(&mut watched, &home).await;
+            }
+            () = &mut idle => return Ok(()),
         }
     }
 }
@@ -201,7 +238,8 @@ async fn reconcile_runtime_resources(litci_root: &Path) {
 
 async fn handle(
     stream: UnixStream,
-    watched: &mut BTreeMap<PathBuf, String>,
+    watched: &mut BTreeMap<PathBuf, WatchedRepository>,
+    home: &Path,
 ) -> anyhow::Result<bool> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half).take(MAX_MESSAGE_BYTES.saturating_add(1));
@@ -227,13 +265,8 @@ async fn handle(
                 if protocol != PROTOCOL_VERSION || binary != env!("CARGO_PKG_VERSION") {
                     response = version_response(protocol, &binary, false);
                 } else {
-                    match repository_fingerprint(&repository) {
-                        Ok(fingerprint) => {
-                            let changed = watched
-                                .insert(repository, fingerprint.clone())
-                                .is_none_or(|prior| prior != fingerprint);
-                            response = success_response(changed);
-                        }
+                    match refresh_repository(watched, repository, home).await {
+                        Ok(changed) => response = success_response(changed),
                         Err(message) => response = error_response(&message),
                     }
                 }
@@ -297,6 +330,322 @@ fn start() -> anyhow::Result<()> {
         .spawn()
         .map(|_| ())
         .map_err(|error| anyhow::anyhow!("could not start preparation daemon: {error}"))
+}
+
+async fn refresh_watched(watched: &mut BTreeMap<PathBuf, WatchedRepository>, home: &Path) {
+    let repositories = watched.keys().cloned().collect::<Vec<_>>();
+    for repository in repositories {
+        let _result = refresh_repository(watched, repository, home).await;
+    }
+}
+
+async fn refresh_repository(
+    watched: &mut BTreeMap<PathBuf, WatchedRepository>,
+    repository: PathBuf,
+    home: &Path,
+) -> Result<bool, String> {
+    let canonical = fs::canonicalize(&repository)
+        .map_err(|error| format!("could not inspect repository: {error}"))?;
+    let fingerprint = repository_fingerprint(&canonical)?;
+    if let Some(state) = watched.get(&canonical)
+        && state.fingerprint == fingerprint
+    {
+        let preparation_running = state
+            .preparation
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+        if preparation_running || has_ready_template(home, &canonical) {
+            return Ok(false);
+        }
+    }
+    let generation = watched
+        .get(&canonical)
+        .map_or(1, |state| state.generation.saturating_add(1));
+    if let Some(task) = watched
+        .get_mut(&canonical)
+        .and_then(|state| state.preparation.take())
+    {
+        task.abort();
+    }
+    let task_repository = canonical.clone();
+    let task_home = home.to_path_buf();
+    let task_fingerprint = fingerprint.clone();
+    let preparation = tokio::spawn(async move {
+        background_prepare(task_repository, task_home, task_fingerprint, generation).await;
+    });
+    watched.insert(
+        canonical,
+        WatchedRepository {
+            fingerprint,
+            generation,
+            preparation: Some(preparation),
+        },
+    );
+    Ok(true)
+}
+
+async fn background_prepare(
+    repository: PathBuf,
+    home: PathBuf,
+    fingerprint: String,
+    generation: u64,
+) {
+    let capture_repository = repository.clone();
+    let capture_home = home.clone();
+    let capture_fingerprint = fingerprint.clone();
+    let captured = tokio::task::spawn_blocking(move || {
+        capture_source_template(
+            &capture_repository,
+            &capture_home,
+            &capture_fingerprint,
+            generation,
+        )
+    })
+    .await;
+    let Ok(Ok((temporary, ready))) = captured else {
+        return;
+    };
+    if publish_source_template(&temporary, &ready).is_err() {
+        let _result = fs::remove_dir_all(&temporary);
+        return;
+    }
+    prefetch_repository_actions(&repository).await;
+}
+
+fn capture_source_template(
+    repository: &Path,
+    home: &Path,
+    fingerprint: &str,
+    generation: u64,
+) -> Result<(PathBuf, PathBuf), String> {
+    let key = repository_key(repository);
+    let repository_templates = template_root(home).join("repos").join(&key);
+    fs::create_dir_all(&repository_templates)
+        .map_err(|error| format!("could not create source-template directory: {error}"))?;
+    let fingerprint = identity_component(fingerprint);
+    let temporary = repository_templates.join(format!(".tmp-{}-{generation}", std::process::id()));
+    if temporary.exists() {
+        fs::remove_dir_all(&temporary)
+            .map_err(|error| format!("could not replace stale source preparation: {error}"))?;
+    }
+    fs::create_dir(&temporary)
+        .map_err(|error| format!("could not create source preparation: {error}"))?;
+    let snapshot = match SourceSnapshot::capture(repository, &temporary.join("source")) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let _result = fs::remove_dir_all(&temporary);
+            return Err(error.to_string());
+        }
+    };
+    let prepared = PreparedSnapshot {
+        commit: snapshot.commit,
+        dirty: snapshot.dirty,
+        digest: snapshot.digest,
+        entries: snapshot.entries,
+    };
+    let metadata = serde_json::to_vec(&prepared)
+        .map_err(|error| format!("could not encode source preparation: {error}"))?;
+    let metadata_path = temporary.join("snapshot.json");
+    let mut file = File::create(&metadata_path)
+        .map_err(|error| format!("could not create source preparation metadata: {error}"))?;
+    file.write_all(&metadata)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("could not persist source preparation metadata: {error}"))?;
+    File::open(&temporary)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("could not persist source preparation: {error}"))?;
+    Ok((
+        temporary,
+        repository_templates.join(format!("ready-{fingerprint}")),
+    ))
+}
+
+fn publish_source_template(temporary: &Path, ready: &Path) -> Result<(), String> {
+    match fs::rename(temporary, ready) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_dir_all(temporary)
+                .map_err(|remove| format!("could not discard duplicate preparation: {remove}"))?;
+        }
+        Err(error) => return Err(format!("could not publish source preparation: {error}")),
+    }
+    if let Some(parent) = ready.parent() {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                format!("could not persist source preparation publication: {error}")
+            })?;
+    }
+    Ok(())
+}
+
+async fn prefetch_repository_actions(repository: &Path) {
+    let token = crate::auth::current_token().ok().flatten();
+    let Ok((config, _pinned)) = crate::run_cmd::build_action_runtime_config(token, false) else {
+        return;
+    };
+    let workflows = repository.join(".github").join("workflows");
+    let Ok(entries) = fs::read_dir(workflows) else {
+        return;
+    };
+    let mut references = std::collections::BTreeSet::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("yml" | "yaml")
+            )
+        {
+            continue;
+        }
+        let Some(source_name) = path.strip_prefix(repository).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        let Ok(workflow) = greenlit_workflow::parse_workflow_file_with_name(&path, source_name)
+        else {
+            continue;
+        };
+        let Ok(extraction) = greenlit_workflow::extract_static(&workflow) else {
+            continue;
+        };
+        references.extend(extraction.uses.into_iter().map(|uses| uses.value));
+    }
+    for reference in references {
+        let Ok(greenlit_actions::ActionRef::Repository(action)) =
+            greenlit_actions::ActionRef::parse(&reference)
+        else {
+            continue;
+        };
+        let Ok(commit) = greenlit_actions::resolve::resolve_ref(
+            config.resolver.as_ref(),
+            &action.owner,
+            &action.repo,
+            &action.git_ref,
+        )
+        .await
+        else {
+            continue;
+        };
+        let _result = config
+            .store
+            .ensure_fetched(
+                &action.owner,
+                &action.repo,
+                &commit,
+                config.fetcher.as_ref(),
+            )
+            .await;
+    }
+}
+
+/// Atomically claims one daemon-prepared source snapshot and verifies it
+/// against the current repository before returning it to run evidence.
+pub(crate) fn take_source_template(
+    repository: &Path,
+    destination: &Path,
+) -> Option<Result<SourceSnapshot, greenlit_engine::SourceSnapshotError>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if !home.is_absolute() {
+        return None;
+    }
+    let canonical = fs::canonicalize(repository).ok()?;
+    let source = template_root(&home)
+        .join("repos")
+        .join(repository_key(&canonical));
+    let mut candidates = fs::read_dir(&source)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ready-"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| right.cmp(left));
+    let claims = template_root(&home).join("claims");
+    if fs::create_dir_all(&claims).is_err() {
+        return None;
+    }
+    for candidate in candidates {
+        let claim = claims.join(format!(
+            "{}-{}-{}",
+            repository_key(&canonical),
+            std::process::id(),
+            monotonic_token()
+        ));
+        if fs::rename(&candidate, &claim).is_err() {
+            continue;
+        }
+        let prepared = fs::read(claim.join("snapshot.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PreparedSnapshot>(&bytes).ok());
+        let Some(prepared) = prepared else {
+            let _result = fs::remove_dir_all(&claim);
+            continue;
+        };
+        let snapshot = SourceSnapshot {
+            commit: prepared.commit,
+            dirty: prepared.dirty,
+            digest: prepared.digest,
+            entries: prepared.entries,
+            root: claim.join("source"),
+        };
+        match snapshot.verify_and_adopt(&canonical, destination) {
+            Ok(snapshot) => {
+                let _result = fs::remove_dir_all(&claim);
+                return Some(Ok(snapshot));
+            }
+            Err(greenlit_engine::SourceSnapshotError::ChangedDuringCapture) => {
+                let _result = fs::remove_dir_all(&claim);
+            }
+            Err(error) => {
+                let _result = fs::remove_dir_all(&claim);
+                return Some(Err(error));
+            }
+        }
+    }
+    None
+}
+
+fn template_root(home: &Path) -> PathBuf {
+    home.join(".litci").join("daemon").join("templates")
+}
+
+fn has_ready_template(home: &Path, repository: &Path) -> bool {
+    fs::read_dir(
+        template_root(home)
+            .join("repos")
+            .join(repository_key(repository)),
+    )
+    .is_ok_and(|mut entries| {
+        entries.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().into_string().ok())
+                .is_some_and(|name| name.starts_with("ready-"))
+        })
+    })
+}
+
+fn repository_key(repository: &Path) -> String {
+    identity_component(&greenlit_engine::opaque_revision(
+        repository.as_os_str().as_encoded_bytes(),
+    ))
+}
+
+fn identity_component(identity: &str) -> String {
+    identity
+        .strip_prefix("sha256:")
+        .unwrap_or(identity)
+        .to_string()
+}
+
+fn monotonic_token() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 fn same_user(stream: &UnixStream) -> anyhow::Result<bool> {
@@ -376,32 +725,15 @@ fn collect_relevant(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> 
 
 fn relevant_directory(path: &Path) -> bool {
     path.starts_with(".github")
+        || path == Path::new(".git")
         || path.starts_with(".git/refs")
         || (!path.starts_with(".git") && !path.starts_with("target") && !path.starts_with(".litci"))
 }
 
 fn relevant_file(path: &Path) -> bool {
-    if path.starts_with(".github/workflows") || path == Path::new(".git/HEAD") {
-        return true;
-    }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    name == "action.yml"
-        || name == "action.yaml"
-        || name.starts_with("Dockerfile")
-        || name.ends_with(".lock")
-        || matches!(
-            name,
-            "rust-toolchain.toml"
-                | "rust-toolchain"
-                | ".node-version"
-                | ".python-version"
-                | ".tool-versions"
-                | "go.mod"
-                | "go.sum"
-                | "package.json"
-        )
+    path == Path::new(".git/HEAD")
+        || path.starts_with(".git/refs")
+        || (!path.starts_with(".git") && !path.starts_with("target") && !path.starts_with(".litci"))
 }
 
 fn success_response(changed: bool) -> Response {
@@ -439,10 +771,18 @@ fn version_response(protocol: u32, binary: &str, changed: bool) -> Response {
     }
 }
 
-struct SocketGuard(PathBuf);
+struct SocketGuard {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _result = fs::remove_file(&self.0);
+        let owns_path = fs::metadata(&self.path)
+            .is_ok_and(|metadata| metadata.dev() == self.device && metadata.ino() == self.inode);
+        if owns_path {
+            let _result = fs::remove_file(&self.path);
+        }
     }
 }

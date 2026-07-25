@@ -185,21 +185,39 @@ fn daemon_and_no_daemon_paths_persist_identical_terminal_results() {
         "auto-managed daemon did not become ready: {}",
         support::stderr_text(&status)
     );
+    let template_root = sandbox.home().join(".litci/daemon/templates/repos");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline && !contains_ready_template(&template_root) {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        contains_ready_template(&template_root),
+        "daemon did not publish a one-use source template"
+    );
 
-    let mut results = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+    let prepared = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
+    assert!(!prepared.status.success());
+
+    let run_directories = std::fs::read_dir(sandbox.home().join(".litci/runs"))
         .expect("run evidence exists")
-        .map(|entry| {
-            std::fs::read(
-                entry
-                    .expect("run evidence entry")
-                    .path()
-                    .join("result.json"),
-            )
-            .expect("terminal result exists")
+        .map(|entry| entry.expect("run evidence entry").path())
+        .collect::<Vec<_>>();
+    let mut results = run_directories
+        .iter()
+        .map(|directory| {
+            std::fs::read(directory.join("result.json")).expect("terminal result exists")
         })
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 2);
-    assert_eq!(results.pop(), results.pop());
+    assert_eq!(results.len(), 3);
+    let expected = results.pop().expect("one result");
+    assert!(results.iter().all(|result| result == &expected));
+    assert!(
+        run_directories.iter().any(|directory| {
+            std::fs::read_to_string(directory.join("trace.ndjson"))
+                .is_ok_and(|trace| trace.contains("\"event\":\"source_template_adopted\""))
+        }),
+        "a prepared source template was published but never adopted"
+    );
 
     let shutdown = sandbox.run(&["daemon", "--shutdown"]);
     assert!(
@@ -207,6 +225,27 @@ fn daemon_and_no_daemon_paths_persist_identical_terminal_results() {
         "daemon shutdown failed: {}",
         support::stderr_text(&shutdown)
     );
+}
+
+fn contains_ready_template(path: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ready-"))
+        {
+            return true;
+        }
+        if path.is_dir() && contains_ready_template(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]

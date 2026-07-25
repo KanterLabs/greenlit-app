@@ -128,6 +128,53 @@ impl SourceSnapshot {
         }
         Err(SourceSnapshotError::ChangedDuringCapture)
     }
+
+    /// Re-verifies a previously prepared snapshot against the repository's
+    /// current bytes and atomically adopts it at `destination` when identical.
+    ///
+    /// This is the daemon fast path: prepared content is only a performance
+    /// hint. The same commit, canonical entry manifest, and dirty state are
+    /// recomputed before the snapshot becomes a run input. A mismatch returns
+    /// [`SourceSnapshotError::ChangedDuringCapture`] so callers can discard the
+    /// hint and use [`Self::capture`].
+    pub fn verify_and_adopt(
+        self,
+        repo_root: &Path,
+        destination: &Path,
+    ) -> Result<Self, SourceSnapshotError> {
+        if destination.exists() {
+            return Err(io_error(
+                destination,
+                "destination already exists; choose a new run directory",
+            ));
+        }
+        let commit_before = git_text(repo_root, &["rev-parse", "HEAD"])?;
+        let paths = git_paths(
+            repo_root,
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+        )?;
+        let entries = hash_live_entries(repo_root, &paths)?;
+        let commit_after = git_text(repo_root, &["rev-parse", "HEAD"])?;
+        let dirty = !git_status(repo_root)?.is_empty();
+        if commit_before != commit_after
+            || self.commit != commit_after
+            || self.entries != entries
+            || self.dirty != dirty
+        {
+            return Err(SourceSnapshotError::ChangedDuringCapture);
+        }
+        fs::rename(&self.root, destination).map_err(|error| io_error(destination, error))?;
+        Ok(Self {
+            root: destination.to_path_buf(),
+            ..self
+        })
+    }
 }
 
 fn capture_once(

@@ -92,9 +92,13 @@ impl RunEvidence {
             )
         })?;
         let source_root = directory.join("source");
-        let source = SourceSnapshot::capture(repo_root, &source_root).map_err(|error| {
-            anyhow::anyhow!("{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry")
-        })?;
+        let prepared_source = crate::daemon::take_source_template(repo_root, &source_root);
+        let used_prepared_source = prepared_source.is_some();
+        let source = prepared_source
+            .unwrap_or_else(|| SourceSnapshot::capture(repo_root, &source_root))
+            .map_err(|error| {
+                anyhow::anyhow!("{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry")
+            })?;
         write_json_atomic(&directory.join("source-manifest.json"), &source.entries)?;
         let content_store = greenlit_store::cas::CasStore::open(
             greenlit_store::cas::CasStore::default_path_under(&home),
@@ -125,6 +129,15 @@ impl RunEvidence {
                 ("dirty".to_string(), evidence.source.dirty.to_string()),
             ]),
         )?;
+        if used_prepared_source {
+            evidence.append_trace(
+                "source_template_adopted",
+                BTreeMap::from([(
+                    "snapshot_digest".to_string(),
+                    evidence.source.digest.clone(),
+                )]),
+            )?;
+        }
         Ok(evidence)
     }
 
