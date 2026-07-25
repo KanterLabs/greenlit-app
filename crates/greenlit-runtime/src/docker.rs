@@ -575,12 +575,15 @@ impl ContainerEngine for DockerEngine {
         let exit_code = match wait_stream.next().await {
             Some(Ok(response)) => response.status_code,
             // A container that already exited by the time `wait` was issued
-            // is reported this way by some daemon versions rather than a
-            // normal response; re-inspecting is unnecessary — the log
-            // stream above only ends once the container has stopped, so
-            // treat an empty/erroring wait as "already exited, unknown
-            // code" rather than failing the whole action.
-            Some(Err(_)) | None => 1,
+            // can race the wait stream into reporting an empty/erroring
+            // response instead of the real status -- the stream can miss an
+            // already-exited container. Re-inspecting recovers the code the
+            // daemon actually recorded; only fall back to the placeholder 1
+            // if inspecting also fails or the daemon has no code for us.
+            Some(Err(_)) | None => match self.inspect_container(id).await {
+                Ok(state) => state.exit_code.unwrap_or(1),
+                Err(_) => 1,
+            },
         };
         Ok(ExecOutput { exit_code })
     }
