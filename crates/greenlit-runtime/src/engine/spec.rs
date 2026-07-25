@@ -169,6 +169,21 @@ pub struct ContainerSpec {
     pub network_aliases: Vec<String>,
     /// The container's own hostname.
     pub hostname: Option<String>,
+    /// Whether the container runs privileged.
+    ///
+    /// Reachable by exactly one caller: Greenlit's own Docker-in-Docker
+    /// sidecar, which does not start without it (verified — `CAP_SYS_ADMIN`
+    /// alone makes `docker:dind` exit immediately). A workflow can never set
+    /// it: `--privileged` in job-container or service `options:` is rejected
+    /// outright by `crate::executor::container::validate_options`, and that
+    /// rejection stays.
+    ///
+    /// This is the trade `greenlit-v0-spec.md` already made. It chooses an
+    /// isolated DinD sidecar *precisely so the host socket is never exposed*;
+    /// a privileged sidecar confined to the run's own bridge and torn down
+    /// with the job is a far smaller blast radius than handing a workflow the
+    /// host daemon.
+    pub privileged: bool,
     /// Linux capabilities to add.
     ///
     /// Only ever populated for Greenlit's own netguard sidecar, which needs
