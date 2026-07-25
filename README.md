@@ -6,7 +6,7 @@
 
 *Green locally means green on GitHub.*
 
-[![CI](https://github.com/ShaneKanterman04/greenlit-app/actions/workflows/ci.yml/badge.svg)](https://github.com/ShaneKanterman04/greenlit-app/actions/workflows/ci.yml)
+[![CI](https://github.com/KanterLabs/greenlit-app/actions/workflows/ci.yml/badge.svg)](https://github.com/KanterLabs/greenlit-app/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.96.0](https://img.shields.io/badge/rust-1.96.0-b7410e.svg)](rust-toolchain.toml)
 [![Platform](https://img.shields.io/badge/platform-linux%2Fx86__64-lightgrey.svg)](#requirements)
@@ -29,7 +29,7 @@ Greenlit is built around one claim instead: **if it passes here, it passes on Gi
 Greenlit is pre-release: there's no published crate or binary yet, so you build it.
 
 ```bash
-git clone https://github.com/ShaneKanterman04/greenlit-app.git
+git clone https://github.com/KanterLabs/greenlit-app.git
 cd greenlit-app
 cargo build --release -p greenlit-app     # produces target/release/litci
 install -m755 target/release/litci ~/.local/bin/
