@@ -31,6 +31,73 @@ pub enum EnsureOutcome {
     Shared,
 }
 
+/// Read-only storage health and reclaimability report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreDoctorReport {
+    /// Metadata/filesystem inconsistencies that block destructive GC.
+    pub issues: Vec<String>,
+    /// Distinct unexpired run leases.
+    pub active_leases: u64,
+    /// Immutable objects eligible for collection.
+    pub reclaimable_objects: usize,
+    /// Bytes in eligible immutable objects.
+    pub reclaimable_bytes: u64,
+    /// Retained interrupted partial downloads, reclaimed before objects.
+    pub partial_downloads: usize,
+    /// Bytes in retained interrupted partial downloads.
+    pub partial_bytes: u64,
+}
+
+impl StoreDoctorReport {
+    /// Whether destructive collection is safe.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
+/// Result of one reference-aware collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GarbageCollection {
+    /// Interrupted partial downloads removed first.
+    pub partial_downloads: usize,
+    /// Unreferenced and unleased immutable objects removed.
+    pub objects: usize,
+    /// Total filesystem bytes reclaimed.
+    pub bytes: u64,
+}
+
+/// Heartbeating lease for immutable objects used by one active run.
+pub struct LeaseGuard {
+    lease_id: String,
+    store: CasStore,
+    stop: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    heartbeat: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for LeaseGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeaseGuard")
+            .field("lease_id", &self.lease_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.stop;
+        if let Ok(mut stopped) = lock.lock() {
+            *stopped = true;
+            wake.notify_all();
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _result = heartbeat.join();
+        }
+        let _result = self.store.release_lease(&self.lease_id);
+    }
+}
+
 /// A content-store failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CasError {
@@ -366,6 +433,170 @@ impl CasStore {
         self.catalog.resolve_text_alias(kind, requested)
     }
 
+    /// Acquire or replace a digest lease for an active run.
+    pub fn acquire_lease(
+        &self,
+        lease_id: &str,
+        digests: &[ObjectDigest],
+        ttl: Duration,
+    ) -> Result<(), CasError> {
+        self.catalog
+            .acquire_lease(lease_id, digests, expiry_after(ttl)?)
+    }
+
+    /// Acquire an active-run lease and heartbeat it until the guard drops.
+    pub fn lease_guard(
+        &self,
+        lease_id: impl Into<String>,
+        digests: &[ObjectDigest],
+    ) -> Result<LeaseGuard, CasError> {
+        const TTL: Duration = Duration::from_secs(60);
+        const HEARTBEAT: Duration = Duration::from_secs(10);
+        let lease_id = lease_id.into();
+        self.acquire_lease(&lease_id, digests, TTL)?;
+        let store = self.clone();
+        let heartbeat_id = lease_id.clone();
+        let stop = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread_stop = stop.clone();
+        let heartbeat = std::thread::Builder::new()
+            .name("greenlit-lease".to_string())
+            .spawn(move || {
+                let (lock, wake) = &*thread_stop;
+                let Ok(mut stopped) = lock.lock() else {
+                    return;
+                };
+                loop {
+                    let Ok((next, timeout)) = wake.wait_timeout(stopped, HEARTBEAT) else {
+                        return;
+                    };
+                    stopped = next;
+                    if *stopped {
+                        return;
+                    }
+                    if timeout.timed_out() {
+                        let _result = store.heartbeat_lease(&heartbeat_id, TTL);
+                    }
+                }
+            })
+            .map_err(|source| CasError::Io {
+                path: self.root.display().to_string(),
+                source,
+            })?;
+        Ok(LeaseGuard {
+            lease_id,
+            store: self.clone(),
+            stop,
+            heartbeat: Some(heartbeat),
+        })
+    }
+
+    /// Extend every digest held by one active run lease.
+    pub fn heartbeat_lease(&self, lease_id: &str, ttl: Duration) -> Result<usize, CasError> {
+        self.catalog.heartbeat_lease(lease_id, expiry_after(ttl)?)
+    }
+
+    /// Release every digest held by one run.
+    pub fn release_lease(&self, lease_id: &str) -> Result<(), CasError> {
+        self.catalog.release_lease(lease_id)
+    }
+
+    /// Whether one run currently holds at least one unexpired digest lease.
+    pub fn lease_is_active(&self, lease_id: &str) -> Result<bool, CasError> {
+        self.catalog.lease_is_active(lease_id, unix_seconds()?)
+    }
+
+    /// Keep immutable objects referenced by a retained RunLock or user pin.
+    pub fn pin_objects(
+        &self,
+        owner_kind: &str,
+        owner_id: &str,
+        digests: &[ObjectDigest],
+    ) -> Result<(), CasError> {
+        self.catalog.pin_objects(owner_kind, owner_id, digests)
+    }
+
+    /// Persist a durable run state transition.
+    pub fn record_run_state(
+        &self,
+        run_id: &str,
+        lock_digest: Option<&str>,
+        state: &str,
+    ) -> Result<(), CasError> {
+        self.catalog.record_run_state(run_id, lock_digest, state)
+    }
+
+    /// Inspect catalog consistency, active leases, and reclaimable bytes
+    /// without deleting anything.
+    pub fn doctor(&self) -> Result<StoreDoctorReport, CasError> {
+        let now = unix_seconds()?;
+        let mut issues = self.catalog.integrity_issues()?;
+        for (digest, expected_size) in self.catalog.all_objects()? {
+            let path = self.object_path(&digest);
+            match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() && metadata.len() == expected_size => {}
+                Ok(metadata) => issues.push(format!(
+                    "catalog object {digest} expects {expected_size} bytes but {} has {} bytes",
+                    path.display(),
+                    metadata.len()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => issues.push(format!(
+                    "catalog object {digest} is missing from {}",
+                    path.display()
+                )),
+                Err(error) => issues.push(format!(
+                    "catalog object {digest} could not be inspected at {}: {error}",
+                    path.display()
+                )),
+            }
+        }
+        let reclaimable = self.catalog.reclaimable_objects(now)?;
+        let (partial_downloads, partial_bytes) = directory_files(&self.root.join("tmp"))?;
+        Ok(StoreDoctorReport {
+            issues,
+            active_leases: self.catalog.active_lease_count(now)?,
+            reclaimable_objects: reclaimable.len(),
+            reclaimable_bytes: reclaimable.iter().map(|(_, size)| size).sum(),
+            partial_downloads,
+            partial_bytes,
+        })
+    }
+
+    /// Remove interrupted partials first, then unreferenced immutable objects.
+    ///
+    /// Any metadata inconsistency refuses the entire destructive operation.
+    pub fn collect_garbage(&self) -> Result<GarbageCollection, CasError> {
+        let report = self.doctor()?;
+        if !report.is_consistent() {
+            return Err(CasError::CatalogState {
+                path: self.root.join("catalog.sqlite3").display().to_string(),
+            });
+        }
+        let mut collection = GarbageCollection {
+            partial_downloads: 0,
+            objects: 0,
+            bytes: 0,
+        };
+        let tmp = self.root.join("tmp");
+        for entry in fs::read_dir(&tmp).map_err(|error| io_error(&tmp, error))? {
+            let entry = entry.map_err(|error| io_error(&tmp, error))?;
+            let path = entry.path();
+            let metadata = entry.metadata().map_err(|error| io_error(&path, error))?;
+            if metadata.is_file() {
+                fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
+                collection.partial_downloads = collection.partial_downloads.saturating_add(1);
+                collection.bytes = collection.bytes.saturating_add(metadata.len());
+            }
+        }
+        for (digest, size) in self.catalog.reclaimable_objects(unix_seconds()?)? {
+            let path = self.object_path(&digest);
+            fs::remove_file(&path).map_err(|error| io_error(&path, error))?;
+            self.catalog.remove_object(&digest)?;
+            collection.objects = collection.objects.saturating_add(1);
+            collection.bytes = collection.bytes.saturating_add(size);
+        }
+        Ok(collection)
+    }
+
     /// Ingests a directory as a canonical tree whose file and symlink
     /// payloads are separate verified CAS objects.
     pub fn put_tree(&self, root: &Path) -> Result<ObjectDigest, CasError> {
@@ -512,6 +743,36 @@ impl Drop for InFlightGuard {
 
 fn digest_bytes(bytes: &[u8]) -> ObjectDigest {
     ObjectDigest::of_bytes(bytes)
+}
+
+fn expiry_after(ttl: Duration) -> Result<i64, CasError> {
+    let now = unix_seconds()?;
+    let seconds = i64::try_from(ttl.as_secs()).map_err(|_| CasError::ClockRange)?;
+    now.checked_add(seconds).ok_or(CasError::ClockRange)
+}
+
+fn unix_seconds() -> Result<i64, CasError> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(CasError::Clock)?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| CasError::ClockRange)
+}
+
+fn directory_files(path: &Path) -> Result<(usize, u64), CasError> {
+    let mut count = 0_usize;
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(path).map_err(|error| io_error(path, error))? {
+        let entry = entry.map_err(|error| io_error(path, error))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| io_error(&entry.path(), error))?;
+        if metadata.is_file() {
+            count = count.saturating_add(1);
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok((count, bytes))
 }
 
 fn digest_file(path: &Path) -> Result<(ObjectDigest, u64), CasError> {

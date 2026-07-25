@@ -127,6 +127,8 @@ pub enum Operation {
     ListImages,
     /// Removing an image.
     RemoveImage,
+    /// Listing and removing abandoned Greenlit runtime resources.
+    ReconcileResources,
 }
 
 impl fmt::Display for Operation {
@@ -153,6 +155,7 @@ impl fmt::Display for Operation {
             Operation::RemoveVolume => "remove volume",
             Operation::ListImages => "list images",
             Operation::RemoveImage => "remove image",
+            Operation::ReconcileResources => "reconcile abandoned resources",
         };
         f.write_str(name)
     }

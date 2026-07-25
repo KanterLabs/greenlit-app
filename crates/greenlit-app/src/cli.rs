@@ -35,12 +35,21 @@ pub(crate) enum Command {
     Stats,
     /// Inspect the immutable lock and result evidence for a local run.
     Inspect(InspectArgs),
+    /// Diagnose local daemon, run, and storage state without deleting data.
+    Doctor(DoctorArgs),
     /// Remove Greenlit's derived caches and built images. Credentials and run
     /// history are never touched.
     Clean(CleanArgs),
     /// Internal per-user preparation daemon.
     #[command(name = "daemon", hide = true)]
     Daemon(DaemonArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct DoctorArgs {
+    /// Emit the report as machine-readable JSON.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, clap::Args)]

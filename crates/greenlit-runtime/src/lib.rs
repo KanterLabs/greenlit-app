@@ -42,7 +42,7 @@ pub mod writeback;
 
 pub use cancel::Cancellation;
 pub use detect::{Endpoint, EngineFix, EngineProber, EngineState, SystemProber, detect};
-pub use docker::DockerEngine;
+pub use docker::{DockerEngine, ReconcileReport};
 pub use engine::{
     BindMount, BuildSpec, CommitSpec, ContainerEngine, ContainerSpec, ContainerState, ExecOutput,
     ExecOutputSink, ExecSpec, HealthCheck, HealthState, ImageIdentity, ImageSummary, NetworkInfo,

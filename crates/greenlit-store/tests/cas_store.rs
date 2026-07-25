@@ -145,6 +145,56 @@ fn interrupted_partial_content_is_resumed_at_its_verified_offset() {
 }
 
 #[test]
+fn leases_block_gc_and_inconsistent_metadata_blocks_destruction() {
+    let temp = TempDir::new().expect("temp root should be created");
+    let store = CasStore::open(temp.path()).expect("store should open");
+    let leased = digest(b"leased");
+    let reclaimable = digest(b"reclaimable");
+    store
+        .put_verified(&leased, b"leased")
+        .expect("leased object should publish");
+    store
+        .put_verified(&reclaimable, b"reclaimable")
+        .expect("reclaimable object should publish");
+    store
+        .acquire_lease(
+            "active-run",
+            std::slice::from_ref(&leased),
+            std::time::Duration::from_secs(60),
+        )
+        .expect("active lease should persist");
+    fs::write(temp.path().join("tmp/interrupted.partial"), b"partial")
+        .expect("partial download should be retained");
+
+    let preview = store.doctor().expect("store should be consistent");
+    assert!(preview.is_consistent());
+    assert_eq!(preview.active_leases, 1);
+    assert_eq!(preview.reclaimable_objects, 1);
+    assert_eq!(preview.partial_downloads, 1);
+    let collected = store
+        .collect_garbage()
+        .expect("safe collection should succeed");
+    assert_eq!(collected.partial_downloads, 1);
+    assert_eq!(collected.objects, 1);
+    assert_eq!(
+        store.read_verified(&leased).expect("leased read"),
+        Some(b"leased".to_vec())
+    );
+
+    store
+        .release_lease("active-run")
+        .expect("lease should release");
+    fs::remove_file(object_path(temp.path(), &leased))
+        .expect("test should create inconsistent metadata");
+    let inconsistent = store.doctor().expect("doctor should report inconsistency");
+    assert!(!inconsistent.is_consistent());
+    assert!(matches!(
+        store.collect_garbage(),
+        Err(CasError::CatalogState { .. })
+    ));
+}
+
+#[test]
 fn interrupted_http_download_resumes_by_range_and_offline_requires_the_exact_object() {
     let temp = TempDir::new().expect("temp root should be created");
     let store = CasStore::open(temp.path()).expect("store should open");

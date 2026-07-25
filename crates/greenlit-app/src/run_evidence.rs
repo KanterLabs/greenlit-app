@@ -21,6 +21,8 @@ pub(crate) struct RunEvidence {
     next_trace_sequence: Cell<u64>,
     terminal_result_written: Cell<bool>,
     support: RefCell<SupportReport>,
+    content_store: greenlit_store::cas::CasStore,
+    lease: RefCell<Option<greenlit_store::cas::LeaseGuard>>,
 }
 
 pub(crate) struct LockInputs<'a> {
@@ -94,7 +96,15 @@ impl RunEvidence {
             anyhow::anyhow!("{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry")
         })?;
         write_json_atomic(&directory.join("source-manifest.json"), &source.entries)?;
-        ingest_source(&home, &source)?;
+        let content_store = greenlit_store::cas::CasStore::open(
+            greenlit_store::cas::CasStore::default_path_under(&home),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
+            )
+        })?;
+        ingest_source(&content_store, &source)?;
         let evidence = Self {
             run_id,
             directory,
@@ -102,6 +112,8 @@ impl RunEvidence {
             next_trace_sequence: Cell::new(1),
             terminal_result_written: Cell::new(false),
             support: RefCell::new(local_support_report()),
+            content_store,
+            lease: RefCell::new(None),
         };
         evidence.append_trace(
             "source_locked",
@@ -178,19 +190,30 @@ impl RunEvidence {
         lock.containers = containers;
         lock.toolchains = toolchains;
         lock.compatibility = self.support.borrow().clone();
+        let lock_digest = lock.digest().map_err(|error| {
+            anyhow::anyhow!(
+                "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
+            )
+        })?;
         write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
         self.write_job_locks(plan, &lock)?;
+        let leased = self.source_digests()?;
+        self.content_store
+            .pin_objects("run-lock", &lock_digest, &leased)
+            .and_then(|()| {
+                self.content_store
+                    .record_run_state(&self.run_id, Some(&lock_digest), "resolved")
+            })
+            .map_err(lifecycle_error)?;
+        let lease = self
+            .content_store
+            .lease_guard(self.run_id.clone(), &leased)
+            .map_err(lifecycle_error)?;
+        self.lease.replace(Some(lease));
         self.append_trace(
             "run_lock_finalized",
             BTreeMap::from([
-                (
-                    "digest".to_string(),
-                    lock.digest().map_err(|error| {
-                        anyhow::anyhow!(
-                            "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
-                        )
-                    })?,
-                ),
+                ("digest".to_string(), lock_digest),
                 ("offline".to_string(), lock.offline.to_string()),
             ]),
         )?;
@@ -221,8 +244,25 @@ impl RunEvidence {
                 ("assurance".to_string(), format!("{:?}", result.assurance)),
             ]),
         )?;
+        self.content_store
+            .record_run_state(&self.run_id, None, "completed")
+            .map_err(lifecycle_error)?;
         self.terminal_result_written.set(true);
+        self.lease.replace(None);
         Ok(result)
+    }
+
+    fn source_digests(&self) -> anyhow::Result<Vec<greenlit_store::cas::ObjectDigest>> {
+        std::iter::once(&self.source.digest)
+            .chain(self.source.entries.iter().map(|entry| &entry.digest))
+            .map(|digest| {
+                greenlit_store::cas::ObjectDigest::parse(digest).map_err(|error| {
+                    anyhow::anyhow!(
+                        "source manifest contains invalid identity {digest}: {error}\n  fix: preserve the run directory and file a Greenlit defect"
+                    )
+                })
+            })
+            .collect()
     }
 
     fn append_trace(
@@ -319,14 +359,11 @@ impl Drop for RunEvidence {
     }
 }
 
-fn ingest_source(home: &Path, source: &SourceSnapshot) -> anyhow::Result<()> {
-    use greenlit_store::cas::{CasStore, ObjectDigest};
-
-    let store = CasStore::open(CasStore::default_path_under(home)).map_err(|error| {
-        anyhow::anyhow!(
-            "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
-        )
-    })?;
+fn ingest_source(
+    store: &greenlit_store::cas::CasStore,
+    source: &SourceSnapshot,
+) -> anyhow::Result<()> {
+    use greenlit_store::cas::ObjectDigest;
     for entry in &source.entries {
         let digest = ObjectDigest::parse(&entry.digest).map_err(|error| {
             anyhow::anyhow!(
@@ -388,6 +425,12 @@ fn matrix_leg_selected(
 fn content_error(path: &str, error: greenlit_store::cas::CasError) -> anyhow::Error {
     anyhow::anyhow!(
         "could not publish verified source content {path}: {error}\n  fix: run `litci doctor`; corrupted content will be quarantined automatically"
+    )
+}
+
+fn lifecycle_error(error: greenlit_store::cas::CasError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "could not persist active-run storage state: {error}\n  fix: run `litci doctor`, repair the reported metadata issue, then retry"
     )
 }
 

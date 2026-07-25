@@ -121,10 +121,11 @@ async fn serve_async() -> anyhow::Result<()> {
     let socket = socket_path()?;
     let parent = socket
         .parent()
+        .map(Path::to_path_buf)
         .ok_or_else(|| anyhow::anyhow!("daemon socket has no parent"))?;
-    fs::create_dir_all(parent)
+    fs::create_dir_all(&parent)
         .map_err(|error| anyhow::anyhow!("could not create daemon directory: {error}"))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
         .map_err(|error| anyhow::anyhow!("could not secure daemon directory: {error}"))?;
     if socket.exists() {
         if request(&Request::Ping {
@@ -143,6 +144,17 @@ async fn serve_async() -> anyhow::Result<()> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .map_err(|error| anyhow::anyhow!("could not secure daemon socket: {error}"))?;
     let _socket_guard = SocketGuard(socket);
+    crate::doctor_cmd::reconcile_interrupted_runs(
+        parent
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("daemon state directory has no Greenlit root"))?,
+    )?;
+    reconcile_runtime_resources(
+        parent
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("daemon state directory has no Greenlit root"))?,
+    )
+    .await;
     let mut watched = BTreeMap::new();
     loop {
         let accepted = tokio::time::timeout(IDLE_TIMEOUT, listener.accept()).await;
@@ -158,6 +170,33 @@ async fn serve_async() -> anyhow::Result<()> {
             return Ok(());
         }
     }
+}
+
+async fn reconcile_runtime_resources(litci_root: &Path) {
+    use greenlit_runtime::{EngineState, SystemProber};
+
+    let Some(home) = litci_root.parent() else {
+        return;
+    };
+    let Ok(store) = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(home),
+    ) else {
+        return;
+    };
+    let Ok(report) = store.doctor() else {
+        return;
+    };
+    if !report.is_consistent() || report.active_leases > 0 {
+        return;
+    }
+    let EngineState::Available { endpoint } = greenlit_runtime::detect(&SystemProber::new()).await
+    else {
+        return;
+    };
+    let Ok(engine) = greenlit_runtime::DockerEngine::connect(&endpoint) else {
+        return;
+    };
+    let _result = engine.reconcile_managed_resources().await;
 }
 
 async fn handle(

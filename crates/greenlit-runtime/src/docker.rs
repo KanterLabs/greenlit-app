@@ -20,7 +20,8 @@ use bollard::models::{
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CommitContainerOptionsBuilder, CreateContainerOptionsBuilder,
     CreateImageOptionsBuilder, DownloadFromContainerOptionsBuilder, InspectContainerOptions,
-    ListImagesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
+    ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
+    ListVolumesOptionsBuilder, LogsOptionsBuilder, RemoveContainerOptionsBuilder,
     RemoveImageOptions, RemoveVolumeOptions, StopContainerOptionsBuilder,
     WaitContainerOptionsBuilder,
 };
@@ -48,6 +49,17 @@ const STOP_GRACE_SECS: i32 = 10;
 #[derive(Clone)]
 pub struct DockerEngine {
     docker: Docker,
+}
+
+/// Abandoned runtime resources reclaimed during startup reconciliation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    /// Containers removed before their networks and volumes.
+    pub containers: usize,
+    /// Job-private networks removed after containers.
+    pub networks: usize,
+    /// Job-private volumes removed last.
+    pub volumes: usize,
 }
 
 impl DockerEngine {
@@ -83,6 +95,60 @@ impl DockerEngine {
             }
         };
         Ok(DockerEngine { docker })
+    }
+
+    /// Remove every abandoned Greenlit runtime resource.
+    ///
+    /// Callers must first prove that no active run lease exists. Containers
+    /// are removed before networks and volumes so dependency ordering cannot
+    /// strand a lower-level resource.
+    pub async fn reconcile_managed_resources(&self) -> Result<ReconcileReport, RuntimeError> {
+        let container_options = ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&HashMap::from([("label", vec!["greenlit.managed=1"])]))
+            .build();
+        let containers = self
+            .docker
+            .list_containers(Some(container_options))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
+        let mut report = ReconcileReport::default();
+        for container in containers {
+            if let Some(id) = container.id {
+                self.remove_container(&id).await?;
+                report.containers = report.containers.saturating_add(1);
+            }
+        }
+
+        let networks = self
+            .docker
+            .list_networks(Some(ListNetworksOptionsBuilder::new().build()))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?;
+        for network in networks {
+            if let Some(name) = network
+                .name
+                .filter(|name| name.starts_with("greenlit-run-"))
+            {
+                self.remove_network(&name).await?;
+                report.networks = report.networks.saturating_add(1);
+            }
+        }
+
+        let volumes = self
+            .docker
+            .list_volumes(Some(ListVolumesOptionsBuilder::new().build()))
+            .await
+            .map_err(|error| RuntimeError::api(Operation::ReconcileResources, error))?
+            .volumes
+            .unwrap_or_default();
+        for volume in volumes {
+            if volume.name.starts_with("greenlit-run-") {
+                self.remove_volume(&volume.name).await?;
+                report.volumes = report.volumes.saturating_add(1);
+            }
+        }
+        Ok(report)
     }
 }
 

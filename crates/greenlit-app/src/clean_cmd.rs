@@ -69,6 +69,14 @@ struct Plan {
     directories: Vec<(PathBuf, &'static str, u64)>,
     /// Greenlit-built images, or why they could not be enumerated.
     images: Result<Vec<(String, u64)>, String>,
+    /// Reference-aware immutable store preview.
+    store: Result<
+        (
+            greenlit_store::cas::CasStore,
+            greenlit_store::cas::StoreDoctorReport,
+        ),
+        String,
+    >,
 }
 
 impl Plan {
@@ -79,7 +87,11 @@ impl Plan {
     /// still surfaced, so a user who expected images gone learns why they are
     /// not.
     fn is_empty(&self) -> bool {
+        let store_empty = self.store.as_ref().map_or(true, |(_, report)| {
+            report.reclaimable_objects == 0 && report.partial_downloads == 0
+        });
         self.directories.is_empty()
+            && store_empty
             && self
                 .images
                 .as_ref()
@@ -93,7 +105,16 @@ impl Plan {
             .as_ref()
             .map(|images| images.iter().map(|(_, size)| size).sum())
             .unwrap_or_default();
-        directories + images
+        let store = self
+            .store
+            .as_ref()
+            .map(|(_, report)| {
+                report
+                    .reclaimable_bytes
+                    .saturating_add(report.partial_bytes)
+            })
+            .unwrap_or_default();
+        directories.saturating_add(images).saturating_add(store)
     }
 }
 
@@ -110,6 +131,11 @@ pub(crate) fn run(args: CleanArgs) -> anyhow::Result<ExitCode> {
         })?;
 
     let plan = build_plan(&root, &runtime);
+    if let Err(reason) = &plan.store {
+        anyhow::bail!(
+            "refusing to clean because storage metadata is inconsistent: {reason}\n  fix: preserve ~/.litci and run `litci doctor`"
+        );
+    }
 
     if plan.is_empty() {
         println!("Nothing to clean — no Greenlit caches or images are present.");
@@ -145,6 +171,18 @@ fn build_plan(root: &Path, runtime: &tokio::runtime::Runtime) -> Plan {
     Plan {
         directories,
         images: runtime.block_on(list_images()),
+        store: greenlit_store::cas::CasStore::open(root.join("store"))
+            .and_then(|store| store.doctor().map(|report| (store, report)))
+            .and_then(|(store, report)| {
+                if report.is_consistent() {
+                    Ok((store, report))
+                } else {
+                    Err(greenlit_store::cas::CasError::CatalogState {
+                        path: root.join("store/catalog.sqlite3").display().to_string(),
+                    })
+                }
+            })
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -182,6 +220,28 @@ fn report(plan: &Plan) {
         println!("  {:>9}  {}", human_bytes(*size), path.display());
         println!("             {cost}");
     }
+    if let Ok((_, store)) = &plan.store {
+        if store.partial_downloads > 0 {
+            println!(
+                "  {:>9}  {} interrupted partial download(s)",
+                human_bytes(store.partial_bytes),
+                store.partial_downloads
+            );
+        }
+        if store.reclaimable_objects > 0 {
+            println!(
+                "  {:>9}  {} unreferenced immutable object(s)",
+                human_bytes(store.reclaimable_bytes),
+                store.reclaimable_objects
+            );
+        }
+        if store.active_leases > 0 {
+            println!(
+                "             {} active lease(s) remain protected",
+                store.active_leases
+            );
+        }
+    }
     match &plan.images {
         Ok(images) => {
             for (reference, size) in images {
@@ -203,10 +263,19 @@ fn report(plan: &Plan) {
 /// A removal that fails is reported and skipped: partial reclamation is more
 /// useful than aborting, and nothing here is load-bearing.
 fn apply(plan: &Plan, runtime: &tokio::runtime::Runtime) -> u64 {
-    let mut reclaimed = 0;
+    let mut reclaimed = 0_u64;
+    if let Ok((store, _)) = &plan.store {
+        match store.collect_garbage() {
+            Ok(collection) => reclaimed = reclaimed.saturating_add(collection.bytes),
+            Err(error) => {
+                eprintln!("could not collect immutable content safely: {error}");
+                return 0;
+            }
+        }
+    }
     for (path, _, size) in &plan.directories {
         match std::fs::remove_dir_all(path) {
-            Ok(()) => reclaimed += size,
+            Ok(()) => reclaimed = reclaimed.saturating_add(*size),
             Err(error) => {
                 eprintln!("could not remove {}: {error}", path.display());
             }
@@ -216,7 +285,7 @@ fn apply(plan: &Plan, runtime: &tokio::runtime::Runtime) -> u64 {
     if let Ok(images) = &plan.images
         && !images.is_empty()
     {
-        reclaimed += runtime.block_on(remove_images(images));
+        reclaimed = reclaimed.saturating_add(runtime.block_on(remove_images(images)));
     }
     reclaimed
 }

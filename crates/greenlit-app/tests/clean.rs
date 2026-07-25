@@ -164,3 +164,32 @@ fn an_unreachable_daemon_still_reclaims_the_caches() {
         "the on-disk half is reclaimed regardless of the daemon"
     );
 }
+
+#[test]
+fn clean_collects_unreferenced_content_but_preserves_active_leases() {
+    let sandbox = Sandbox::new();
+    let root = greenlit_store::cas::CasStore::default_path_under(sandbox.home());
+    let store = greenlit_store::cas::CasStore::open(root).expect("store should open");
+    let leased = greenlit_store::cas::ObjectDigest::of_bytes(b"active");
+    let unused = greenlit_store::cas::ObjectDigest::of_bytes(b"unused");
+    store
+        .put_verified(&leased, b"active")
+        .expect("leased object should publish");
+    store
+        .put_verified(&unused, b"unused")
+        .expect("unused object should publish");
+    let _lease = store
+        .lease_guard("active-run", std::slice::from_ref(&leased))
+        .expect("active run should acquire a lease");
+
+    let output = sandbox.run_with_env(&["clean", "--yes"], &[NO_DAEMON]);
+    assert!(output.status.success(), "{}", support::stderr_text(&output));
+    assert_eq!(
+        store.read_verified(&leased).expect("leased object read"),
+        Some(b"active".to_vec())
+    );
+    assert_eq!(
+        store.read_verified(&unused).expect("unused object read"),
+        None
+    );
+}

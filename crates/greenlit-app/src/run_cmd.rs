@@ -347,7 +347,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         // (`PHASE-3-actions.md` Secrets: "Every resolved secret value
         // registers with the Phase 2 masker before any step runs").
         initial_masks: all_secrets.iter().map(|(_, value)| value.clone()).collect(),
-        volume_namespace: run_volume_namespace(),
+        volume_namespace: evidence.run_id.clone(),
         locked_images: Some(run_lock.containers.clone()),
         write_back: args.write_back,
         readiness: greenlit_runtime::ReadinessConfig::default(),
@@ -560,22 +560,6 @@ async fn write_back_one(
         }
     }
     Ok(())
-}
-
-/// A token unique to this process invocation, used to namespace any job
-/// container named-volume source so it can never resolve to a pre-existing
-/// daemon-global volume (`RunConfig::volume_namespace`,
-/// `greenlit_runtime::executor::container::validate_container`). Wall-clock
-/// nanoseconds plus the process id is unique enough for this purpose — it
-/// need not be cryptographically random, only distinct from any name an
-/// attacker-controlled workflow could predict and target in advance from a
-/// *previous* run.
-fn run_volume_namespace() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{nanos}", std::process::id())
 }
 
 /// Detect and connect to the container engine, mapping every failure state to a

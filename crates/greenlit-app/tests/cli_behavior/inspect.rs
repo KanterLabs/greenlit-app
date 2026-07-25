@@ -29,3 +29,27 @@ fn inspect_rejects_path_traversal_as_a_run_identity() {
     assert!(!output.status.success());
     assert!(stderr_text(&output).contains("invalid run identity"));
 }
+
+#[test]
+fn doctor_reports_reclaimable_bytes_without_deleting_content() {
+    let sandbox = Sandbox::new();
+    let root = greenlit_store::cas::CasStore::default_path_under(sandbox.home());
+    let store = greenlit_store::cas::CasStore::open(&root).expect("store should open");
+    let digest = greenlit_store::cas::ObjectDigest::of_bytes(b"reclaimable");
+    store
+        .put_verified(&digest, b"reclaimable")
+        .expect("object should publish");
+
+    let output = sandbox.run(&["doctor", "--json"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let document: serde_json::Value =
+        serde_json::from_str(&stdout_text(&output)).expect("doctor output should be JSON");
+    assert_eq!(document["consistent"], true);
+    assert_eq!(document["reclaimable_objects"], 1);
+    assert_eq!(document["reclaimable_bytes"], 11);
+    assert_eq!(
+        store.read_verified(&digest).expect("object should remain"),
+        Some(b"reclaimable".to_vec()),
+        "doctor is read-only"
+    );
+}
