@@ -92,6 +92,64 @@ pub(crate) struct CommandFileEffects {
     pub summary_within_limit: bool,
 }
 
+/// The filename [`write_event_file`] writes under a job's `CMDFILES_BASE`
+/// (`crate::executor::job::CMDFILES_BASE`).
+const EVENT_FILE_NAME: &str = "event.json";
+
+/// The in-container path [`write_event_file`] writes the run's event payload
+/// to, given a job's `CMDFILES_BASE`-rooted directory — the value threaded
+/// into `GITHUB_EVENT_PATH` and the `github.event_path` context property
+/// (`crate::executor::context::job_github_context`), so both stay
+/// byte-for-byte the same string as what this module actually writes.
+pub(crate) fn event_file_path(base: &str) -> String {
+    format!("{base}/{EVENT_FILE_NAME}")
+}
+
+/// Writes `event_json` (already-serialized, real JSON — see
+/// `crate::executor::event_json`) to [`event_file_path`], once per job after
+/// its container is ready, using the same quoted-heredoc technique
+/// [`prepare`] uses for a step's script (no shell expansion of the JSON
+/// body, and no risk of a delimiter collision with event content).
+///
+/// `base` is a job's `CMDFILES_BASE`-rooted directory. For a job that
+/// provisions a Docker-sibling shared volume
+/// (`crate::executor::job::DOCKER_SIBLING_VOLUMES`), that directory is the
+/// shared volume itself, so a Docker action's sibling container sees the
+/// identical file at the identical path — deliberate, not a leak: this file
+/// is read-only, non-secret content (the same widening rationale
+/// [`open_to_sibling`]'s doc comment gives does not even need to apply here,
+/// since nothing about this file is credential-bearing).
+///
+/// # Errors
+///
+/// Returns [`CommandFileError::Prepare`] if the writing exec fails or exits
+/// non-zero.
+pub(crate) async fn write_event_file(
+    engine: &dyn ContainerEngine,
+    container: &str,
+    base: &str,
+    event_json: &str,
+) -> Result<(), CommandFileError> {
+    let delimiter = heredoc_delimiter(event_json);
+    let program = format!(
+        "mkdir -p {base} && cat > {path} <<'{delimiter}'\n{event_json}\n{delimiter}\n",
+        path = event_file_path(base),
+    );
+    let spec = ExecSpec {
+        cmd: vec!["sh".to_string(), "-c".to_string(), program],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let mut sink = CaptureSink::default();
+    let output = engine.exec(container, &spec, &mut sink).await?;
+    if output.exit_code != 0 {
+        return Err(CommandFileError::Prepare {
+            exit_code: output.exit_code,
+        });
+    }
+    Ok(())
+}
+
 /// Create the step directory, truncate the four command files fresh, and write
 /// the step `script`.
 ///
@@ -290,5 +348,13 @@ mod tests {
         let script = "line\nGREENLIT_SCRIPT_EOF_0\nmore";
         let delimiter = heredoc_delimiter(script);
         assert!(!script.lines().any(|line| line == delimiter));
+    }
+
+    #[test]
+    fn event_file_path_is_rooted_under_the_given_base() {
+        assert_eq!(
+            event_file_path("/greenlit/cmdfiles"),
+            "/greenlit/cmdfiles/event.json"
+        );
     }
 }

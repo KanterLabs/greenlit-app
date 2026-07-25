@@ -6,6 +6,7 @@ mod boot;
 mod teardown;
 
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -24,11 +25,14 @@ use crate::executor::actions::docker_action;
 use crate::executor::actions::node_runtime;
 use crate::executor::actions::nodejs::NodeRuntimeMounts;
 use crate::executor::actions::resolve::{JobActionPlan, resolve_job_actions};
+use crate::executor::cmdfiles;
 use crate::executor::container::{ResolvedContainer, ResolvedCredentials, validate_container};
 use crate::executor::context::{
-    ContextRoots, LiveState, build_context, resolve_env_layer, runner_context,
+    ContextRoots, LiveState, build_context, copy_event_env_vars, job_github_context,
+    resolve_env_layer, runner_context,
 };
 use crate::executor::dind;
+use crate::executor::event_json;
 use crate::executor::instance::JobInstance;
 use crate::executor::netguard;
 use crate::executor::provision;
@@ -36,7 +40,8 @@ use crate::executor::readiness;
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
 use crate::executor::step::{
-    JobRuntime, StepLoopState, execute_step, run_post_steps, run_pre_steps,
+    JobRuntime, StepLoopState, compute_step_action_ids, execute_step, mask_command_file_error,
+    run_post_steps, run_pre_steps,
 };
 use crate::executor::{ExecError, Shared, stage_span};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -112,7 +117,63 @@ pub(crate) async fn run_instance(
     runner_env.actions_service = job_network.actions_service().cloned();
 
     let mut base_env = runner_env.clone().into_map();
+    // `GITHUB_WORKFLOW_REF`/`GITHUB_WORKFLOW_SHA`/`GITHUB_HEAD_REF`/
+    // `GITHUB_BASE_REF`: copied straight off the run's already-assembled
+    // `github` object rather than re-derived (`context::copy_event_env_vars`
+    // doc comment) -- same value for every job in the run, so this can run
+    // once here alongside the rest of `base_env`'s construction.
+    copy_event_env_vars(&mut base_env, &shared.roots.github);
+    // `GITHUB_EVENT_PATH`: the in-container path `write_event_file` below
+    // writes the synthetic event payload to, once the container exists.
+    // Every job's `CMDFILES_BASE` is the same in-container constant string
+    // (`crate::executor::cmdfiles::event_file_path`'s doc comment), so this
+    // value is already correct even though the file itself isn't written
+    // until later in this function -- `base_env` is the seam every step kind
+    // (`run:`, every `uses:` variant, composite nesting) ultimately layers
+    // its own env on top of, matching how `GITHUB_WORKFLOW`/`GITHUB_SHA`/...
+    // already reach every step from here.
+    let event_path = cmdfiles::event_file_path(CMDFILES_BASE);
+    base_env.insert("GITHUB_EVENT_PATH".to_string(), event_path.clone());
     let runner_ctx = runner_context(&runner_env);
+
+    // The run-wide `github` context roots patched with this job instance's
+    // own runtime-only properties (`context::job_github_context` doc
+    // comment: `job`/`event_path`/`workspace`/`run_id`/`run_number`/
+    // `run_attempt`, the classify.rs-deferred subset this crate can now
+    // supply). `shared` is shadowed with a job-scoped copy for the rest of
+    // this function so every downstream `shared.roots`/`env_ctx` call below
+    // (activation, `env:`/`defaults:` resolution, service/container
+    // resolution, the job body, job outputs) sees the patched object without
+    // threading a second parameter through each of them.
+    let job_roots = ContextRoots {
+        github: job_github_context(&shared.roots.github, &runner_env, &event_path),
+        vars: shared.roots.vars.clone(),
+        inputs: shared.roots.inputs.clone(),
+        secrets: shared.roots.secrets.clone(),
+        fs: Arc::clone(&shared.roots.fs),
+    };
+    let job_shared = Shared {
+        engine: shared.engine,
+        config: shared.config,
+        roots: &job_roots,
+        workflow_env: shared.workflow_env,
+    };
+    let shared = &job_shared;
+
+    // The run's `github.event` payload, serialized to real JSON once up
+    // front (`crate::executor::event_json`) -- the same for every job in
+    // the run, so this can be computed here and written after the container
+    // is ready, below. `to_json`'s tree is built entirely from
+    // `Value::{Null,Bool,Number,String,Array,Object}`, which
+    // `serde_json::to_string` cannot fail to serialize (no user `Serialize`
+    // impl in that tree can error), so the fallback here is unreachable in
+    // practice rather than a silently swallowed real failure.
+    let event_payload = match &shared.roots.github {
+        Value::Object(object) => object.get("event").cloned().unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    let event_json_text = serde_json::to_string_pretty(&event_json::to_json(&event_payload))
+        .unwrap_or_else(|_| "null".to_string());
 
     let needs_run_status = needs_status(needs);
     let activation_ctx = env_ctx(
@@ -376,30 +437,40 @@ pub(crate) async fn run_instance(
         .then_some(DOCKER_SIBLING_VOLUMES);
     let outcome = match ready {
         Ok(()) => match seed_container_path(shared.engine, &container, &mut base_env).await {
-            Ok(()) => {
-                run_job_body(
-                    shared,
-                    masker,
-                    instance,
-                    RunnerLayers {
-                        runner_ctx: &runner_ctx,
-                        base_env: &base_env,
-                        workflow_env: &job_env.workflow_env,
-                        job_env: &job_env.job_env,
-                        default_shell: job_env.default_shell.as_deref(),
-                        default_wd: job_env.default_wd.as_deref(),
-                        in_container,
-                        bash_available,
-                        action_plan: &action_plan,
-                        node_mounts: &node_mounts,
-                        docker_volumes,
-                    },
-                    (&container, &runner_env),
-                    needs,
-                    out,
-                )
-                .await
-            }
+            Ok(()) => match cmdfiles::write_event_file(
+                shared.engine,
+                &container,
+                CMDFILES_BASE,
+                &event_json_text,
+            )
+            .await
+            {
+                Ok(()) => {
+                    run_job_body(
+                        shared,
+                        masker,
+                        instance,
+                        RunnerLayers {
+                            runner_ctx: &runner_ctx,
+                            base_env: &base_env,
+                            workflow_env: &job_env.workflow_env,
+                            job_env: &job_env.job_env,
+                            default_shell: job_env.default_shell.as_deref(),
+                            default_wd: job_env.default_wd.as_deref(),
+                            in_container,
+                            bash_available,
+                            action_plan: &action_plan,
+                            node_mounts: &node_mounts,
+                            docker_volumes,
+                        },
+                        (&container, &runner_env),
+                        needs,
+                        out,
+                    )
+                    .await
+                }
+                Err(error) => Err(mask_command_file_error(masker, &error)),
+            },
             Err(error) => Err(error),
         },
         Err(error) => Err(error),
@@ -446,6 +517,11 @@ async fn run_job_body(
     needs: &[NeedRecord],
     out: &mut (dyn Write + Send),
 ) -> Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError> {
+    // `GITHUB_ACTION` per step: a pure function of the authored plan (never
+    // runtime data), so every step's value is settled once, up front, rather
+    // than re-derived per phase (`crate::executor::step::compute_step_action_ids`
+    // doc comment).
+    let step_action_ids = compute_step_action_ids(instance.steps);
     let job_rt = JobRuntime {
         engine: shared.engine,
         container,
@@ -467,6 +543,7 @@ async fn run_job_body(
         node_mounts: layers.node_mounts,
         volume_namespace: &shared.config.volume_namespace,
         docker_volumes: layers.docker_volumes,
+        step_action_ids: &step_action_ids,
     };
 
     let mut state = StepLoopState::new();

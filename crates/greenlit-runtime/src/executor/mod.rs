@@ -22,6 +22,7 @@ mod cmdfiles;
 pub mod container;
 mod context;
 mod dind;
+mod event_json;
 mod health;
 mod instance;
 mod job;
@@ -33,6 +34,7 @@ mod readiness;
 mod report;
 mod services;
 mod step;
+mod step_ids;
 
 use std::collections::HashMap;
 use std::io::Write;

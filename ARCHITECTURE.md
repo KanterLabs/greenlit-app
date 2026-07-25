@@ -521,7 +521,25 @@ policy actively contains. They are not deferred Greenlit behavior.
   action relying on a non-literal, expression-valued `default:` would
   observe differently under this implementation (the raw text would be
   passed through, rather than evaluated). Recorded here as a known,
-  narrow fidelity gap rather than left silent.
+  narrow fidelity gap rather than left silent. **Closed by the
+  action-fidelity wave**, for both action kinds that declare inputs at all:
+  `nodejs::input_env` already evaluated a JS action's default (Phase 3);
+  `composite::composite_inputs_value` now does the same for a composite's
+  own declared inputs, evaluating each `default:` as a `${{ }}` template
+  against the *enclosing* scope that resolved the invoking step's `with:` —
+  matching `ActionManifestManager.EvaluateDefaultInput`, which runs against
+  that same invoking step's `IExecutionContext`. A nested composite's
+  defaults get that enclosing scope with full fidelity (the parent
+  composite's own already-built context, threaded straight through); a
+  *top-level* composite step's defaults fall back to a reconstructed
+  context assembled from what this crate's executor actually keeps on hand
+  for it (`composite::fallback_caller_context`) — real `github`/`vars`/
+  `secrets`/`env`/`needs`/`status`, but an empty `steps` context, since
+  nothing threads the job's `StepRecord` history into composite execution
+  today. A top-level composite input default referencing `steps.*` is
+  therefore still a narrower, separately-recorded gap rather than a revived
+  version of this one. Pinned by
+  `crates/greenlit-runtime/tests/actions_composite.rs`.
 
 - **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
   it out of the ordinary secrets chain.** GitHub secret and configuration

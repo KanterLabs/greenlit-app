@@ -47,6 +47,26 @@ jobs:
       - name: cleanup always runs
         if: always()
         run: echo "cleanup ran"
+      - name: event payload is written to GITHUB_EVENT_PATH
+        run: |
+          test -n "$GITHUB_EVENT_PATH"
+          test -f "$GITHUB_EVENT_PATH"
+          grep -q '"full_name"' "$GITHUB_EVENT_PATH"
+          grep -q 'greenlit/shell-ci' "$GITHUB_EVENT_PATH"
+      - name: github context roots resolve at runtime
+        run: |
+          test -n "${{ github.event_path }}"
+          test -n "${{ github.workspace }}"
+          test -n "${{ github.job }}"
+          echo "ROOTS_OK:[${{ github.event_path }}|${{ github.workspace }}|${{ github.job }}]"
+
+  action-ids:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GITHUB_ACTION_IS:[$GITHUB_ACTION]"
+      - run: echo "GITHUB_ACTION_IS:[$GITHUB_ACTION]"
+      - id: explicit
+        run: echo "GITHUB_ACTION_IS:[$GITHUB_ACTION]"
 
   container-job:
     runs-on: ubuntu-latest
