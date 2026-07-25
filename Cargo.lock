@@ -741,6 +741,7 @@ dependencies = [
  "greenlit-workflow",
  "indexmap",
  "linux-keyutils",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

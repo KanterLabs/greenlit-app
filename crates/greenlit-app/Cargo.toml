@@ -90,6 +90,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # clears them, same as any session credential cache) and the documented
 # 0600-file fallback this crate's absence/failure falls back to.
 linux-keyutils = "0.2.5"
+# Authenticated encryption for repository-local persisted secrets. The random
+# 256-bit key lives only under the user's 0700 `~/.litci`; repositories contain
+# AES-GCM ciphertext and a nonce, never the key or plaintext.
+ring = "0.17.14"
 
 [dev-dependencies]
 # Integration tests (`crates/greenlit-app/tests/`) spawn the compiled
