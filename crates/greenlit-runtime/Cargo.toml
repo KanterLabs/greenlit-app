@@ -38,6 +38,10 @@ bollard = "0.21.0"
 # network's gateway and hands the job the `ACTIONS_*` addresses
 # (`PHASE-4-environment.md` "Cache and artifacts").
 greenlit-store = { path = "../greenlit-store", version = "0.1.0" }
+# Reads the GitHub `runner-images` toolset manifest, which is JSON. Same
+# pinned version `greenlit-actions` and `greenlit-store` already use; the
+# workspace's chosen deserializer, so no new dependency family.
+serde_json = "1.0.145"
 # Draining bollard's streaming responses (image pull/build progress, exec output).
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 # `bollard::body_full` takes a `bytes::Bytes`; used to send the base-image build

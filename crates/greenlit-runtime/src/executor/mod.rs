@@ -28,6 +28,7 @@ mod job;
 mod logsink;
 mod netguard;
 mod preflight;
+mod provision;
 mod readiness;
 mod report;
 mod services;
