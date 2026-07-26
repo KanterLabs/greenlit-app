@@ -13,14 +13,16 @@ readonly stargz_version='v0.18.2'
 readonly stargz_archive_sha256='515a3c3af0012f192ace31fb79e910597977c77227e976680aeaaef6e9ae50a9'
 readonly fixture='ghcr.io/stargz-containers/ubuntu@sha256:8ae89e93cf60d297da92e0e1649261401b5d173746d285e3c91de73546f3b9d4'
 readonly container_name="greenlit-stargz-provider-test-$$"
-state_dir="$(mktemp -d -p /tmp greenlit-stargz-provider.XXXXXX)"
+readonly state_parent="${RUNNER_TEMP:-/tmp}"
+state_dir="$(mktemp -d "${state_parent%/}/greenlit-stargz-provider.XXXXXX")"
 
 cleanup() {
   docker rm --force "${container_name}" >/dev/null 2>&1 || true
-  case "${state_dir}" in
-    /tmp/greenlit-stargz-provider.*) rm -rf "${state_dir}" ;;
-    *) printf 'refusing to remove unexpected provider-test path: %s\n' "${state_dir}" >&2 ;;
-  esac
+  if [[ "${state_dir}" == "${state_parent%/}/greenlit-stargz-provider."* ]]; then
+    rm -rf -- "${state_dir}"
+  else
+    printf 'refusing to remove unexpected provider-test path: %s\n' "${state_dir}" >&2
+  fi
 }
 trap cleanup EXIT
 

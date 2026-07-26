@@ -32,8 +32,11 @@ budgets, and two installed-release-binary dogfood runs.
 
 - The approved scope deliberately ships no full-screen TUI. Plain output is
   the reviewable foundation for any later interactive renderer.
-- No remote repository, PR, release, package, container image, or external
-  message was changed during implementation.
+- The stargz acceptance fixture now uses the CI runner's job-scoped temporary
+  directory. This prevents unrelated shared `/tmp` cleanup from removing its
+  bind source between creation and Docker mount validation.
+- The implementation was published through the Phase 11 pull request; no
+  release, package, container image, or external message was published.
 - The release binary was installed locally at
   `/home/shane/.cargo/bin/litci`. The previous binary is recoverable at
   `/home/shane/.cargo/bin/litci.backup-phase11-20260726`.
