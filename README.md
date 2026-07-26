@@ -51,75 +51,31 @@ A three-job workflow — env layering, output propagation through `$GITHUB_OUTPU
 ```console
 $ litci run
 
-• job build
-overlay-setup: unprivileged overlayfs unavailable (EPERM); copying the checkout into the workspace instead
-overlay-setup: workspace ready (copy-in)
-▶ env layering
-workflow=wf job=job step=step
-  ✓ env layering
-▶ grouped output
-▾ Compiling
-  compiling the widget
-  ✓ grouped output
-▶ generate output
-  ✓ generate output
-▶ propagate through GITHUB_ENV
-  ✓ propagate through GITHUB_ENV
-▶ read propagated env
-stamp is stamped
-  ✓ read propagated env
-▶ soft failure is tolerated
-this command fails but the job continues
-  ✓ soft failure is tolerated
-  – only on failure (skipped)
-▶ cleanup always runs
-cleanup ran
-  ✓ cleanup always runs
+Greenlit  000000000000000018c5e1a7f6f03fc8-000a4c3c-0000
+  source snapshot    finished  sha256:888abf...
+  actions            finished  3 locked
+  runners            finished  1 locked
 
-• job container-job
-overlay-setup: unprivileged overlayfs unavailable (EPERM); copying the checkout into the workspace instead
-overlay-setup: workspace ready (copy-in)
-▶ prove we are in the requested image
-container step running
-  ✓ prove we are in the requested image
-▶ writes land in the overlay
-  ✓ writes land in the overlay
+job build
+  OK     env layering  282ms
+  OK     grouped output  1.2s
+  OK     generate output  251ms
+  - only on failure  step condition or implicit status gate evaluated false
+  OK     cleanup always runs  96ms
 
-• job report
-overlay-setup: unprivileged overlayfs unavailable (EPERM); copying the checkout into the workspace instead
-overlay-setup: workspace ready (copy-in)
-▶ consume the dependency output
-built version 1.2.3
-  ✓ consume the dependency output
+job report
+  OK     consume the dependency output  143ms
 
-Run summary
-  build [success]
-    ✓ env layering  221ms
-    ✓ grouped output  231ms
-    ✓ generate output  216ms
-    ✓ propagate through GITHUB_ENV  210ms
-    ✓ read propagated env  220ms
-    ✓ soft failure is tolerated  222ms
-    – only on failure  —
-    ✓ cleanup always runs  208ms
-  container-job [success]
-    ✓ prove we are in the requested image  208ms
-    ✓ writes land in the overlay  220ms
-  report [success]
-    ✓ consume the dependency output  217ms
-
-Result: success
-stage timings (run):
-  parse           0.94 ms
-  eval            0.88 ms
-  plan            0.98 ms
-  detection       1.20 ms
-  image-ensure     41.77 ms
-  container-boot    728.87 ms
-  overlay-setup    108.34 ms
-  exec         2181.73 ms
-  total        4045.84 ms
+OK Passed locally - degraded compatibility
+  evidence: 000000000000000018c5e1a7f6f03fc8-000a4c3c-0000 (Passed/Degraded/Local)
+  logs:     litci logs 000000000000000018c5e1a7f6f03fc8-000a4c3c-0000
 ```
+
+Compact mode is intentionally quiet: successful step bodies are retained,
+not discarded. Use `litci logs [RUN_ID]`, add `--job`/`--step`/`--tail` to
+narrow the replay, or run with `--log-mode full` when you want every line
+live. `litci run --format jsonl` and `litci logs --format jsonl` expose the
+same schema-versioned records stored with the run evidence.
 
 Every stage is timed, every run appends one record to a local file, and `litci stats` shows the trend. That data never leaves your machine — see [Your machine, your data](#your-machine-your-data).
 
@@ -206,6 +162,8 @@ Not a silent skip. Not a confusing failure forty seconds into a container boot. 
 litci run    [-e EVENT] [-W FILE] [-j JOB] [--var K=V] [--input K=V] [-s K=V]
              [--isolation auto|overlay|copy-in] [--write-back] [--no-input]
              [--clean] [--hermetic] [--offline] [--no-daemon]
+             [--format plain|jsonl] [--log-mode compact|full]
+             [--color auto|always|never]
 litci plan   [--json] [-e EVENT] [-W FILE] [--var K=V] [--input K=V]
 litci export [RUN_ID] [--output DIRECTORY]
 litci confirm RUN_ID --repository OWNER/REPO --github-run ID
@@ -213,6 +171,8 @@ litci setup  [-y]
 litci auth   [--pat | --gh]
 litci stats
 litci inspect [RUN_ID]
+litci logs [RUN_ID] [--job ID] [--step ID] [--tail N] [--follow]
+           [--format plain|jsonl]
 litci doctor [--json]
 litci clean [-y]
 ```

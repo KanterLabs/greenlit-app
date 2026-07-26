@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use super::instance::JobGroup;
 use super::report::{JobReport, RunReport};
 use super::{CompletedJob, ExecError, Shared, aggregate, job};
+use crate::events::{ExecutionEvent, ExecutionEventSink, JobScope, RunLogSink};
 use crate::progress::{ProgressEvent, ProgressSink};
 
 struct GroupResult {
@@ -41,6 +42,13 @@ struct ScheduleLimits {
     workers: Arc<Semaphore>,
     machine_workers: Option<Arc<super::worker_pool::MachineWorkerPool>>,
     concurrency: ConcurrencyCoordinator,
+}
+
+#[derive(Clone)]
+struct GroupChannels<'a> {
+    writer: SharedWriter<'a>,
+    events: SharedEvents<'a>,
+    progress: SharedProgress<'a>,
 }
 
 impl ConcurrencyCoordinator {
@@ -94,7 +102,8 @@ impl ConcurrencyCoordinator {
 
 #[derive(Clone)]
 struct SharedWriter<'a> {
-    inner: Arc<Mutex<&'a mut (dyn Write + Send)>>,
+    inner: Arc<Mutex<&'a mut (dyn RunLogSink + Send)>>,
+    scope: JobScope,
 }
 
 impl Write for SharedWriter<'_> {
@@ -103,7 +112,7 @@ impl Write for SharedWriter<'_> {
             .inner
             .lock()
             .map_err(|_| io::Error::other("run log writer lock was poisoned"))?;
-        writer.write(bytes)
+        writer.write(&self.scope, bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -112,6 +121,19 @@ impl Write for SharedWriter<'_> {
             .lock()
             .map_err(|_| io::Error::other("run log writer lock was poisoned"))?;
         writer.flush()
+    }
+}
+
+#[derive(Clone)]
+struct SharedEvents<'a> {
+    inner: Arc<Mutex<&'a mut (dyn ExecutionEventSink + Send)>>,
+}
+
+impl ExecutionEventSink for SharedEvents<'_> {
+    fn on_event(&mut self, event: ExecutionEvent) {
+        if let Ok(mut sink) = self.inner.lock() {
+            sink.on_event(event);
+        }
     }
 }
 
@@ -132,11 +154,20 @@ pub(super) async fn run(
     shared: &Shared<'_>,
     groups: &[JobGroup<'_>],
     baseline_masker: &Masker,
-    out: &mut (dyn Write + Send),
+    logs: &mut (dyn RunLogSink + Send),
+    events: &mut (dyn ExecutionEventSink + Send),
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<RunReport, ExecError> {
     let writer = SharedWriter {
-        inner: Arc::new(Mutex::new(out)),
+        inner: Arc::new(Mutex::new(logs)),
+        scope: JobScope {
+            job_id: String::new(),
+            instance_id: String::new(),
+            display: String::new(),
+        },
+    };
+    let events = SharedEvents {
+        inner: Arc::new(Mutex::new(events)),
     };
     let progress = SharedProgress {
         inner: Arc::new(Mutex::new(progress)),
@@ -172,8 +203,11 @@ pub(super) async fn run(
                 group,
                 &wave_dependencies,
                 baseline_masker,
-                writer.clone(),
-                progress.clone(),
+                GroupChannels {
+                    writer: writer.clone(),
+                    events: events.clone(),
+                    progress: progress.clone(),
+                },
                 limits.clone(),
             ));
         }
@@ -212,8 +246,7 @@ async fn run_group(
     group: &JobGroup<'_>,
     completed: &HashMap<String, CompletedJob>,
     baseline_masker: &Masker,
-    writer: SharedWriter<'_>,
-    progress: SharedProgress<'_>,
+    channels: GroupChannels<'_>,
     limits: ScheduleLimits,
 ) -> Result<GroupResult, ExecError> {
     let needs = Arc::new(needs_records(group.needs, completed));
@@ -224,8 +257,9 @@ async fn run_group(
     let mut running = FuturesUnordered::new();
     let make_leg = |index, instance| {
         let mut masker = baseline_masker.clone();
-        let mut instance_writer = writer.clone();
-        let mut instance_progress = progress.clone();
+        let mut instance_writer = channels.writer.clone();
+        let mut instance_events = channels.events.clone();
+        let mut instance_progress = channels.progress.clone();
         let workers = Arc::clone(&limits.workers);
         let machine_workers = limits.machine_workers.clone();
         let instance_needs = Arc::clone(&needs);
@@ -233,7 +267,19 @@ async fn run_group(
         let coordinator = limits.concurrency.clone();
         let instance_key = format!("{}-{index:03}", group.id.0);
         async move {
+            instance_writer.scope = JobScope {
+                job_id: group.id.0.clone(),
+                instance_id: instance_key.clone(),
+                display: String::new(),
+            };
             if cancellation.is_cancelled() {
+                emit_cancelled(
+                    &mut instance_events,
+                    &group.id,
+                    &instance_key,
+                    instance,
+                    &masker,
+                );
                 return Ok((index, cancelled_report(&group.id, instance, &masker)));
             }
             let job_cancellation = crate::Cancellation::new();
@@ -254,6 +300,13 @@ async fn run_group(
                     {
                         Ok(permit) => Some(permit),
                         Err(_) if cancellation.is_cancelled() => {
+                            emit_cancelled(
+                                &mut instance_events,
+                                &group.id,
+                                &instance_key,
+                                instance,
+                                &masker,
+                            );
                             return Ok((index, cancelled_report(&group.id, instance, &masker)));
                         }
                         Err(error) => return Err(error),
@@ -278,6 +331,13 @@ async fn run_group(
                 Some(pool) => match pool.acquire(&cancellation).await {
                     Ok(permit) => Some(permit),
                     Err(_) if cancellation.is_cancelled() => {
+                        emit_cancelled(
+                            &mut instance_events,
+                            &group.id,
+                            &instance_key,
+                            instance,
+                            &masker,
+                        );
                         return Ok((index, cancelled_report(&group.id, instance, &masker)));
                     }
                     Err(error) => return Err(error),
@@ -302,7 +362,10 @@ async fn run_group(
                     matrix_index: index,
                 },
                 instance_needs.as_slice(),
-                &mut instance_writer,
+                job::JobChannels {
+                    log: &mut instance_writer,
+                    events: &mut instance_events,
+                },
                 &mut instance_progress,
             );
             tokio::pin!(result);
@@ -387,6 +450,24 @@ async fn run_group(
         },
         reports,
     })
+}
+
+fn emit_cancelled(
+    events: &mut (dyn ExecutionEventSink + Send),
+    job_id: &JobId,
+    instance_id: &str,
+    instance: &super::instance::JobInstance<'_>,
+    masker: &Masker,
+) {
+    events.on_event(ExecutionEvent::JobFinished {
+        scope: JobScope {
+            job_id: job_id.0.clone(),
+            instance_id: instance_id.to_string(),
+            display: masker.apply(&instance.display.source),
+        },
+        conclusion: Conclusion::Cancelled,
+        duration: Duration::ZERO,
+    });
 }
 
 fn cancelled_report(

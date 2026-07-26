@@ -21,6 +21,7 @@ use greenlit_engine::{Conclusion, ContainerPlan, JobId};
 use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::ExecSpec;
+use crate::events::{ExecutionEvent, ExecutionEventSink, JobScope};
 use crate::executor::actions::docker_action;
 use crate::executor::actions::node_runtime;
 use crate::executor::actions::nodejs::NodeRuntimeMounts;
@@ -39,8 +40,8 @@ use crate::executor::readiness;
 use crate::executor::report::{JobReport, StepReport};
 use crate::executor::services;
 use crate::executor::step::{
-    JobRuntime, StepLoopState, compute_step_action_ids, execute_step, mask_command_file_error,
-    run_post_steps, run_pre_steps,
+    JobRuntime, StepLoopState, StepOutput, compute_step_action_ids, execute_step,
+    mask_command_file_error, run_post_steps, run_pre_steps,
 };
 use crate::executor::{ExecError, Shared, stage_span};
 use crate::progress::{ProgressEvent, ProgressSink};
@@ -89,6 +90,11 @@ pub(crate) struct JobIdentity<'a> {
     pub(crate) matrix_index: usize,
 }
 
+pub(crate) struct JobChannels<'a> {
+    pub(crate) log: &'a mut (dyn Write + Send),
+    pub(crate) events: &'a mut (dyn ExecutionEventSink + Send),
+}
+
 /// Run one job instance and produce its report.
 ///
 /// # Errors
@@ -101,16 +107,22 @@ pub(crate) async fn run_instance(
     instance: &JobInstance<'_>,
     identity: JobIdentity<'_>,
     needs: &[NeedRecord],
-    out: &mut (dyn Write + Send),
+    channels: JobChannels<'_>,
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<JobReport, ExecError> {
     let started = Instant::now();
     if shared.cancellation.is_cancelled() {
-        return Ok(cancelled_report(
-            identity.id,
-            masker.apply(&instance.display.source),
-            started,
-        ));
+        let display = masker.apply(&instance.display.source);
+        channels.events.on_event(ExecutionEvent::JobFinished {
+            scope: JobScope {
+                job_id: identity.id.0.clone(),
+                instance_id: identity.instance_key.to_string(),
+                display: display.clone(),
+            },
+            conclusion: Conclusion::Cancelled,
+            duration: started.elapsed(),
+        });
+        return Ok(cancelled_report(identity.id, display, started));
     }
 
     let mut runner_env = shared.config.runner_env.clone();
@@ -214,12 +226,28 @@ pub(crate) async fn run_instance(
     // masked that value via `::add-mask::`.
     let display =
         masker.apply(&resolve_string(instance.display, &display_ctx).map_err(ExecError::eval)?);
+    let event_scope = JobScope {
+        job_id: identity.id.0.clone(),
+        instance_id: identity.instance_key.to_string(),
+        display: display.clone(),
+    };
 
     if !job_activates(instance, needs, &activation_ctx)? {
-        let _ = writeln!(out, "\n\u{2022} job {display}: skipped");
+        channels.events.on_event(ExecutionEvent::JobSkipped {
+            scope: event_scope,
+            reason: "job condition evaluated false".to_string(),
+        });
         return Ok(skipped_report(identity.id, display, started));
     }
-    let _ = writeln!(out, "\n\u{2022} job {display}");
+    channels.events.on_event(ExecutionEvent::JobStarted {
+        scope: event_scope.clone(),
+    });
+    let mut step_output = StepOutput {
+        log: channels.log,
+        events: channels.events,
+        scope: event_scope,
+        next_index: 0,
+    };
 
     let job_env = resolve_env_and_defaults(
         shared,
@@ -538,7 +566,7 @@ pub(crate) async fn run_instance(
                             },
                             (&container, &runner_env),
                             needs,
-                            out,
+                            &mut step_output,
                         )
                         .await
                     }
@@ -569,13 +597,19 @@ pub(crate) async fn run_instance(
     .await;
 
     let (step_reports, outputs, result) = outcome?;
+    let duration = started.elapsed();
+    step_output.events.on_event(ExecutionEvent::JobFinished {
+        scope: step_output.scope,
+        conclusion: result,
+        duration,
+    });
     Ok(JobReport {
         id: identity.id.0.clone(),
         display,
         result,
         steps: step_reports,
         outputs,
-        duration: started.elapsed(),
+        duration,
         container_id: shared.config.write_back.then_some(container),
     })
 }
@@ -588,7 +622,7 @@ async fn run_job_body(
     layers: RunnerLayers<'_>,
     (container, runner_env): (&str, &RunnerEnv),
     needs: &[NeedRecord],
-    out: &mut (dyn Write + Send),
+    output: &mut StepOutput<'_>,
 ) -> Result<(Vec<StepReport>, IndexMap<String, String>, Conclusion), ExecError> {
     // `GITHUB_ACTION` per step: a pure function of the authored plan (never
     // runtime data), so every step's value is settled once, up front, rather
@@ -624,13 +658,13 @@ async fn run_job_body(
     // Front-loaded, job-wide: every top-level action's `pre:` script runs
     // before the job's first step, in action (job step) order
     // (`crate::executor::step::run_pre_steps` module docs).
-    run_pre_steps(&job_rt, needs, instance.steps, &mut state, masker, out)
+    run_pre_steps(&job_rt, needs, instance.steps, &mut state, masker, output)
         .instrument(stage_span("exec"))
         .await?;
 
     let mut step_reports = Vec::with_capacity(instance.steps.len());
     for (index, step) in instance.steps.iter().enumerate() {
-        let executed = execute_step(&job_rt, needs, step, index, &mut state, masker, out)
+        let executed = execute_step(&job_rt, needs, step, index, &mut state, masker, output)
             .instrument(stage_span("exec"))
             .await?;
         state.status = advance_status(state.status, executed.result.conclusion);
@@ -646,7 +680,7 @@ async fn run_job_body(
     // Drained regardless of the job's rolling status — "post steps run in
     // REVERSE order at job end REGARDLESS of failure"
     // (`crate::executor::step::run_post_steps` module docs).
-    let post_executed = run_post_steps(&job_rt, needs, &mut state, masker, out)
+    let post_executed = run_post_steps(&job_rt, needs, &mut state, masker, output)
         .instrument(stage_span("exec"))
         .await?;
     for executed in post_executed {

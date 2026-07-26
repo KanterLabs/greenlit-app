@@ -28,6 +28,7 @@ use greenlit_engine::{Conclusion, StepKind, StepPlan};
 use greenlit_expr::{Context, RunStatus, Value};
 
 use crate::engine::{ContainerEngine, ExecSpec};
+use crate::events::{ExecutionEvent, ExecutionEventSink, JobScope, StepEventKind};
 use crate::executor::ExecError;
 use crate::executor::actions::node_runtime::NodeVariant;
 use crate::executor::actions::post_chain::{NodePostEntry, PostAction, PostChain, PostEntry};
@@ -41,6 +42,22 @@ use crate::executor::logsink::StepLogSink;
 // module alongside the rest of the per-job step-execution API, rather than
 // naming the small `step_ids` module directly.
 pub(crate) use crate::executor::step_ids::compute_step_action_ids;
+
+/// Typed lifecycle and masked body output for one concrete job.
+pub(crate) struct StepOutput<'a> {
+    pub(crate) log: &'a mut (dyn Write + Send),
+    pub(crate) events: &'a mut (dyn ExecutionEventSink + Send),
+    pub(crate) scope: JobScope,
+    pub(crate) next_index: usize,
+}
+
+impl StepOutput<'_> {
+    fn take_index(&mut self) -> usize {
+        let index = self.next_index;
+        self.next_index = self.next_index.saturating_add(1);
+        index
+    }
+}
 
 /// Per-job constants a step needs — the container, the resolved env layers, the
 /// job defaults, the run-wide context roots, and everything action execution
@@ -166,7 +183,7 @@ pub(crate) async fn run_pre_steps(
     steps: &[StepPlan],
     state: &mut StepLoopState,
     masker: &mut Masker,
-    out: &mut (dyn Write + Send),
+    output: &mut StepOutput<'_>,
 ) -> Result<(), ExecError> {
     for (index, step) in steps.iter().enumerate() {
         let Some(ResolvedUses::Node(node)) =
@@ -203,7 +220,19 @@ pub(crate) async fn run_pre_steps(
             "GITHUB_ACTION".to_string(),
             job.step_action_ids[index].clone(),
         );
-        let _ = writeln!(out, "  \u{25b6} Pre {}", step_reference(step));
+        let label = format!("Pre {}", step_reference(step));
+        let event_index = output.take_index();
+        output.events.on_event(ExecutionEvent::StepStarted {
+            scope: output.scope.clone(),
+            event_id: format!("pre-{index}"),
+            index: event_index,
+            step_id: step.id.clone(),
+            label: label.clone(),
+            kind: StepEventKind::ActionPre {
+                reference: step_reference(step),
+            },
+        });
+        let started = Instant::now();
         nodejs::run_phase(
             nodejs::PhaseRequest {
                 engine: job.engine,
@@ -217,10 +246,20 @@ pub(crate) async fn run_pre_steps(
                 phase_key: &format!("{index}-pre"),
                 working_dir: job.workspace,
             },
-            out,
+            output.log,
             masker,
         )
         .await?;
+        output.events.on_event(ExecutionEvent::StepFinished {
+            scope: output.scope.clone(),
+            event_id: format!("pre-{index}"),
+            index: event_index,
+            step_id: step.id.clone(),
+            label,
+            outcome: Conclusion::Success,
+            conclusion: Conclusion::Success,
+            duration: started.elapsed(),
+        });
     }
     Ok(())
 }
@@ -248,17 +287,28 @@ pub(crate) async fn run_post_steps(
     needs: &[NeedRecord],
     state: &mut StepLoopState,
     masker: &mut Masker,
-    out: &mut (dyn Write + Send),
+    output: &mut StepOutput<'_>,
 ) -> Result<Vec<ExecutedStep>, ExecError> {
     let entries = state.post_chain.drain_reverse();
     let mut results = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for (post_index, entry) in entries.into_iter().enumerate() {
         let started = Instant::now();
         let label = masker.apply(&entry.label);
+        let event_id = format!("post-{post_index}");
+        let event_index = output.take_index();
         let ctx = pre_pass_context(job, needs, state);
         let result = match &entry.action {
             PostAction::Checkout(post) => {
-                let _ = writeln!(out, "\u{25b6} {label}");
+                output.events.on_event(ExecutionEvent::StepStarted {
+                    scope: output.scope.clone(),
+                    event_id: event_id.clone(),
+                    index: event_index,
+                    step_id: None,
+                    label: label.clone(),
+                    kind: StepEventKind::ActionPost {
+                        reference: label.clone(),
+                    },
+                });
                 checkout::run_post(job.engine, job.container, post).await?;
                 Some(step_result_from_exit(StepExit::Success, false))
             }
@@ -267,8 +317,17 @@ pub(crate) async fn run_post_steps(
                 if crate::executor::actions::template::resolve_condition(post_if, &ctx)
                     .map_err(ExecError::template_eval)?
                 {
-                    let _ = writeln!(out, "\u{25b6} {label}");
-                    let exit = run_node_post(job, state, post, out, masker).await?;
+                    output.events.on_event(ExecutionEvent::StepStarted {
+                        scope: output.scope.clone(),
+                        event_id: event_id.clone(),
+                        index: event_index,
+                        step_id: None,
+                        label: label.clone(),
+                        kind: StepEventKind::ActionPost {
+                            reference: label.clone(),
+                        },
+                    });
+                    let exit = run_node_post(job, state, post, output.log, masker).await?;
                     Some(step_result_from_exit(exit, false))
                 } else {
                     None
@@ -277,9 +336,25 @@ pub(crate) async fn run_post_steps(
         };
         let duration = started.elapsed();
         if let Some(result) = result {
-            let _ = writeln!(out, "  {} {label}", status_sigil(result.conclusion));
+            output.events.on_event(ExecutionEvent::StepFinished {
+                scope: output.scope.clone(),
+                event_id: event_id.clone(),
+                index: event_index,
+                step_id: None,
+                label: label.clone(),
+                outcome: result.outcome,
+                conclusion: result.conclusion,
+                duration,
+            });
         } else {
-            let _ = writeln!(out, "  \u{2013} {label} (skipped)");
+            output.events.on_event(ExecutionEvent::StepSkipped {
+                scope: output.scope.clone(),
+                event_id,
+                index: event_index,
+                step_id: None,
+                label: label.clone(),
+                reason: "post condition evaluated false".to_string(),
+            });
         }
         results.push(ExecutedStep {
             result: result.unwrap_or_else(step_result_skipped),
@@ -342,7 +417,7 @@ pub(crate) async fn execute_step(
     index: usize,
     state: &mut StepLoopState,
     masker: &mut Masker,
-    out: &mut (dyn Write + Send),
+    output: &mut StepOutput<'_>,
 ) -> Result<ExecutedStep, ExecError> {
     let empty = IndexMap::new();
     let mut pre_env = layer_step_env(EnvLayers {
@@ -405,6 +480,7 @@ pub(crate) async fn execute_step(
     // see the redacted form, matching the "secret values are masked in all
     // log output" security invariant (`AGENTS.md`).
     let label = masker.apply(&step_label(step, index, &ctx)?);
+    let event_index = output.take_index();
 
     let condition_true = match &step.condition {
         Some(condition) => resolve_condition(condition, &ctx).map_err(ExecError::eval)?,
@@ -412,7 +488,14 @@ pub(crate) async fn execute_step(
     };
     if !step_activates(state.status, step.implicit_status_gate, condition_true) {
         record_skip(step, &mut state.records);
-        let _ = writeln!(out, "  \u{2013} {label} (skipped)");
+        output.events.on_event(ExecutionEvent::StepSkipped {
+            scope: output.scope.clone(),
+            event_id: format!("step-{index}"),
+            index: event_index,
+            step_id: step.id.clone(),
+            label: label.clone(),
+            reason: "step condition or implicit status gate evaluated false".to_string(),
+        });
         return Ok(ExecutedStep {
             result: step_result_skipped(),
             label,
@@ -427,15 +510,30 @@ pub(crate) async fn execute_step(
     };
 
     let started = Instant::now();
-    let mut io = StepIo { out, masker };
+    let mut io = StepIo {
+        out: output.log,
+        masker,
+    };
+    let kind = match &step.kind {
+        StepKind::Run { .. } => StepEventKind::Run,
+        StepKind::Uses { reference, .. } => StepEventKind::Uses {
+            reference: reference.clone(),
+        },
+    };
+    output.events.on_event(ExecutionEvent::StepStarted {
+        scope: output.scope.clone(),
+        event_id: format!("step-{index}"),
+        index: event_index,
+        step_id: step.id.clone(),
+        label: label.clone(),
+        kind,
+    });
     let (exit, outputs) = match &step.kind {
         StepKind::Run { .. } => {
-            let _ = writeln!(io.out, "\u{25b6} {label}");
             run_script_step(job, step, &ctx, &full_env, index, state, &mut io).await?
         }
         StepKind::Uses { with, .. } => {
             let with_resolved = resolve_env_layer(with, &ctx).map_err(ExecError::eval)?;
-            let _ = writeln!(io.out, "\u{25b6} {label}");
             execute_uses_step(job, needs, step, index, &with_resolved, state, &mut io).await?
         }
     };
@@ -450,7 +548,16 @@ pub(crate) async fn execute_step(
             outputs,
         });
     }
-    let _ = writeln!(io.out, "  {} {label}", status_sigil(result.conclusion));
+    output.events.on_event(ExecutionEvent::StepFinished {
+        scope: output.scope.clone(),
+        event_id: format!("step-{index}"),
+        index: event_index,
+        step_id: step.id.clone(),
+        label: label.clone(),
+        outcome: result.outcome,
+        conclusion: result.conclusion,
+        duration,
+    });
     Ok(ExecutedStep {
         result,
         label,
@@ -988,14 +1095,4 @@ fn step_label(
         return Ok(id.clone());
     }
     Ok(format!("step {}", index + 1))
-}
-
-/// A short sigil for a step's conclusion in the live status line.
-fn status_sigil(conclusion: Conclusion) -> &'static str {
-    match conclusion {
-        Conclusion::Success => "\u{2713}",
-        Conclusion::Failure => "\u{2717}",
-        Conclusion::Cancelled => "\u{29b8}",
-        Conclusion::Skipped => "\u{2013}",
-    }
 }

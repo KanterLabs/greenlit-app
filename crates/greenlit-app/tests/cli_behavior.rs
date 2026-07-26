@@ -20,6 +20,8 @@ mod git_context;
 mod github_confirmation;
 #[path = "cli_behavior/inspect.rs"]
 mod inspect;
+#[path = "cli_behavior/logs.rs"]
+mod logs;
 #[path = "cli_behavior/policy_modes.rs"]
 mod policy_modes;
 #[path = "cli_behavior/repository.rs"]

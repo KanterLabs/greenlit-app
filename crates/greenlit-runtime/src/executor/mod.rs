@@ -439,6 +439,38 @@ pub async fn run_plan_cancellable(
     progress: &mut (dyn ProgressSink + Send),
     cancellation: &crate::Cancellation,
 ) -> Result<RunReport, ExecError> {
+    let mut logs = crate::events::FlatLogSink::new(out);
+    let mut events = crate::events::ExecutionEventNull;
+    run_plan_with_events_cancellable(
+        engine,
+        plan,
+        config,
+        &mut logs,
+        &mut events,
+        progress,
+        cancellation,
+    )
+    .await
+}
+
+/// Execute a plan with job-scoped logs and structured lifecycle events.
+///
+/// This is the presentation-neutral execution entrypoint used by the CLI's
+/// plain, JSONL, persisted-log, and future interactive renderers.
+///
+/// # Errors
+///
+/// Returns the same execution and infrastructure errors as
+/// [`run_plan_cancellable`].
+pub async fn run_plan_with_events_cancellable(
+    engine: &dyn ContainerEngine,
+    plan: &ExecutionPlan,
+    config: &RunConfig,
+    logs: &mut (dyn crate::events::RunLogSink + Send),
+    events: &mut (dyn crate::events::ExecutionEventSink + Send),
+    progress: &mut (dyn ProgressSink + Send),
+    cancellation: &crate::Cancellation,
+) -> Result<RunReport, ExecError> {
     let mut masker = Masker::new();
     for value in &config.initial_masks {
         masker.add(value);
@@ -462,7 +494,7 @@ pub async fn run_plan_cancellable(
         namespace: &config.volume_namespace,
     };
 
-    scheduler::run(&shared, &groups, &masker, out, progress).await
+    scheduler::run(&shared, &groups, &masker, logs, events, progress).await
 }
 
 /// Aggregate a job's per-leg results into the single result and merged output

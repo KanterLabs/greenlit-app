@@ -5,6 +5,5 @@
 //! schema").
 
 pub(crate) mod diagnostics;
-pub(crate) mod progress;
 pub(crate) mod terminal;
 pub(crate) mod tree;

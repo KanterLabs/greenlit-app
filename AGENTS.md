@@ -23,7 +23,7 @@ These names are final for v0. There is no legacy command or data-path compatibil
 1. `AGENTS.md` — this file: working rules, stub discipline, quality bar, metrics rules, status tables.
 2. `greenlit-v0-spec.md` — the product: principles, scope, security model, CLI, phase summaries.
 3. `TESTING.md` — the four test classes, the banned list, the internal CI pipeline.
-4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-10-confirmation.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time. Phases 1–4 record the original executor foundation; Phases 5–10 replace its environment and execution architecture with the evidence-first design in the v0 spec.
+4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-11-terminal-events.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time. Phases 1–4 record the original executor foundation; Phases 5–10 replace its environment and execution architecture with the evidence-first design in the v0 spec; Phase 11 makes that executor presentation-neutral.
 
 `README.md` is the repository's public front door, not a governance document: it describes what ships, and the documents above remain authoritative when they disagree.
 
@@ -94,6 +94,7 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 8 — Daemon & recovery | `docs/PHASE-8-daemon-recovery.md` | completed |
 | 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | completed |
 | 10 — Confirmation | `docs/PHASE-10-confirmation.md` | completed |
+| 11 — Terminal events | `docs/PHASE-11-terminal-events.md` | completed |
 
 ## Target workspace layout
 
