@@ -18,7 +18,7 @@ env:
 jobs:
   verify:
     name: build and package release candidate
-    runs-on: homelab
+    runs-on: homelab-heavy
     steps:
       - name: Check out exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

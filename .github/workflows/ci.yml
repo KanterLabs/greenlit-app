@@ -25,7 +25,7 @@ env:
 jobs:
   ci:
     name: fmt, clippy, deny, stubs, test, doc, bench
-    runs-on: homelab
+    runs-on: homelab-heavy
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
   provider-and-policy:
     name: configured stargz provider and policy modes
     needs: ci
-    runs-on: homelab
+    runs-on: homelab-heavy
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -120,7 +120,7 @@ jobs:
   # contents such as rustup.
   dogfood:
     name: this repo's own gates, under litci
-    runs-on: homelab
+    runs-on: homelab-heavy
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

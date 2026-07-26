@@ -71,7 +71,7 @@ pub(crate) fn plan_error(e: &PlanError) -> anyhow::Error {
         }
         PlanError::Matrix { .. } => "fix the `strategy` field named in the message above",
         PlanError::Runner { .. } => {
-            "use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab"
+            "use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab, homelab-heavy"
         }
         PlanError::Eval { .. } => "fix the expression referenced above",
         PlanError::JobConditionUnavailable { .. } => {

@@ -171,8 +171,8 @@ jobs:
 
 ```console
 $ litci plan -W fixtures/unsupported-runner.yml
-fixtures/unsupported-runner.yml:10:14: unsupported runner 'windows-latest' — v0 supports only: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab
-  fix: use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab
+fixtures/unsupported-runner.yml:10:14: unsupported runner 'windows-latest' — v0 supports only: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab, homelab-heavy
+  fix: use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab, homelab-heavy
 
 $ litci plan -W fixtures/workflow-call.yml
 fixtures/workflow-call.yml:7:18: workflow_call: not in v0

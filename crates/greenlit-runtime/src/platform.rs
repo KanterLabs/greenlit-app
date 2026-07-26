@@ -9,7 +9,8 @@
 //! `resolve_runner_label`: planning validates and rejects `runs-on:` labels,
 //! and here we translate an already-accepted label into the concrete Ubuntu
 //! release the base image is built from. `ubuntu-latest`, `ubuntu-24.04`, and
-//! the KanterLabs `homelab` runner map to 24.04; `ubuntu-22.04` maps to 22.04.
+//! the KanterLabs `homelab` runner tiers map to 24.04; `ubuntu-22.04` maps to
+//! 22.04.
 
 /// The host is not a v0-supported platform.
 ///
@@ -78,7 +79,7 @@ fn check_host(os: &str, arch: &str) -> Result<(), UnsupportedHost> {
 /// Docker Hub — not the `runs-on:` label itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UbuntuRelease {
-    /// Ubuntu 24.04 LTS — the target of `ubuntu-24.04`, `ubuntu-latest`, and `homelab`.
+    /// Ubuntu 24.04 LTS — the target of hosted 24.04 and both homelab tiers.
     Noble2404,
     /// Ubuntu 22.04 LTS — the target of `ubuntu-22.04`.
     Jammy2204,
@@ -117,7 +118,9 @@ impl UbuntuRelease {
 #[must_use]
 pub fn resolve_base_image(label: &str) -> Option<UbuntuRelease> {
     match label {
-        "ubuntu-latest" | "ubuntu-24.04" | "homelab" => Some(UbuntuRelease::Noble2404),
+        "ubuntu-latest" | "ubuntu-24.04" | "homelab" | "homelab-heavy" => {
+            Some(UbuntuRelease::Noble2404)
+        }
         "ubuntu-22.04" => Some(UbuntuRelease::Jammy2204),
         _ => None,
     }
@@ -147,6 +150,10 @@ mod tests {
         );
         assert_eq!(
             resolve_base_image("homelab"),
+            Some(UbuntuRelease::Noble2404)
+        );
+        assert_eq!(
+            resolve_base_image("homelab-heavy"),
             Some(UbuntuRelease::Noble2404)
         );
         assert_eq!(resolve_base_image("ubuntu-20.04"), None);

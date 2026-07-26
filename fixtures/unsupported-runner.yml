@@ -1,5 +1,5 @@
 # Exercises the accepted-labels rejection for a `runs-on:` label outside
-# v0's stable x64 Ubuntu set plus the KanterLabs homelab alias. Every other
+# v0's stable x64 Ubuntu set plus the KanterLabs homelab aliases. Every other
 # label is recognized and rejected during planning with the supported list
 # and source location.
 on: push
