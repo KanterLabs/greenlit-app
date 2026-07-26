@@ -44,6 +44,19 @@ litci run        # that's it — no flags, no image selection, no config file
 
 No setup file. No image to pick. `litci run` finds your workflow, plans it, and runs it.
 
+## This repository's GitHub CI
+
+Greenlit and ARC are separate systems. Greenlit (`litci`) is the product in
+this repository: a local workflow planner and executor. GitHub CI for this
+repository runs `litci` and the Rust test suite inside official ephemeral
+GitHub Actions runner pods. Actions Runner Controller (ARC) manages when those
+pods exist; ARC does not execute the tests itself.
+
+The CI, dogfood, benchmark, integration, and release-verification jobs use the
+`homelab-heavy` tier. The inexpensive crate-publishing job uses `homelab`.
+KanterLabs' canonical ARC and runner documentation is in the
+[infrastructure runner runbook](https://github.com/KanterLabs/infrastructure/tree/main/homelab/ci-runners).
+
 ## See it run
 
 A three-job workflow — env layering, output propagation through `$GITHUB_OUTPUT` and `$GITHUB_ENV`, a `continue-on-error` step, `if: failure()` and `if: always()` gating, a custom job container, and a `needs:` consumer — start to finish:
@@ -171,8 +184,8 @@ jobs:
 
 ```console
 $ litci plan -W fixtures/unsupported-runner.yml
-fixtures/unsupported-runner.yml:10:14: unsupported runner 'windows-latest' — v0 supports only: ubuntu-latest, ubuntu-24.04, ubuntu-22.04
-  fix: use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04
+fixtures/unsupported-runner.yml:10:14: unsupported runner 'windows-latest' — v0 supports only: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab, homelab-heavy
+  fix: use one of the supported runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab, homelab-heavy
 
 $ litci plan -W fixtures/workflow-call.yml
 fixtures/workflow-call.yml:7:18: workflow_call: not in v0

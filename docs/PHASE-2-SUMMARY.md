@@ -24,7 +24,7 @@ three real defects (see below), all fixed before the green run.
   pure-bollard Docker backend; three-state engine detection over an injected prober
   (`DOCKER_HOST` → Docker socket → Podman socket; rootful/rootless daemon-stopped fixes;
   absent → `litci setup`), with remote/ssh `DOCKER_HOST` rejected before any probing;
-  Linux x86_64 host validation and the three supported runner labels mapped to versioned
+  Linux x86_64 host validation and the supported runner labels mapped to versioned
   Ubuntu images; base-image build through the engine API tagged with a content hash.
 - **`greenlit-init`** (private, `publish = false`, embedded in `litci`, never a host
   command) — overlayfs workspace over the Docker-level read-only repo bind, errno-classified

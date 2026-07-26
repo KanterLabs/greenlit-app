@@ -17,7 +17,7 @@ env:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    runs-on: homelab-heavy
     container:
       image: rust:1.96.0 # matches rust-toolchain.toml channel
     defaults:

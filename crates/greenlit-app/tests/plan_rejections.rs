@@ -83,7 +83,13 @@ fn every_unsupported_runner_form_is_rejected_with_the_accepted_list() {
             stderr.contains("fixtures/unsupported-runner.yml:"),
             "row '{name}' lacks a source location: {stderr}"
         );
-        for accepted in ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"] {
+        for accepted in [
+            "ubuntu-latest",
+            "ubuntu-24.04",
+            "ubuntu-22.04",
+            "homelab",
+            "homelab-heavy",
+        ] {
             assert!(stderr.contains(accepted), "row '{name}': {stderr}");
         }
         assert!(stderr.contains("fix:"), "row '{name}': {stderr}");
