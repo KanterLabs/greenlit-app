@@ -14,7 +14,7 @@
 - Trait: pull/build/commit image; create/start/stop/remove container; exec with streamed stdout/stderr and exit code; create/remove network. All async.
 - Bollard-backed Docker implementation. No shelling out to `docker`.
 - **Three-state engine detection:** (a) reachable via `DOCKER_HOST` → Unix socket → Podman socket → use it; (b) binary installed but daemon down → prompt, then `sudo systemctl start docker` (handle socket activation and rootless `systemctl --user` cases); (c) absent → `litci setup` runs Docker's official install script after one confirmation. Every failure state produces the message + fix action; never a raw connection error.
-- Validate the Linux x86_64 host before engine work. Map only `ubuntu-latest`, `ubuntu-24.04`, and `ubuntu-22.04`; the alias uses 24.04 in v0.
+- Validate the Linux x86_64 host before engine work. Map `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, and the KanterLabs `homelab` alias; `ubuntu-latest` and `homelab` use 24.04 in v0.
 
 ### Base image and private init helper
 

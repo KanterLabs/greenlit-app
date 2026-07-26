@@ -1,7 +1,8 @@
 //! `runs-on:` → [`RunnerImage`]: supported-runner validation.
 //!
 //! Source: `greenlit-v0-spec.md` "Tech" — "Supported runner labels:
-//! `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`. Every other label is
+//! `ubuntu-latest`, `ubuntu-24.04`, `ubuntu-22.04`, and the KanterLabs
+//! `homelab` Ubuntu runner. Every other label is
 //! recognized and rejected during planning with the supported list and
 //! source location" — cross-referenced against GitHub's
 //! [hosted-runner label table](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job),
@@ -57,14 +58,15 @@ pub type RunnerPlan = Planned<RunnerImage>;
 /// `ubuntu-latest` included, even though it resolves to
 /// [`RunnerImage::Ubuntu2404`], because this is the *accepted-input* list
 /// shown in error messages, not the resolved-image list.
-pub const SUPPORTED_RUNNER_LABELS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
+pub const SUPPORTED_RUNNER_LABELS: [&str; 4] =
+    ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04", "homelab"];
 
 /// Resolves a bare label string (already known statically) to a
 /// [`RunnerImage`], or `None` if unsupported.
 #[must_use]
 pub fn resolve_runner_label(label: &str) -> Option<RunnerImage> {
     match label {
-        "ubuntu-latest" | "ubuntu-24.04" => Some(RunnerImage::Ubuntu2404),
+        "ubuntu-latest" | "ubuntu-24.04" | "homelab" => Some(RunnerImage::Ubuntu2404),
         "ubuntu-22.04" => Some(RunnerImage::Ubuntu2204),
         _ => None,
     }
@@ -75,7 +77,7 @@ pub fn resolve_runner_label(label: &str) -> Option<RunnerImage> {
 /// the message text is unambiguous `thiserror` syntax. The supported-runner
 /// rejection integration test pins the displayed list so it cannot silently
 /// drift from [`SUPPORTED_RUNNER_LABELS`].
-const SUPPORTED_RUNNER_LABELS_DISPLAY: &str = "ubuntu-latest, ubuntu-24.04, ubuntu-22.04";
+const SUPPORTED_RUNNER_LABELS_DISPLAY: &str = "ubuntu-latest, ubuntu-24.04, ubuntu-22.04, homelab";
 
 /// Everything that can go wrong resolving `runs-on:`.
 #[derive(Debug, thiserror::Error)]

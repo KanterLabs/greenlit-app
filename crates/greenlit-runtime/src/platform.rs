@@ -8,8 +8,8 @@
 //! The label map is the runtime-side counterpart to `greenlit-engine`'s
 //! `resolve_runner_label`: planning validates and rejects `runs-on:` labels,
 //! and here we translate an already-accepted label into the concrete Ubuntu
-//! release the base image is built from. Only `ubuntu-latest`, `ubuntu-24.04`,
-//! and `ubuntu-22.04` map; `ubuntu-latest` resolves to 24.04 in v0.
+//! release the base image is built from. `ubuntu-latest`, `ubuntu-24.04`, and
+//! the KanterLabs `homelab` runner map to 24.04; `ubuntu-22.04` maps to 22.04.
 
 /// The host is not a v0-supported platform.
 ///
@@ -78,7 +78,7 @@ fn check_host(os: &str, arch: &str) -> Result<(), UnsupportedHost> {
 /// Docker Hub — not the `runs-on:` label itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UbuntuRelease {
-    /// Ubuntu 24.04 LTS — the target of `ubuntu-24.04` and `ubuntu-latest`.
+    /// Ubuntu 24.04 LTS — the target of `ubuntu-24.04`, `ubuntu-latest`, and `homelab`.
     Noble2404,
     /// Ubuntu 22.04 LTS — the target of `ubuntu-22.04`.
     Jammy2204,
@@ -111,13 +111,13 @@ impl UbuntuRelease {
 ///
 /// Returns `None` for every unsupported label. Planning in `greenlit-engine`
 /// already rejects unsupported labels with a source-spanned message; this map
-/// is the defense-in-depth runtime translation and only accepts the three
-/// labels `greenlit-v0-spec.md` ("Supported runner labels") lists.
+/// is the defense-in-depth runtime translation and accepts the hosted Ubuntu
+/// labels plus the KanterLabs `homelab` Ubuntu alias.
 /// `ubuntu-latest` resolves to 24.04 for v0.
 #[must_use]
 pub fn resolve_base_image(label: &str) -> Option<UbuntuRelease> {
     match label {
-        "ubuntu-latest" | "ubuntu-24.04" => Some(UbuntuRelease::Noble2404),
+        "ubuntu-latest" | "ubuntu-24.04" | "homelab" => Some(UbuntuRelease::Noble2404),
         "ubuntu-22.04" => Some(UbuntuRelease::Jammy2204),
         _ => None,
     }
@@ -127,7 +127,7 @@ pub fn resolve_base_image(label: &str) -> Option<UbuntuRelease> {
 mod tests {
     use super::*;
 
-    // Oracle-style rows for the three accepted labels and their v0 targets,
+    // Oracle-style rows for the accepted labels and their v0 targets,
     // plus rejection of everything else. This pins the runtime-side half of the
     // label contract (`PHASE-2-execution.md` exit criterion 5: "the three
     // supported labels map to the intended versioned images").
@@ -144,6 +144,10 @@ mod tests {
         assert_eq!(
             resolve_base_image("ubuntu-22.04"),
             Some(UbuntuRelease::Jammy2204)
+        );
+        assert_eq!(
+            resolve_base_image("homelab"),
+            Some(UbuntuRelease::Noble2404)
         );
         assert_eq!(resolve_base_image("ubuntu-20.04"), None);
         assert_eq!(resolve_base_image("windows-latest"), None);
