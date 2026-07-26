@@ -82,6 +82,14 @@ pub(crate) fn runner_context(runner_env: &RunnerEnv) -> Value {
     Value::object(vec![
         ("os".to_string(), Value::String("Linux".to_string())),
         ("arch".to_string(), Value::String("X64".to_string())),
+        // GitHub documents `runner.environment` as `github-hosted` or
+        // `self-hosted`. Greenlit owns the local runner, so the latter is the
+        // exact semantic match:
+        // https://docs.github.com/actions/reference/workflows-and-actions/contexts#runner-context
+        (
+            "environment".to_string(),
+            Value::String("self-hosted".to_string()),
+        ),
         (
             "name".to_string(),
             Value::String(runner_env.runner_name.clone()),

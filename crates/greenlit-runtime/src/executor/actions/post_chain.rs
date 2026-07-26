@@ -34,10 +34,10 @@ pub(crate) struct NodePostEntry {
     pub post_script: String,
     /// Raw `post-if` text; `None` means the documented `always()` default.
     pub post_if: Option<String>,
-    /// This instance's already-resolved `with:` inputs (same map the main
-    /// step used — GitHub resolves `with:` once per step instance, shared
-    /// across pre/main/post).
-    pub with: indexmap::IndexMap<String, String>,
+    /// This instance's fully resolved `INPUT_*` environment, including
+    /// action-manifest defaults. GitHub resolves inputs once per action
+    /// instance and exposes the same values to main and post.
+    pub input_env: Vec<(String, String)>,
     /// This step's own workflow-authored `env:` layer, resolved once at
     /// step-reach time (shared across pre/main/post, same as `with`).
     pub step_env: indexmap::IndexMap<String, String>,
