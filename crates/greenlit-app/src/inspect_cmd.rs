@@ -44,7 +44,7 @@ pub(crate) fn run(args: InspectArgs) -> anyhow::Result<()> {
     })
 }
 
-fn runs_root() -> anyhow::Result<PathBuf> {
+pub(crate) fn runs_root() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| {
         anyhow::anyhow!(
             "could not find run evidence because HOME is not set\n  fix: set HOME to an absolute directory, then retry"
@@ -59,7 +59,7 @@ fn runs_root() -> anyhow::Result<PathBuf> {
     Ok(home.join(".litci").join("runs"))
 }
 
-fn validate_run_id(run_id: &str) -> anyhow::Result<String> {
+pub(crate) fn validate_run_id(run_id: &str) -> anyhow::Result<String> {
     if run_id.is_empty()
         || !run_id
             .bytes()

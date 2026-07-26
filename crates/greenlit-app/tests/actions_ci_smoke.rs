@@ -164,6 +164,8 @@ fn actions_ci_fixture_runs_green_end_to_end() {
             "run",
             "-W",
             ".github/workflows/ci.yml",
+            "--log-mode",
+            "full",
             "--var",
             "LOCAL_MODE=ci",
             "-s",

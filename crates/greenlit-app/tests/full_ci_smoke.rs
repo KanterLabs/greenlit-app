@@ -116,7 +116,7 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     sandbox.init_git();
 
     // ---- Run 1: everything cold ----
-    let first = sandbox.run(&["run", "--no-input"]);
+    let first = sandbox.run(&["run", "--no-input", "--log-mode", "full"]);
     let first_out = support::stdout_text(&first);
     let first_err = support::stderr_text(&first);
     assert!(
@@ -143,7 +143,7 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     assert_eq!(cold_results.len(), 1);
 
     // ---- Run 2: same $HOME, so the cache and the image are there ----
-    let second = sandbox.run(&["run", "--no-input"]);
+    let second = sandbox.run(&["run", "--no-input", "--log-mode", "full"]);
     let second_out = support::stdout_text(&second);
     let second_err = support::stderr_text(&second);
     assert!(
@@ -185,7 +185,7 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
     );
 
     // ---- Run 3: exact verified setup content only ----
-    let offline = sandbox.run(&["run", "--offline", "--no-input"]);
+    let offline = sandbox.run(&["run", "--offline", "--no-input", "--log-mode", "full"]);
     let offline_out = support::stdout_text(&offline);
     let offline_err = support::stderr_text(&offline);
     assert!(
@@ -193,12 +193,12 @@ fn full_ci_fixture_is_green_warm_and_replays_verified_setup_offline() {
         "fully cached offline run failed\nstdout:\n{offline_out}\nstderr:\n{offline_err}"
     );
     assert!(
-        offline_err.contains("(CAS hit)"),
-        "offline preparation must report verified CAS reuse: {offline_err}"
+        offline_out.contains("cached"),
+        "offline preparation must report verified CAS reuse: {offline_out}"
     );
     assert!(
-        !offline_err.contains("pulling "),
-        "offline preparation must not start an image download: {offline_err}"
+        !offline_out.contains("downloaded"),
+        "offline preparation must not start an image download: {offline_out}"
     );
 
     // Nothing in any run leaks the run's own credentials.

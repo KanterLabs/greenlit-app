@@ -17,7 +17,7 @@ Tests exist to pin GitHub's behavior and Greenlit's invariants. They do not exis
 - **No interaction testing** ("was this function called N times") — except where the interaction *is* the contract (for example, zero-refetch and no-script-replay invariants), and then it is asserted at the recording-boundary layer, not on internal calls.
 - **No duplicate homes.** Each behavior is asserted in exactly one place. Before writing a test, search for the behavior; extend the existing table or fixture instead of adding a parallel one.
 - **No coverage targets.** Coverage percentages manufacture tests. The bar is oracle completeness + the phase exit criteria, nothing else.
-- **No snapshot tests** except the declared stable schemas: `litci plan --json`, metrics records, `RunLock`, `JobLock`, and execution-result JSON. Diagnostics, progress, logs, and timing output are asserted separately.
+- **No snapshot tests** except the declared stable schemas: `litci plan --json`, metrics records, `RunLock`, `JobLock`, execution-result JSON, and the run-event journal. Human diagnostics, progress, log projections, and timing output are asserted separately.
 - **Property tests** only where a GitHub rule is genuinely algebraic (coercion); one property per rule, bounded cases. Everything else is a table row.
 
 ## Enforcement

@@ -171,6 +171,23 @@ Keep identities and policy distinct:
   shared storage reused; and the item causing the wait. Step-time traffic is
   labeled workflow traffic.
 
+### Events, terminal output, and retained logs
+
+- The executor emits typed lifecycle events and job-scoped redacted log
+  chunks. Renderers never infer job or step state from workflow text.
+- Every run retains a schema-versioned, ordered `events.ndjson` beside its
+  lock, trace, and result evidence. `litci run --format jsonl` projects those
+  exact records to stdout; `plain` is the default human projection.
+- Compact mode retains every redacted body line but hides successful step
+  bodies. A failure displays only the final 200 lines or 256 KiB, whichever
+  bound is reached first, plus the exact `litci logs` replay command.
+  `--log-mode full` streams bodies without changing execution or evidence.
+- `litci logs` replays a run journal and filters by job, concrete job
+  instance, step id/ordinal/event id, tail count, or follow mode. JSONL replay
+  returns the original matching records.
+- Color follows `--color auto|always|never`; `NO_COLOR` disables automatic
+  styling. Machine output never contains presentation-only records.
+
 ### Daemon, recovery, and garbage collection
 
 The same `litci` binary may run a per-user optional daemon. `litci run`

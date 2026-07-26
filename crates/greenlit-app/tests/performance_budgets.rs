@@ -79,6 +79,24 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
         support::stdout_text(&cold),
         support::stderr_text(&cold)
     );
+    let cold_stdout = support::stdout_text(&cold);
+    assert!(
+        !cold_stdout.contains("successful body retained only in the journal")
+            && !cold_stdout.contains("workflow fake marker"),
+        "compact output must hide successful workflow bodies: {cold_stdout}"
+    );
+    let runs = sandbox.home().join(".litci/runs");
+    let cold_run = std::fs::read_dir(&runs)
+        .expect("run evidence directory")
+        .filter_map(Result::ok)
+        .max_by_key(|entry| entry.file_name())
+        .expect("cold run directory");
+    let journal =
+        std::fs::read_to_string(cold_run.path().join("events.ndjson")).expect("event journal");
+    assert!(journal.contains("\"type\":\"step_finished\""));
+    assert!(journal.contains("successful body retained only in the journal"));
+    assert!(journal.contains("workflow fake marker: OK forged success"));
+    assert!(journal.contains("\"type\":\"run_finished\""));
 
     let mut warm_outputs = Vec::with_capacity(WARM_SAMPLES);
     for _ in 0..WARM_SAMPLES {
@@ -142,6 +160,48 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
         "warm workflow p95 was {:.2} ms, budget is < 30000 ms",
         workflow_ms[percentile_index]
     );
+
+    let failure = sandbox.run(&[
+        "run",
+        "--no-daemon",
+        "--no-input",
+        "--event",
+        "workflow_dispatch",
+    ]);
+    assert!(!failure.status.success(), "failure fixture must fail");
+    let failure_stdout = support::stdout_text(&failure);
+    assert!(
+        !failure_stdout.contains("failure-line-000"),
+        "compact failure output exceeded the 200-line tail: {failure_stdout}"
+    );
+    assert!(
+        failure_stdout.contains("failure-line-204"),
+        "failure tail omitted its final line: {failure_stdout}"
+    );
+    assert!(failure_stdout.contains("full log: litci logs "));
+    assert!(failure_stdout.contains("--job test-000 --step step-1"));
+
+    let jsonl = sandbox.run(&["run", "--no-daemon", "--no-input", "--format", "jsonl"]);
+    assert!(
+        jsonl.status.success(),
+        "JSONL run failed: {}",
+        support::stderr_text(&jsonl)
+    );
+    let jsonl_stdout = support::stdout_text(&jsonl);
+    let mut run_id = None;
+    for line in jsonl_stdout.lines() {
+        let event: serde_json::Value =
+            serde_json::from_str(line).expect("JSONL stdout contains only events");
+        let event_run_id = event["run_id"].as_str().expect("event run id");
+        match &run_id {
+            Some(expected) => assert_eq!(event_run_id, expected),
+            None => run_id = Some(event_run_id.to_string()),
+        }
+    }
+    let run_id = run_id.expect("JSONL emitted a run_started event");
+    let persisted = std::fs::read_to_string(runs.join(run_id).join("events.ndjson"))
+        .expect("JSONL run journal");
+    assert_eq!(jsonl_stdout, persisted);
 }
 
 fn stage_ms(record: &serde_json::Value, name: &str) -> f64 {
