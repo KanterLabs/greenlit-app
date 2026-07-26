@@ -59,7 +59,6 @@ jobs:
       # Provision the exact locked profile up front: once execution begins,
       # Greenlit correctly refuses to replace a missing locked image.
       - name: Prepare pinned runner profile for real-daemon tests
-        if: ${{ vars.GREENLIT_DOGFOOD != 'true' }}
         run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
 
       # 5. cargo test --workspace (oracle + integration + invariant)
