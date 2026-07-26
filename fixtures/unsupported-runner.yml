@@ -1,8 +1,7 @@
 # Exercises the accepted-labels rejection for a `runs-on:` label outside
-# v0's stable x64 Ubuntu set (`greenlit-v0-spec.md` "Tech": "Supported
-# runner labels: ubuntu-latest, ubuntu-24.04, ubuntu-22.04. Every other
+# v0's stable x64 Ubuntu set plus the KanterLabs homelab aliases. Every other
 # label is recognized and rejected during planning with the supported list
-# and source location").
+# and source location.
 on: push
 
 jobs:

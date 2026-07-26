@@ -4,6 +4,19 @@
 
 ## Project identity
 
+### GitHub CI infrastructure
+
+Greenlit (`litci`) is the product under test; it is not Actions Runner
+Controller. ARC manages the ephemeral GitHub runner pods that execute this
+repository's workflows. Keep sustained Rust, dogfood, benchmark, integration,
+and release-verification jobs on `homelab-heavy`; keep inexpensive publishing
+or metadata work on `homelab`. Choose per job and preserve the runner-label
+planner/runtime tests when adding a tier.
+
+A test failure after GitHub assigns a runner is not by itself an ARC failure.
+The canonical platform contract is
+`KanterLabs/infrastructure/homelab/ci-runners/README.md`.
+
 | Surface | Name |
 |---|---|
 | Product display name | Greenlit |
