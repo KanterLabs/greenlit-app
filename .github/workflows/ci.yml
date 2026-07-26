@@ -18,6 +18,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The homelab runner and its DinD sidecar share runner.temp. Host paths
+  # created under the runner container's private /tmp are invisible to Docker.
+  TMPDIR: /home/runner/_work/_temp
 
 jobs:
   ci:
