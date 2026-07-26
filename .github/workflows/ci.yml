@@ -26,15 +26,25 @@ jobs:
   ci:
     name: fmt, clippy, deny, stubs, test, doc, bench
     runs-on: homelab-heavy
+    # Keep the portable gates independent of whatever happens to be installed
+    # on a runner host. Greenlit resolves this tag to an immutable digest in
+    # the RunLock, and both GitHub and local runs see the same Rust userspace.
+    container:
+      image: rust:1.96.0
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins channel 1.96.0 plus the rustfmt/clippy
-      # components; `rustup show` is enough to make the runner's existing
-      # rustup notice the file and provision exactly that toolchain.
+      # rust-toolchain.toml pins the components and musl target used by the
+      # workspace. The image already supplies the exact Rust release.
       - name: Provision pinned Rust toolchain
-        run: rustup show
+        run: |
+          rustc --version
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -56,16 +66,20 @@ jobs:
 
       # 4. tools/check-stubs
       - name: Stub registry consistency
-        run: python3 tools/check-stubs
-
-      # The real-daemon executor tests begin at the post-RunLock boundary.
-      # Provision the exact locked profile up front: once execution begins,
-      # Greenlit correctly refuses to replace a missing locked image.
-      - name: Prepare pinned runner profile for real-daemon tests
-        run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+        run: |
+          command -v python3 >/dev/null || {
+            apt-get update
+            apt-get install -y --no-install-recommends python3
+          }
+          python3 tools/check-stubs
 
       # 5. cargo test --workspace (oracle + integration + invariant)
+      # Real-daemon acceptance has its own host runner below. GitHub exposes
+      # its Docker daemon inside job containers, but the locked runner image is
+      # deliberately prepared only in that dedicated acceptance job.
       - name: Test
+        env:
+          LITCI_TEST_DISABLE_REAL_DOCKER: "1"
         run: cargo test --workspace
 
       # 6. RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -79,12 +93,47 @@ jobs:
       - name: Criterion benchmarks
         run: cargo bench --workspace
 
+  # A workflow job container intentionally cannot receive the host Docker
+  # socket. Keep the real-daemon acceptance on the heavy runner, while the
+  # portable suite above remains identical locally and on GitHub.
+  runtime-integration:
+    name: real Docker executor acceptance
+    needs: ci
+    runs-on: homelab-heavy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The real-daemon executor tests begin at the post-RunLock boundary.
+      # Provision the exact locked profile up front: once execution begins,
+      # Greenlit correctly refuses to replace a missing locked image.
+      - name: Prepare pinned runner profile
+        run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+
+      - name: Run real-daemon executor tests
+        run: |
+          cargo test -p greenlit-runtime \
+            --test actions_composite \
+            --test actions_docker \
+            --test actions_nodejs \
+            --test base_image \
+            --test engine_surface \
+            --test isolation \
+            --test isolation_overlay \
+            --test shell_ci_smoke
+
   # TESTING.md snapshotter-path coverage forbids capability self-skips. This
   # job provisions a real, isolated containerd/stargz stack and runs the direct
   # provider acceptance plus live clean/hermetic policy acceptance.
   provider-and-policy:
     name: configured stargz provider and policy modes
-    needs: ci
+    needs: runtime-integration
     runs-on: homelab-heavy
     steps:
       - name: Check out repository

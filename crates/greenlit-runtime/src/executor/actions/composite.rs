@@ -820,7 +820,7 @@ async fn run_nested_uses(
                         action_path: node.action_path.clone(),
                         post_script: node.runs.post.clone().unwrap_or_default(),
                         post_if: node.runs.post_if.clone(),
-                        with,
+                        input_env,
                         step_env: IndexMap::new(),
                         node_version: node.runs.using,
                         state_key,
