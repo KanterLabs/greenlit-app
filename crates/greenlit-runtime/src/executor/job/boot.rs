@@ -20,7 +20,7 @@ use crate::executor::readiness::READY_MARKER;
 use crate::executor::runner_profile;
 use crate::executor::services;
 use crate::executor::{ExecError, Shared, stage_span};
-use crate::image::{INIT_IN_IMAGE_PATH, init_binary};
+use crate::image::INIT_IN_IMAGE_PATH;
 use crate::isolation::{IsolationStrategy, isolation_container_spec};
 use crate::progress::{ProgressEvent, ProgressSink};
 
@@ -304,7 +304,12 @@ pub(crate) async fn boot_container(
     // Runner profiles and job-container images are immutable external OCI
     // content. Inject the private helper read-only rather than rebuilding or
     // mutating either image.
-    let helper = write_helper_binary()?;
+    let state_root = shared
+        .config
+        .store
+        .as_ref()
+        .map(services::StoreConfig::toolcache_root_parent);
+    let helper = super::helper_binary::stage(state_root.as_deref())?;
     spec.binds.push(BindMount {
         host_path: helper,
         container_path: INIT_IN_IMAGE_PATH.to_string(),
@@ -396,29 +401,4 @@ pub(crate) async fn boot_container(
     };
     progress.on_progress(ProgressEvent::BootFinished);
     Ok(Some(id))
-}
-
-/// Write the embedded `greenlit-init` bytes to a host temp file (mode 0755) so
-/// they can be bind-mounted into a job container.
-fn write_helper_binary() -> Result<String, ExecError> {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("greenlit-init-{}-{nanos}", std::process::id()));
-    std::fs::write(&path, init_binary()).map_err(helper_io_error)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(helper_io_error)?;
-    Ok(path.to_string_lossy().into_owned())
-}
-
-/// Map a helper-staging I/O error onto an [`ExecError`] with a fix.
-fn helper_io_error(source: std::io::Error) -> ExecError {
-    ExecError::Infrastructure {
-        message: format!("could not stage the greenlit-init helper: {source}"),
-        fix: "ensure the system temporary directory is writable".to_string(),
-    }
 }

@@ -35,6 +35,8 @@ pub(crate) enum Command {
     Stats,
     /// Inspect the immutable lock and result evidence for a local run.
     Inspect(InspectArgs),
+    /// Replay redacted logs from a local run's structured event journal.
+    Logs(LogsArgs),
     /// Export a separate, fully pinned workflow and GitHub evidence artifact.
     Export(ExportArgs),
     /// Import read-only GitHub evidence for a completed local run.
@@ -208,6 +210,83 @@ pub(crate) struct RunArgs {
     /// Maximum writable container-layer size, in bytes.
     #[arg(long, value_name = "BYTES", value_parser = parse_positive_i64)]
     pub(crate) disk_limit: Option<i64>,
+
+    /// Human output or newline-delimited structured events.
+    #[arg(long, value_enum, default_value = "plain")]
+    pub(crate) format: RunFormatArg,
+
+    /// Whether successful step bodies are hidden or streamed.
+    #[arg(long, value_enum, default_value = "compact")]
+    pub(crate) log_mode: LogModeArg,
+
+    /// Terminal color and Unicode policy.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub(crate) color: ColorArg,
+}
+
+/// Stored-log replay options.
+#[derive(Debug, clap::Args)]
+pub(crate) struct LogsArgs {
+    /// Run identity. When omitted, read the latest run with an event journal.
+    pub(crate) run_id: Option<String>,
+
+    /// Select one authored job id or concrete instance id.
+    #[arg(long)]
+    pub(crate) job: Option<String>,
+
+    /// Select one authored step id, one-based ordinal, or event id.
+    #[arg(long, requires = "job")]
+    pub(crate) step: Option<String>,
+
+    /// Print only the final number of matching log lines.
+    #[arg(long, value_parser = parse_positive_u64)]
+    pub(crate) tail: Option<u64>,
+
+    /// Wait for appended records until the run reaches a terminal event.
+    #[arg(short = 'f', long)]
+    pub(crate) follow: bool,
+
+    /// Human log text or matching raw JSONL event records.
+    #[arg(long, value_enum, default_value = "plain")]
+    pub(crate) format: LogFormatArg,
+}
+
+/// `litci run` output encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum RunFormatArg {
+    /// Polished outcome-based terminal output.
+    Plain,
+    /// Stable newline-delimited JSON event records.
+    Jsonl,
+}
+
+/// Successful-step body visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogModeArg {
+    /// Journal successful bodies and render only outcomes.
+    Compact,
+    /// Stream every redacted body line.
+    Full,
+}
+
+/// Terminal styling selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ColorArg {
+    /// Style only a capable TTY unless `NO_COLOR` is present.
+    Auto,
+    /// Force ANSI color and Unicode symbols.
+    Always,
+    /// Emit unstyled ASCII.
+    Never,
+}
+
+/// Stored-log output encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogFormatArg {
+    /// Reconstructed grouped log text.
+    Plain,
+    /// Original matching event records.
+    Jsonl,
 }
 
 fn parse_positive_i64(value: &str) -> Result<i64, String> {

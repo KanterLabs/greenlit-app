@@ -10,22 +10,22 @@
 //! invocation appends one NDJSON record"), and renders the human summary.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Write};
+use std::io;
 use std::process::ExitCode;
 
 use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::git::{collect_git_context, find_repository_root};
 use greenlit_engine::{
-    Conclusion, DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, MatrixPlan,
-    MatrixValue, PlanOptions, analyze_support, build_synthetic_event, plan, validate_v0_support,
+    DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, MatrixPlan, MatrixValue,
+    PlanOptions, analyze_support, build_synthetic_event, plan, validate_v0_support,
 };
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
     Cancellation, ContainerEngine, DockerEngine, EngineState, InteractiveConfirm,
-    IsolationStrategy, RunConfig, RunReport, StepReport, SystemProber, WriteBackOutcome, detect,
-    reject_hermetic_late_inputs, reject_uses_steps, run_plan_cancellable, run_write_back,
-    validate_host, validate_request,
+    IsolationStrategy, RunConfig, RunReport, SystemProber, WriteBackOutcome, detect,
+    reject_hermetic_late_inputs, reject_uses_steps, run_plan_with_events_cancellable,
+    run_write_back, validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
@@ -95,6 +95,14 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let evidence = invocation.time_stage("source-freeze", || {
         crate::run_evidence::RunEvidence::capture(&repo_root)
     })?;
+    let recorder = crate::run_events::RunEventRecorder::create(
+        &evidence.directory,
+        &evidence.run_id,
+        args.format,
+        args.log_mode,
+        args.color,
+    )?;
+    recorder.preparation_finished("source snapshot", Some(evidence.source.digest.clone()))?;
     evidence.apply_execution_policy(clean, args.hermetic)?;
     let frozen_repo_root = evidence.source.root.clone();
     let frozen_workflow_path = frozen_repo_root.join(&workflow_path.source_name);
@@ -107,8 +115,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             )
         })
         .map_err(|error| errors::parse_error(&error))?;
+    recorder.preparation_finished("workflow", Some(workflow_path.source_name.clone()))?;
     evidence.merge_support(&analyze_support(&workflow))?;
     validate_v0_support(&workflow).map_err(|error| errors::plan_error(&error))?;
+    recorder.preparation_finished("compatibility", None)?;
 
     let extraction = greenlit_workflow::extract_static(&workflow)
         .map_err(|error| errors::parse_error(&error))?;
@@ -210,6 +220,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let execution_plan = invocation
         .time_stage("plan", || plan(&workflow, &event, &plan_options))
         .map_err(|error| errors::plan_error(&error))?;
+    recorder.preparation_finished("execution plan", None)?;
     let execution_plan = match &args.job {
         Some(job) => prune_to_job(&execution_plan, job, &args.matrix, args.write_back)?,
         None => execution_plan,
@@ -272,6 +283,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             ))
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    recorder.preparation_finished(
+        "actions",
+        Some(format!("{} locked", action_preflight.actions.len())),
+    )?;
     runtime
         .block_on(pinned_resolver.freeze())
         .map_err(|error| anyhow::anyhow!(
@@ -294,6 +309,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         }
     }
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
+    recorder.preparation_finished("container runtime", None)?;
     let runtime_fingerprint = runtime
         .block_on(engine.runtime_fingerprint())
         .map_err(|error| {
@@ -302,7 +318,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             )
         })?;
     let content_store = open_content_store()?;
-    let mut progress = render::progress::renderer_for_stderr();
+    let mut progress = recorder.clone();
     let container_locks = invocation
         .time_stage("image-resolve", || {
             runtime.block_on(greenlit_runtime::preflight_plan_images(
@@ -315,6 +331,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             ))
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    recorder.preparation_finished(
+        "containers",
+        Some(format!("{} locked", container_locks.len())),
+    )?;
     let runner_locks = invocation
         .time_stage("runner-resolve", || {
             runtime.block_on(greenlit_runtime::preflight_plan_runners(
@@ -326,6 +346,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             ))
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
+    recorder.preparation_finished("runners", Some(format!("{} locked", runner_locks.len())))?;
     let run_lock = evidence.lock(crate::run_evidence::LockInputs {
         workflow_path: &workflow_path.source_name,
         event_name: event_kind.event_name(),
@@ -343,6 +364,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         runners: runner_locks,
         toolchains: action_preflight.toolchains,
     })?;
+    recorder.preparation_finished("RunLock", Some(run_lock.source.snapshot_digest.clone()))?;
 
     // The local stores this run serves. A machine whose `HOME` cannot be
     // resolved simply runs without them -- `actions/cache` then behaves as it
@@ -397,18 +419,17 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         },
     };
 
-    // `Stdout` (not a lock guard) is `Send`, which the executor's streaming sink
-    // requires; each write still locks internally. Phase progress renders on
-    // stderr so this stream stays the machine-parseable run log.
-    let mut out = io::stdout();
+    let mut logs = recorder.clone();
+    let mut events = recorder.clone();
     let cancellation = Cancellation::new();
     let report = runtime
         .block_on(async {
-            let execution = run_plan_cancellable(
+            let execution = run_plan_with_events_cancellable(
                 &engine,
                 &execution_plan,
                 &config,
-                &mut out,
+                &mut logs,
+                &mut events,
                 &mut progress,
                 &cancellation,
             );
@@ -465,6 +486,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         if cache_counts.bytes_written > 0 {
             invocation.record_lookup_bytes("cache", true, cache_counts.bytes_written);
         }
+        recorder.cache_summary("workflow cache", cache_counts.hits, cache_counts.misses)?;
     }
     let action_counts = config.actions.store.counts();
     for _ in 0..action_counts.hits {
@@ -473,6 +495,7 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     for _ in 0..action_counts.misses {
         invocation.record_lookup("action-fetch", false);
     }
+    recorder.cache_summary("actions", action_counts.hits, action_counts.misses)?;
     let node_runtime_counts = config.actions.node_runtime_store.counts();
     for _ in 0..node_runtime_counts.hits {
         invocation.record_lookup("action-runtime-fetch", true);
@@ -480,36 +503,29 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     for _ in 0..node_runtime_counts.misses {
         invocation.record_lookup("action-runtime-fetch", false);
     }
+    recorder.cache_summary(
+        "action runtimes",
+        node_runtime_counts.hits,
+        node_runtime_counts.misses,
+    )?;
 
-    render_run_table(&report, &mut out).map_err(|error| {
-        anyhow::anyhow!(
-            "could not write the run summary: {error}\n  fix: ensure stdout is writable"
-        )
-    })?;
     let conclusion = if report.failed() {
         ExecutionConclusion::Failed
     } else {
         ExecutionConclusion::Passed
     };
+    recorder.verify_durable()?;
     let result = evidence.write_result(
         conclusion,
         run_lock.compatibility.clone(),
         clean,
         args.hermetic,
     )?;
-    writeln!(
-        io::stderr(),
-        "evidence: {} ({:?}/{:?}/{:?})",
-        evidence.run_id,
-        result.conclusion,
-        result.compatibility,
-        result.assurance
-    )
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "could not report the run evidence identity: {error}\n  fix: ensure stderr is writable"
-        )
-    })?;
+    recorder.finish(
+        format!("{:?}", result.conclusion),
+        format!("{:?}", result.compatibility),
+        format!("{:?}", result.assurance),
+    )?;
 
     if args.write_back {
         // Every ran job kept its container alive (`RunConfig::write_back`,
@@ -889,49 +905,6 @@ fn matrix_leg_matches(
                 .get(key.as_str())
                 .is_some_and(|actual| actual == value)
         })
-}
-
-/// Render the end-of-run table: each job, its steps' outcomes and durations,
-/// then the overall result.
-fn render_run_table(report: &RunReport, out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "\nRun summary")?;
-    for job in &report.jobs {
-        writeln!(out, "  {} [{}]", job.display, job.result.as_github_str())?;
-        for step in &job.steps {
-            writeln!(
-                out,
-                "    {} {}  {}",
-                step_sigil(step),
-                step.label,
-                format_duration(step)
-            )?;
-        }
-    }
-    writeln!(out, "\nResult: {}", report.overall.as_github_str())?;
-    Ok(())
-}
-
-/// A short sigil for a step's conclusion in the summary table.
-fn step_sigil(step: &StepReport) -> &'static str {
-    match step.conclusion {
-        Conclusion::Success => "\u{2713}",
-        Conclusion::Failure => "\u{2717}",
-        Conclusion::Cancelled => "\u{29b8}",
-        Conclusion::Skipped => "\u{2013}",
-    }
-}
-
-/// Format a step's duration, or a dash for a step that did not run.
-fn format_duration(step: &StepReport) -> String {
-    if !step.ran {
-        return "—".to_string();
-    }
-    let millis = step.duration.as_millis();
-    if millis >= 1000 {
-        format!("{:.1}s", step.duration.as_secs_f64())
-    } else {
-        format!("{millis}ms")
-    }
 }
 
 #[cfg(test)]
