@@ -990,6 +990,16 @@ policy actively contains. They are not deferred Greenlit behavior.
   preserved in `Recipe::pinned_version` and surfaced in the install log as
   `distribution default` rather than papered over with an invented number.
 
+- **Docker bind sources must outlive container creation and startup.** A CI
+  run observed a helper written under the runner-managed temporary directory
+  disappear after Docker accepted the container specification but before
+  `runc` started it. Docker's bind syntax then materialized the absent source
+  as a directory, so `/greenlit/bin/greenlit-init` failed with `is a
+  directory: permission denied`. Greenlit now publishes the embedded helper
+  atomically under `~/.litci/runtime`, keyed and verified by SHA-256. A corrupt
+  regular file is atomically replaced; a non-file at that immutable identity
+  fails closed with an actionable error.
+
 ## Phase 11 event boundary
 
 `greenlit-runtime` now exposes two presentation-neutral ports beside

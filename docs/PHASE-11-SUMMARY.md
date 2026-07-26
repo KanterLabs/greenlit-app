@@ -27,6 +27,10 @@ budgets, and two installed-release-binary dogfood runs.
   Old runs without journals fail with an actionable version boundary.
 - The obsolete direct progress renderer was removed; preparation observations
   now use the same durable record and projection path as execution.
+- The embedded `greenlit-init` helper is atomically published under
+  `~/.litci/runtime` by SHA-256 identity, verified before reuse, and repaired
+  if its bytes are corrupted. Docker container startup no longer races
+  runner-managed temporary-directory cleanup.
 
 ## Deviations and external operations
 
@@ -50,6 +54,8 @@ None.
 - Added compiled-binary `litci logs` integration coverage for latest-run
   selection, job/step/tail filtering, exact JSONL replay, and pre-journal run
   rejection.
+- Added runtime unit coverage for stable executable helper reuse, corrupt
+  helper repair, and rejection of a directory at an immutable helper path.
 - Extended the existing performance fixture to prove, on a real daemon, that
   compact success bodies and a workflow-forged success marker remain journal
   logs, failure output obeys the 200-line bound and points to replay, and

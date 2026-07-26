@@ -3,6 +3,7 @@
 //! teardown.
 
 mod boot;
+mod helper_binary;
 mod teardown;
 
 use std::io::Write;
