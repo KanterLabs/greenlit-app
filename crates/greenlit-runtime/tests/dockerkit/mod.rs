@@ -4,6 +4,9 @@
 //! whenever Docker is reachable (it is in this project's environment) and print
 //! a clear notice, rather than silently passing, when it is not. The engine is a
 //! true external, so it is used real here — not faked (`TESTING.md`).
+//! `LITCI_TEST_DISABLE_REAL_DOCKER=1` reserves a containerized portable test
+//! job for daemon-independent coverage when a separate CI job owns the required
+//! real-daemon acceptance.
 //!
 //! Not every symbol is used by every test binary that includes this module, so
 //! the odd unused helper is expected.
@@ -20,6 +23,9 @@ use greenlit_runtime::engine::{ContainerEngine, ExecOutputSink};
 /// Returns `None` (after a stderr notice) when no daemon answers, so a
 /// daemon-less CI run degrades to a no-op rather than a hard failure.
 pub async fn engine_if_reachable() -> Option<DockerEngine> {
+    if std::env::var_os("LITCI_TEST_DISABLE_REAL_DOCKER").is_some() {
+        return None;
+    }
     let engine = DockerEngine::connect(&Endpoint::DockerSocket).ok()?;
     // A cheap round-trip proves the daemon actually answers, not merely that a
     // client was constructed.
@@ -34,6 +40,10 @@ pub async fn engine_if_reachable() -> Option<DockerEngine> {
 
 /// Emit the standard "skipped — no daemon" notice for a test.
 pub fn notice_no_daemon(test: &str) {
+    if std::env::var_os("LITCI_TEST_DISABLE_REAL_DOCKER").is_some() {
+        eprintln!("{test}: real-daemon coverage is reserved for its dedicated CI job");
+        return;
+    }
     eprintln!("{test}: no Docker daemon reachable; skipping the real-daemon checks");
 }
 

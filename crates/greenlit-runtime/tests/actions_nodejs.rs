@@ -32,11 +32,21 @@ use dockerkit::{engine_if_reachable, notice_no_daemon};
 
 /// A fake "node" executable: a POSIX shell script (works under both glibc
 /// and Alpine/busybox `sh`) that ignores its script-path argument and
-/// proves the env/command-file protocol instead: echoes `INPUT_GREETING`
-/// and `GITHUB_ACTION_PATH`, and writes a `GITHUB_OUTPUT` assignment.
+/// proves the env/command-file protocol instead. Main writes output and saved
+/// state; post verifies both the resolved input (including defaults) and its
+/// matching `STATE_*` value.
 const FAKE_NODE_SCRIPT: &str = "#!/bin/sh\n\
+case \"$1\" in\n\
+  *post.js)\n\
+    echo \"fake-node post: input=$INPUT_GREETING state=$STATE_saved\"\n\
+    test \"$STATE_saved\" = \"$INPUT_GREETING\" || exit $?\n\
+    test \"$INPUT_GREETING\" != \"fail-post\" || exit $?\n\
+    exit 0\n\
+    ;;\n\
+esac\n\
 echo \"fake-node ran: input=$INPUT_GREETING action_path=$GITHUB_ACTION_PATH\"\n\
-echo \"greeted=$INPUT_GREETING\" >> \"$GITHUB_OUTPUT\"\n";
+echo \"greeted=$INPUT_GREETING\" >> \"$GITHUB_OUTPUT\"\n\
+echo \"saved=$INPUT_GREETING\" >> \"$GITHUB_STATE\"\n";
 
 /// Builds a tiny gzip-compressed tar containing `bin/node` (the fake script
 /// above), mirroring the real bundles' `bin/node` layout.
@@ -162,12 +172,17 @@ fn write_local_node_action(repo_root: &std::path::Path, name: &str, using: &str)
     std::fs::write(
         dir.join("action.yml"),
         format!(
-            "name: {name}\ninputs:\n  greeting:\n    default: hello\nruns:\n  using: {using}\n  main: main.js\n"
+            "name: {name}\ninputs:\n  greeting:\n    default: hello\nruns:\n  using: {using}\n  main: main.js\n  post: post.js\n"
         ),
     )
     .unwrap();
     std::fs::write(
         dir.join("main.js"),
+        b"// never executed by the fake node runtime\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("post.js"),
         b"// never executed by the fake node runtime\n",
     )
     .unwrap();
@@ -225,7 +240,7 @@ async fn node20_and_node24_actions_execute_in_the_ordinary_job_container() {
     std::fs::create_dir_all(repo_root.path().join(".github/workflows")).unwrap();
     std::fs::write(
         repo_root.path().join(".github/workflows/ci.yml"),
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - id: n20\n        uses: ./.github/actions/fake-node20\n        with:\n          greeting: hi-twenty\n      - id: n24\n        uses: ./.github/actions/fake-node24\n        with:\n          greeting: hi-twentyfour\n",
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - id: n20\n        uses: ./.github/actions/fake-node20\n        with:\n          greeting: hi-twenty\n      - id: n24\n        uses: ./.github/actions/fake-node24\n",
     )
     .unwrap();
 
@@ -278,12 +293,17 @@ async fn node20_and_node24_actions_execute_in_the_ordinary_job_container() {
     let build = &report.jobs[0];
     assert_eq!(build.result, Conclusion::Success);
     assert!(
-        log.contains("input=hi-twenty") && log.contains("input=hi-twentyfour"),
-        "both node20 and node24 actions received their INPUT_* env var\n--- log ---\n{log}"
+        log.contains("input=hi-twenty") && log.contains("input=hello"),
+        "authored and manifest-default inputs reach node20 and node24 actions\n--- log ---\n{log}"
     );
     assert!(
         log.contains(".github/actions/fake-node20") && log.contains(".github/actions/fake-node24"),
         "GITHUB_ACTION_PATH pointed at each action's own directory\n--- log ---\n{log}"
+    );
+    assert!(
+        log.contains("fake-node post: input=hi-twenty state=hi-twenty")
+            && log.contains("fake-node post: input=hello state=hello"),
+        "post phases receive the same resolved inputs and saved state as main\n--- log ---\n{log}"
     );
 }
 
@@ -299,7 +319,7 @@ async fn a_node_action_executes_in_a_custom_job_container() {
     std::fs::create_dir_all(repo_root.path().join(".github/workflows")).unwrap();
     std::fs::write(
         repo_root.path().join(".github/workflows/ci.yml"),
-        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container:\n      image: ubuntu:24.04\n    steps:\n      - uses: ./.github/actions/fake-node20\n        with:\n          greeting: hi-from-container\n",
+        "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    container:\n      image: ubuntu:24.04\n    steps:\n      - uses: ./.github/actions/fake-node20\n        with:\n          greeting: fail-post\n",
     )
     .unwrap();
 
@@ -346,11 +366,12 @@ async fn a_node_action_executes_in_a_custom_job_container() {
 
     assert_eq!(
         report.overall,
-        Conclusion::Success,
-        "the action succeeds inside the custom job container\n--- log ---\n{log}"
+        Conclusion::Failure,
+        "a failing post action must fail the job instead of producing a false green\n--- log ---\n{log}"
     );
     assert!(
-        log.contains("input=hi-from-container"),
-        "the action ran inside the requested container image\n--- log ---\n{log}"
+        log.contains("input=fail-post")
+            && log.contains("fake-node post: input=fail-post state=fail-post"),
+        "the post action received its authored input and saved state inside the custom container\n--- log ---\n{log}"
     );
 }

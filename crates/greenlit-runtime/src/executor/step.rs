@@ -256,11 +256,11 @@ pub(crate) async fn run_post_steps(
         let started = Instant::now();
         let label = masker.apply(&entry.label);
         let ctx = pre_pass_context(job, needs, state);
-        let ran = match &entry.action {
+        let result = match &entry.action {
             PostAction::Checkout(post) => {
                 let _ = writeln!(out, "\u{25b6} {label}");
                 checkout::run_post(job.engine, job.container, post).await?;
-                true
+                Some(step_result_from_exit(StepExit::Success, false))
             }
             PostAction::Node(post) => {
                 let post_if = post.post_if.as_deref().unwrap_or("always()");
@@ -268,31 +268,24 @@ pub(crate) async fn run_post_steps(
                     .map_err(ExecError::template_eval)?
                 {
                     let _ = writeln!(out, "\u{25b6} {label}");
-                    run_node_post(job, state, post, out, masker).await?;
-                    true
+                    let exit = run_node_post(job, state, post, out, masker).await?;
+                    Some(step_result_from_exit(exit, false))
                 } else {
-                    false
+                    None
                 }
             }
         };
         let duration = started.elapsed();
-        if ran {
-            let _ = writeln!(out, "  {} {label}", status_sigil(Conclusion::Success));
+        if let Some(result) = result {
+            let _ = writeln!(out, "  {} {label}", status_sigil(result.conclusion));
         } else {
             let _ = writeln!(out, "  \u{2013} {label} (skipped)");
         }
         results.push(ExecutedStep {
-            result: if ran {
-                StepResult {
-                    outcome: Conclusion::Success,
-                    conclusion: Conclusion::Success,
-                }
-            } else {
-                step_result_skipped()
-            },
+            result: result.unwrap_or_else(step_result_skipped),
             label,
             duration,
-            ran,
+            ran: result.is_some(),
         });
     }
     Ok(results)
@@ -304,27 +297,18 @@ async fn run_node_post(
     post: &NodePostEntry,
     out: &mut (dyn Write + Send),
     masker: &mut Masker,
-) -> Result<(), ExecError> {
+) -> Result<StepExit, ExecError> {
     let variant =
         node_runtime::ensure_variant(job.engine, job.container, &mut state.node_variant).await?;
     let node_binary = nodejs::node_binary(job.node_mounts, post.node_version, variant)?;
-    let mut input_env: Vec<(String, String)> = post
-        .with
-        .iter()
-        .map(|(k, v)| {
-            (
-                format!("INPUT_{}", k.replace(' ', "_").to_uppercase()),
-                v.clone(),
-            )
-        })
-        .collect();
+    let mut input_env = post.input_env.clone();
     if let Some(state_map) = state.action_state.get(&post.state_key) {
         for (name, value) in state_map {
             input_env.push((format!("STATE_{name}"), value.clone()));
         }
     }
     let full_env = layered_env(job, state, &post.step_env);
-    nodejs::run_phase(
+    let outcome = nodejs::run_phase(
         nodejs::PhaseRequest {
             engine: job.engine,
             container: job.container,
@@ -341,7 +325,7 @@ async fn run_node_post(
         masker,
     )
     .await?;
-    Ok(())
+    Ok(outcome.exit)
 }
 
 /// Execute step `index`, mutating the job's live state and streaming its log.
@@ -710,7 +694,7 @@ async fn execute_uses_step(
                         action_path: node.action_path.clone(),
                         post_script: node.runs.post.clone().unwrap_or_default(),
                         post_if: node.runs.post_if.clone(),
-                        with: with.clone(),
+                        input_env: input_env.clone(),
                         step_env: IndexMap::new(),
                         node_version: node.runs.using,
                         state_key: index,

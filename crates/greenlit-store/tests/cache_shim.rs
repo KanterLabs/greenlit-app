@@ -152,6 +152,41 @@ async fn the_full_save_then_restore_sequence_matches_the_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_toolkits_sixty_four_mib_upload_chunk_is_accepted() {
+    let fixture = start().await;
+    let base = fixture.base.clone();
+    let agent = agent();
+    let auth = format!("Bearer {TOKEN}");
+
+    let mut reserved = agent
+        .post(&format!("{base}_apis/artifactcache/caches"))
+        .header("Authorization", &auth)
+        .send_json(serde_json::json!({ "key": "large", "version": "v1" }))
+        .expect("reserve");
+    let id = reserved
+        .body_mut()
+        .read_json::<serde_json::Value>()
+        .expect("body")
+        .get("cacheId")
+        .and_then(serde_json::Value::as_i64)
+        .expect("cacheId");
+
+    // Current `actions/cache` and `rust-cache` request 64 MiB upload chunks.
+    // Axum's default 2 MiB body limit previously rejected this exact client
+    // request with 413, leaving every local run cold.
+    let chunk = vec![0x5a; 64 * 1024 * 1024];
+    let uploaded = agent
+        .patch(&format!("{base}_apis/artifactcache/caches/{id}"))
+        .header("Authorization", &auth)
+        .header("Content-Range", &format!("bytes 0-{}/*", chunk.len() - 1))
+        .send(&chunk)
+        .expect("upload a toolkit-sized chunk");
+    assert_eq!(uploaded.status(), 200);
+
+    fixture.shim.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restore_key_hit_reports_the_key_that_actually_matched() {
     let fixture = start().await;
     let base = fixture.base.clone();

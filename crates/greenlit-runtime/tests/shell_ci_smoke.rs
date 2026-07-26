@@ -228,6 +228,10 @@ async fn shell_ci_fixture_runs_green_end_to_end() {
         log.contains(&format!("|{workspace}|build]")),
         "github.workspace/job interpolate to this job's own values\n--- log ---\n{log}"
     );
+    assert!(
+        log.contains("RUNNER_ENVIRONMENT_OK:[self-hosted]"),
+        "runner.environment identifies Greenlit as self-hosted\n--- log ---\n{log}"
+    );
 
     // Per-step `GITHUB_ACTION` (`crate::executor::step_ids`): an id-less
     // `run:` step gets the runner's own default `__run`, a repeated one

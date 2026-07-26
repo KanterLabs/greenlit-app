@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -37,6 +38,11 @@ use serde::{Deserialize, Serialize};
 use crate::cache::CacheStore;
 use crate::error::StoreError;
 use crate::server::state::ShimState;
+
+/// The toolkit caps `CACHE_UPLOAD_CHUNK_SIZE` at 128 MiB. Keep the shim
+/// bounded at that documented client maximum while accepting the 64 MiB
+/// chunks used by current `actions/cache` and `Swatinem/rust-cache`.
+const CACHE_UPLOAD_BODY_LIMIT: usize = 128 * 1024 * 1024;
 
 /// `GET cache?keys=…&version=…` — the ordered key list, comma separated.
 #[derive(Debug, Deserialize)]
@@ -83,6 +89,7 @@ pub(crate) fn routes(router: Router<Arc<ShimState>>) -> Router<Arc<ShimState>> {
             patch(upload).post(commit),
         )
         .route("/_apis/artifactcache/blobs/{id}", get(download))
+        .layer(DefaultBodyLimit::max(CACHE_UPLOAD_BODY_LIMIT))
 }
 
 async fn lookup(
