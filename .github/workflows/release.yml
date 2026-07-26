@@ -18,7 +18,7 @@ env:
 jobs:
   verify:
     name: build and package release candidate
-    runs-on: ubuntu-24.04
+    runs-on: homelab
     steps:
       - name: Check out exact source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -43,7 +43,7 @@ jobs:
     name: publish crates in dependency order
     if: inputs.publish
     needs: verify
-    runs-on: ubuntu-24.04
+    runs-on: homelab
     environment: release
     steps:
       - name: Check out exact source
