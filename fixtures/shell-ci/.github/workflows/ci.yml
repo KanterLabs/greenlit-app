@@ -59,6 +59,9 @@ jobs:
           test -n "${{ github.workspace }}"
           test -n "${{ github.job }}"
           echo "ROOTS_OK:[${{ github.event_path }}|${{ github.workspace }}|${{ github.job }}]"
+      - name: self-hosted runner environment resolves at runtime
+        if: runner.environment == 'self-hosted'
+        run: echo "RUNNER_ENVIRONMENT_OK:[${{ runner.environment }}]"
 
   action-ids:
     runs-on: ubuntu-latest
