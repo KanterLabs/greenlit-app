@@ -1003,7 +1003,10 @@ policy actively contains. They are not deferred Greenlit behavior.
   directory: permission denied`. Greenlit now publishes the embedded helper
   atomically under `~/.litci/runtime`, keyed and verified by SHA-256. A corrupt
   regular file is atomically replaced; a non-file at that immutable identity
-  fails closed with an actionable error.
+  fails closed with an actionable error. The runtime state root is an explicit
+  executor input independent of workflow-facing stores; disabling those stores
+  cannot return helper publication to daemon-invisible host scratch, and no
+  ephemeral executable fallback exists.
 
 ## Phase 11 event boundary
 
