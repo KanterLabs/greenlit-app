@@ -38,6 +38,7 @@ _EXPECTED_DECLARATIONS = (
     "          test '${{ steps.emit.outputs.seed_value }}' = 'greenlit'",
     "          printf 'PARITY_OUTPUT seed_value=%s\\n' \\",
     "            '${{ steps.emit.outputs.seed_value }}'",
+    "          umask 0022",
     "          printf '%s\\n' 'greenlit' > parity-seed.txt",
     "          test \"$(cat parity-seed.txt)\" = 'greenlit'",
     "          mode=\"$(stat -c '%a' parity-seed.txt)\"",
