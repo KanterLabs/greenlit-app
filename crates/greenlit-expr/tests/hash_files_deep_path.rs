@@ -4,6 +4,7 @@
 mod support;
 
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,11 +23,14 @@ fn public_hash_files_traversal_state_stays_depth_proportional_beyond_path_max() 
     // at most depth * name_len. This directly demonstrates the underlying
     // fix too: every level is created via a relative `mkdirat` from its own
     // parent fd (never a joined path string), so the chain's true lexical
-    // length can — and here does — exceed Linux's `PATH_MAX` (4096 bytes)
-    // by more than an order of magnitude; passing a path that long to any
-    // ordinary path-based syscall would fail with `ENAMETOOLONG`.
+    // length can — and here does — exceed Linux's `PATH_MAX` (4096 bytes).
+    // Keep it below the canonical runner container's 8192-byte AppArmor path
+    // reconstruction bound so the security module can still authorize each
+    // descriptor-relative operation. AppArmor defines that default as twice
+    // PATH_MAX:
+    // https://github.com/torvalds/linux/blob/62cc90241548d5570ee68e01aaba6506964e9811/security/apparmor/lsm.c#L1881-L1883
     const DEPTH: usize = 800;
-    const NAME_LEN: usize = 100;
+    const NAME_LEN: usize = 5;
     // The repository root may be overlayfs, which reconstructs full paths
     // internally and rejects descriptor-relative chains at PATH_MAX. tmpfs
     // supports the kernel behavior this invariant owns. Absence, insufficient
@@ -66,10 +70,22 @@ fn public_hash_files_traversal_state_stays_depth_proportional_beyond_path_max() 
         .write_all(b"deep")
         .expect("write deep payload");
 
-    let total_lexical_bytes = DEPTH * (NAME_LEN + 1);
+    let mut deep_payload = tree.path().to_path_buf();
+    for _ in 0..DEPTH {
+        deep_payload.push(name.as_str());
+    }
+    deep_payload.push("payload.txt");
+    let total_lexical_bytes = deep_payload.as_os_str().as_bytes().len();
     assert!(
-        total_lexical_bytes > 16 * 4096,
-        "test setup must exceed PATH_MAX by a wide margin, got {total_lexical_bytes} bytes"
+        total_lexical_bytes > 4096 && total_lexical_bytes < 8192,
+        "test setup must exceed PATH_MAX without exceeding the runner's AppArmor bound, got {total_lexical_bytes} bytes"
+    );
+    let conventional_error = std::fs::metadata(&deep_payload)
+        .expect_err("an ordinary full-path syscall must reject the beyond-PATH_MAX fixture");
+    assert_eq!(
+        conventional_error.raw_os_error(),
+        Some(rustix::io::Errno::NAMETOOLONG.raw_os_error()),
+        "the conventional full-path failure must be ENAMETOOLONG"
     );
 
     let context = Context::new(Arc::new(RealFs::new(tree.path())));

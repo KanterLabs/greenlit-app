@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/greenlit-release-local-evidence"
           test ! -e "$output"
-          install -d -m 0700 "$output"
+          install -d -m 000700 "$output"
           tools/check-live-parity local \
             --repository-root "$GITHUB_WORKSPACE" \
             --greenlit-binary \
@@ -125,7 +125,7 @@ jobs:
           set -euo pipefail
           bundle="$GITHUB_WORKSPACE/target/release-local-evidence.tar"
           binary="$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci"
-          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
             /usr/bin/python3 -E -s -B \
               tools/release_check_credential_bundle.py pack-local \
@@ -164,10 +164,10 @@ jobs:
             >/dev/null 2>&1
           git switch -C greenlit-release-github "$GITHUB_SHA"
           command -v /usr/bin/python3 >/dev/null
-          command -v /usr/bin/gh >/dev/null
+          command -v /usr/local/bin/gh >/dev/null
           output="$RUNNER_TEMP/greenlit-release-github-evidence"
           test ! -e "$output"
-          install -d -m 0700 "$output"
+          install -d -m 000700 "$output"
           /usr/bin/python3 -E -s -B \
             tools/release_check_credential.py --self-test
 
@@ -186,7 +186,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle="$GITHUB_WORKSPACE/target/release-github-evidence.tar"
-          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
             /usr/bin/python3 -E -s -B \
               tools/release_check_credential_bundle.py pack-github \
@@ -273,31 +273,29 @@ jobs:
 
       - name: Provision isolated keyring prerequisites
         run: |
-          command -v unshare >/dev/null
-          if ! command -v keyctl >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends keyutils
-          fi
+          test "$(/usr/bin/uname -s)" = Linux
+          test "$(/usr/bin/uname -m)" = x86_64
+          test -x /usr/bin/unshare
+          keyutils_root="$RUNNER_TEMP/greenlit-keyutils"
+          tools/tests/provision-keyctl "$keyutils_root"
+          printf '%s\n' "$keyutils_root/package/usr/bin" >> "$GITHUB_PATH"
 
       - name: Run production persistent-keyring acceptance
         run: tools/test-credential-capability
 
       - name: Provision privileged copy-strategy prerequisites
         run: |
-          missing_packages=()
-          command -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)
-          command -v losetup >/dev/null || missing_packages+=(util-linux)
-          if ((${#missing_packages[@]})); then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
-          fi
+          test "$(/usr/bin/uname -s)" = Linux
+          test "$(/usr/bin/uname -m)" = x86_64
+          test -x /usr/bin/docker
+          /usr/bin/docker info >/dev/null
 
       - name: Reflink and bounded-stream copy strategies
         run: |
-          cargo build --locked -p greenlit-init
-          sudo --preserve-env=PATH \
-            tools/tests/check-greenlit-init-copy-strategies \
-            target/debug/greenlit-init
+          cargo build --locked -p greenlit-init --profile init \
+            --target x86_64-unknown-linux-musl
+          tools/test-copy-strategy-capability \
+            target/x86_64-unknown-linux-musl/init/greenlit-init
 
       - name: Run real-daemon executor tests
         run: tools/tests/check-capability-test-manifest --run-owner docker-runtime
@@ -379,7 +377,7 @@ jobs:
           download="$RUNNER_TEMP/greenlit-candidate-download/greenlit-release-candidate.tar"
           output="$RUNNER_TEMP/greenlit-candidate-unpacked"
           test ! -e "$output"
-          install -d -m 0700 "$output"
+          install -d -m 000700 "$output"
           tools/release-provenance unpack \
             --repository-root "$GITHUB_WORKSPACE" \
             --bundle "$download" \

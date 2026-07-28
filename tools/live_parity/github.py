@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,7 +22,7 @@ from .errors import GateError
 from .process import run_command
 
 
-GH = "/usr/bin/gh"
+GH_CANDIDATES = (Path("/usr/local/bin/gh"), Path("/usr/bin/gh"))
 MAX_TOKEN_BYTES = 64 * 1024
 TOKEN_DESCRIPTOR = "GREENLIT_GITHUB_CREDENTIAL_FD"
 PRODUCER_TOKEN_DESCRIPTOR = "GREENLIT_GITHUB_PRODUCER_CREDENTIAL_FD"
@@ -149,6 +150,25 @@ def _bounded_integer(raw: str) -> int:
     return value
 
 
+def _gh_executable() -> str:
+    for candidate in GH_CANDIDATES:
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid == 0
+            and metadata.st_mode & 0o111
+            and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+        ):
+            return str(candidate)
+    raise GateError(
+        "live parity requires a trusted GitHub CLI at "
+        "/usr/local/bin/gh or /usr/bin/gh"
+    )
+
+
 def _api(
     credential: GitHubCredential,
     endpoint: str,
@@ -157,7 +177,7 @@ def _api(
     timeout: float = 120,
 ) -> Any:
     command = [
-        GH,
+        _gh_executable(),
         "api",
         "--hostname",
         "github.com",

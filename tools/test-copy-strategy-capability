@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Run the real privileged copy-strategy gate in an isolated pinned child.
+set -euo pipefail
+
+readonly runner_image='ghcr.io/kanterlabs/homelab-runner:2.336.0-3@sha256:f8d30c1e995667f5e5146c638b411288163efaf79fe44f06df91385b924f18dd'
+readonly btrfs_url='https://archive.ubuntu.com/ubuntu/pool/main/b/btrfs-progs/btrfs-progs_6.6.3-1.1build2_amd64.deb'
+readonly btrfs_sha256='b4aeb482adcce07b276827d8f4b0c502427a2a43574fa8349081f23dcd8c96aa'
+readonly lzo_url='https://archive.ubuntu.com/ubuntu/pool/main/l/lzo2/liblzo2-2_2.10-2build4_amd64.deb'
+readonly lzo_sha256='e0d13be155013138b8db4cfe68212b866080af661c78302c2eab0d2f9d0d454e'
+readonly reiser_url='https://archive.ubuntu.com/ubuntu/pool/main/r/reiserfsprogs/libreiserfscore0t64_3.6.27-7.1build1_amd64.deb'
+readonly reiser_sha256='6c2dfd68a96f4ea7ab26b548cd1dab1965c7fff491b45064665f7ffccda13108'
+readonly label_key='greenlit.test.copy-strategy'
+readonly docker=/usr/bin/docker
+
+readonly repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+if [[ $# -ne 1 ]]; then
+  echo "usage: test-copy-strategy-capability target/x86_64-unknown-linux-musl/init/greenlit-init" >&2
+  exit 2
+fi
+
+candidate="$1"
+if [[ "$candidate" != /* ]]; then
+  candidate="$repository_root/$candidate"
+fi
+if [[ -L "$candidate" || ! -f "$candidate" || ! -x "$candidate" ]]; then
+  echo "copy-strategy capability requires one regular executable helper" >&2
+  exit 1
+fi
+readonly binary="$(/usr/bin/realpath -e -- "$candidate")"
+case "$binary" in
+  "$repository_root"/*) ;;
+  *)
+    echo "copy-strategy helper must be inside the repository" >&2
+    exit 1
+    ;;
+esac
+readonly binary_relative="${binary#"$repository_root/"}"
+if [[ "$binary_relative" \
+  != target/x86_64-unknown-linux-musl/init/greenlit-init ]]; then
+  echo "copy-strategy capability requires the canonical musl init artifact" >&2
+  exit 1
+fi
+
+if [[ "$(/usr/bin/uname -s)" != Linux \
+  || "$(/usr/bin/uname -m)" != x86_64 \
+  || ! -x "$docker" ]]; then
+  echo "copy-strategy capability requires Linux x86_64 and Docker" >&2
+  exit 1
+fi
+"$docker" info >/dev/null
+"$docker" pull "$runner_image" >/dev/null
+
+readonly suffix="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${BASHPID}-${RANDOM}"
+if [[ ! "$suffix" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,96}$ ]]; then
+  echo "copy-strategy capability received an invalid run identity" >&2
+  exit 1
+fi
+readonly volume="greenlit-copy-capability-$suffix"
+readonly prep_container="greenlit-copy-prep-$suffix"
+readonly run_container="greenlit-copy-run-$suffix"
+resources_started=0
+
+remove_labeled_resources() {
+  local resource_type="$1"
+  local found=''
+  if ! found="$("$docker" "$resource_type" ls \
+    --quiet \
+    --filter "label=$label_key=$suffix")"; then
+    return 1
+  fi
+  if [[ -z "$found" ]]; then
+    return 0
+  fi
+  while IFS= read -r resource; do
+    if [[ -n "$resource" ]]; then
+      if [[ "$resource_type" = container ]]; then
+        "$docker" container rm --force "$resource" >/dev/null
+      else
+        "$docker" volume rm "$resource" >/dev/null
+      fi
+    fi
+  done <<<"$found"
+}
+
+cleanup() {
+  local original_status=$?
+  local cleanup_failed=0
+  local remaining_containers=''
+  local remaining_volumes=''
+  trap - EXIT INT TERM
+  if ((resources_started)); then
+    if ! remove_labeled_resources container; then
+      echo "copy-strategy cleanup could not remove containers" >&2
+      cleanup_failed=1
+    fi
+    if ! remove_labeled_resources volume; then
+      echo "copy-strategy cleanup could not remove volumes" >&2
+      cleanup_failed=1
+    fi
+    if ! remaining_containers="$("$docker" container ls \
+      --all \
+      --quiet \
+      --filter "label=$label_key=$suffix")" \
+      || ! remaining_volumes="$("$docker" volume ls \
+        --quiet \
+        --filter "label=$label_key=$suffix")"; then
+      echo "copy-strategy cleanup could not verify resource removal" >&2
+      cleanup_failed=1
+    elif [[ -n "$remaining_containers" || -n "$remaining_volumes" ]]; then
+      echo "copy-strategy capability left privileged resources behind" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if ((cleanup_failed)); then
+    exit 1
+  fi
+  exit "$original_status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+created_volume="$("$docker" volume create \
+  --label "$label_key=$suffix" \
+  "$volume")"
+resources_started=1
+if [[ "$created_volume" != "$volume" \
+  || "$("$docker" volume inspect \
+    --format "{{ index .Labels \"$label_key\" }}" \
+    "$volume")" != "$suffix" ]]; then
+  echo "copy-strategy capability could not establish its private volume" >&2
+  exit 1
+fi
+
+"$docker" run \
+  --rm \
+  --pull never \
+  --name "$prep_container" \
+  --label "$label_key=$suffix" \
+  --user 0:0 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --read-only \
+  --tmpfs /tmp:rw,nosuid,nodev,size=64m,mode=1777 \
+  --mount "type=bind,src=$repository_root,dst=/workspace,readonly" \
+  --mount "type=volume,src=$volume,dst=/stage" \
+  --env "BINARY_RELATIVE=$binary_relative" \
+  --env "BTRFS_URL=$btrfs_url" \
+  --env "BTRFS_SHA256=$btrfs_sha256" \
+  --env "LZO_URL=$lzo_url" \
+  --env "LZO_SHA256=$lzo_sha256" \
+  --env "REISER_URL=$reiser_url" \
+  --env "REISER_SHA256=$reiser_sha256" \
+  --entrypoint /usr/bin/bash \
+  "$runner_image" \
+  --noprofile \
+  --norc \
+  -euo pipefail \
+  -c '
+    /usr/bin/install -d -m 000700 /stage/root
+    fetch() {
+      /usr/bin/curl \
+        --fail \
+        --location \
+        --proto "=https" \
+        --show-error \
+        --silent \
+        --tlsv1.2 \
+        --output "$3" \
+        "$1"
+      printf "%s  %s\n" "$2" "$3" \
+        | /usr/bin/sha256sum --check --strict
+    }
+    verify_package() {
+      if [[ "$(/usr/bin/dpkg-deb --field "$1" Package)" != "$2" \
+        || "$(/usr/bin/dpkg-deb --field "$1" Version)" != "$3" \
+        || "$(/usr/bin/dpkg-deb --field "$1" Architecture)" != amd64 ]]; then
+        echo "copy-strategy package identity differs from its pin: $2" >&2
+        exit 1
+      fi
+    }
+    fetch "$BTRFS_URL" "$BTRFS_SHA256" /stage/btrfs.deb
+    fetch "$LZO_URL" "$LZO_SHA256" /stage/lzo.deb
+    fetch "$REISER_URL" "$REISER_SHA256" /stage/reiser.deb
+    verify_package /stage/btrfs.deb btrfs-progs 6.6.3-1.1build2
+    verify_package /stage/lzo.deb liblzo2-2 2.10-2build4
+    verify_package \
+      /stage/reiser.deb \
+      libreiserfscore0t64 \
+      1:3.6.27-7.1build1
+    /usr/bin/dpkg-deb --extract /stage/btrfs.deb /stage/root
+    /usr/bin/dpkg-deb --extract /stage/lzo.deb /stage/root
+    /usr/bin/dpkg-deb --extract /stage/reiser.deb /stage/root
+    /usr/bin/install \
+      -m 0755 \
+      "/workspace/$BINARY_RELATIVE" \
+      /stage/greenlit-init
+    /usr/bin/install \
+      -m 0644 \
+      /workspace/tools/tests/check-greenlit-init-copy-strategies \
+      /stage/check-greenlit-init-copy-strategies
+  '
+
+"$docker" run \
+  --rm \
+  --pull never \
+  --name "$run_container" \
+  --label "$label_key=$suffix" \
+  --privileged \
+  --network none \
+  --user 0:0 \
+  --read-only \
+  --memory 1g \
+  --pids-limit 128 \
+  --mount "type=volume,src=$volume,dst=/greenlit,readonly" \
+  --tmpfs /var/tmp:rw,exec,nosuid,nodev,size=512m,mode=0700 \
+  --env 'PATH=/greenlit/root/sbin:/greenlit/root/bin:/greenlit/root/usr/sbin:/greenlit/root/usr/bin:/home/runner/.cargo/bin:/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+  --env 'LD_LIBRARY_PATH=/greenlit/root/lib/x86_64-linux-gnu:/greenlit/root/usr/lib/x86_64-linux-gnu' \
+  --entrypoint /usr/bin/python3 \
+  "$runner_image" \
+  -E \
+  -s \
+  -B \
+  /greenlit/check-greenlit-init-copy-strategies \
+  /greenlit/greenlit-init

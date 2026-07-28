@@ -158,29 +158,17 @@ jobs:
 
       - name: Provision privileged copy-strategy prerequisites
         run: |
-          command -v python3 >/dev/null
-          missing_packages=()
-          command -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)
-          if ! command -v losetup >/dev/null \
-            || ! command -v mount >/dev/null \
-            || ! command -v umount >/dev/null; then
-            missing_packages+=(util-linux)
-          fi
-          if ((${#missing_packages[@]})); then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
-          fi
-          command -v mkfs.btrfs >/dev/null
-          command -v losetup >/dev/null
-          command -v mount >/dev/null
-          command -v umount >/dev/null
+          test "$(/usr/bin/uname -s)" = Linux
+          test "$(/usr/bin/uname -m)" = x86_64
+          test -x /usr/bin/docker
+          /usr/bin/docker info >/dev/null
 
       - name: Reflink and bounded-stream copy strategies
         run: |
-          cargo build --locked -p greenlit-init
-          sudo --preserve-env=PATH \
-            tools/tests/check-greenlit-init-copy-strategies \
-            target/debug/greenlit-init
+          cargo build --locked -p greenlit-init --profile init \
+            --target x86_64-unknown-linux-musl
+          tools/test-copy-strategy-capability \
+            target/x86_64-unknown-linux-musl/init/greenlit-init
 
       # The real-daemon executor tests begin at the post-RunLock boundary.
       # Provision the exact locked profile up front: once execution begins,
@@ -210,13 +198,12 @@ jobs:
 
       - name: Provision isolated keyring prerequisites
         run: |
-          test "$(uname -s)" = Linux
-          command -v unshare >/dev/null
-          if ! command -v keyctl >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends keyutils
-          fi
-          command -v keyctl >/dev/null
+          test "$(/usr/bin/uname -s)" = Linux
+          test "$(/usr/bin/uname -m)" = x86_64
+          test -x /usr/bin/unshare
+          keyutils_root="$RUNNER_TEMP/greenlit-keyutils"
+          tools/tests/provision-keyctl "$keyutils_root"
+          printf '%s\n' "$keyutils_root/package/usr/bin" >> "$GITHUB_PATH"
 
       - name: Run production persistent-keyring acceptance
         run: tools/test-credential-capability
@@ -322,7 +309,7 @@ jobs:
         run: |
           parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
           test ! -e "$parity_target"
-          install -d -m 0700 "$parity_target"
+          install -d -m 000700 "$parity_target"
           CARGO_TARGET_DIR="$parity_target" \
             cargo build --locked --release -p greenlit-app --bin litci
 
@@ -333,7 +320,7 @@ jobs:
           parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
           parity_output="${RUNNER_TEMP}/greenlit-live-local"
           test ! -e "$parity_output"
-          install -d -m 0700 "$parity_output"
+          install -d -m 000700 "$parity_output"
           tools/check-live-parity local \
             --repository-root "$GITHUB_WORKSPACE" \
             --greenlit-binary "$parity_target/release/litci" \
@@ -344,7 +331,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle="$GITHUB_WORKSPACE/target/ci-live-local.tar"
-          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
             /usr/bin/python3 -E -s -B \
               tools/release_check_credential_bundle.py pack-local \
@@ -387,10 +374,10 @@ jobs:
             >/dev/null 2>&1
           git switch -C greenlit-live-github "$GITHUB_SHA"
           command -v /usr/bin/python3 >/dev/null
-          command -v /usr/bin/gh >/dev/null
+          command -v /usr/local/bin/gh >/dev/null
           output="$RUNNER_TEMP/greenlit-live-github"
           test ! -e "$output"
-          install -d -m 0700 "$output"
+          install -d -m 000700 "$output"
           /usr/bin/python3 -E -s -B \
             tools/release_check_credential.py --self-test
 
@@ -409,7 +396,7 @@ jobs:
         run: |
           set -euo pipefail
           bundle="$GITHUB_WORKSPACE/target/ci-live-github.tar"
-          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
             /usr/bin/python3 -E -s -B \
               tools/release_check_credential_bundle.py pack-github \

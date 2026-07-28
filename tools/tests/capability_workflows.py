@@ -6,6 +6,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from capability_workflow_policy import (
+    load_governed_workflows,
+    validate_route_policy,
+)
 from cargo_test_manifest import GateError
 
 
@@ -102,7 +106,7 @@ EXECUTION_MARKERS = (
     "tools/tests/check-capability-test-manifest --run-owner docker-runtime",
     "tools/tests/check-capability-test-manifest --run-owner docker-policy",
     "tools/tests/check-capability-test-manifest --run-owner host-deep-path",
-    "tools/tests/check-greenlit-init-copy-strategies",
+    "tools/test-copy-strategy-capability",
     "tools/test-credential-capability",
     "tools/test-stargz-provider",
     "tools/check-release-dogfood",
@@ -223,6 +227,7 @@ def validate_route_schema(value: Any, path: Path) -> list[dict[str, Any]]:
         )
         if actual != (runner, needs, capabilities):
             raise GateError(f"{identity!r} route policy differs from required binding")
+    validate_route_policy(routes)
     return routes
 
 
@@ -333,17 +338,15 @@ def _steps(block: list[str], path: Path, job: str) -> list[dict[str, str]]:
 def validate_workflow_routes(routes: list[dict[str, Any]], root: Path) -> int:
     """Bind every declared route to its exact workflow job and step commands."""
 
+    governed_workflows = {workflow for workflow, _job in REQUIRED_ROUTES}
+    workflow_lines = load_governed_workflows(root, governed_workflows)
+
     parsed: dict[tuple[str, str], list[dict[str, str]]] = {}
     execution_bindings: set[tuple[str, str, str]] = set()
     for route in routes:
         relative = route["workflow"]
         path = root / relative
-        if path.is_symlink() or not path.is_file():
-            raise GateError(f"{path}: workflow must be a regular non-symlink file")
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError) as error:
-            raise GateError(f"could not read workflow {path}: {error}") from error
+        lines = workflow_lines[relative]
         block = _job_block(lines, route["job"], path)
         identity = (relative, route["job"])
         if _scalar(block, "runs-on", path, route["job"]) != route["runs_on"]:
@@ -375,9 +378,10 @@ def validate_workflow_routes(routes: list[dict[str, Any]], root: Path) -> int:
             run = step.get("run", "")
             if any(marker in run for marker in EXECUTION_MARKERS):
                 discovered.add((workflow, job, step["name"]))
-    if not discovered <= execution_bindings:
+    if discovered != execution_bindings:
         raise GateError(
-            "capability execution steps are not inventory-bound; "
+            "capability execution steps differ from the inventory; "
+            f"missing={sorted(execution_bindings - discovered)!r}, "
             f"unbound={sorted(discovered - execution_bindings)!r}"
         )
     return len(routes)
