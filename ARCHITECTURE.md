@@ -1028,12 +1028,14 @@ journal and never reconstructs lifecycle state from text.
 ## Phase 12 containment and test-authority boundary
 
 Phase 12 treats every capability as uncertified until a later stabilization
-phase supplies authoritative evidence. `litci run` registers explicit
-command-line sensitive values before allocating evidence, captures the source
-once into the private run tree, parses the selected workflow from that captured
-tree, and applies `greenlit-app::run_quarantine` once before constructing a
-credential client, action resolver, store, network path, or container engine.
-The assessment combines source-located findings with
+phase supplies authoritative evidence. Explicit `run` secret, dispatch-input,
+and variable arguments are non-forceably quarantined before invocation
+metrics, source capture, or run-state allocation, so their values cannot enter
+retained state. An accepted invocation captures the source once through a
+private staging tree, adopts it into the private run tree, parses the selected
+workflow only from that captured tree, and applies
+`greenlit-app::run_quarantine` before constructing a credential client, action
+resolver, store, network path, or container engine. The assessment combines source-located findings with
 `greenlit-runtime::assess_runtime_capabilities`; the executor independently
 re-derives its plan/configuration findings and rejects any assessment drift
 before the first `ContainerEngine` operation. Phase 13 still owns a shared
@@ -1049,6 +1051,31 @@ daemon is disabled through Phase 25, while export and confirmation are
 disabled through Phase 27; their historical implementations are not current
 certification paths.
 
+Retained completion is one catalog-last transaction. Metrics and result
+material are prepared and scanned first; the terminal journal is made durable;
+the matching completion trace and no-replace `result.json` are published and
+their directory is synchronized; only then can the durable catalog transition
+irreversibly to `completed`. `inspect`, `logs`, `logs --follow`, recovery, and
+doctor accept a completed run only when that catalog state agrees with the
+result, the exact `RunFinished` terminal, and the `run_completed` trace.
+Presentation failure after that commit can fail the command but cannot rewrite
+or discard the authoritative evidence. Startup recovery holds a private
+descriptor-backed publication lock before aborting or cleaning an incomplete
+run, so it cannot race an active writer.
+
+A bounded clone-shared mask registry is the masking authority across the app,
+runtime, metrics, event journal, and retained-evidence scan. Runtime-discovered
+`::add-mask::` values become effective for all subsequent output, while
+pattern-count, retained-byte, and line-size ceilings fail closed. The final
+recursive scan follows no links and rejects sensitive bytes, encoded forms,
+unsafe file types, or broad physical modes before result publication.
+
+Phase 12 publishes neither frozen source nor workflow data into the shared
+CAS. The action/cache shim, artifact service, writable toolcache, and package
+cache are also absent from every execution mode, including ordinary degraded
+runs; no `ACTIONS_*` service URL or bearer token reaches a workflow. Phases 19
+and 24 own the immutable-content and workflow-storage replacements.
+
 Phase 12 also removes scripted `ContainerEngine`, resolver, fetcher, runtime
 bundle, and planner substitutes from capability evidence. The portable
 pipeline executes only non-capability tests. Capability-owning
@@ -1057,12 +1084,26 @@ required-feature targets:
 
 - native Docker: base image, container exit, overlay/copy isolation,
   selected-matrix evidence, and complete retained-secret scanning;
-- configured containerd/stargz plus ordinary/clean/hermetic policy and the
-  native warm-budget gate;
+- configured containerd/stargz through the direct provider acceptance only;
+- clean/hermetic policy and the production-config release-profile 20-sample
+  native warm gate in a separate, fresh `homelab-heavy` `performance-policy`
+  job, with no build-target cache or compiler wrapper;
 - an isolated Linux persistent keyring for the production credential target;
 - reflink and bounded-stream copy strategies through the real
   `greenlit-init`; and
 - two fresh-home dogfood invocations through the release-built `litci`.
+
+Canonical parity evidence uses live, attempt-bound acquisition and exact-source
+comparison. On CI branch pushes, a tokenless exact-source job builds the
+release binary and emits the oracle and Greenlit observations from that same
+source. Release certification instead transfers the prepared binary through a
+digest- and source-bound bundle before the isolated local observation. In both
+routes, a separate credential-only job acquires one exact GitHub run attempt
+with no candidate `litci` binary, build, or run in the credential-bearing
+process domain. Comparison requires the exact source SHA and every producer
+requires exact repository HEAD; attempt identity is acquisition authority and
+is normalized out of semantic comparison. Historical fixed-capture replay has
+been removed.
 
 Retained run directories and physical artifacts are born with exact modes
 `0700` and `0600`. When a retained manifest describes source content, its
