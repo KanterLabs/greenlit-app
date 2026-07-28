@@ -311,7 +311,7 @@ jobs:
         run: tools/test-stargz-provider
 
       - name: Clean, hermetic, and native performance policy
-        run: tools/tests/check-capability-test-manifest --run-owner docker-policy
+        run: GREENLIT_BUILD_COMMIT="$GITHUB_SHA" tools/tests/check-capability-test-manifest --run-owner docker-policy
 
       - name: Run and verify repository gates under release litci twice
         run: tools/check-release-dogfood target/release-candidate/target/release/litci

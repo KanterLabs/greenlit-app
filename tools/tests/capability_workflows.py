@@ -43,7 +43,12 @@ REQUIRED_ROUTES = {
     ),
     (".github/workflows/ci.yml", "dogfood"): (
         "homelab-heavy",
-        ("provider-and-policy", "credential-capability", "host-deep-path"),
+        (
+            "provider-and-policy",
+            "performance-policy",
+            "credential-capability",
+            "host-deep-path",
+        ),
         frozenset({"release-dogfood"}),
     ),
     (".github/workflows/ci.yml", "host-deep-path"): (
@@ -66,10 +71,15 @@ REQUIRED_ROUTES = {
         ("ci",),
         frozenset({"live-parity-local"}),
     ),
+    (".github/workflows/ci.yml", "performance-policy"): (
+        "homelab-heavy",
+        ("runtime-integration",),
+        frozenset({"docker-policy"}),
+    ),
     (".github/workflows/ci.yml", "provider-and-policy"): (
         "homelab-heavy",
         ("runtime-integration",),
-        frozenset({"docker-policy", "stargz-provider"}),
+        frozenset({"stargz-provider"}),
     ),
     (".github/workflows/ci.yml", "runtime-integration"): (
         "homelab-heavy",

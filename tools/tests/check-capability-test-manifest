@@ -17,6 +17,7 @@ from cargo_test_manifest import (
     listed_tests,
     run_target,
     unique_object,
+    validate_release_profile_environment,
 )
 from capability_manifest_selftest import self_test_negative
 from capability_workflows import validate_route_schema, validate_workflow_routes
@@ -26,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MANIFEST = Path(__file__).with_name("capability-test-manifest.json")
 TOP_LEVEL_KEYS = {"schema_version", "targets", "workflow_routes"}
 ENTRY_KEYS = {
+    "cargo_profile",
     "features",
     "owner",
     "package",
@@ -33,12 +35,16 @@ ENTRY_KEYS = {
     "test_cfgs",
     "tests",
 }
+CARGO_PROFILES = {"release", "test"}
 OWNERS = {
     "credential-keyring",
     "docker-policy",
     "docker-runtime",
     "host-deep-path",
     "stargz-provider",
+}
+RELEASE_PROFILE_TARGETS = {
+    ("greenlit-app", "performance_budgets"),
 }
 TEST_CFGS = {"litci_test_boundaries"}
 
@@ -82,8 +88,8 @@ def load_manifest(
         raise GateError(
             f"{path}: top level must contain exactly {sorted(TOP_LEVEL_KEYS)!r}"
         )
-    if value["schema_version"] != 2:
-        raise GateError(f"{path}: schema_version must be 2")
+    if value["schema_version"] != 3:
+        raise GateError(f"{path}: schema_version must be 3")
     entries = value["targets"]
     if not isinstance(entries, list) or not entries:
         raise GateError(f"{path}: targets must be a nonempty array")
@@ -95,10 +101,15 @@ def load_manifest(
         location = f"{path}: targets[{index}]"
         if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
             raise GateError(f"{location} must contain exactly {sorted(ENTRY_KEYS)!r}")
-        for field in ("package", "target", "owner"):
+        for field in ("cargo_profile", "package", "target", "owner"):
             text = entry[field]
             if not isinstance(text, str) or not text or text.strip() != text:
                 raise GateError(f"{location}.{field} must be nonempty trimmed text")
+        if entry["cargo_profile"] not in CARGO_PROFILES:
+            raise GateError(
+                f"{location}.cargo_profile must be one of "
+                f"{sorted(CARGO_PROFILES)!r}"
+            )
         if entry["owner"] not in OWNERS:
             raise GateError(
                 f"{location}.owner must be one of {sorted(OWNERS)!r}"
@@ -115,9 +126,11 @@ def load_manifest(
             raise GateError(
                 f"{location}.test_cfgs contains unknown cfgs {sorted(unknown_cfgs)!r}"
             )
+        identity = (entry["package"], entry["target"])
         expected_cfgs = (
             ["litci_test_boundaries"]
             if entry["package"] == "greenlit-app"
+            and identity not in RELEASE_PROFILE_TARGETS
             else []
         )
         if entry["test_cfgs"] != expected_cfgs:
@@ -128,13 +141,23 @@ def load_manifest(
         entry["tests"] = text_list(
             entry["tests"], f"{location}.tests", nonempty=True
         )
-        identity = (entry["package"], entry["target"])
         if identity in identities:
             raise GateError(f"{location} duplicates target identity {identity!r}")
         if previous is not None and identity < previous:
             raise GateError(f"{path}: targets must be sorted by package and target")
         identities.add(identity)
         previous = identity
+    release_targets = {
+        (entry["package"], entry["target"])
+        for entry in entries
+        if entry["cargo_profile"] == "release"
+    }
+    if release_targets != RELEASE_PROFILE_TARGETS:
+        raise GateError(
+            f"{path}: release-profile targets differ from the fixed authority; "
+            f"missing={sorted(RELEASE_PROFILE_TARGETS - release_targets)!r}, "
+            f"unexpected={sorted(release_targets - RELEASE_PROFILE_TARGETS)!r}"
+        )
     if owners_seen != OWNERS:
         raise GateError(
             f"{path}: every fixed capability owner must be nonempty; "
@@ -186,6 +209,38 @@ def validate_declarations(
     )
 
 
+def validate_release_feature_markers(
+    entries: list[dict[str, Any]],
+    targets: list[CargoTarget],
+) -> None:
+    """Require release authority features to remain dependency-free markers."""
+
+    target_by_identity = {
+        (target.package, target.name): target
+        for target in targets
+    }
+    for entry in entries:
+        if entry["cargo_profile"] != "release":
+            continue
+        identity = (entry["package"], entry["target"])
+        target = target_by_identity.get(identity)
+        if target is None:
+            raise GateError(f"release-profile target {identity!r} is absent from Cargo")
+        definitions = dict(target.feature_definitions)
+        for feature in entry["features"]:
+            members = definitions.get(feature)
+            if members is None:
+                raise GateError(
+                    f"{identity!r}: release-profile feature {feature!r} "
+                    "is absent from Cargo metadata"
+                )
+            if members:
+                raise GateError(
+                    f"{identity!r}: release-profile feature {feature!r} "
+                    "must remain an empty Cargo marker"
+                )
+
+
 def validate_cases(entries: list[dict[str, Any]], root: Path) -> int:
     """List and compare every selected target's exact nonzero cases."""
 
@@ -198,6 +253,7 @@ def validate_cases(entries: list[dict[str, Any]], root: Path) -> int:
             selector="test",
             features=tuple(entry["features"]),
             test_cfgs=tuple(entry["test_cfgs"]),
+            cargo_profile=entry["cargo_profile"],
         )
         expected = entry["tests"]
         if not actual:
@@ -232,6 +288,7 @@ def run_owner(entries: list[dict[str, Any]], root: Path, owner: str) -> int:
             selector="test",
             features=tuple(entry["features"]),
             test_cfgs=tuple(entry["test_cfgs"]),
+            cargo_profile=entry["cargo_profile"],
         )
     print(
         f"capability owner {owner} passed: {len(selected)} targets, "
@@ -289,9 +346,20 @@ def main() -> int:
 
     try:
         entries, routes = load_manifest(manifest)
+        selected_entries = (
+            entries
+            if run_group is None
+            else [entry for entry in entries if entry["owner"] == run_group]
+        )
+        if any(
+            entry["cargo_profile"] == "release"
+            for entry in selected_entries
+        ):
+            validate_release_profile_environment()
         route_count = validate_workflow_routes(routes, root)
         targets = cargo_metadata(root)
         validate_declarations(entries, targets)
+        validate_release_feature_markers(entries, targets)
         if run_group is not None:
             return run_owner(entries, root, run_group)
         selected = validate_cases(entries, root)
