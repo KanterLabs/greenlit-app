@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, fchmod, openat, renameat_with, unlinkat};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, openat, renameat_with, statat, unlinkat,
+};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
@@ -150,9 +152,29 @@ fn open_private_helper(
     ) {
         Ok(file) => File::from(file),
         Err(Errno::NOENT) => return Ok(None),
-        Err(error) => return Err(io_error(error.into())),
+        Err(error @ Errno::LOOP) => {
+            return Err(published_helper_error(
+                path,
+                &format!("is an unsafe symbolic-link identity that could not be opened: {error}"),
+            ));
+        }
+        Err(error) => match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => return Ok(None),
+            Ok(stat)
+                if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+                    || stat.st_uid != rustix::process::getuid().as_raw()
+                    || stat.st_nlink != 1
+                    || stat.st_mode & 0o7777 != 0o700 =>
+            {
+                return Err(published_helper_error(
+                    path,
+                    &format!("is an unsafe existing identity that could not be opened: {error}"),
+                ));
+            }
+            Ok(_) | Err(_) => return Err(io_error(error.into())),
+        },
     };
-    validate_private_helper(path, &file, 0o700)?;
+    validate_published_helper(path, &file, 0o700)?;
     Ok(Some(file))
 }
 
@@ -170,10 +192,17 @@ fn helper_matches(file: &mut File, digest: &str) -> Result<bool, ExecError> {
 }
 
 fn mismatched_helper_error(path: &Path) -> ExecError {
+    published_helper_error(
+        path,
+        "is private but its bytes do not match the embedded helper digest",
+    )
+}
+
+fn published_helper_error(path: &Path, detail: &str) -> ExecError {
     ExecError::Infrastructure {
         message: format!(
-            "could not stage the greenlit-init helper: {} is private but its bytes do not match the embedded helper digest",
-            path.display()
+            "could not stage the greenlit-init helper: {} {detail}",
+            path.display(),
         ),
         fix: format!("remove {}, then retry", path.display()),
     }
@@ -204,6 +233,27 @@ fn validate_private_helper(path: &Path, file: &File, expected: u32) -> Result<()
             path.display(),
             metadata.nlink()
         )));
+    }
+    Ok(())
+}
+
+fn validate_published_helper(path: &Path, file: &File, expected: u32) -> Result<(), ExecError> {
+    let metadata = file.metadata().map_err(io_error)?;
+    let current_uid = rustix::process::getuid().as_raw();
+    let mode = metadata.mode() & 0o7777;
+    if metadata.uid() != current_uid
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || mode != expected
+    {
+        return Err(published_helper_error(
+            path,
+            &format!(
+                "has unsafe owner uid {}, file type, mode 0{mode:03o}, or link count {}",
+                metadata.uid(),
+                metadata.nlink()
+            ),
+        ));
     }
     Ok(())
 }
