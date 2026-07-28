@@ -105,7 +105,7 @@ jobs:
 
       - name: Parity comparator contract
         run: |
-          /usr/bin/python3 -E -s -B \
+          /usr/bin/python3 -I -B \
             tools/release_check_credential.py --self-test
           tools/tests/check-release-transfer-bundles
           tools/tests/check-release-provenance-temp
@@ -377,7 +377,7 @@ jobs:
           bundle="$GITHUB_WORKSPACE/target/ci-live-local.tar"
           install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
-            /usr/bin/python3 -E -s -B \
+            /usr/bin/python3 -I -B \
               tools/release_check_credential_bundle.py pack-local \
               --input-root "$RUNNER_TEMP/greenlit-live-local" \
               --greenlit-binary \
@@ -422,7 +422,7 @@ jobs:
           output="$RUNNER_TEMP/greenlit-live-github"
           test ! -e "$output"
           install -d -m 000700 "$output"
-          /usr/bin/python3 -E -s -B \
+          /usr/bin/python3 -I -B \
             tools/release_check_credential.py --self-test
 
       - name: Collect GitHub evidence with no candidate present
@@ -430,7 +430,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GREENLIT_BUILD_COMMIT: ${{ github.sha }}
         run: >-
-          exec /usr/bin/python3 -E -s -B
+          exec /usr/bin/python3 -I -B
           tools/check-live-parity github
           --repository-root "$GITHUB_WORKSPACE"
           --output-root "$RUNNER_TEMP/greenlit-live-github"
@@ -442,7 +442,7 @@ jobs:
           bundle="$GITHUB_WORKSPACE/target/ci-live-github.tar"
           install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
-            /usr/bin/python3 -E -s -B \
+            /usr/bin/python3 -I -B \
               tools/release_check_credential_bundle.py pack-github \
               --input-root "$RUNNER_TEMP/greenlit-live-github" \
               --output "$bundle" \
@@ -504,13 +504,13 @@ jobs:
           github_root="$RUNNER_TEMP/greenlit-ci-live-github-unpacked"
           output="$RUNNER_TEMP/greenlit-live-parity"
           chmod 0600 "$local_bundle" "$github_bundle"
-          /usr/bin/python3 -E -s -B \
+          /usr/bin/python3 -I -B \
             tools/release_check_credential_bundle.py unpack-local \
             --bundle "$local_bundle" \
             --output-root "$local_root" \
             --expected-sha256 "${{ needs.live_parity_local.outputs.local_sha256 }}" \
             --expected-source "$GITHUB_SHA"
-          /usr/bin/python3 -E -s -B \
+          /usr/bin/python3 -I -B \
             tools/release_check_credential_bundle.py unpack-github \
             --bundle "$github_bundle" \
             --output-root "$github_root" \

@@ -22,7 +22,7 @@ from .source import exact_source
 
 
 PYTHON = "/usr/bin/python3"
-PYTHON_OPTIONS = ("-E", "-s", "-B")
+PYTHON_OPTIONS = ("-I", "-B")
 
 
 def _verify_source(repository: Path, source_commit: str, stage: str) -> None:

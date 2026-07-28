@@ -1,5 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/bash -p
 set -euo pipefail
+
+IFS=$' \t\n'
+umask 077
+release_input_path="${PATH:-}"
+PATH=/usr/bin:/bin
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE
+unset LD_AUDIT LD_PRELOAD
+unset PYTHONHOME PYTHONINSPECT PYTHONPATH PYTHONSTARTUP PYTHONWARNINGS
 
 if [[ -n "${GH_TOKEN+x}" || -n "${GITHUB_TOKEN+x}" \
   || -n "${GH_ENTERPRISE_TOKEN+x}" || -n "${GITHUB_ENTERPRISE_TOKEN+x}" \
@@ -13,9 +22,16 @@ if [[ "$#" -ne 1 || ( "$1" != prepare && "$1" != finalize ) ]]; then
 fi
 stage="$1"
 
-repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
-cd "$repository_root"
+checkout_root="$(CDPATH= cd -- "$(/usr/bin/dirname -- "$0")/.." && pwd -P)"
+cd "$checkout_root"
 export PYTHONDONTWRITEBYTECODE=1
+
+for git_variable in "${!GIT_@}"; do
+  unset "$git_variable"
+done
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_TERMINAL_PROMPT=0
 
 source_commit="${GREENLIT_BUILD_COMMIT:-}"
 if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
@@ -37,21 +53,210 @@ if /usr/bin/git config --local --get-regexp \
   exit 1
 fi
 
+temporary_parent="${RUNNER_TEMP:-/tmp}"
+if [[ ! -d "$temporary_parent" || -L "$temporary_parent" ]]; then
+  echo "release temporary parent is not a real directory: $temporary_parent" >&2
+  exit 1
+fi
+
+declare -A release_commands=()
+for command_name in cargo cargo-clippy cargo-deny cargo-fmt rustc rustdoc rustfmt; do
+  command_path="$(
+    PATH="$release_input_path" command -v -- "$command_name" 2>/dev/null || true
+  )"
+  if [[ "$command_path" != /* || ! -f "$command_path" || ! -x "$command_path" ]]; then
+    echo "release verification requires an absolute executable $command_name command" >&2
+    exit 1
+  fi
+  release_commands["$command_name"]="$command_path"
+done
+
+release_authority_root=""
+release_source_root=""
+release_command_root=""
+release_work_root=""
+prepared_staging=""
 finalize_unpack_root=""
 finalize_candidate_parent=""
 finalize_retain_outputs=0
-cleanup_finalize() {
+
+remove_release_tree() {
+  local root="$1"
+  if [[ -d "$root" && ! -L "$root" ]]; then
+    /usr/bin/find "$root" -xdev -type d -exec /usr/bin/chmod u+rwx -- {} + \
+      || return 1
+    /usr/bin/find "$root" -xdev -depth -delete || return 1
+  fi
+}
+
+cleanup_release() {
   local failed=0
+  if [[ -n "$prepared_staging" && -d "$prepared_staging" ]]; then
+    remove_release_tree "$prepared_staging" || failed=1
+  fi
   if [[ "$finalize_retain_outputs" -eq 0 \
     && -n "$finalize_candidate_parent" \
     && -d "$finalize_candidate_parent" ]]; then
-    find "$finalize_candidate_parent" -xdev -depth -delete || failed=1
+    remove_release_tree "$finalize_candidate_parent" || failed=1
   fi
   if [[ -n "$finalize_unpack_root" && -d "$finalize_unpack_root" ]]; then
-    find "$finalize_unpack_root" -xdev -depth -delete || failed=1
+    remove_release_tree "$finalize_unpack_root" || failed=1
+  fi
+  if [[ -n "$release_work_root" && -d "$release_work_root" ]]; then
+    remove_release_tree "$release_work_root" || failed=1
+  fi
+  if [[ -n "$release_authority_root" && -d "$release_authority_root" ]]; then
+    remove_release_tree "$release_authority_root" || failed=1
   fi
   return "$failed"
 }
+
+release_exit() {
+  local status=$?
+  trap - EXIT
+  if ! cleanup_release; then
+    status=1
+  fi
+  exit "$status"
+}
+trap release_exit EXIT
+
+release_authority_root="$(
+  /usr/bin/mktemp -d "$temporary_parent/greenlit-release-authority.XXXXXX"
+)"
+/usr/bin/chmod 0700 "$release_authority_root"
+release_source_root="$release_authority_root/source"
+release_command_root="$release_authority_root/commands"
+/usr/bin/mkdir -m 0700 -- "$release_source_root" "$release_command_root"
+/usr/bin/git archive --format=tar "$source_commit" \
+  | /usr/bin/tar \
+    --extract \
+    --file=- \
+    --directory="$release_source_root" \
+    --no-same-owner \
+    --no-same-permissions
+
+for command_name in "${!release_commands[@]}"; do
+  /usr/bin/install \
+    -m 0555 \
+    -- "${release_commands[$command_name]}" "$release_command_root/$command_name"
+done
+PATH="$release_command_root:/usr/bin:/bin"
+export PATH
+cargo_command="$release_command_root/cargo"
+
+authority_tools=(
+  tools/tests/check-release-transfer-bundles
+  tools/tests/check-release-provenance-temp
+  tools/check-stubs
+  tools/check-stabilization-ledger
+  tools/check-test-authority
+  tools/tests/check-portable-test-manifest
+  tools/tests/check-capability-test-manifest
+  tools/compare-parity
+  tools/tests/check-parity-producer
+  tools/tests/check-criterion-manifest
+  tools/release_check_credential_bundle.py
+  tools/check-live-parity
+  tools/release-provenance
+)
+declare -A authority_tool_sha256=()
+for relative_tool in "${authority_tools[@]}"; do
+  authority_tool="$release_source_root/$relative_tool"
+  if [[ ! -f "$authority_tool" || -L "$authority_tool" ]]; then
+    echo "release source is missing regular authority tool $relative_tool" >&2
+    exit 1
+  fi
+  checksum_line="$(/usr/bin/sha256sum -- "$authority_tool")"
+  authority_tool_sha256["$relative_tool"]="${checksum_line%% *}"
+done
+/usr/bin/find "$release_source_root" -xdev -exec /usr/bin/chmod a-w -- {} +
+
+assert_checkout_unchanged() {
+  if [[ "$(
+    /usr/bin/git -C "$checkout_root" rev-parse --verify HEAD^{commit}
+  )" != "$source_commit" \
+    || -n "$(
+      /usr/bin/git -C "$checkout_root" status \
+        --porcelain=v1 \
+        --untracked-files=all \
+        --ignored=matching \
+        -- \
+        . \
+        ':(exclude)target'
+    )" ]]; then
+    echo "release source changed after authority binding; retry from a pristine checkout" >&2
+    exit 1
+  fi
+}
+
+run_authority_python() {
+  local relative_tool="$1"
+  shift
+  local authority_tool="$release_source_root/$relative_tool"
+  local expected_sha="${authority_tool_sha256[$relative_tool]:-}"
+  if [[ -z "$expected_sha" ]]; then
+    echo "release authority tool was not bound: $relative_tool" >&2
+    exit 1
+  fi
+  /usr/bin/python3 \
+    -I \
+    -B \
+    -X pycache_prefix=/dev/null \
+    -c '
+import hashlib
+import os
+import stat
+import sys
+from pathlib import Path
+
+script, expected, tools_root, *arguments = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(script, flags)
+try:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise SystemExit(f"release authority tool is not one regular file: {script}")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+finally:
+    os.close(descriptor)
+source = b"".join(chunks)
+if hashlib.sha256(source).hexdigest() != expected:
+    raise SystemExit(f"release authority tool identity changed: {script}")
+sys.path[:0] = [str(Path(script).parent), tools_root]
+sys.argv = [script, *arguments]
+namespace = {
+    "__name__": "__main__",
+    "__file__": script,
+    "__cached__": None,
+    "__package__": None,
+    "__spec__": None,
+}
+exec(compile(source, script, "exec"), namespace)
+' \
+    "$authority_tool" \
+    "$expected_sha" \
+    "$release_source_root/tools" \
+    "$@"
+}
+
+run_release_gate() {
+  run_authority_python "$@"
+  assert_checkout_unchanged
+}
+
+run_cargo() {
+  "$cargo_command" "$@"
+  assert_checkout_unchanged
+}
+
+cd "$release_source_root"
+assert_checkout_unchanged
 
 finalize_release() {
   local prepared_bundle="${GREENLIT_PREPARED_BUNDLE:-}"
@@ -60,8 +265,7 @@ finalize_release() {
   local local_sha="${GREENLIT_LOCAL_SHA256:-}"
   local github_bundle="${GREENLIT_GITHUB_BUNDLE:-}"
   local github_sha="${GREENLIT_GITHUB_SHA256:-}"
-  local temporary_parent="${RUNNER_TEMP:-/tmp}"
-  local candidate_parent="$repository_root/target"
+  local candidate_parent="$checkout_root/target"
   local candidate_root="$candidate_parent/release-candidate"
   local parity_root="$candidate_parent/parity-evidence"
   local unpack_root candidate_staging parity_staging
@@ -79,59 +283,60 @@ finalize_release() {
     echo "finalization requires a real temporary directory and no prior target output" >&2
     exit 1
   fi
-  unpack_root="$(mktemp -d "$temporary_parent/greenlit-release-finalize.XXXXXX")"
-  chmod 0700 "$unpack_root"
+  unpack_root="$(
+    /usr/bin/mktemp -d "$temporary_parent/greenlit-release-finalize.XXXXXX"
+  )"
+  /usr/bin/chmod 0700 "$unpack_root"
   finalize_unpack_root="$unpack_root"
   finalize_candidate_parent="$candidate_parent"
   finalize_retain_outputs=0
   candidate_staging="$unpack_root/prepared/candidate"
   parity_staging="$unpack_root/local/parity"
-  trap 'status=$?; trap - EXIT; cleanup_finalize || exit 1; exit "$status"' EXIT
-  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+  run_release_gate tools/release_check_credential_bundle.py \
     unpack-prepared \
     --bundle "$prepared_bundle" \
     --output-root "$unpack_root/prepared" \
     --expected-sha256 "$prepared_sha" \
     --expected-source "$source_commit"
-  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+  run_release_gate tools/release_check_credential_bundle.py \
     unpack-local \
     --bundle "$local_bundle" \
     --output-root "$unpack_root/local" \
     --expected-sha256 "$local_sha" \
     --expected-source "$source_commit"
-  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+  run_release_gate tools/release_check_credential_bundle.py \
     unpack-github \
     --bundle "$github_bundle" \
     --output-root "$unpack_root/github" \
     --expected-sha256 "$github_sha" \
     --expected-source "$source_commit"
-  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+  run_release_gate tools/release_check_credential_bundle.py \
     verify-binary-match \
     --prepared-binary "$candidate_staging/target/release/litci" \
     --local-binary "$unpack_root/local/binary/litci"
-  mv -- "$unpack_root/github/parity/seed-github-actions.json" "$parity_staging/"
-  mv -- \
+  /usr/bin/mv -- "$unpack_root/github/parity/seed-github-actions.json" "$parity_staging/"
+  /usr/bin/mv -- \
     "$unpack_root/github/parity/captures/shell-only-seed-github-actions.json" \
     "$parity_staging/captures/"
-  tools/check-live-parity compare \
-    --repository-root "$repository_root" \
+  run_release_gate tools/check-live-parity compare \
+    --repository-root "$release_source_root" \
     --greenlit-binary "$candidate_staging/target/release/litci" \
     --output-root "$parity_staging"
-  tools/release-provenance create \
-    --repository-root "$repository_root" \
+  run_release_gate tools/release-provenance create \
+    --repository-root "$release_source_root" \
     --candidate-root "$candidate_staging" \
     --parity-root "$parity_staging" \
     --expected-source "$source_commit"
-  tools/release-provenance verify \
-    --repository-root "$repository_root" \
+  run_release_gate tools/release-provenance verify \
+    --repository-root "$release_source_root" \
     --candidate-root "$candidate_staging" \
     --parity-root "$parity_staging" \
     --expected-source "$source_commit"
-  install -d -m 0755 "$candidate_parent"
-  mv -- "$candidate_staging" "$candidate_root"
-  mv -- "$parity_staging" "$parity_root"
+  /usr/bin/install -d -m 0755 "$candidate_parent"
+  /usr/bin/mv -- "$candidate_staging" "$candidate_root"
+  /usr/bin/mv -- "$parity_staging" "$parity_root"
   finalize_retain_outputs=1
-  cleanup_finalize
+  cleanup_release
   trap - EXIT
   echo "verified release candidate: $candidate_root"
   echo "retained live parity evidence: $parity_root"
@@ -142,73 +347,60 @@ if [[ "$stage" == finalize ]]; then
   exit 0
 fi
 
-candidate_parent="$repository_root/target"
+candidate_parent="$checkout_root/target"
 if [[ -L "$candidate_parent" || ( -e "$candidate_parent" && ! -d "$candidate_parent" ) ]]; then
   echo "$candidate_parent must be one real directory" >&2
   exit 1
 fi
-mkdir -p "$candidate_parent"
+/usr/bin/mkdir -p "$candidate_parent"
 
-if [[ ! -f Cargo.lock || -L Cargo.lock ]]; then
+if [[ ! -f "$release_source_root/Cargo.lock" || -L "$release_source_root/Cargo.lock" ]]; then
   echo "Cargo.lock must be a regular checked-in file" >&2
   exit 1
 fi
-cargo_lock_checksum="$(sha256sum -- Cargo.lock)"
+cargo_lock_checksum="$(/usr/bin/sha256sum -- "$release_source_root/Cargo.lock")"
 assert_cargo_lock_unchanged() {
   local current_checksum
-  current_checksum="$(sha256sum -- Cargo.lock)"
+  current_checksum="$(/usr/bin/sha256sum -- "$release_source_root/Cargo.lock")"
   if [[ "$current_checksum" != "$cargo_lock_checksum" ]]; then
     echo "release preparation mutated Cargo.lock" >&2
     exit 1
   fi
 }
 
-temporary_parent="${RUNNER_TEMP:-/tmp}"
-if [[ ! -d "$temporary_parent" || -L "$temporary_parent" ]]; then
-  echo "release temporary parent is not a real directory: $temporary_parent" >&2
-  exit 1
-fi
-release_work_root="$(mktemp -d "$temporary_parent/greenlit-release.XXXXXX")"
-prepared_staging=""
-cleanup_prepare() {
-  local failed=0
-  if [[ -n "$prepared_staging" && -d "$prepared_staging" ]]; then
-    find "$prepared_staging" -xdev -depth -delete || failed=1
-  fi
-  find "$release_work_root" -xdev -depth -delete || failed=1
-  return "$failed"
-}
-trap 'status=$?; trap - EXIT; cleanup_prepare || exit 1; exit "$status"' EXIT
+release_work_root="$(
+  /usr/bin/mktemp -d "$temporary_parent/greenlit-release.XXXXXX"
+)"
 
 export CARGO_TARGET_DIR="$release_work_root/build-target"
 unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
 unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET
 
-tools/tests/check-release-transfer-bundles
-tools/tests/check-release-provenance-temp
-cargo fetch --locked
-cargo deny fetch
+run_release_gate tools/tests/check-release-transfer-bundles
+run_release_gate tools/tests/check-release-provenance-temp
+run_cargo fetch --locked
+run_cargo deny fetch
 export CARGO_NET_OFFLINE=true
 
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo deny --frozen check
-python3 tools/check-stubs
-python3 tools/check-stabilization-ledger
-python3 tools/check-stabilization-ledger --self-test-negative
-tools/check-test-authority
-tools/check-test-authority --self-test-negative
-tools/tests/check-portable-test-manifest
-tools/tests/check-portable-test-manifest --self-test-negative
-tools/tests/check-capability-test-manifest
-tools/tests/check-capability-test-manifest --self-test-negative
-tools/tests/check-parity-producer
-tools/compare-parity --self-test
-tools/tests/check-portable-test-manifest --run
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
-tools/tests/check-criterion-manifest
+run_cargo fmt --all -- --check
+run_cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+run_cargo deny --frozen check
+run_release_gate tools/check-stubs
+run_release_gate tools/check-stabilization-ledger
+run_release_gate tools/check-stabilization-ledger --self-test-negative
+run_release_gate tools/check-test-authority
+run_release_gate tools/check-test-authority --self-test-negative
+run_release_gate tools/tests/check-portable-test-manifest
+run_release_gate tools/tests/check-portable-test-manifest --self-test-negative
+run_release_gate tools/tests/check-capability-test-manifest
+run_release_gate tools/tests/check-capability-test-manifest --self-test-negative
+run_release_gate tools/compare-parity --self-test
+run_release_gate tools/tests/check-parity-producer
+run_release_gate tools/tests/check-portable-test-manifest --run
+RUSTDOCFLAGS="-D warnings" run_cargo doc --locked --workspace --no-deps
+run_release_gate tools/tests/check-criterion-manifest
 
-cargo build --locked --release -p greenlit-app --bin litci
+run_cargo build --locked --release -p greenlit-app --bin litci
 release_binary="$CARGO_TARGET_DIR/release/litci"
 if [[ ! -x "$release_binary" || -L "$release_binary" ]]; then
   echo "release build did not produce one regular executable litci" >&2
@@ -216,9 +408,9 @@ if [[ ! -x "$release_binary" || -L "$release_binary" ]]; then
 fi
 
 package_target="$release_work_root/package-target"
-mkdir -m 0700 "$package_target"
+/usr/bin/mkdir -m 0700 "$package_target"
 CARGO_TARGET_DIR="$package_target" \
-  cargo package --locked --offline --workspace --exclude greenlit-init
+  run_cargo package --locked --offline --workspace --exclude greenlit-init
 shopt -s nullglob
 package_artifacts=("$package_target/package"/greenlit-*.crate)
 shopt -u nullglob
@@ -232,23 +424,26 @@ if [[ -e "$prepared_bundle" || -L "$prepared_bundle" ]]; then
   echo "$prepared_bundle already exists; remove it before retrying" >&2
   exit 1
 fi
-prepared_staging="$(mktemp -d "$candidate_parent/.release-prepared.XXXXXX")"
-install -d -m 0755 \
+prepared_staging="$(
+  /usr/bin/mktemp -d "$candidate_parent/.release-prepared.XXXXXX"
+)"
+/usr/bin/install -d -m 0755 \
   "$prepared_staging/candidate/target/release" \
   "$prepared_staging/candidate/target/package"
-install -m 0755 -- "$release_binary" \
+/usr/bin/install -m 0755 -- "$release_binary" \
   "$prepared_staging/candidate/target/release/litci"
 for artifact in "${package_artifacts[@]}"; do
-  install -m 0644 -- "$artifact" \
+  /usr/bin/install -m 0644 -- "$artifact" \
     "$prepared_staging/candidate/target/package/"
 done
-/usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+run_release_gate tools/release_check_credential_bundle.py \
   pack-prepared \
   --input-root "$prepared_staging" \
   --output "$prepared_bundle" \
   --expected-source "$source_commit"
 assert_cargo_lock_unchanged
+assert_checkout_unchanged
+cleanup_release
 prepared_staging=""
-cleanup_prepare
 trap - EXIT
 echo "sealed tokenless release preparation: $prepared_bundle"

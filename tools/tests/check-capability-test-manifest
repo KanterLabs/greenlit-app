@@ -1,14 +1,32 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Check or execute exact feature-gated capability test owner groups."""
 
 from __future__ import annotations
 
 import json
+import os
 import sys
-from pathlib import Path
 from typing import Any
 
+if not sys.flags.isolated:
+    os.execve(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", "-B", __file__, *sys.argv[1:]],
+        os.environ,
+    )
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/proc/self/fd/greenlit-impossible-pycache"
+
+from pathlib import Path
+
+_ENTRYPOINT = Path(__file__).absolute()
+if _ENTRYPOINT.is_symlink():
+    print(
+        "capability test manifest gate failed: launcher must not be a symbolic link",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+sys.path[:0] = [str(_ENTRYPOINT.parent), str(_ENTRYPOINT.parents[1])]
 
 from cargo_test_manifest import (
     CargoTarget,
@@ -21,6 +39,7 @@ from cargo_test_manifest import (
 )
 from capability_manifest_selftest import self_test_negative
 from capability_workflows import validate_route_schema, validate_workflow_routes
+from test_authority.model import GateError as AuthorityGateError
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -88,7 +107,11 @@ def load_manifest(
         raise GateError(
             f"{path}: top level must contain exactly {sorted(TOP_LEVEL_KEYS)!r}"
         )
-    if value["schema_version"] != 3:
+    if (
+        not isinstance(value["schema_version"], int)
+        or isinstance(value["schema_version"], bool)
+        or value["schema_version"] != 3
+    ):
         raise GateError(f"{path}: schema_version must be 3")
     entries = value["targets"]
     if not isinstance(entries, list) or not entries:
@@ -356,21 +379,24 @@ def main() -> int:
             for entry in selected_entries
         ):
             validate_release_profile_environment()
-        route_count = validate_workflow_routes(routes, root)
+        route_count, harness_count, source_count = validate_workflow_routes(
+            routes, root
+        )
         targets = cargo_metadata(root)
         validate_declarations(entries, targets)
         validate_release_feature_markers(entries, targets)
         if run_group is not None:
             return run_owner(entries, root, run_group)
         selected = validate_cases(entries, root)
-    except GateError as error:
+    except (GateError, AuthorityGateError) as error:
         print(f"capability test manifest gate failed: {error}", file=sys.stderr)
         return 1
 
     print(
         f"capability test manifest gate passed: {len(entries)} targets, "
         f"{selected} selected tests, {len(OWNERS)} fixed owners, "
-        f"{route_count} workflow routes"
+        f"{route_count} workflow routes, {harness_count} non-Cargo harnesses, "
+        f"{source_count} reviewed sources"
     )
     return 0
 

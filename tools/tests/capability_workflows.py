@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
 from capability_workflow_policy import (
     load_governed_workflows,
     validate_route_policy,
+    validate_step_policy,
+    validate_workflow_bytes,
 )
+from capability_yaml import job_block, needs, scalar, steps
 from cargo_test_manifest import GateError
+from test_authority.noncargo_commands import CommandEdge, shell_command_edges
+from test_authority.noncargo_policy import (
+    validate_execution_commands,
+    validate_harness_policy,
+)
 
 
 ROUTE_KEYS = {
@@ -112,24 +119,6 @@ REQUIRED_ROUTES = {
         frozenset({"live-parity-local"}),
     ),
 }
-EXECUTION_MARKERS = (
-    "tools/tests/check-capability-test-manifest --run-owner docker-runtime",
-    "tools/tests/check-capability-test-manifest --run-owner docker-policy",
-    "tools/tests/check-capability-test-manifest --run-owner host-deep-path",
-    "tools/test-copy-strategy-capability",
-    "tools/test-credential-capability",
-    "tools/test-stargz-provider",
-    "tools/check-release-dogfood",
-    "tools/check-live-parity local",
-    "tools/check-live-parity github",
-    "tools/check-live-parity compare",
-    "tools/release-check finalize",
-    "tools/compare-parity \\",
-)
-JOB_HEADER = re.compile(r"^  ([A-Za-z0-9_-]+):$")
-STEP_HEADER = re.compile(r"^      - name: (.+)$")
-
-
 def _text_list(value: Any, location: str, *, nonempty: bool) -> list[str]:
     if not isinstance(value, list) or (nonempty and not value):
         qualifier = "nonempty " if nonempty else ""
@@ -229,143 +218,62 @@ def validate_route_schema(value: Any, path: Path) -> list[dict[str, Any]]:
         )
     for route in routes:
         identity = (route["workflow"], route["job"])
-        runner, needs, capabilities = REQUIRED_ROUTES[identity]
+        required_runner, required_needs, required_capabilities = REQUIRED_ROUTES[
+            identity
+        ]
         actual = (
             route["runs_on"],
             tuple(route["needs"]),
             frozenset(route["capabilities"]),
         )
-        if actual != (runner, needs, capabilities):
+        if actual != (
+            required_runner,
+            required_needs,
+            required_capabilities,
+        ):
             raise GateError(f"{identity!r} route policy differs from required binding")
     validate_route_policy(routes)
     return routes
 
 
-def _job_block(lines: list[str], job: str, path: Path) -> list[str]:
-    matches = [
-        index
-        for index, line in enumerate(lines)
-        if (match := JOB_HEADER.fullmatch(line)) and match.group(1) == job
-    ]
-    if len(matches) != 1:
-        raise GateError(f"{path}: expected exactly one job id {job!r}")
-    start = matches[0] + 1
-    end = len(lines)
-    for index in range(start, len(lines)):
-        if JOB_HEADER.fullmatch(lines[index]) or (
-            lines[index]
-            and not lines[index].startswith((" ", "#"))
-        ):
-            end = index
-            break
-    return lines[start:end]
-
-
-def _scalar(block: list[str], key: str, path: Path, job: str) -> str:
-    prefix = f"    {key}: "
-    values = [line[len(prefix) :] for line in block if line.startswith(prefix)]
-    if len(values) != 1 or not values[0]:
-        raise GateError(f"{path}: job {job!r} must declare exactly one {key}")
-    return values[0]
-
-
-def _needs(block: list[str], path: Path, job: str) -> list[str]:
-    inline = [
-        line[len("    needs: ") :]
-        for line in block
-        if line.startswith("    needs: ")
-    ]
-    headers = [index for index, line in enumerate(block) if line == "    needs:"]
-    if len(inline) + len(headers) != 1:
-        raise GateError(f"{path}: job {job!r} must declare exactly one needs")
-    if inline:
-        return [inline[0]]
-    start = headers[0] + 1
-    result: list[str] = []
-    for line in block[start:]:
-        if line.startswith("      - "):
-            result.append(line[len("      - ") :])
-            continue
-        if line.strip() and not line.startswith("      "):
-            break
-    if not result:
-        raise GateError(f"{path}: job {job!r} has an empty needs list")
-    return result
-
-
-def _run_text(step: list[str], path: Path, job: str, name: str) -> str | None:
-    indices = [
-        index for index, line in enumerate(step) if line.startswith("        run: ")
-    ]
-    if not indices:
-        return None
-    if len(indices) != 1:
-        raise GateError(f"{path}: job {job!r} step {name!r} repeats run")
-    index = indices[0]
-    value = step[index][len("        run: ") :]
-    if value not in {"|", "|-", ">", ">-"}:
-        return value
-    content: list[str] = []
-    for line in step[index + 1 :]:
-        if line and not line.startswith("          "):
-            break
-        content.append(line[10:] if line else "")
-    if not content:
-        raise GateError(f"{path}: job {job!r} step {name!r} has an empty run block")
-    return "\n".join(content)
-
-
-def _steps(block: list[str], path: Path, job: str) -> list[dict[str, str]]:
-    starts = [
-        index for index, line in enumerate(block) if STEP_HEADER.fullmatch(line)
-    ]
-    result: list[dict[str, str]] = []
-    names: set[str] = set()
-    for ordinal, start in enumerate(starts):
-        end = starts[ordinal + 1] if ordinal + 1 < len(starts) else len(block)
-        step = block[start:end]
-        name = STEP_HEADER.fullmatch(step[0]).group(1)  # type: ignore[union-attr]
-        if name in names:
-            raise GateError(f"{path}: job {job!r} repeats step name {name!r}")
-        names.add(name)
-        run = _run_text(step, path, job, name)
-        uses = [
-            line[len("        uses: ") :]
-            for line in step
-            if line.startswith("        uses: ")
-        ]
-        if run is not None and uses:
-            raise GateError(f"{path}: job {job!r} step {name!r} mixes run and uses")
-        item = {"name": name}
-        if run is not None:
-            item["run"] = run
-        elif len(uses) == 1:
-            item["uses"] = uses[0]
-        result.append(item)
-    return result
-
-
-def validate_workflow_routes(routes: list[dict[str, Any]], root: Path) -> int:
+def validate_workflow_routes(
+    routes: list[dict[str, Any]], root: Path
+) -> tuple[int, int, int]:
     """Bind every declared route to its exact workflow job and step commands."""
 
     governed_workflows = {workflow for workflow, _job in REQUIRED_ROUTES}
     workflow_lines = load_governed_workflows(root, governed_workflows)
 
-    parsed: dict[tuple[str, str], list[dict[str, str]]] = {}
-    execution_bindings: set[tuple[str, str, str]] = set()
+    parsed_edges: dict[tuple[str, str], tuple[CommandEdge, ...]] = {}
+    execution_edges: list[CommandEdge] = []
     for route in routes:
         relative = route["workflow"]
         path = root / relative
-        lines = workflow_lines[relative]
-        block = _job_block(lines, route["job"], path)
+        _raw, lines = workflow_lines[relative]
+        block = job_block(lines, route["job"], path)
         identity = (relative, route["job"])
-        if _scalar(block, "runs-on", path, route["job"]) != route["runs_on"]:
+        if scalar(block, "runs-on", path, route["job"]) != route["runs_on"]:
             raise GateError(f"{identity!r} runs-on differs from manifest")
-        if _needs(block, path, route["job"]) != route["needs"]:
+        if needs(block, path, route["job"]) != route["needs"]:
             raise GateError(f"{identity!r} needs topology differs from manifest")
-        actual_steps = _steps(block, path, route["job"])
-        parsed[identity] = actual_steps
-        positions = {step["name"]: index for index, step in enumerate(actual_steps)}
+        actual_steps = steps(block, path, route["job"])
+        validate_step_policy(identity, actual_steps)
+        positions = {
+            step.name: step.ordinal
+            for step in actual_steps
+            if step.name is not None
+        }
+        all_edges: list[CommandEdge] = []
+        edges_by_ordinal: dict[int, tuple[CommandEdge, ...]] = {}
+        for actual in actual_steps:
+            current = (
+                shell_command_edges(path, actual.command)
+                if actual.kind == "run"
+                else ()
+            )
+            edges_by_ordinal[actual.ordinal] = current
+            all_edges.extend(current)
+        parsed_edges[identity] = tuple(all_edges)
         for role in ("prerequisites", "executions"):
             expected_steps = route[role]
             expected_positions: list[int] = []
@@ -374,24 +282,32 @@ def validate_workflow_routes(routes: list[dict[str, Any]], root: Path) -> int:
                 if name not in positions:
                     raise GateError(f"{identity!r} is missing required step {name!r}")
                 actual = actual_steps[positions[name]]
-                if actual != expected:
+                expected_kind = "run" if "run" in expected else "uses"
+                if (
+                    actual.name != name
+                    or actual.kind != expected_kind
+                    or actual.command != expected[expected_kind]
+                ):
                     raise GateError(f"{identity!r} step {name!r} command differs")
                 expected_positions.append(positions[name])
                 if role == "executions":
-                    execution_bindings.add((relative, route["job"], name))
+                    current_edges = edges_by_ordinal[actual.ordinal]
+                    if not current_edges:
+                        raise GateError(
+                            f"{identity!r} execution step {name!r} has no "
+                            "structured local command edge"
+                        )
+                    execution_edges.extend(current_edges)
             if expected_positions != sorted(expected_positions):
                 raise GateError(f"{identity!r} {role} order differs from manifest")
 
-    discovered: set[tuple[str, str, str]] = set()
-    for (workflow, job), steps in parsed.items():
-        for step in steps:
-            run = step.get("run", "")
-            if any(marker in run for marker in EXECUTION_MARKERS):
-                discovered.add((workflow, job, step["name"]))
-    if discovered != execution_bindings:
-        raise GateError(
-            "capability execution steps differ from the inventory; "
-            f"missing={sorted(execution_bindings - discovered)!r}, "
-            f"unbound={sorted(discovered - execution_bindings)!r}"
-        )
-    return len(routes)
+    validate_workflow_bytes(workflow_lines)
+    entrypoints, route_commands = validate_execution_commands(
+        root,
+        parsed_edges,
+        tuple(execution_edges),
+    )
+    harness_count, source_count = validate_harness_policy(
+        root, entrypoints, route_commands
+    )
+    return len(routes), harness_count, source_count

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import os
+import py_compile
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
 from .model import GateError
+from .noncargo_sources import closure_digest
+from .selftest_noncargo import non_cargo_semantic_canaries
+from .selftest_release import release_gate_order_canary
 
 
 CHECKER = Path(__file__).resolve().parents[1] / "check-test-authority"
@@ -21,13 +26,55 @@ def write_fixture(root: Path, relative: str, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def boundary_run(root: Path) -> subprocess.CompletedProcess[str]:
+def install_minimal_policy(root: Path) -> None:
+    """Install one real reviewed harness so clean fixtures keep authority."""
+
+    entrypoint = "tools/authority-harness"
+    raw = b"#!/usr/bin/env bash\nset -euo pipefail\n"
+    write_fixture(root, entrypoint, raw.decode("utf-8"))
+    policy = {
+        "schema_version": 1,
+        "execution_commands": [
+            {
+                "entrypoint": entrypoint,
+                "executable": entrypoint,
+                "argv": [],
+                "count": 1,
+            }
+        ],
+        "route_entrypoints": [entrypoint],
+        "entries": [
+            {
+                "entrypoint": entrypoint,
+                "language": "shell",
+                "import_roots": [],
+                "inventory_roots": [],
+                "sources": [entrypoint],
+                "closure_sha256": closure_digest({entrypoint: raw}),
+                "dynamic_sources": [],
+                "delegates": [],
+                "import_targets": [],
+                "authority_imports": [],
+            }
+        ],
+    }
+    write_fixture(
+        root,
+        "tools/test_authority/noncargo-policy.json",
+        json.dumps(policy, indent=2) + "\n",
+    )
+
+
+def boundary_run(
+    root: Path,
+    environment: dict[str, str] | None = None,
+    *,
+    launcher: Path = CHECKER,
+) -> subprocess.CompletedProcess[str]:
     """Invoke the installed public checker against one fixture repository."""
 
     command = [
-        sys.executable,
-        "-B",
-        str(CHECKER),
+        str(launcher),
         "--repository-root",
         str(root),
     ]
@@ -36,9 +83,11 @@ def boundary_run(root: Path) -> subprocess.CompletedProcess[str]:
             command,
             check=False,
             capture_output=True,
+            env=environment,
             text=True,
+            timeout=30,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise GateError(f"could not execute command-boundary canary: {error}") from error
 
 
@@ -85,6 +134,116 @@ def clean_fixture() -> dict[str, str]:
             "#[test]\nfn live_boundary() { assert!(true); }\n"
         ),
     }
+
+
+def _compile_sourceless(path: Path, source: str) -> None:
+    """Create one bytecode-only local import candidate."""
+
+    source_path = path.with_suffix(".py")
+    write_fixture(source_path.parent, source_path.name, source)
+    try:
+        py_compile.compile(
+            str(source_path),
+            cfile=str(path),
+            doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+        )
+    except py_compile.PyCompileError as error:
+        raise GateError(f"could not create forged bytecode canary: {error}") from error
+    source_path.unlink()
+
+
+def launcher_policy_canaries(
+    temporary: Path,
+    clean: dict[str, str],
+    baseline: Path,
+) -> int:
+    """Prove policy and isolated-launch authority at the public boundary."""
+
+    missing = temporary / "missing-both-manifests"
+    for relative, text in clean.items():
+        write_fixture(missing, relative, text)
+    install_minimal_policy(missing)
+    (missing / "tools/test_authority/noncargo-policy.json").unlink()
+    capability = missing / "tools/tests/capability-test-manifest.json"
+    if capability.exists() or capability.is_symlink():
+        raise GateError(
+            "missing-manifest canary unexpectedly installed a capability manifest"
+        )
+    result = boundary_run(missing)
+    expected = (
+        "reviewed non-Cargo policy is mandatory even when "
+        "other test manifests are absent"
+    )
+    if result.returncode != 1 or expected not in result.stderr:
+        raise GateError(
+            "missing non-Cargo and capability manifests did not fail closed\n"
+            f"status={result.returncode}\n{result.stdout}{result.stderr}"
+        )
+
+    hostile = temporary / "hostile-python"
+    hostile_package = hostile / "test_authority"
+    poison = hostile / "poison-loaded"
+    _compile_sourceless(hostile_package / "__init__.pyc", "")
+    _compile_sourceless(
+        hostile_package / "gate.pyc",
+        f"open({str(poison)!r}, 'w').write('loaded')\n"
+        "def check(_root):\n"
+        "    return 0\n",
+    )
+    _compile_sourceless(
+        hostile_package / "model.pyc",
+        "class GateError(Exception):\n"
+        "    pass\n",
+    )
+    site_poison = hostile / "site-loaded"
+    write_fixture(
+        hostile,
+        "sitecustomize.py",
+        f"open({str(site_poison)!r}, 'w').write('loaded')\n",
+    )
+    hostile_bin = hostile / "bin"
+    for name in ("python", "python3"):
+        write_fixture(hostile_bin, name, "#!/bin/sh\nexit 91\n")
+        (hostile_bin / name).chmod(0o755)
+    cache_prefix = hostile / "external-pycache"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{hostile_bin}:{environment.get('PATH', '')}",
+            "PYTHONHOME": str(hostile / "home"),
+            "PYTHONPATH": str(hostile),
+            "PYTHONPYCACHEPREFIX": str(cache_prefix),
+        }
+    )
+    result = boundary_run(baseline, environment)
+    cache_outputs = tuple(cache_prefix.rglob("*")) if cache_prefix.exists() else ()
+    if (
+        result.returncode != 0
+        or poison.exists()
+        or site_poison.exists()
+        or cache_outputs
+    ):
+        raise GateError(
+            "isolated launcher accepted hostile Python state or wrote bytecode\n"
+            f"status={result.returncode}\n{result.stdout}{result.stderr}"
+        )
+
+    symlink = temporary / "check-test-authority-link"
+    try:
+        symlink.symlink_to(CHECKER)
+    except (NotImplementedError, OSError) as error:
+        raise GateError(f"could not create launcher symlink canary: {error}") from error
+    result = boundary_run(baseline, launcher=symlink)
+    if (
+        result.returncode != 1
+        or "launcher must not be a symbolic link" not in result.stderr
+    ):
+        raise GateError(
+            "symbolic-link launcher canary did not fail closed\n"
+            f"status={result.returncode}\n{result.stdout}{result.stderr}"
+        )
+    return 3
 
 
 def rejection_mutations() -> list[tuple[dict[str, str], str]]:
@@ -190,17 +349,24 @@ def self_test_negative() -> int:
         baseline = Path(directory) / "baseline"
         for relative, text in clean.items():
             write_fixture(baseline, relative, text)
+        install_minimal_policy(baseline)
         positive = boundary_run(baseline)
         if positive.returncode != 0:
             raise GateError(
                 "clean command-boundary canary failed\n"
                 f"{positive.stdout}{positive.stderr}"
             )
+        launcher_count = launcher_policy_canaries(
+            Path(directory),
+            clean,
+            baseline,
+        )
 
         for index, (changed, expected) in enumerate(mutations):
             case = Path(directory) / f"negative-{index}"
             for clean_relative, clean_text in clean.items():
                 write_fixture(case, clean_relative, clean_text)
+            install_minimal_policy(case)
             for relative, text in changed.items():
                 write_fixture(case, relative, text)
             result = boundary_run(case)
@@ -209,8 +375,12 @@ def self_test_negative() -> int:
                     f"{expected} canary did not fail at the public command boundary\n"
                     f"status={result.returncode}\n{result.stdout}{result.stderr}"
                 )
+        semantic_count = non_cargo_semantic_canaries(Path(directory), clean)
+        release_gate_order_canary(Path(directory))
     print(
         f"test authority negative gate passed: clean baseline and "
-        f"{len(mutations)} rejection canaries"
+        f"{len(mutations)} Rust rejection canaries, {semantic_count} non-Cargo "
+        f"semantic canaries, {launcher_count} launcher/policy canaries, plus "
+        "release fail-fast order"
     )
     return 0

@@ -23,6 +23,7 @@ from .model import (
     TargetSource,
     Violation,
 )
+from .noncargo_policy import POLICY_RELATIVE, validate_harness_policy
 from .rust_source import read_source, test_bodies
 
 
@@ -233,6 +234,13 @@ def display_path(path: Path, root: Path) -> Path:
 def check(root: Path) -> int:
     """Run the repository gate and render stable source diagnostics."""
 
+    policy_path = root / POLICY_RELATIVE
+    if not (policy_path.exists() or policy_path.is_symlink()):
+        raise GateError(
+            f"{policy_path}: reviewed non-Cargo policy is mandatory even when "
+            "other test manifests are absent"
+        )
+    _harnesses, reviewed_sources = validate_harness_policy(root)
     violations, scanned = collect_violations(root)
     if violations:
         for violation in violations:
@@ -248,5 +256,10 @@ def check(root: Path) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"test authority gate passed: {scanned} Rust source/test files")
+    suffix = (
+        f", {reviewed_sources} reviewed non-Cargo sources"
+        if reviewed_sources
+        else ""
+    )
+    print(f"test authority gate passed: {scanned} Rust source/test files{suffix}")
     return 0
