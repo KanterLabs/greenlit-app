@@ -11,7 +11,7 @@ __pycache__/
 
 # Ignore markdown scratch/notes files except README and the project's
 # required governance docs (AGENTS.md/spec/TESTING.md/PHASE-*.md/ARCHITECTURE.md
-# are mandated to exist and stay tracked per AGENTS.md).
+# and stabilization ledgers/workflow are mandated to stay tracked).
 *.md
 !README.md
 !AGENTS.md
@@ -19,3 +19,5 @@ __pycache__/
 !TESTING.md
 !ARCHITECTURE.md
 !PHASE-*.md
+!docs/STABILIZATION-*.md
+!docs/PARITY-EXCEPTIONS.md

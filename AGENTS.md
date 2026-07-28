@@ -36,7 +36,15 @@ These names are final for v0. There is no legacy command or data-path compatibil
 1. `AGENTS.md` — this file: working rules, stub discipline, quality bar, metrics rules, status tables.
 2. `greenlit-v0-spec.md` — the product: principles, scope, security model, CLI, phase summaries.
 3. `TESTING.md` — the four test classes, the banned list, the internal CI pipeline.
-4. `docs/PHASE-1-engine-core.md` → `docs/PHASE-11-terminal-events.md` — implementation briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly one brief is active at a time. Phases 1–4 record the original executor foundation; Phases 5–10 replace its environment and execution architecture with the evidence-first design in the v0 spec; Phase 11 makes that executor presentation-neutral.
+4. `docs/PHASE-1-engine-core.md` → the current phase brief — implementation
+   briefs, alongside each completed phase's `docs/PHASE-N-SUMMARY.md`. Exactly
+   one brief is active at a time. Phases 1–11 are historical. Stabilization
+   Phases 12–28 are sequenced by `docs/STABILIZATION-WORKFLOW.md`; only the
+   active stabilization brief exists in full.
+5. `docs/STABILIZATION-WORKFLOW.md` — the owner-authorized stabilization
+   sequence, certification model, and head-agent execution directive.
+6. `docs/STABILIZATION-LEDGER.md` and `docs/PARITY-EXCEPTIONS.md` — permanent
+   defect and approved-exception history. Rows are closed, never deleted.
 
 `README.md` is the repository's public front door, not a governance document: it describes what ships, and the documents above remain authoritative when they disagree.
 
@@ -46,7 +54,11 @@ Precedence on conflict: phase file over spec for implementation detail; spec ove
 
 - **Head agent:** reads all documents once for orientation, then owns sequencing and enforcement — activates one phase at a time, delegates it, verifies exit criteria by *running* the verification commands, maintains the Phase status and Stub registry tables, and writes each phase summary. Never implements ahead of the active phase.
 - **Worker agents:** receive exactly four documents — this file, the spec, TESTING.md, and the active phase file — and implement only that phase.
-- **Owner (human):** supplies the Owner-provided inputs below on their listed schedule. The owner approved the evidence-first v0 replacement and uninterrupted progression through Phases 5–10 on 2026-07-25. Public publication and launch remain separately authorized actions.
+- **Owner (human):** supplies the Owner-provided inputs below on their listed
+  schedule. The owner approved the evidence-first v0 replacement and
+  uninterrupted progression through Phases 5–10 on 2026-07-25, then
+  authorized the stabilization workflow through Phase 28 on 2026-07-27.
+  Public publication and launch remain separately authorized actions.
 
 ## Owner-provided inputs
 
@@ -108,6 +120,23 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | completed |
 | 10 — Confirmation | `docs/PHASE-10-confirmation.md` | completed |
 | 11 — Terminal events | `docs/PHASE-11-terminal-events.md` | completed |
+| 12 — Containment and test authority | `docs/PHASE-12-containment-test-authority.md` | in progress |
+| 13 — Workflow intake and frozen source | `docs/PHASE-13-workflow-intake-frozen-source.md` | not started |
+| 14 — YAML schema and typed workflow model | `docs/PHASE-14-yaml-schema-workflow-model.md` | not started |
+| 15 — Expression language | `docs/PHASE-15-expression-language.md` | not started |
+| 16 — Events, contexts, trust, and input preflight | `docs/PHASE-16-events-contexts-trust.md` | not started |
+| 17 — Planner and workflow control graph | `docs/PHASE-17-planner-control-graph.md` | not started |
+| 18 — Evidence identities and lifecycle contracts | `docs/PHASE-18-evidence-lifecycle-contracts.md` | not started |
+| 19 — Immutable content, CAS, actions, and OCI resolution | `docs/PHASE-19-immutable-content-resolution.md` | not started |
+| 20 — Engine, runner, and sandbox provisioning | `docs/PHASE-20-sandbox-provisioning.md` | not started |
+| 21 — Scheduler and job lifecycle | `docs/PHASE-21-scheduler-job-lifecycle.md` | not started |
+| 22 — Run-step semantics | `docs/PHASE-22-run-step-semantics.md` | not started |
+| 23 — Action execution | `docs/PHASE-23-action-execution.md` | not started |
+| 24 — Services, cache, artifacts, and workflow storage | `docs/PHASE-24-services-workflow-storage.md` | not started |
+| 25 — Daemon, recovery, and storage operations | `docs/PHASE-25-daemon-recovery-storage.md` | not started |
+| 26 — Terminal events, results, logs, metrics, and write-back | `docs/PHASE-26-terminal-results.md` | not started |
+| 27 — Verified consumers, export, and GitHub confirmation | `docs/PHASE-27-verified-consumers.md` | not started |
+| 28 — Whole-product certification | `docs/PHASE-28-whole-product-certification.md` | not started |
 
 ## Target workspace layout
 
@@ -186,4 +215,10 @@ Cleanliness is enforced mechanically, not aspirationally:
 
 ## Definition of done (per phase)
 
-Code + tests + the complete TESTING.md pipeline passing + status table updated + `tools/check-stubs` clean for the active and all earlier phases + a short summary listing: what was built, deviations from the phase file, new dependencies, tests added/deleted, stubs created (with registry rows), and stubs realized (with commits). Phases transition immediately through Phase 10; publication remains outside the phase-completion gate.
+Code + tests + the complete TESTING.md pipeline passing + status table updated
+plus `tools/check-stubs` and the stabilization-ledger checker clean for the active
+and all earlier phases + a short summary listing: what was built, deviations
+from the phase file, new dependencies, tests added/deleted, stubs created
+(with registry rows), and stubs realized (with commits). Stabilization phases
+transition immediately through Phase 28; publication remains outside the
+phase-completion gate.
