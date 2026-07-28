@@ -309,12 +309,7 @@ pub(crate) async fn boot_container(
     // Runner profiles and job-container images are immutable external OCI
     // content. Inject the private helper read-only rather than rebuilding or
     // mutating either image.
-    let state_root = shared
-        .config
-        .store
-        .as_ref()
-        .map(services::StoreConfig::toolcache_root_parent);
-    let helper = super::helper_binary::stage(state_root.as_deref())?;
+    let helper = super::helper_binary::stage(&shared.config.runtime_state_root)?;
     spec.binds.push(BindMount {
         host_path: helper,
         container_path: INIT_IN_IMAGE_PATH.to_string(),

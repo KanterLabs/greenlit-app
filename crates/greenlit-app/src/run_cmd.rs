@@ -448,6 +448,7 @@ fn execute(
         }));
         let config = RunConfig {
             repo_host_path: frozen_repo_root,
+            runtime_state_root: evidence.state_root.clone(),
             workspace: workspace.clone(),
             strategy: resolved_strategy(args.isolation, args.write_back),
             runner_env: build_runner_env(&git, event_kind, workflow_name, workspace),

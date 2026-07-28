@@ -495,9 +495,14 @@ fn assert_restrictive_umask_full_execution_is_private() {
             );
             continue;
         }
+        let expected_mode = if is_runtime_helper(&path) {
+            0o700
+        } else {
+            0o600
+        };
         assert_eq!(
             mode,
-            0o600,
+            expected_mode,
             "{} was not born with its exact private mode under umask 0777",
             path.display()
         );
@@ -508,9 +513,11 @@ fn assert_restrictive_umask_full_execution_is_private() {
         "restrictive-umask full execution did not publish a result"
     );
     support::assert_run_resources_removed(&run);
-    assert!(
-        !state.join("runtime").exists(),
-        "Phase 12 retained a durable runtime helper despite disabling all run stores"
+    let first_helpers = runtime_helpers(&state);
+    assert_eq!(
+        first_helpers.len(),
+        1,
+        "full execution did not retain exactly one digest-addressed runtime helper"
     );
     let second = RunningLitci::spawn_under_restrictive_umask(
         &sandbox,
@@ -531,6 +538,41 @@ fn assert_restrictive_umask_full_execution_is_private() {
         "second restrictive-umask execution did not publish a result"
     );
     support::assert_run_resources_removed(&second_run);
+    assert_eq!(
+        runtime_helpers(&state),
+        first_helpers,
+        "the second run did not reuse the same durable runtime helper identity"
+    );
+}
+
+fn is_runtime_helper(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(digest) = name.strip_prefix("greenlit-init-") else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && path
+            .parent()
+            .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "runtime"))
+}
+
+fn runtime_helpers(state: &Path) -> Vec<std::path::PathBuf> {
+    let runtime = state.join("runtime");
+    let mut helpers = fs::read_dir(&runtime)
+        .expect("read durable runtime directory")
+        .map(|entry| entry.expect("read durable runtime entry").path())
+        .collect::<Vec<_>>();
+    helpers.sort();
+    assert!(
+        helpers.iter().all(|path| is_runtime_helper(path)),
+        "runtime directory retained an unexpected entry"
+    );
+    helpers
 }
 
 fn exercise_terminal_path(terminal: TerminalPath) {
