@@ -11,6 +11,13 @@ use crate::support::Sandbox;
 
 pub(super) const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy)]
+enum LaunchBoundary {
+    Direct,
+    RestrictiveUmask,
+    AddressSpaceLimit { kibibytes: u64 },
+}
+
 pub(crate) struct RunningLitci {
     child: Option<Child>,
     stdout_prefix: Vec<u8>,
@@ -30,33 +37,58 @@ impl RunningLitci {
     }
 
     pub(crate) fn spawn_under_restrictive_umask(sandbox: &Sandbox, workflow: &str) -> Self {
-        Self::spawn_inner_with_options(sandbox, workflow, Stdio::piped(), true, &[])
+        Self::spawn_inner_with_options(
+            sandbox,
+            workflow,
+            Stdio::piped(),
+            LaunchBoundary::RestrictiveUmask,
+            &[],
+        )
+    }
+
+    pub(crate) fn spawn_with_address_space_limit(
+        sandbox: &Sandbox,
+        workflow: &str,
+        kibibytes: u64,
+    ) -> Self {
+        Self::spawn_inner_with_options(
+            sandbox,
+            workflow,
+            Stdio::piped(),
+            LaunchBoundary::AddressSpaceLimit { kibibytes },
+            &[],
+        )
     }
 
     fn spawn_inner(sandbox: &Sandbox, workflow: &str, extra_env: &[(&str, &str)]) -> Self {
-        Self::spawn_inner_with_options(sandbox, workflow, Stdio::piped(), false, extra_env)
+        Self::spawn_inner_with_options(
+            sandbox,
+            workflow,
+            Stdio::piped(),
+            LaunchBoundary::Direct,
+            extra_env,
+        )
     }
 
     fn spawn_inner_with_options(
         sandbox: &Sandbox,
         workflow: &str,
         stdout: Stdio,
-        restrictive_umask: bool,
+        launch_boundary: LaunchBoundary,
         extra_env: &[(&str, &str)],
     ) -> Self {
         sandbox.write(".github/workflows/retained-secret.yml", workflow);
         sandbox.init_git();
         let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
-        let mut command = if restrictive_umask {
-            let mut command = Command::new("sh");
-            command
-                .arg("-c")
-                .arg("umask 0777; exec \"$@\"")
-                .arg("litci-restrictive-umask")
-                .arg(env!("CARGO_BIN_EXE_litci"));
-            command
-        } else {
-            Command::new(env!("CARGO_BIN_EXE_litci"))
+        let mut command = match launch_boundary {
+            LaunchBoundary::Direct => Command::new(env!("CARGO_BIN_EXE_litci")),
+            LaunchBoundary::RestrictiveUmask => {
+                shell_wrapped_command("umask 0777; exec \"$@\"", "litci-restrictive-umask")
+            }
+            LaunchBoundary::AddressSpaceLimit { kibibytes } => shell_wrapped_command(
+                &format!("ulimit -v {kibibytes} || exit 125; exec \"$@\""),
+                "litci-address-space-limit",
+            ),
         };
         command
             .args([
@@ -215,6 +247,16 @@ impl RunningLitci {
             thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+fn shell_wrapped_command(script: &str, argument_zero: &str) -> Command {
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg(argument_zero)
+        .arg(env!("CARGO_BIN_EXE_litci"));
+    command
 }
 
 impl Drop for RunningLitci {
