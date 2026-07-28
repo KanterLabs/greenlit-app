@@ -256,7 +256,6 @@ expected_types = (
         "job_finished",
         "cache_summary",
         "cache_summary",
-        "cache_summary",
         "run_finished",
     ]
 )
@@ -301,9 +300,8 @@ if (
 ):
     fail("dogfood job did not finish successfully")
 
-caches = lifecycle[3 + len(labels) * 2 : 6 + len(labels) * 2]
+caches = lifecycle[3 + len(labels) * 2 : 5 + len(labels) * 2]
 if [cache.get("store") for cache in caches] != [
-    "workflow cache",
     "actions",
     "action runtimes",
 ]:
