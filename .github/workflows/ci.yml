@@ -126,7 +126,7 @@ jobs:
         run: cargo doc --locked --workspace --no-deps
 
       # 8. The manifest gate lists and samples every declared Criterion name;
-      # the provider-and-policy job below owns whole-run Phase 10 budgets.
+      # the performance-policy job below owns whole-run Phase 10 budgets.
       - name: Criterion benchmark manifest
         run: tools/tests/check-criterion-manifest
 
@@ -238,9 +238,9 @@ jobs:
 
   # TESTING.md snapshotter-path coverage forbids capability self-skips. This
   # job provisions a real, isolated containerd/stargz stack and runs the direct
-  # provider acceptance plus live clean/hermetic policy acceptance.
+  # provider acceptance.
   provider-and-policy:
-    name: configured stargz provider and policy modes
+    name: configured stargz provider
     needs: runtime-integration
     runs-on: homelab-heavy
     steps:
@@ -265,8 +265,33 @@ jobs:
       - name: Direct containerd/stargz provider
         run: tools/test-stargz-provider
 
+  # Keep the native performance authority on a fresh ARC pod and private DinD
+  # daemon so earlier provider work cannot warm or contaminate its runtime.
+  performance-policy:
+    name: native performance and policy modes
+    needs: runtime-integration
+    runs-on: homelab-heavy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Require native Docker capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          docker info >/dev/null
+
       - name: Clean, hermetic, and native performance policy
-        run: tools/tests/check-capability-test-manifest --run-owner docker-policy
+        run: GREENLIT_BUILD_COMMIT="$GITHUB_SHA" tools/tests/check-capability-test-manifest --run-owner docker-policy
 
   live_parity_local:
     name: tokenless same-SHA oracle and Greenlit evidence
@@ -521,6 +546,7 @@ jobs:
     name: two release-built degraded dogfood runs
     needs:
       - provider-and-policy
+      - performance-policy
       - credential-capability
       - host-deep-path
     runs-on: homelab-heavy

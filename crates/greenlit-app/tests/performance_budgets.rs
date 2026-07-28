@@ -1,5 +1,7 @@
 //! Whole-run Phase 10 performance gate on a native Linux x86_64 Docker host.
 
+#[path = "performance_budgets/attribution.rs"]
+mod attribution;
 pub mod support;
 
 use std::collections::BTreeSet;
@@ -152,6 +154,11 @@ fn assert_daemon_quarantined(sandbox: &Sandbox) {
 
 #[test]
 fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
+    let debug_assertions = std::hint::black_box(cfg!(debug_assertions));
+    assert!(
+        !debug_assertions,
+        "the native performance authority must execute in Cargo's release profile"
+    );
     assert!(
         std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64",
         "the Phase 10 benchmark host must be native Linux x86_64"
@@ -196,6 +203,7 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
     let mut invocation_to_step_ms = Vec::with_capacity(WARM_SAMPLES);
     let mut invocation_windows = Vec::with_capacity(WARM_SAMPLES);
     let mut workflow_ms = Vec::with_capacity(WARM_SAMPLES);
+    let mut journals = Vec::with_capacity(WARM_SAMPLES);
     for _ in 0..WARM_SAMPLES {
         let before = run_directories(&runs);
         let invoked_at_unix_ms = unix_ms_now();
@@ -221,6 +229,7 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
         assert_zero_setup_downloads(&events);
         support::assert_run_resources_removed(&run);
         assert_daemon_quarantined(&sandbox);
+        journals.push(events);
     }
 
     let records = std::fs::read_to_string(sandbox.metrics_file()).expect("metrics records");
@@ -232,7 +241,7 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
     assert_eq!(records.len(), WARM_SAMPLES + 1);
     records.remove(0);
 
-    let mut setup_stage_ms = records
+    let mut runtime_bootstrap_subset_ms = records
         .iter()
         .map(|record| {
             let setup = ["image-ensure", "container-boot", "overlay-setup"]
@@ -243,14 +252,21 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
             setup
         })
         .collect::<Vec<_>>();
-    for (record, (invoked_at_unix_ms, first_step_unix_ms)) in
-        records.iter().zip(invocation_windows.iter())
+    for (
+        sample_index,
+        (((record, &(invoked_at_unix_ms, first_step_unix_ms)), events), &workflow_duration_ms),
+    ) in records
+        .iter()
+        .zip(&invocation_windows)
+        .zip(&journals)
+        .zip(&workflow_ms)
+        .enumerate()
     {
         let started_at_unix_ms = record["started_at_unix_ms"]
             .as_u64()
             .expect("retained invocation start timestamp") as u128;
         assert!(
-            started_at_unix_ms >= *invoked_at_unix_ms && started_at_unix_ms <= *first_step_unix_ms,
+            started_at_unix_ms >= invoked_at_unix_ms && started_at_unix_ms <= first_step_unix_ms,
             "retained metrics start is outside the measured invocation-to-step window"
         );
         assert!(
@@ -259,16 +275,30 @@ fn native_warm_budgets_and_zero_setup_downloads_are_enforced() {
                 .is_some_and(|duration| duration.is_finite() && duration > 0.0),
             "metrics total duration is missing or invalid"
         );
+        eprintln!(
+            "warm-pre-step-attribution {}",
+            attribution::render(attribution::Sample {
+                number: sample_index + 1,
+                invoked_at_unix_ms,
+                first_user_step_unix_ms: first_step_unix_ms,
+                workflow_ms: workflow_duration_ms,
+                events,
+                metrics: record,
+            })
+        );
     }
+    // Structured attribution above is diagnostic only. The fixed p95
+    // assertions below remain the performance authority.
     invocation_to_step_ms.sort_by(f64::total_cmp);
-    setup_stage_ms.sort_by(f64::total_cmp);
+    runtime_bootstrap_subset_ms.sort_by(f64::total_cmp);
     workflow_ms.sort_by(f64::total_cmp);
     let percentile_index = (WARM_SAMPLES * 95).div_ceil(100) - 1;
     eprintln!(
-        "warm budgets: invocation-to-first-user-step p95 {:.2} ms; setup stages p95 {:.2} ms; \
-         workflow p95 {:.2} ms; retained setup downloads 0",
+        "warm budgets: invocation-to-first-user-step p95 {:.2} ms; \
+         runtime-bootstrap subset p95 {:.2} ms; workflow p95 {:.2} ms; \
+         retained setup downloads 0",
         invocation_to_step_ms[percentile_index],
-        setup_stage_ms[percentile_index],
+        runtime_bootstrap_subset_ms[percentile_index],
         workflow_ms[percentile_index]
     );
     assert!(

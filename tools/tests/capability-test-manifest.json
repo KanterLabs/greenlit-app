@@ -1,7 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "targets": [
     {
+      "cargo_profile": "test",
       "package": "greenlit-app",
       "features": [
         "credential-capability-tests"
@@ -18,20 +19,20 @@
       ]
     },
     {
+      "cargo_profile": "release",
       "package": "greenlit-app",
       "features": [
         "live-runtime-tests"
       ],
       "owner": "docker-policy",
       "target": "performance_budgets",
-      "test_cfgs": [
-        "litci_test_boundaries"
-      ],
+      "test_cfgs": [],
       "tests": [
         "native_warm_budgets_and_zero_setup_downloads_are_enforced"
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-app",
       "features": [
         "live-runtime-tests"
@@ -46,6 +47,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-app",
       "features": [
         "live-runtime-tests"
@@ -63,6 +65,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-app",
       "features": [
         "live-runtime-tests"
@@ -77,6 +80,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-expr",
       "features": [
         "host-deep-path-tests"
@@ -89,6 +93,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-runtime",
       "features": [
         "live-runtime-tests"
@@ -101,6 +106,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-runtime",
       "features": [
         "live-runtime-tests"
@@ -113,6 +119,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-runtime",
       "features": [
         "live-runtime-tests"
@@ -125,6 +132,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-runtime",
       "features": [
         "live-runtime-tests"
@@ -137,6 +145,7 @@
       ]
     },
     {
+      "cargo_profile": "test",
       "package": "greenlit-runtime",
       "features": [
         "live-runtime-tests"
@@ -175,6 +184,7 @@
       "runs_on": "homelab-heavy",
       "needs": [
         "provider-and-policy",
+        "performance-policy",
         "credential-capability",
         "host-deep-path"
       ],
@@ -290,10 +300,29 @@
     },
     {
       "workflow": ".github/workflows/ci.yml",
+      "job": "performance-policy",
+      "runs_on": "homelab-heavy",
+      "needs": ["runtime-integration"],
+      "capabilities": ["docker-policy"],
+      "prerequisites": [
+        {
+          "name": "Require native Docker capability",
+          "run": "test \"$(uname -s)\" = Linux\ntest \"$(uname -m)\" = x86_64\ndocker info >/dev/null\n"
+        }
+      ],
+      "executions": [
+        {
+          "name": "Clean, hermetic, and native performance policy",
+          "run": "GREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" tools/tests/check-capability-test-manifest --run-owner docker-policy"
+        }
+      ]
+    },
+    {
+      "workflow": ".github/workflows/ci.yml",
       "job": "provider-and-policy",
       "runs_on": "homelab-heavy",
       "needs": ["runtime-integration"],
-      "capabilities": ["docker-policy", "stargz-provider"],
+      "capabilities": ["stargz-provider"],
       "prerequisites": [
         {
           "name": "Require native Docker capability",
@@ -304,10 +333,6 @@
         {
           "name": "Direct containerd/stargz provider",
           "run": "tools/test-stargz-provider"
-        },
-        {
-          "name": "Clean, hermetic, and native performance policy",
-          "run": "tools/tests/check-capability-test-manifest --run-owner docker-policy"
         }
       ]
     },
@@ -397,7 +422,7 @@
         },
         {
           "name": "Clean, hermetic, and native performance policy",
-          "run": "tools/tests/check-capability-test-manifest --run-owner docker-policy"
+          "run": "GREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" tools/tests/check-capability-test-manifest --run-owner docker-policy"
         },
         {
           "name": "Run and verify repository gates under release litci twice",

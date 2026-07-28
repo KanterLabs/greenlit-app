@@ -13,16 +13,16 @@ from cargo_test_manifest import GateError
 
 
 REQUIRED_ROUTE_POLICY_SHA256 = (
-    "2df3297a926dfd0731dac8945e32552b1c93be13c5408872787073246f5aa5c5"
+    "e690c670c6c0ba7e14e5ef20c83c80fd140f614fdee7ba9dfc9275fd35831e8d"
 )
 # These are explicit reviewed authority baselines. There is intentionally no
 # auto-update path: any workflow byte change requires a code-reviewed rebind.
 REQUIRED_WORKFLOW_POLICY_SHA256 = {
     ".github/workflows/ci.yml": (
-        "e1f0a00fe8a822b2c20ea0080ece411ebf36b9877a972f124a16194f4cdc5fda"
+        "46ed4a6aeb81c1122a5f706aed932c4eb147dd02a0bd288b906c7dcdcad6aa32"
     ),
     ".github/workflows/release.yml": (
-        "e1318997ca2743dd6488825669d8de4fc4ff0cb03978bce309534d4808be578c"
+        "0bf17d0a1f11ce9f7f646045068a286571f1e24e3819ff94c13b0f63f693a101"
     ),
 }
 MAX_WORKFLOW_BYTES = 1024 * 1024

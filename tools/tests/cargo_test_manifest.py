@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ class CargoTarget:
     source: Path
     test: bool
     doctest: bool
+    feature_definitions: tuple[tuple[str, tuple[str, ...]], ...]
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -76,15 +78,30 @@ def cargo_metadata(root: Path) -> list[CargoTarget]:
             continue
         package_name = package.get("name")
         targets = package.get("targets")
+        feature_definitions = package.get("features")
         if (
             not isinstance(package_name, str)
             or not package_name
             or not isinstance(targets, list)
+            or not isinstance(feature_definitions, dict)
         ):
             raise GateError("Cargo metadata contains a malformed workspace package")
         if package_name in packages_seen:
             raise GateError(f"Cargo metadata repeats package {package_name!r}")
         packages_seen.add(package_name)
+        parsed_features: list[tuple[str, tuple[str, ...]]] = []
+        for feature, members in feature_definitions.items():
+            if (
+                not isinstance(feature, str)
+                or not feature
+                or not isinstance(members, list)
+                or not all(isinstance(member, str) and member for member in members)
+            ):
+                raise GateError(
+                    f"Cargo metadata contains malformed feature data in {package_name}"
+                )
+            parsed_features.append((feature, tuple(sorted(members))))
+        parsed_features.sort()
         for target in targets:
             if not isinstance(target, dict):
                 raise GateError(
@@ -125,6 +142,7 @@ def cargo_metadata(root: Path) -> list[CargoTarget]:
                     source=source_path.resolve(),
                     test=test,
                     doctest=doctest,
+                    feature_definitions=tuple(parsed_features),
                 )
             )
     if not result:
@@ -149,10 +167,15 @@ def target_command(
     selector: str,
     features: tuple[str, ...],
     *,
+    cargo_profile: str = "test",
     list_only: bool,
 ) -> list[str]:
     """Build one whole-target Cargo test command with no name filter."""
 
+    if cargo_profile not in {"release", "test"}:
+        raise GateError(
+            f"{package}/{target}: unknown Cargo profile {cargo_profile!r}"
+        )
     command = [
         "cargo",
         "test",
@@ -161,6 +184,8 @@ def target_command(
         "-p",
         package,
     ]
+    if cargo_profile == "release":
+        command.append("--release")
     if features:
         command.extend(["--features", ",".join(features)])
     if selector == "doc":
@@ -179,10 +204,64 @@ def target_command(
     return command
 
 
-def test_environment(test_cfgs: tuple[str, ...]) -> dict[str, str]:
-    """Add custom cfgs only to this debug test subprocess."""
+def _release_environment_entry_is_forbidden(name: str, value: str) -> bool:
+    """Identify compiler and Cargo profile inputs that can change release code."""
+
+    if name in {"CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"}:
+        return value != ""
+    if name == "CARGO_INCREMENTAL":
+        return value != "0"
+    if name == "CARGO_BUILD_INCREMENTAL":
+        return value != "false"
+    return (
+        name
+        in {
+            "RUSTC",
+            "RUSTUP_TOOLCHAIN",
+        }
+        or name.startswith("RUSTC_")
+        or name in {"CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_TARGET"}
+        or name.startswith("CARGO_BUILD_RUSTC")
+        or name.startswith("CARGO_PROFILE_")
+        or (name.startswith("CARGO_TARGET_") and name != "CARGO_TARGET_DIR")
+    )
+
+
+def validate_release_profile_environment(
+    environment: Mapping[str, str] | None = None,
+) -> None:
+    """Reject ambient inputs that can change release-profile compiler semantics."""
+
+    source = os.environ if environment is None else environment
+    forbidden = sorted(
+        name
+        for name, value in source.items()
+        if _release_environment_entry_is_forbidden(name, value)
+    )
+    if forbidden:
+        raise GateError(
+            "release-profile Cargo environment contains forbidden compiler/profile "
+            f"customization: {', '.join(forbidden)}"
+        )
+
+
+def test_environment(
+    test_cfgs: tuple[str, ...],
+    *,
+    cargo_profile: str = "test",
+) -> dict[str, str]:
+    """Build the profile-specific Cargo environment boundary."""
 
     environment = os.environ.copy()
+    if cargo_profile == "release":
+        validate_release_profile_environment(environment)
+        if test_cfgs:
+            raise GateError(
+                "release-profile Cargo commands cannot inject test-only cfgs"
+            )
+        return environment
+    if cargo_profile != "test":
+        raise GateError(f"unknown Cargo profile {cargo_profile!r}")
     if not test_cfgs:
         return environment
     additions = [part for cfg in test_cfgs for part in ("--cfg", cfg)]
@@ -203,6 +282,7 @@ def run(
     root: Path,
     capture: bool,
     test_cfgs: tuple[str, ...] = (),
+    cargo_profile: str = "test",
 ) -> subprocess.CompletedProcess[str]:
     """Run one command and turn every nonzero status into a gate failure."""
 
@@ -210,7 +290,7 @@ def run(
         completed = subprocess.run(
             command,
             cwd=root,
-            env=test_environment(test_cfgs),
+            env=test_environment(test_cfgs, cargo_profile=cargo_profile),
             check=False,
             capture_output=capture,
             text=True,
@@ -240,6 +320,7 @@ def listed_tests(
     selector: str,
     features: tuple[str, ...],
     test_cfgs: tuple[str, ...],
+    cargo_profile: str = "test",
 ) -> list[str]:
     """List exact Rust test identities for one whole target."""
 
@@ -248,6 +329,7 @@ def listed_tests(
         target,
         selector,
         features,
+        cargo_profile=cargo_profile,
         list_only=True,
     )
     output = run(
@@ -255,6 +337,7 @@ def listed_tests(
         root=root,
         capture=True,
         test_cfgs=test_cfgs,
+        cargo_profile=cargo_profile,
     ).stdout
     suffix = ": test"
     names = [
@@ -275,6 +358,7 @@ def run_target(
     selector: str,
     features: tuple[str, ...],
     test_cfgs: tuple[str, ...],
+    cargo_profile: str = "test",
 ) -> None:
     """Execute one complete target after its exact list was checked."""
 
@@ -283,6 +367,7 @@ def run_target(
         target,
         selector,
         features,
+        cargo_profile=cargo_profile,
         list_only=False,
     )
     run(
@@ -290,4 +375,5 @@ def run_target(
         root=root,
         capture=False,
         test_cfgs=test_cfgs,
+        cargo_profile=cargo_profile,
     )

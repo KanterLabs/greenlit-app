@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,11 @@ MANIFEST = Path(__file__).with_name("capability-test-manifest.json")
 def _run(
     manifest: Path,
     repository_root: Path = ROOT,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
     return subprocess.run(
         [
             sys.executable,
@@ -35,6 +40,7 @@ def _run(
         ],
         check=False,
         capture_output=True,
+        env=environment,
         text=True,
     )
 
@@ -124,6 +130,52 @@ def self_test_negative() -> int:
                 f"{result.stdout}{result.stderr}"
             )
 
+        release_defaults = _run(
+            baseline,
+            environment_overrides={
+                "CARGO_BUILD_INCREMENTAL": "false",
+                "CARGO_ENCODED_RUSTFLAGS": "",
+                "CARGO_INCREMENTAL": "0",
+                "RUSTFLAGS": "",
+            },
+        )
+        if release_defaults.returncode != 0:
+            raise GateError(
+                "release-default environment canary failed\n"
+                f"{release_defaults.stdout}{release_defaults.stderr}"
+            )
+
+        no_tools = temporary / "no-tools"
+        no_tools.mkdir()
+        environment_canaries = (
+            ("CARGO_INCREMENTAL", "1"),
+            ("RUSTFLAGS", "--cfg litci_test_boundaries"),
+            ("RUSTUP_TOOLCHAIN", "stable"),
+        )
+        for variable, value in environment_canaries:
+            result = _run(
+                baseline,
+                environment_overrides={
+                    "PATH": str(no_tools),
+                    variable: value,
+                },
+            )
+            expected_environment_rejection = (
+                "capability test manifest gate failed: release-profile Cargo "
+                "environment contains forbidden compiler/profile customization: "
+                f"{variable}\n"
+            )
+            if (
+                result.returncode != 1
+                or result.stdout
+                or result.stderr != expected_environment_rejection
+            ):
+                raise GateError(
+                    f"ambient release customization {variable} did not fail "
+                    "before Cargo\n"
+                    f"status={result.returncode}\n{result.stdout}{result.stderr}"
+                )
+
         mutations: list[tuple[str, dict[str, Any], str]] = []
         removed = copy.deepcopy(baseline_value)
         removed["workflow_routes"].pop()
@@ -151,6 +203,31 @@ def self_test_negative() -> int:
         execution["workflow_routes"][0]["executions"][0]["run"] = "true"
         mutations.append(
             ("execution substitution", execution, "checker-owned command policy")
+        )
+
+        profiles = copy.deepcopy(baseline_value)
+        performance = next(
+            entry
+            for entry in profiles["targets"]
+            if (entry["package"], entry["target"])
+            == ("greenlit-app", "performance_budgets")
+        )
+        policy = next(
+            entry
+            for entry in profiles["targets"]
+            if (entry["package"], entry["target"])
+            == ("greenlit-app", "policy_modes_live")
+        )
+        performance["cargo_profile"], policy["cargo_profile"] = (
+            policy["cargo_profile"],
+            performance["cargo_profile"],
+        )
+        mutations.append(
+            (
+                "release-profile substitution",
+                profiles,
+                "release-profile targets differ from the fixed authority",
+            )
         )
 
         for index, (label, value, expected) in enumerate(mutations):
@@ -252,7 +329,7 @@ def self_test_negative() -> int:
                     f"status={result.returncode}\n{result.stdout}{result.stderr}"
                 )
     print(
-        "capability manifest negative gate passed: 11 route, coordinated, "
-        "condition, and command mutations rejected"
+        "capability manifest negative gate passed: 15 environment, route, profile, "
+        "coordinated, condition, and command mutations rejected"
     )
     return 0

@@ -174,7 +174,10 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let workspace = format!("/home/runner/work/{repo_leaf}/{repo_leaf}");
     let all_secrets: Vec<(String, String)> = Vec::new();
     let secrets_value = Value::object(Vec::<(String, Value)>::new());
-    let (actions_config, pinned_resolver) = build_action_runtime_config(None, args.offline)
+    let (actions_config, pinned_resolver) = invocation
+        .time_stage("action-resolve", || {
+            build_action_runtime_config(None, args.offline)
+        })
         .map_err(|message| anyhow::anyhow!(message))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -199,37 +202,42 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         "actions",
         Some(format!("{} locked", action_preflight.actions.len())),
     )?;
-    runtime
-        .block_on(pinned_resolver.freeze())
-        .map_err(|error| anyhow::anyhow!(
-            "could not finalize action resolutions: {error}\n  fix: retry after the mutable action ref stops changing"
-        ))?;
-    let pinned_actions = pinned_resolver.resolutions().map_err(|error| {
-        anyhow::anyhow!(
-            "could not read finalized action resolutions: {error}\n  fix: preserve the run directory and retry"
-        )
-    })?;
-    for (reference, commit) in pinned_actions {
-        if !action_preflight
-            .actions
-            .values()
-            .any(|locked| locked == &commit)
-        {
-            anyhow::bail!(
-                "finalized action resolution {reference}={commit} is absent from the preflight action inventory\n  fix: preserve the run directory and file a Greenlit defect"
-            );
+    invocation.time_stage("action-resolve", || -> anyhow::Result<()> {
+        runtime
+            .block_on(pinned_resolver.freeze())
+            .map_err(|error| anyhow::anyhow!(
+                "could not finalize action resolutions: {error}\n  fix: retry after the mutable action ref stops changing"
+            ))?;
+        let pinned_actions = pinned_resolver.resolutions().map_err(|error| {
+            anyhow::anyhow!(
+                "could not read finalized action resolutions: {error}\n  fix: preserve the run directory and retry"
+            )
+        })?;
+        for (reference, commit) in pinned_actions {
+            if !action_preflight
+                .actions
+                .values()
+                .any(|locked| locked == &commit)
+            {
+                anyhow::bail!(
+                    "finalized action resolution {reference}={commit} is absent from the preflight action inventory\n  fix: preserve the run directory and file a Greenlit defect"
+                );
+            }
         }
-    }
+        Ok(())
+    })?;
     let engine = invocation.time_stage("detection", || runtime.block_on(connect_engine()))?;
     recorder.preparation_finished("container runtime", None)?;
-    let runtime_fingerprint = runtime
-        .block_on(engine.runtime_fingerprint())
+    let runtime_fingerprint = invocation
+        .time_stage("runtime-fingerprint", || {
+            runtime.block_on(engine.runtime_fingerprint())
+        })
         .map_err(|error| {
             anyhow::anyhow!(
                 "could not fingerprint the container runtime: {error}\n  fix: restart the local container daemon, then retry"
             )
         })?;
-    let content_store = open_content_store()?;
+    let content_store = invocation.time_stage("content-store-open", open_content_store)?;
     let mut progress = recorder.clone();
     let container_locks = invocation
         .time_stage("image-resolve", || {
@@ -259,22 +267,24 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         })
         .map_err(|error| anyhow::anyhow!("{error}"))?;
     recorder.preparation_finished("runners", Some(format!("{} locked", runner_locks.len())))?;
-    let run_lock = evidence.lock(crate::run_evidence::LockInputs {
-        workflow_path: &workflow_path.source_name,
-        event_name: event_kind.event_name(),
-        inputs: &args.inputs,
-        selected_job: args.job.as_deref(),
-        selected_matrix: &args.matrix,
-        offline: args.offline,
-        clean,
-        hermetic: args.hermetic,
-        runtime: &runtime_fingerprint,
-        plan: &execution_plan,
-        secrets: &all_secrets,
-        actions: action_preflight.actions,
-        containers: container_locks,
-        runners: runner_locks,
-        toolchains: action_preflight.toolchains,
+    let run_lock = invocation.time_stage("run-lock", || {
+        evidence.lock(crate::run_evidence::LockInputs {
+            workflow_path: &workflow_path.source_name,
+            event_name: event_kind.event_name(),
+            inputs: &args.inputs,
+            selected_job: args.job.as_deref(),
+            selected_matrix: &args.matrix,
+            offline: args.offline,
+            clean,
+            hermetic: args.hermetic,
+            runtime: &runtime_fingerprint,
+            plan: &execution_plan,
+            secrets: &all_secrets,
+            actions: action_preflight.actions,
+            containers: container_locks,
+            runners: runner_locks,
+            toolchains: action_preflight.toolchains,
+        })
     })?;
     recorder.preparation_finished("RunLock", Some(run_lock.source.snapshot_digest.clone()))?;
 
