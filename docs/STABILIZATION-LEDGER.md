@@ -109,6 +109,7 @@ commit.
 | GL-STAB-098 | high | 12 | The capability owner runs all Docker-heavy cases concurrently and waits for containers without observing child exit, so load or an early product failure becomes an ambiguous fixed-deadline failure. | Manifest-owned serial whole-target execution plus real-Docker child-liveness and bounded-termination diagnostics | resolved | f23ae36 |
 | GL-STAB-099 | high | 12 | The closed-output invariant drops the renderer before Greenlit fully renders the final workflow log, so its intended post-execution writer failure can race with step execution. | Real-Docker retained invariant that reads the complete final masked log line from the compiled CLI pipe before closing that pipe | resolved | 106d3aa |
 | GL-STAB-100 | high | 12 | Disabling workflow stores returns the embedded init helper to ephemeral host scratch, which is invisible to a sibling Docker daemon and can turn the helper bind into a directory. | Real-Docker retained invariant requiring one reusable digest-addressed private helper plus release-built tokenless parity on the canonical DinD runner | resolved | 26e21cc |
+| GL-STAB-101 | medium | 12 | An oversized private file at the digest-addressed init-helper identity can exhaust Greenlit memory before the collision receives an actionable rejection. | Compiled-CLI real-Docker sparse-helper collision under a child address-space cap with exact preparation-failure and zero-step resource-cleanup evidence | resolved | def8a56 |
 
 ## Field contract
 
