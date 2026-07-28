@@ -26,7 +26,7 @@ commit.
 | GL-STAB-015 | high | 12 | Shell scripts pretending to be Node and over-broad fake engines support real-runtime claims. | CI authority inventory and genuine-runtime ownership gate | resolved | 6be9366 |
 | GL-STAB-016 | high | 12 | Documented live-test commands use the ignored-test flag on non-ignored tests and execute zero cases. | Command-manifest gate that observes a nonzero selected test count | resolved | 6be9366 |
 | GL-STAB-017 | high | 12 | Overlay, reflink, bounded-copy, and beyond-platform-path-limit tests can pass without exercising the named path. | Forced-path heavy-runner capability gates with recorded strategy | resolved | 6be9366 |
-| GL-STAB-018 | high | 12 | Dogfood and release verification omit required gates, permit capability no-ops, and run only once. | Release-built two-run dogfood and release-check command manifest | resolved | 9e6fcfb |
+| GL-STAB-018 | high | 12 | Dogfood and release verification omit required gates, permit capability no-ops, and run only once. | Release-built two-run dogfood and release-check command manifest | resolved | a9f1169 |
 | GL-STAB-019 | high | 12 | No canonical parity schema, comparator, seed oracle, or intentional-mismatch gate exists. | Four-stage Parity Observation V1 seed comparison workflow | resolved | 6be9366 |
 | GL-STAB-020 | medium | 12 | Criterion silently drops parser or evaluator benchmarks after fixture setup failure. | Criterion benchmark-name manifest and nonzero-sample gate | resolved | 6be9366 |
 | GL-STAB-021 | critical | 13 | Workflow discovery and source capture can follow unsafe or changing filesystem content. | Frozen-source race, alias, containment, and sealed-tree fixture | open | — |
