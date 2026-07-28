@@ -47,7 +47,7 @@ commit.
 | GL-STAB-036 | high | 20 | Provisioning failures and skipped jobs can leak containers, volumes, networks, or sidecars. | Fault injection after every resource transition with zero survivors | open | — |
 | GL-STAB-037 | high | 21 | Queued, fail-fast, and preparation cancellation paths omit lifecycle terminals. | Scheduler cancellation matrix with exactly one terminal per instance | open | — |
 | GL-STAB-038 | critical | 21 | Cleanup errors are discarded, allowing success while untrusted resources survive. | Removal-failure lifecycle gate that prevents successful completion | open | — |
-| GL-STAB-039 | high | 22 | Shell, environment, command-file, timeout, and step-result semantics can differ from GitHub. | shell-ci and matrix-needs compiled/GitHub comparison | open | — |
+| GL-STAB-039 | high | 22 | Shell, default process umask and workspace modes, environment, command-file, timeout, and step-result semantics can differ from GitHub. | shell-ci including default-umask workspace modes and matrix-needs compiled/GitHub comparison | open | — |
 | GL-STAB-040 | critical | 23 | Cross-repository checkout implicitly writes the host GitHub credential into workflow-readable Git config. | Real checkout credential/config and exfiltration boundary probe | open | — |
 | GL-STAB-041 | critical | 23 | Docker action builds and siblings can reach host networks, omit limits, or survive cancellation. | Dockerfile-build canary, actual-limit, and cancellation teardown cases | open | — |
 | GL-STAB-042 | high | 23 | Action pre/main/post, real Node 20/24, state, checkout, and nested lifecycle behavior is uncertified. | Genuine-runtime actions-ci compiled/GitHub comparison | open | — |
@@ -98,6 +98,8 @@ commit.
 | GL-STAB-087 | critical | 12 | Retained run directories inherit SGID from the runner while evidence creation ignores special bits, so the terminal secret scanner rejects and may remove otherwise valid evidence. | Compiled-CLI SGID-HOME creation and pre-existing-special-bit rejection case plus real retained-secret capability owner | open | — |
 | GL-STAB-088 | high | 12 | Live local parity replaces the selected source branch with a synthetic name that fails the seed workflow's push filters before the release binary can execute. | Exact selected-ref branch binding in CI and release routes plus same-SHA local parity production | open | — |
 | GL-STAB-089 | high | 12 | Both release-binary dogfood runs pass, but their enclosing job fails cleanup because the no-new-privileges runner cannot sudo away root-owned derived cache entries. | Two complete dogfood passes followed by exact-root cleanup through an already-materialized pinned networkless helper | open | — |
+| GL-STAB-090 | high | 12 | The canonical parity seed requires a 0644 workspace probe without authoring the 0022 umask that creates it, so certification depends on the nested runtime's ambient umask and can fail before comparison. | Exact same-SHA homelab seed with an authored 0022 umask, requiring oracle, GitHub, and release-Greenlit observations to retain mode 0644 | open | — |
+| GL-STAB-091 | high | 12 | The warm-start budget owner benchmarks Cargo's unoptimized custom-cfg test binary instead of the release product, so either a pass or failure can misstate shipped performance. | Manifest-bound production-config release-profile target, public profile-transfer rejection, and exact homelab warm-start budget gate | open | — |
 
 ## Field contract
 
