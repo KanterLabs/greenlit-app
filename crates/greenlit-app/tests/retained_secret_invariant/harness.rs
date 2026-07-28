@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,6 +15,7 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(super) struct RunningLitci {
     child: Option<Child>,
+    stdout_prefix: Vec<u8>,
 }
 
 impl RunningLitci {
@@ -85,7 +88,10 @@ impl RunningLitci {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn compiled litci");
-        RunningLitci { child: Some(child) }
+        RunningLitci {
+            child: Some(child),
+            stdout_prefix: Vec::new(),
+        }
     }
 
     pub(super) fn signal_interrupt(&self) {
@@ -102,7 +108,11 @@ impl RunningLitci {
         kill_process(pid, Signal::KILL).expect("send SIGKILL to litci");
     }
 
-    pub(super) fn close_stdout(&mut self) {
+    pub(super) fn close_stdout_after_line(&mut self, expected: &[u8]) {
+        assert!(
+            self.stdout_prefix.is_empty(),
+            "litci stdout reader was already consumed"
+        );
         let stdout = self
             .child
             .as_mut()
@@ -110,26 +120,85 @@ impl RunningLitci {
             .stdout
             .take()
             .expect("piped litci stdout");
-        drop(stdout);
+        let expected = expected.to_vec();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            let mut observed = Vec::new();
+            let outcome = loop {
+                let mut line = Vec::new();
+                match stdout.read_until(b'\n', &mut line) {
+                    Ok(0) => break Err("litci stdout closed before the expected line"),
+                    Ok(_) => {
+                        let matched = line == expected;
+                        observed.extend_from_slice(&line);
+                        if matched {
+                            break Ok(observed);
+                        }
+                    }
+                    Err(_) => break Err("could not read litci stdout"),
+                }
+            };
+            drop(stdout);
+            let _ = sender.send(outcome);
+        });
+        match receiver.recv_timeout(RUN_TIMEOUT) {
+            Ok(Ok(observed)) => {
+                reader.join().expect("join litci stdout reader");
+                self.stdout_prefix = observed;
+            }
+            Ok(Err(message)) => {
+                reader.join().expect("join failed litci stdout reader");
+                panic!("{message}");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let output = self.terminate_and_collect();
+                reader.join().expect("join timed-out litci stdout reader");
+                panic!(
+                    "litci did not render the expected line before the invariant-test deadline: \
+                     terminated {}; stdout={} bytes, stderr={} bytes",
+                    output.status,
+                    output.stdout.len(),
+                    output.stderr.len()
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                reader
+                    .join()
+                    .expect("join disconnected litci stdout reader");
+                panic!("litci stdout reader exited without reporting its result");
+            }
+        }
     }
 
     fn exited_output(&mut self) -> Option<Output> {
         let child = self.child.as_mut().expect("running litci");
-        child.try_wait().expect("poll litci").map(|_| {
-            self.child
-                .take()
-                .expect("exited litci")
-                .wait_with_output()
-                .expect("collect exited litci output")
-        })
+        child.try_wait().expect("poll litci")?;
+        let output = self
+            .child
+            .take()
+            .expect("exited litci")
+            .wait_with_output()
+            .expect("collect exited litci output");
+        Some(self.with_stdout_prefix(output))
     }
 
     fn terminate_and_collect(&mut self) -> Output {
         let mut child = self.child.take().expect("running litci");
         let _ = child.kill();
-        child
+        let output = child
             .wait_with_output()
-            .expect("collect terminated litci output")
+            .expect("collect terminated litci output");
+        self.with_stdout_prefix(output)
+    }
+
+    fn with_stdout_prefix(&mut self, mut output: Output) -> Output {
+        if self.stdout_prefix.is_empty() {
+            return output;
+        }
+        self.stdout_prefix.append(&mut output.stdout);
+        output.stdout = std::mem::take(&mut self.stdout_prefix);
+        output
     }
 
     pub(super) fn finish(mut self) -> Output {
@@ -137,7 +206,8 @@ impl RunningLitci {
         let deadline = Instant::now() + RUN_TIMEOUT;
         loop {
             if child.try_wait().expect("poll litci").is_some() {
-                return child.wait_with_output().expect("collect litci output");
+                let output = child.wait_with_output().expect("collect litci output");
+                return self.with_stdout_prefix(output);
             }
             if Instant::now() >= deadline {
                 child.kill().expect("terminate timed-out litci");

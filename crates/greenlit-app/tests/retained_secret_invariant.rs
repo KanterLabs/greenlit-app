@@ -605,8 +605,7 @@ fn exercise_terminal_path(terminal: TerminalPath) {
         running.signal_interrupt();
     } else if matches!(terminal, TerminalPath::ClosedOutput) {
         wait_for_container_path(&container, EMITTED_MARKER);
-        wait_for_durable_closed_output_boundary(&run);
-        running.close_stdout();
+        running.close_stdout_after_line(b"    split=***\n");
         assert!(
             docker(["exec", &container, "touch", FINISH_MARKER])
                 .status
@@ -657,28 +656,6 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     }
     container_cleanup.cleanup();
     support::assert_run_resources_removed(&run);
-}
-
-fn wait_for_durable_closed_output_boundary(run: &Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if fs::read_to_string(run.join("events.ndjson")).is_ok_and(|events| {
-            events.lines().any(|line| {
-                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
-                    record["type"] == "log"
-                        && record["text"] == "split=***"
-                        && record["partial"].as_bool() == Some(false)
-                })
-            })
-        }) {
-            return;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "closed-output path did not durably record its final masked log line"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
 }
 
 fn assert_result_and_journal_truth(run: &Path, terminal: TerminalPath) {
