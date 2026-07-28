@@ -35,8 +35,9 @@ pub struct ResolvedImage {
     pub os: String,
     /// Config-declared architecture.
     pub architecture: String,
-    /// Whether verified manifest/config bytes came entirely from the CAS
-    /// after the registry's zero-body alias recheck.
+    /// Whether verified manifest/config bytes came entirely from the CAS.
+    /// Mutable aliases are first zero-body rechecked with the registry; exact
+    /// digest references may reuse their cached identity without a request.
     pub cache_hit: bool,
     /// Whether every filesystem layer carries a verified eStargz TOC
     /// annotation and can therefore be mounted and chunk-verified lazily.
@@ -150,6 +151,16 @@ impl RegistryResolver {
     /// that manifest's config identity and platform.
     pub fn resolve_linux_amd64(&self, reference: &str) -> Result<ResolvedImage, OciError> {
         let parsed = RegistryReference::parse(reference)?;
+        // greenlit-v0-spec.md "Content and environment preparation" requires
+        // SHA-256-verified immutable reuse and exact offline identities without
+        // substitution. An authored digest supplies that exact top identity;
+        // cached_resolution still requires matching aliases and verified
+        // manifest/config bytes before network access can be skipped.
+        if let Ok(top_digest) = ObjectDigest::parse(&parsed.reference)
+            && let Some(cached) = self.cached_resolution(&parsed, reference, &top_digest)?
+        {
+            return Ok(cached);
+        }
         let probe = self.authenticate(&parsed)?;
         if let Some(top_digest) = probe.digest.as_ref()
             && let Some(cached) = self.cached_resolution(&parsed, reference, top_digest)?
@@ -169,17 +180,8 @@ impl RegistryResolver {
         let selected = if envelope.manifests.is_empty() {
             (top_digest.clone(), top.bytes)
         } else {
-            let descriptor = envelope
-                .manifests
-                .iter()
-                .find(|descriptor| {
-                    descriptor.platform.as_ref().is_some_and(|platform| {
-                        platform.os == "linux"
-                            && (platform.architecture == "amd64"
-                                || platform.architecture == "x86_64")
-                    })
-                })
-                .ok_or_else(|| OciError::PlatformMissing {
+            let descriptor =
+                linux_amd64_descriptor(&envelope).ok_or_else(|| OciError::PlatformMissing {
                     reference: reference.to_string(),
                 })?;
             let digest =
@@ -276,31 +278,59 @@ impl RegistryResolver {
         if self.store.resolve_alias("oci-top", requested)?.as_ref() != Some(top_digest) {
             return Ok(None);
         }
+        let Some(top_bytes) = read_cache_object(&self.store, top_digest)? else {
+            return Ok(None);
+        };
+        let Ok(envelope) = serde_json::from_slice::<ManifestEnvelope>(&top_bytes) else {
+            return Ok(None);
+        };
         let Some(selected) = self.store.resolve_alias("oci-linux-amd64", requested)? else {
             return Ok(None);
         };
-        let Some(manifest_bytes) = read_cache_object(&self.store, &selected)? else {
+        let manifest_bytes = if envelope.manifests.is_empty() {
+            if &selected != top_digest {
+                return Ok(None);
+            }
+            top_bytes
+        } else {
+            let Some(descriptor) = linux_amd64_descriptor(&envelope) else {
+                return Ok(None);
+            };
+            let Ok(descriptor_digest) = ObjectDigest::parse(&descriptor.digest) else {
+                return Ok(None);
+            };
+            if selected != descriptor_digest {
+                return Ok(None);
+            }
+            let Some(manifest_bytes) = read_cache_object(&self.store, &selected)? else {
+                return Ok(None);
+            };
+            if u64::try_from(manifest_bytes.len()).ok() != Some(descriptor.size) {
+                return Ok(None);
+            }
+            manifest_bytes
+        };
+        let Ok(manifest) = serde_json::from_slice::<ImageManifest>(&manifest_bytes) else {
             return Ok(None);
         };
-        let manifest: ImageManifest =
-            serde_json::from_slice(&manifest_bytes).map_err(|error| OciError::Metadata {
-                reference: requested.to_string(),
-                message: error.to_string(),
-            })?;
         let lazy_compatible = manifest.lazy_compatible();
-        let config_digest =
-            ObjectDigest::parse(&manifest.config.digest).map_err(|error| OciError::Metadata {
-                reference: requested.to_string(),
-                message: format!("config descriptor digest: {error}"),
-            })?;
+        let Ok(config_digest) = ObjectDigest::parse(&manifest.config.digest) else {
+            return Ok(None);
+        };
         let Some(config_bytes) = read_cache_object(&self.store, &config_digest)? else {
             return Ok(None);
         };
-        let image_config: ImageConfig =
-            serde_json::from_slice(&config_bytes).map_err(|error| OciError::Metadata {
-                reference: requested.to_string(),
-                message: format!("image config: {error}"),
-            })?;
+        if u64::try_from(config_bytes.len()).ok() != Some(manifest.config.size) {
+            return Ok(None);
+        }
+        let Ok(image_config) = serde_json::from_slice::<ImageConfig>(&config_bytes) else {
+            return Ok(None);
+        };
+        if image_config.os != "linux"
+            || (image_config.architecture != "amd64" && image_config.architecture != "x86_64")
+        {
+            return Ok(None);
+        }
         Ok(Some(ResolvedImage {
             requested: requested.to_string(),
             pull_reference: format!("{}@{}", parsed.pull_name, selected),
@@ -753,6 +783,15 @@ struct Descriptor {
 struct Platform {
     architecture: String,
     os: String,
+}
+
+fn linux_amd64_descriptor(envelope: &ManifestEnvelope) -> Option<&Descriptor> {
+    envelope.manifests.iter().find(|descriptor| {
+        descriptor.platform.as_ref().is_some_and(|platform| {
+            platform.os == "linux"
+                && (platform.architecture == "amd64" || platform.architecture == "x86_64")
+        })
+    })
 }
 
 #[derive(Debug, Deserialize)]
