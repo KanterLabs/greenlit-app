@@ -81,8 +81,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: |
-          test -f \"$RUNNER_TOOL_CACHE/greenlit-clean-sentinel\"
-          test -f /usr/local/cargo/registry/greenlit-package-sentinel
+          test ! -f \"$RUNNER_TOOL_CACHE/greenlit-clean-sentinel\"
+          test ! -f /usr/local/cargo/registry/greenlit-package-sentinel
+          test -z \"${ACTIONS_CACHE_URL:-}\"
+          test -z \"${ACTIONS_RESULTS_URL:-}\"
+          test -z \"${ACTIONS_RUNTIME_TOKEN:-}\"
 ",
     );
     sandbox.init_git();
@@ -90,7 +93,7 @@ jobs:
     let ordinary = sandbox.run_with_env(&["run", "--no-input", "--allow-degraded"], &[]);
     assert!(
         ordinary.status.success(),
-        "ordinary cache visibility run failed\nstdout:\n{}\nstderr:\n{}",
+        "ordinary storage-quarantine run failed\nstdout:\n{}\nstderr:\n{}",
         support::stdout_text(&ordinary),
         support::stderr_text(&ordinary)
     );
@@ -109,7 +112,7 @@ jobs:
     steps:
       - run: |
           test ! -f \"$RUNNER_TOOL_CACHE/greenlit-clean-sentinel\"
-          test -f /usr/local/cargo/registry/greenlit-package-sentinel
+          test ! -f /usr/local/cargo/registry/greenlit-package-sentinel
 ",
     );
     sandbox.git(&["add", ".github/workflows/ci.yml"]);
