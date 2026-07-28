@@ -150,6 +150,7 @@ def self_test_negative() -> int:
         environment_canaries = (
             ("CARGO_INCREMENTAL", "1"),
             ("RUSTFLAGS", "--cfg litci_test_boundaries"),
+            ("RUSTC_WRAPPER", "/bin/false"),
             ("RUSTUP_TOOLCHAIN", "stable"),
         )
         for variable, value in environment_canaries:
@@ -329,7 +330,7 @@ def self_test_negative() -> int:
                     f"status={result.returncode}\n{result.stdout}{result.stderr}"
                 )
     print(
-        "capability manifest negative gate passed: 15 environment, route, profile, "
+        "capability manifest negative gate passed: 16 environment, route, profile, "
         "coordinated, condition, and command mutations rejected"
     )
     return 0

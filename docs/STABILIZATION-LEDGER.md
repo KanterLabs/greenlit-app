@@ -102,6 +102,7 @@ commit.
 | GL-STAB-091 | high | 12 | The warm-start budget owner benchmarks Cargo's unoptimized custom-cfg test binary instead of the release product, so either a pass or failure can misstate shipped performance. | Manifest-bound production-config release-profile target, public profile-transfer rejection, and exact homelab warm-start budget gate | open | — |
 | GL-STAB-092 | high | 12 | The corrected release-profile warm-start gate has repeated multi-second pre-step outliers while measured runtime bootstrap remains flat, violating the fixed two-second budget and making certification nondeterministic. | Fresh isolated homelab-heavy 20-sample release gate with complete pre-step attribution, no retries, and invocation-to-first-user-step p95 below two seconds | open | — |
 | GL-STAB-093 | high | 12 | Splitting native performance into a fresh capability-owning job leaves the credential-isolation workflow authority's exact job set stale, so the portable parity contract fails and every downstream capability gate is skipped. | Public release and CI isolation self-test against the exact performance-policy job topology | open | — |
+| GL-STAB-094 | high | 12 | The pinned Rust cache action exports a compiler wrapper into the fresh performance job, so the release-profile authority correctly refuses the customized build before measuring the candidate. | Exact fresh performance workflow without build-target caching, retaining the public compiler-wrapper rejection canary and full release-profile budget gate | open | — |
 
 ## Field contract
 
