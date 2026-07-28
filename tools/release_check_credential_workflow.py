@@ -499,7 +499,7 @@ def _validate_publish_job(block: str) -> None:
         != (
             'set -euo pipefail download="$RUNNER_TEMP/greenlit-candidate-download/'
             'greenlit-release-candidate.tar" output="$RUNNER_TEMP/'
-            'greenlit-candidate-unpacked" test ! -e "$output" install -d -m 0700 '
+            'greenlit-candidate-unpacked" test ! -e "$output" install -d -m 000700 '
             '"$output" tools/release-provenance unpack \\ --repository-root '
             '"$GITHUB_WORKSPACE" \\ --bundle "$download" \\ --output-root "$output" '
             '\\ --expected-source "$GITHUB_SHA" \\ --expected-sha256 '

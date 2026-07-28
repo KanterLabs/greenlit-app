@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Provision one digest-verified Ubuntu keyctl binary without host privilege.
+set -euo pipefail
+
+readonly package_url='https://archive.ubuntu.com/ubuntu/pool/main/k/keyutils/keyutils_1.6.3-3build1_amd64.deb'
+readonly package_sha256='9882ac38c3d4b44c597183c95744a74049d9bdc77dc4498ef1484c3cde26f1c2'
+
+if [[ $# -ne 1 || ! "$1" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+  echo "usage: provision-keyctl <new-absolute-private-root>" >&2
+  exit 2
+fi
+
+readonly output_root="$1"
+readonly archive="$output_root/keyutils.deb"
+readonly package_root="$output_root/package"
+readonly keyctl="$package_root/usr/bin/keyctl"
+
+if [[ "$(/usr/bin/uname -s)" != Linux || "$(/usr/bin/uname -m)" != x86_64 ]]; then
+  echo "keyctl provisioning requires Linux x86_64" >&2
+  exit 1
+fi
+for command in /usr/bin/curl /usr/bin/dpkg-deb /usr/bin/dpkg-query \
+  /usr/bin/id /usr/bin/install /usr/bin/sha256sum /usr/bin/stat \
+  /usr/bin/uname; do
+  if [[ ! -x "$command" ]]; then
+    echo "keyctl provisioning lacks trusted command $command" >&2
+    exit 1
+  fi
+done
+if [[ -e "$output_root" || -L "$output_root" ]]; then
+  echo "keyctl provisioning output already exists" >&2
+  exit 1
+fi
+
+umask 077
+/usr/bin/install -d -m 000700 "$output_root"
+/usr/bin/curl \
+  --fail \
+  --location \
+  --proto '=https' \
+  --show-error \
+  --silent \
+  --tlsv1.2 \
+  --output "$archive" \
+  "$package_url"
+printf '%s  %s\n' "$package_sha256" "$archive" \
+  | /usr/bin/sha256sum --check --strict
+
+if [[ "$(/usr/bin/dpkg-deb --field "$archive" Package)" != keyutils \
+  || "$(/usr/bin/dpkg-deb --field "$archive" Version)" != 1.6.3-3build1 \
+  || "$(/usr/bin/dpkg-deb --field "$archive" Architecture)" != amd64 ]]; then
+  echo "keyctl package identity differs from the pinned Ubuntu package" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/dpkg-query -W -f='${Version}' libkeyutils1:amd64)" \
+  != 1.6.3-3build1 ]]; then
+  echo "ambient libkeyutils1 differs from the pinned keyctl package" >&2
+  exit 1
+fi
+/usr/bin/dpkg-deb --extract "$archive" "$package_root"
+if [[ -L "$keyctl" || ! -f "$keyctl" || ! -x "$keyctl" \
+  || "$(/usr/bin/stat -c '%u:%a' "$keyctl")" != "$(/usr/bin/id -u):755" ]]; then
+  echo "keyctl package did not produce one current-user mode-0755 executable" >&2
+  exit 1
+fi
+
+echo "keyctl provisioning passed: Ubuntu keyutils 1.6.3-3build1"

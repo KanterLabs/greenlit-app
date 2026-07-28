@@ -159,7 +159,7 @@
       "prerequisites": [
         {
           "name": "Provision isolated keyring prerequisites",
-          "run": "test \"$(uname -s)\" = Linux\ncommand -v unshare >/dev/null\nif ! command -v keyctl >/dev/null; then\n  sudo apt-get update\n  sudo apt-get install -y --no-install-recommends keyutils\nfi\ncommand -v keyctl >/dev/null\n"
+          "run": "test \"$(/usr/bin/uname -s)\" = Linux\ntest \"$(/usr/bin/uname -m)\" = x86_64\ntest -x /usr/bin/unshare\nkeyutils_root=\"$RUNNER_TEMP/greenlit-keyutils\"\ntools/tests/provision-keyctl \"$keyutils_root\"\nprintf '%s\\n' \"$keyutils_root/package/usr/bin\" >> \"$GITHUB_PATH\"\n"
         }
       ],
       "executions": [
@@ -251,7 +251,7 @@
       "prerequisites": [
         {
           "name": "Prepare credential-only boundary",
-          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-live-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-live-github\"\ntest ! -e \"$output\"\ninstall -d -m 0700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-live-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-live-github\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
         }
       ],
       "executions": [
@@ -274,13 +274,13 @@
         },
         {
           "name": "Build exact release binary outside the checkout",
-          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\ntest ! -e \"$parity_target\"\ninstall -d -m 0700 \"$parity_target\"\nCARGO_TARGET_DIR=\"$parity_target\" \\\n  cargo build --locked --release -p greenlit-app --bin litci\n"
+          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\ntest ! -e \"$parity_target\"\ninstall -d -m 000700 \"$parity_target\"\nCARGO_TARGET_DIR=\"$parity_target\" \\\n  cargo build --locked --release -p greenlit-app --bin litci\n"
         }
       ],
       "executions": [
         {
           "name": "Produce tokenless local evidence",
-          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\nparity_output=\"${RUNNER_TEMP}/greenlit-live-local\"\ntest ! -e \"$parity_output\"\ninstall -d -m 0700 \"$parity_output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$parity_target/release/litci\" \\\n  --output-root \"$parity_output\"\n"
+          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\nparity_output=\"${RUNNER_TEMP}/greenlit-live-local\"\ntest ! -e \"$parity_output\"\ninstall -d -m 000700 \"$parity_output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$parity_target/release/litci\" \\\n  --output-root \"$parity_output\"\n"
         }
       ]
     },
@@ -320,7 +320,7 @@
         },
         {
           "name": "Provision privileged copy-strategy prerequisites",
-          "run": "command -v python3 >/dev/null\nmissing_packages=()\ncommand -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)\nif ! command -v losetup >/dev/null \\\n  || ! command -v mount >/dev/null \\\n  || ! command -v umount >/dev/null; then\n  missing_packages+=(util-linux)\nfi\nif ((${#missing_packages[@]})); then\n  sudo apt-get update\n  sudo apt-get install -y --no-install-recommends \"${missing_packages[@]}\"\nfi\ncommand -v mkfs.btrfs >/dev/null\ncommand -v losetup >/dev/null\ncommand -v mount >/dev/null\ncommand -v umount >/dev/null\n"
+          "run": "test \"$(/usr/bin/uname -s)\" = Linux\ntest \"$(/usr/bin/uname -m)\" = x86_64\ntest -x /usr/bin/docker\n/usr/bin/docker info >/dev/null\n"
         },
         {
           "name": "Prepare pinned runner profile",
@@ -330,7 +330,7 @@
       "executions": [
         {
           "name": "Reflink and bounded-stream copy strategies",
-          "run": "cargo build --locked -p greenlit-init\nsudo --preserve-env=PATH \\\n  tools/tests/check-greenlit-init-copy-strategies \\\n  target/debug/greenlit-init\n"
+          "run": "cargo build --locked -p greenlit-init --profile init \\\n  --target x86_64-unknown-linux-musl\ntools/test-copy-strategy-capability \\\n  target/x86_64-unknown-linux-musl/init/greenlit-init\n"
         },
         {
           "name": "Run real-daemon executor tests",
@@ -359,11 +359,11 @@
         },
         {
           "name": "Provision isolated keyring prerequisites",
-          "run": "command -v unshare >/dev/null\nif ! command -v keyctl >/dev/null; then\n  sudo apt-get update\n  sudo apt-get install -y --no-install-recommends keyutils\nfi\n"
+          "run": "test \"$(/usr/bin/uname -s)\" = Linux\ntest \"$(/usr/bin/uname -m)\" = x86_64\ntest -x /usr/bin/unshare\nkeyutils_root=\"$RUNNER_TEMP/greenlit-keyutils\"\ntools/tests/provision-keyctl \"$keyutils_root\"\nprintf '%s\\n' \"$keyutils_root/package/usr/bin\" >> \"$GITHUB_PATH\"\n"
         },
         {
           "name": "Provision privileged copy-strategy prerequisites",
-          "run": "missing_packages=()\ncommand -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)\ncommand -v losetup >/dev/null || missing_packages+=(util-linux)\nif ((${#missing_packages[@]})); then\n  sudo apt-get update\n  sudo apt-get install -y --no-install-recommends \"${missing_packages[@]}\"\nfi\n"
+          "run": "test \"$(/usr/bin/uname -s)\" = Linux\ntest \"$(/usr/bin/uname -m)\" = x86_64\ntest -x /usr/bin/docker\n/usr/bin/docker info >/dev/null\n"
         }
       ],
       "executions": [
@@ -381,7 +381,7 @@
         },
         {
           "name": "Reflink and bounded-stream copy strategies",
-          "run": "cargo build --locked -p greenlit-init\nsudo --preserve-env=PATH \\\n  tools/tests/check-greenlit-init-copy-strategies \\\n  target/debug/greenlit-init\n"
+          "run": "cargo build --locked -p greenlit-init --profile init \\\n  --target x86_64-unknown-linux-musl\ntools/test-copy-strategy-capability \\\n  target/x86_64-unknown-linux-musl/init/greenlit-init\n"
         },
         {
           "name": "Run real-daemon executor tests",
@@ -414,7 +414,7 @@
       "prerequisites": [
         {
           "name": "Prepare credential-only source boundary",
-          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-release-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-release-github-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 0700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-release-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-release-github-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
         }
       ],
       "executions": [
@@ -443,7 +443,7 @@
       "executions": [
         {
           "name": "Produce credential-free local evidence",
-          "run": "set -euo pipefail\noutput=\"$RUNNER_TEMP/greenlit-release-local-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 0700 \"$output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \\\n    \"$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci\" \\\n  --output-root \"$output\"\n"
+          "run": "set -euo pipefail\noutput=\"$RUNNER_TEMP/greenlit-release-local-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \\\n    \"$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci\" \\\n  --output-root \"$output\"\n"
         }
       ]
     }
