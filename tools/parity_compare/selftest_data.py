@@ -42,6 +42,7 @@ WORKFLOW_BYTES = (
     b"          test '${{ steps.emit.outputs.seed_value }}' = 'greenlit'\n"
     b"          printf 'PARITY_OUTPUT seed_value=%s\\n' \\\n"
     b"            '${{ steps.emit.outputs.seed_value }}'\n"
+    b"          umask 0022\n"
     b"          printf '%s\\n' 'greenlit' > parity-seed.txt\n"
     b"          test \"$(cat parity-seed.txt)\" = 'greenlit'\n"
     b"          mode=\"$(stat -c '%a' parity-seed.txt)\"\n"

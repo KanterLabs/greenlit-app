@@ -282,6 +282,8 @@ The canonical `shell-only-seed` case is intentionally complete and fixed:
 - the workflow has the exact `push` branches `main` and `stabilization/**`
   (`workflow_dispatch` may also be present), one `shell` job, and exactly the
   authored `emit` and `verify` Bash run blocks;
+- the authored `verify` block sets `umask 0022` immediately before creating
+  `parity-seed.txt`, independent of the runner's inherited process umask;
 - contexts are `github.job=shell`, `github.workflow=Parity seed`,
   `runner.arch=X64`, and `runner.os=Linux`;
 - workflow outputs are empty;
