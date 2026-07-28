@@ -307,23 +307,34 @@ jobs:
         env:
           GREENLIT_BUILD_COMMIT: ${{ github.sha }}
         run: |
-          parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
-          test ! -e "$parity_target"
-          install -d -m 000700 "$parity_target"
-          CARGO_TARGET_DIR="$parity_target" \
+          parity_build="${RUNNER_TEMP}/greenlit-parity-release-target"
+          parity_binary_root="${RUNNER_TEMP}/greenlit-parity-release-binary"
+          test ! -e "$parity_build"
+          test ! -e "$parity_binary_root"
+          install -d -m 000700 "$parity_build"
+          install -d -m 000700 "$parity_binary_root"
+          CARGO_TARGET_DIR="$parity_build" \
             cargo build --locked --release -p greenlit-app --bin litci
+          /usr/bin/install \
+            -m 0755 \
+            "$parity_build/release/litci" \
+            "$parity_binary_root/litci"
+          test ! -L "$parity_binary_root/litci"
+          test -f "$parity_binary_root/litci"
+          test -x "$parity_binary_root/litci"
+          test "$(/usr/bin/stat -c %h "$parity_binary_root/litci")" = 1
 
       - name: Produce tokenless local evidence
         env:
           GREENLIT_BUILD_COMMIT: ${{ github.sha }}
         run: |
-          parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
+          parity_binary_root="${RUNNER_TEMP}/greenlit-parity-release-binary"
           parity_output="${RUNNER_TEMP}/greenlit-live-local"
           test ! -e "$parity_output"
           install -d -m 000700 "$parity_output"
           tools/check-live-parity local \
             --repository-root "$GITHUB_WORKSPACE" \
-            --greenlit-binary "$parity_target/release/litci" \
+            --greenlit-binary "$parity_binary_root/litci" \
             --output-root "$parity_output"
 
       - name: Seal local evidence and binary
@@ -337,7 +348,7 @@ jobs:
               tools/release_check_credential_bundle.py pack-local \
               --input-root "$RUNNER_TEMP/greenlit-live-local" \
               --greenlit-binary \
-                "$RUNNER_TEMP/greenlit-parity-release-target/release/litci" \
+                "$RUNNER_TEMP/greenlit-parity-release-binary/litci" \
               --output "$bundle" \
               --expected-source "$GITHUB_SHA"
           )"

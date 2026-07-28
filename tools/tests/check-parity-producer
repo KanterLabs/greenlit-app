@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import shutil
@@ -12,16 +10,18 @@ import stat
 import subprocess
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 
 from parity_producer_bounds import run_bounds_canaries
-
-
-REPOSITORY_ID = "KanterLabs/greenlit-app"
-RUN_ID = 987654321
+from parity_producer_fixture import (
+    JOB_ID,
+    REPOSITORY_ID,
+    RUN_ID,
+    github_inputs,
+    write_job_log,
+)
 
 
 def main() -> int:
@@ -85,7 +85,7 @@ def main() -> int:
 
         raw = test_root / "raw-api"
         raw.mkdir()
-        inputs = _github_inputs(raw, workflow.read_bytes(), source_commit)
+        inputs = github_inputs(raw, workflow.read_bytes(), source_commit)
         github = _tool_command(
             tool,
             "github-actions",
@@ -98,8 +98,8 @@ def main() -> int:
             str(inputs["jobs"]),
             "--content-json",
             str(inputs["content"]),
-            "--logs-zip",
-            str(inputs["logs"]),
+            "--job-log",
+            str(inputs["log"]),
             "--self-test-raw-evidence",
         )
         _run(github)
@@ -124,6 +124,7 @@ def main() -> int:
             source_commit=source_commit,
             github_inputs=inputs,
             run_id=RUN_ID,
+            job_id=JOB_ID,
         )
         private_paths = [
             (output_root, 0o700),
@@ -190,10 +191,38 @@ def main() -> int:
                 "symlinked capture parent was not rejected: " + failed.stderr
             )
 
-        _duplicate_marker_archive(inputs["logs"])
+        write_job_log(inputs["log"], duplicate=True)
         failed = _run(github, success=False)
-        if "authored job/step identity order" not in failed.stderr:
-            raise RuntimeError("duplicate marker did not fail at exact identity mapping")
+        if "duplicate output marker 'seed_value'" not in failed.stderr:
+            raise RuntimeError("duplicate marker inside the job log was not rejected")
+        write_job_log(inputs["log"], masked=True)
+        failed = _run(github, success=False)
+        if "did not observe exactly seed_value=greenlit" not in failed.stderr:
+            raise RuntimeError("masked runtime marker was reconstructed from command echo")
+        write_job_log(inputs["log"])
+
+        original_jobs = inputs["jobs"].read_bytes()
+        job_mutations = (
+            ("id", JOB_ID + 1),
+            ("run_id", RUN_ID + 1),
+            ("run_attempt", 2),
+            ("head_sha", "f" * 40),
+            ("name", "Different job"),
+            ("run_url", "https://api.github.com/repos/other/run"),
+            ("url", "https://api.github.com/repos/other/job"),
+            ("html_url", "https://github.com/other/job"),
+        )
+        for field, value in job_mutations:
+            jobs_document = json.loads(original_jobs)
+            jobs_document["jobs"][0][field] = value
+            inputs["jobs"].write_text(
+                json.dumps(jobs_document, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            failed = _run(github, success=False)
+            if "does not bind the requested run attempt" not in failed.stderr:
+                raise RuntimeError(f"job-log identity accepted mutated {field}")
+        inputs["jobs"].write_bytes(original_jobs)
 
         fixture_root = checkout / "fixtures/stabilization/parity"
         shutil.copytree(output_root / "captures", fixture_root / "captures")
@@ -245,102 +274,6 @@ def main() -> int:
 
     print("parity producer behavior gate passed: oracle + GitHub + replay negatives")
     return 0
-
-
-def _github_inputs(
-    directory: Path,
-    workflow: bytes,
-    source_commit: str,
-) -> dict[str, Path]:
-    run = {
-        "id": RUN_ID,
-        "name": "Parity seed",
-        "event": "push",
-        "status": "completed",
-        "conclusion": "success",
-        "head_sha": source_commit,
-        "path": ".github/workflows/parity-seed.yml",
-        "run_attempt": 1,
-        "run_started_at": "2026-07-28T10:00:00Z",
-        "updated_at": "2026-07-28T10:00:04Z",
-        "html_url": f"https://github.com/{REPOSITORY_ID}/actions/runs/{RUN_ID}",
-        "repository": {"full_name": REPOSITORY_ID},
-    }
-    step_values = (
-        (1, "Set up job", "00", "01"),
-        (2, "Emit deterministic output", "01", "02"),
-        (3, "Verify shell and filesystem behavior", "02", "03"),
-        (4, "Complete job", "03", "04"),
-    )
-    steps = [
-        {
-            "name": step_name,
-            "status": "completed",
-            "conclusion": "success",
-            "number": number,
-            "started_at": f"2026-07-28T10:00:{started}Z",
-            "completed_at": f"2026-07-28T10:00:{completed}Z",
-        }
-        for number, step_name, started, completed in step_values
-    ]
-    jobs = {
-        "total_count": 1,
-        "jobs": [
-            {
-                "name": "Shell-only parity seed",
-                "status": "completed",
-                "conclusion": "success",
-                "head_sha": source_commit,
-                "run_attempt": 1,
-                "started_at": "2026-07-28T10:00:00Z",
-                "completed_at": "2026-07-28T10:00:04Z",
-                "labels": ["homelab"],
-                "steps": steps,
-            }
-        ],
-    }
-    content = {
-        "type": "file",
-        "path": ".github/workflows/parity-seed.yml",
-        "encoding": "base64",
-        "content": base64.b64encode(workflow).decode("ascii"),
-    }
-    paths = {
-        "run": directory / "run.json",
-        "jobs": directory / "jobs.json",
-        "content": directory / "content.json",
-        "logs": directory / "logs.zip",
-    }
-    for key, document in (("run", run), ("jobs", jobs), ("content", content)):
-        paths[key].write_text(
-            json.dumps(document, separators=(",", ":")),
-            encoding="utf-8",
-        )
-    _write_log_archive(paths["logs"], duplicate=False)
-    return paths
-
-
-def _write_log_archive(path: Path, *, duplicate: bool) -> None:
-    digest = hashlib.sha256(b"greenlit\n").hexdigest()
-    lines = [
-        "2026-07-28T10:00:01Z PARITY_IDENTITY job=shell step=emit",
-        "2026-07-28T10:00:02Z PARITY_IDENTITY job=shell step=verify",
-        "2026-07-28T10:00:02Z PARITY_OUTPUT seed_value=greenlit",
-        "2026-07-28T10:00:02Z PARITY_CONTEXT github.job=shell",
-        "2026-07-28T10:00:02Z PARITY_CONTEXT github.workflow=Parity seed",
-        "2026-07-28T10:00:02Z PARITY_CONTEXT runner.arch=X64",
-        "2026-07-28T10:00:02Z PARITY_CONTEXT runner.os=Linux",
-        "2026-07-28T10:00:02Z PARITY_TEMPORARY_DIRECTORY /runner/_temp/seed",
-        f"2026-07-28T10:00:02Z PARITY_PROBE parity-seed-file mode=0644 sha256={digest}",
-    ]
-    if duplicate:
-        lines.insert(1, lines[0])
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("shell.txt", "\n".join(lines) + "\n")
-
-
-def _duplicate_marker_archive(path: Path) -> None:
-    _write_log_archive(path, duplicate=True)
 
 
 def _git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:

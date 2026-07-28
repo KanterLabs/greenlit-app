@@ -91,6 +91,9 @@ commit.
 | GL-STAB-080 | high | 12 | The persistent-keyring capability job tries to install keyctl with sudo even though the canonical runner forbids privilege elevation, so ordinary-user acceptance never executes. | Digest-verified userspace keyctl provisioning plus the real unprivileged persistent-keyring acceptance gate | open | — |
 | GL-STAB-081 | high | 12 | Committed historical parity replay ignores the script-bound checkout trust path and fails inside the portable job container before validating fixture bytes. | Exact pinned-container replay gate with config-independent repository trust | open | — |
 | GL-STAB-082 | high | 12 | The copy-strategy capability job tries to install and execute privileged filesystem tooling with host sudo even though the canonical runner forbids privilege elevation. | Pinned private-DinD child-container acceptance proving real reflink and bounded-stream execution without host sudo | open | — |
+| GL-STAB-083 | high | 12 | GitHub's job-log archive repeats each seed marker in aggregate and per-step entries, so concatenating every entry rejects valid same-SHA evidence as ambiguous. | Attempt-bound plain-text workflow-job log canaries plus exact live GitHub parity collection | open | — |
+| GL-STAB-084 | high | 12 | The isolated copy gate pins a private runner image that the job's credential-free DinD daemon cannot pull, so filesystem capability assertions never execute. | Public digest-pinned child image plus exact native CI execution of the real reflink and bounded-stream gate | open | — |
+| GL-STAB-085 | high | 12 | Same-SHA local parity passes Cargo's final hard-linked binary directly to a single-link identity boundary, so valid release builds are rejected before execution. | Separately installed single-link release binary plus exact live local parity production | open | — |
 
 ## Field contract
 

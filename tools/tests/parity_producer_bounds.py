@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import os
-import stat
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from parity_producer_executables import (
+    write_gh_executable,
+    write_overflow_executable,
+    write_success_escape_executable,
+)
 
 
 TOKEN_DESCRIPTOR = "GREENLIT_GITHUB_PRODUCER_CREDENTIAL_FD"
@@ -24,6 +29,7 @@ def run_bounds_canaries(
     source_commit: str,
     github_inputs: dict[str, Path],
     run_id: int,
+    job_id: int,
 ) -> None:
     """Require bounded rejection and descendant cleanup for both producers."""
     protected = (
@@ -45,13 +51,14 @@ def run_bounds_canaries(
         trusted=trusted,
         source_commit=source_commit,
     )
-    _github_log_overflow(
+    _github_job_log_overflow(
         tool=tool,
         test_root=test_root,
         output_root=output_root,
         trusted=trusted,
         github_inputs=github_inputs,
         run_id=run_id,
+        job_id=job_id,
     )
     if any(path.read_bytes() != before[path] for path in protected):
         raise RuntimeError("failed bounded producer changed prior parity evidence")
@@ -74,7 +81,7 @@ def _local_success_escape(
     home.mkdir(mode=0o700)
     sentinel = test_root / "successful-descendant-survived"
     child_identity = test_root / "successful-descendant.identity"
-    _write_success_escape_executable(
+    write_success_escape_executable(
         binary,
         version_commit=source_commit,
         sentinel=sentinel,
@@ -123,7 +130,7 @@ def _local_overflow(
     home.mkdir(mode=0o700)
     sentinel = test_root / "local-descendant-survived"
     child_identity = test_root / "local-descendant.identity"
-    _write_overflow_executable(
+    write_overflow_executable(
         binary,
         version_commit=source_commit,
         sentinel=sentinel,
@@ -156,7 +163,7 @@ def _local_overflow(
     )
 
 
-def _github_log_overflow(
+def _github_job_log_overflow(
     *,
     tool: Path,
     test_root: Path,
@@ -164,6 +171,7 @@ def _github_log_overflow(
     trusted: list[str],
     github_inputs: dict[str, Path],
     run_id: int,
+    job_id: int,
 ) -> None:
     executable = test_root / "hostile-gh"
     record = test_root / "hostile-gh-calls.ndjson"
@@ -179,12 +187,9 @@ def _github_log_overflow(
             "repos/KanterLabs/greenlit-app/contents/"
             ".github/workflows/parity-seed.yml"
         ),
-        "logs": (
-            f"repos/KanterLabs/greenlit-app/actions/runs/{run_id}"
-            "/attempts/1/logs"
-        ),
+        "log": f"repos/KanterLabs/greenlit-app/actions/jobs/{job_id}/logs",
     }
-    _write_gh_executable(
+    write_gh_executable(
         executable,
         record=record,
         sentinel=sentinel,
@@ -219,7 +224,7 @@ def _github_log_overflow(
         )
     finally:
         os.close(read_descriptor)
-    if "stdout exceeds the 33554432-byte safety limit" not in result.stderr:
+    if "stdout exceeds the 8388608-byte safety limit" not in result.stderr:
         raise RuntimeError(
             "GitHub producer did not reject bounded log stdout: " + result.stderr
         )
@@ -235,7 +240,7 @@ def _github_log_overflow(
         endpoints["run"],
         endpoints["jobs"],
         endpoints["content"],
-        endpoints["logs"],
+        endpoints["log"],
     ]:
         raise RuntimeError("GitHub producer lost exact attempt-specific API binding")
     if any(
@@ -248,136 +253,6 @@ def _github_log_overflow(
         child_identity,
         "failed GitHub producer command",
     )
-
-
-def _write_success_escape_executable(
-    path: Path,
-    *,
-    version_commit: str,
-    sentinel: Path,
-    child_identity: Path,
-) -> None:
-    child = (
-        "import time; from pathlib import Path; time.sleep(0.5); "
-        f"Path({str(sentinel)!r}).write_text('survived', encoding='utf-8')"
-    )
-    source = f"""#!/usr/bin/python3
-import subprocess
-import sys
-from pathlib import Path
-if sys.argv[1:] == ["--version"]:
-    descendant = subprocess.Popen(
-        ["/usr/bin/python3", "-c", {child!r}],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    raw = Path(f"/proc/{{descendant.pid}}/stat").read_bytes()
-    start_time = raw[raw.rfind(b")") + 2:].split()[19]
-    Path({str(child_identity)!r}).write_bytes(
-        str(descendant.pid).encode("ascii") + b" " + start_time
-    )
-    print("litci 0.0.0 ({version_commit})")
-    raise SystemExit(0)
-raise SystemExit(7)
-"""
-    path.write_text(source, encoding="utf-8")
-    path.chmod(0o755)
-
-
-def _write_overflow_executable(
-    path: Path,
-    *,
-    version_commit: str,
-    sentinel: Path,
-    child_identity: Path,
-) -> None:
-    child = (
-        "import time; from pathlib import Path; time.sleep(0.5); "
-        f"Path({str(sentinel)!r}).write_text('survived', encoding='utf-8')"
-    )
-    source = f"""#!/usr/bin/python3
-import os
-import subprocess
-import sys
-from pathlib import Path
-if sys.argv[1:] == ["--version"]:
-    print("litci 0.0.0 ({version_commit})")
-    raise SystemExit(0)
-descendant = subprocess.Popen(
-    ["/usr/bin/python3", "-c", {child!r}],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    start_new_session=True,
-)
-raw = Path(f"/proc/{{descendant.pid}}/stat").read_bytes()
-start_time = raw[raw.rfind(b")") + 2:].split()[19]
-Path({str(child_identity)!r}).write_bytes(
-    str(descendant.pid).encode("ascii") + b" " + start_time
-)
-chunk = b"x" * 65536
-while True:
-    os.write(1, chunk)
-"""
-    path.write_text(source, encoding="utf-8")
-    path.chmod(0o755)
-
-
-def _write_gh_executable(
-    path: Path,
-    *,
-    record: Path,
-    sentinel: Path,
-    child_identity: Path,
-    endpoints: dict[str, str],
-    github_inputs: dict[str, Path],
-) -> None:
-    child = (
-        "import time; from pathlib import Path; time.sleep(0.5); "
-        f"Path({str(sentinel)!r}).write_text('survived', encoding='utf-8')"
-    )
-    mapping = {
-        endpoints["run"]: str(github_inputs["run"]),
-        endpoints["jobs"]: str(github_inputs["jobs"]),
-        endpoints["content"]: str(github_inputs["content"]),
-    }
-    source = f"""#!/usr/bin/python3
-import json
-import os
-import subprocess
-import sys
-from pathlib import Path
-with Path({str(record)!r}).open("a", encoding="utf-8") as handle:
-    handle.write(json.dumps(sys.argv) + "\\n")
-endpoint = next(value for value in sys.argv if value.startswith("repos/"))
-mapping = {mapping!r}
-if endpoint in mapping:
-    sys.stdout.buffer.write(Path(mapping[endpoint]).read_bytes())
-    raise SystemExit(0)
-if endpoint != {endpoints["logs"]!r}:
-    raise SystemExit(3)
-descendant = subprocess.Popen(
-    ["/usr/bin/python3", "-c", {child!r}],
-    stdin=subprocess.DEVNULL,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    start_new_session=True,
-)
-raw = Path(f"/proc/{{descendant.pid}}/stat").read_bytes()
-start_time = raw[raw.rfind(b")") + 2:].split()[19]
-Path({str(child_identity)!r}).write_bytes(
-    str(descendant.pid).encode("ascii") + b" " + start_time
-)
-chunk = b"x" * 65536
-while True:
-    os.write(1, chunk)
-"""
-    path.write_text(source, encoding="utf-8")
-    path.chmod(0o755)
-    if not stat.S_ISREG(path.lstat().st_mode):
-        raise RuntimeError("hostile gh boundary is not a regular file")
 
 
 def _require_descendant_gone(

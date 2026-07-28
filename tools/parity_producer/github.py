@@ -23,7 +23,8 @@ from parity_producer.common import (
 )
 from parity_producer.capture import Production
 from parity_producer.github_evidence import project_github_evidence
-from parity_producer.github_inputs import MAX_LOG_ARCHIVE_BYTES, read_archive
+from parity_producer.github_inputs import MAX_JOB_LOG_BYTES, read_job_log
+from parity_producer.github_job import exact_job_id
 from parity_producer.host_environment import trusted_system_tools
 
 
@@ -40,7 +41,7 @@ def produce_github(
     run_json: Path | None = None,
     jobs_json: Path | None = None,
     content_json: Path | None = None,
-    logs_zip: Path | None = None,
+    job_log_path: Path | None = None,
     self_test_raw_evidence: bool = False,
     self_test_gh_executable: Path | None = None,
 ) -> Production:
@@ -51,7 +52,7 @@ def produce_github(
         )
     if COMMIT.fullmatch(trusted_source_commit) is None:
         raise ProducerError("trusted source commit must be full lowercase SHA")
-    raw_paths = (run_json, jobs_json, content_json, logs_zip)
+    raw_paths = (run_json, jobs_json, content_json, job_log_path)
     if self_test_gh_executable is not None and (
         not self_test_raw_evidence or any(path is not None for path in raw_paths)
     ):
@@ -67,7 +68,7 @@ def produce_github(
             )
         if not all(path is not None for path in raw_paths):
             raise ProducerError(
-                "raw GitHub mode requires run, jobs, content, and logs inputs together"
+                "raw GitHub mode requires run, jobs, content, and job-log inputs together"
             )
         run = require_object(load_json(run_json, "GitHub run API export"), "GitHub run")
         jobs = require_object(
@@ -77,7 +78,7 @@ def produce_github(
             load_json(content_json, "GitHub content API export"),
             "GitHub content response",
         )
-        archive = read_archive(logs_zip)
+        job_log = read_job_log(job_log_path)
     else:
         token = _read_github_token()
         gh = (
@@ -113,6 +114,13 @@ def produce_github(
             ),
             "GitHub jobs API response",
         )
+        job_id = exact_job_id(
+            repository=repository,
+            run_id=run_id,
+            attempt=attempt,
+            trusted_source_commit=trusted_source_commit,
+            jobs_response=jobs,
+        )
         head_sha = require_string(run.get("head_sha"), "GitHub run head SHA")
         content = require_object(
             load_json_bytes(
@@ -127,12 +135,11 @@ def produce_github(
             ),
             "GitHub content API response",
         )
-        archive = _gh_api(
+        job_log = _gh_api(
             token,
             gh,
-            f"repos/{repository}/actions/runs/{run_id}"
-            f"/attempts/{attempt}/logs",
-            output_limit=MAX_LOG_ARCHIVE_BYTES,
+            f"repos/{repository}/actions/jobs/{job_id}/logs",
+            output_limit=MAX_JOB_LOG_BYTES,
         )
 
     return project_github_evidence(
@@ -141,7 +148,7 @@ def produce_github(
         run=run,
         jobs_response=jobs,
         content_response=content,
-        log_archive=archive,
+        job_log=job_log,
         trusted_source_commit=trusted_source_commit,
     )
 

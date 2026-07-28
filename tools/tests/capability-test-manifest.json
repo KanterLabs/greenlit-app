@@ -274,13 +274,13 @@
         },
         {
           "name": "Build exact release binary outside the checkout",
-          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\ntest ! -e \"$parity_target\"\ninstall -d -m 000700 \"$parity_target\"\nCARGO_TARGET_DIR=\"$parity_target\" \\\n  cargo build --locked --release -p greenlit-app --bin litci\n"
+          "run": "parity_build=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\nparity_binary_root=\"${RUNNER_TEMP}/greenlit-parity-release-binary\"\ntest ! -e \"$parity_build\"\ntest ! -e \"$parity_binary_root\"\ninstall -d -m 000700 \"$parity_build\"\ninstall -d -m 000700 \"$parity_binary_root\"\nCARGO_TARGET_DIR=\"$parity_build\" \\\n  cargo build --locked --release -p greenlit-app --bin litci\n/usr/bin/install \\\n  -m 0755 \\\n  \"$parity_build/release/litci\" \\\n  \"$parity_binary_root/litci\"\ntest ! -L \"$parity_binary_root/litci\"\ntest -f \"$parity_binary_root/litci\"\ntest -x \"$parity_binary_root/litci\"\ntest \"$(/usr/bin/stat -c %h \"$parity_binary_root/litci\")\" = 1\n"
         }
       ],
       "executions": [
         {
           "name": "Produce tokenless local evidence",
-          "run": "parity_target=\"${RUNNER_TEMP}/greenlit-parity-release-target\"\nparity_output=\"${RUNNER_TEMP}/greenlit-live-local\"\ntest ! -e \"$parity_output\"\ninstall -d -m 000700 \"$parity_output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$parity_target/release/litci\" \\\n  --output-root \"$parity_output\"\n"
+          "run": "parity_binary_root=\"${RUNNER_TEMP}/greenlit-parity-release-binary\"\nparity_output=\"${RUNNER_TEMP}/greenlit-live-local\"\ntest ! -e \"$parity_output\"\ninstall -d -m 000700 \"$parity_output\"\ntools/check-live-parity local \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$parity_binary_root/litci\" \\\n  --output-root \"$parity_output\"\n"
         }
       ]
     },
