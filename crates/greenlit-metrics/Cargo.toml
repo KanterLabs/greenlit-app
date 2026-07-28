@@ -17,4 +17,4 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 # Opens the local NDJSON file with Linux no-follow/nonblocking semantics so a
 # symlink or special file cannot redirect or stall the metrics boundary.
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
