@@ -40,16 +40,12 @@ def _git(repository: Path, arguments: list[str], *, output: bool = False) -> byt
 def _repository(root: Path) -> tuple[Path, str]:
     repository = root / "repository"
     tools = repository / "tools"
-    _directory(tools, 0o755)
     source = Path(__file__).resolve().parent
-    for name in (
-        "release-check",
-        "release_check_credential_bundle.py",
-        "release_check_credential_bundle_extract.py",
-        "release_check_credential_bundle_inputs.py",
-        "release_check_credential_bundle_io.py",
-    ):
-        shutil.copy2(source / name, tools / name)
+    # Mirror the real checkout's complete release authority surface. The
+    # public finalizer binds every listed authority tool before it considers a
+    # transfer bundle, so a hand-maintained partial fixture can accidentally
+    # stop testing the binary-mismatch boundary when that list grows.
+    shutil.copytree(source, tools)
     _git(repository, ["init", "-q"])
     _git(repository, ["add", "--all"])
     _git(
