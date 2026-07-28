@@ -9,7 +9,7 @@
 //! stores without returning helper publication to ephemeral host scratch.
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,9 +158,15 @@ fn open_private_helper(
 
 fn helper_matches(file: &mut File, digest: &str) -> Result<bool, ExecError> {
     let metadata = file.metadata().map_err(io_error)?;
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(file, &mut bytes).map_err(io_error)?;
-    Ok(metadata.len() == init_binary().len() as u64 && digest_hex(&bytes) == digest)
+    let expected_length = init_binary().len();
+    if metadata.len() != expected_length as u64 {
+        return Ok(false);
+    }
+    let mut bytes = Vec::with_capacity(expected_length);
+    file.take((expected_length as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    Ok(bytes.len() == expected_length && digest_hex(&bytes) == digest)
 }
 
 fn mismatched_helper_error(path: &Path) -> ExecError {

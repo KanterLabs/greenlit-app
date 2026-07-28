@@ -3,7 +3,7 @@
 pub mod support;
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::process::Output;
 use std::thread;
@@ -26,6 +26,9 @@ const STORAGE_ENV_CHECKED_MARKER: &str = "/tmp/greenlit-phase12-storage-env-abse
 const DYNAMIC_VALUE_MARKER: &str = "/tmp/greenlit-dynamic-mask-value";
 const CLI_SECRET_NAME: &str = "RETAINED_TREE_SECRET";
 const ORIGIN_SECRET_VALUE: &str = "ghp_REMOTE_ORIGIN+SENTINEL";
+const HELPER_READ_LIMIT_KIB: u64 = 768 * 1024;
+const OVERSIZED_HELPER_BYTES: u64 = 1536 * 1024 * 1024;
+const SPARSE_HELPER_MAX_ALLOCATED_BYTES: u64 = 1024 * 1024;
 const REJECTED_ENGINE_BOUNDARY: (&str, &str) = (
     "DOCKER_HOST",
     "ssh://greenlit-origin-invariant-never-connects",
@@ -463,11 +466,8 @@ fn catalog_has_terminal_state(sandbox: &Sandbox, run_id: &str) -> bool {
 
 fn assert_restrictive_umask_full_execution_is_private() {
     let sandbox = Sandbox::new();
-    let output = RunningLitci::spawn_under_restrictive_umask(
-        &sandbox,
-        "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
-    )
-    .finish();
+    let workflow = "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n";
+    let output = RunningLitci::spawn_under_restrictive_umask(&sandbox, workflow).finish();
     assert!(
         output.status.success(),
         "full execution failed under umask 0777: {}",
@@ -519,11 +519,7 @@ fn assert_restrictive_umask_full_execution_is_private() {
         1,
         "full execution did not retain exactly one digest-addressed runtime helper"
     );
-    let second = RunningLitci::spawn_under_restrictive_umask(
-        &sandbox,
-        "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
-    )
-    .finish();
+    let second = RunningLitci::spawn_under_restrictive_umask(&sandbox, workflow).finish();
     assert!(
         second.status.success(),
         "second full execution failed under umask 0777: {}",
@@ -542,6 +538,99 @@ fn assert_restrictive_umask_full_execution_is_private() {
         runtime_helpers(&state),
         first_helpers,
         "the second run did not reuse the same durable runtime helper identity"
+    );
+
+    let helper = first_helpers
+        .into_iter()
+        .next()
+        .expect("one reusable runtime helper");
+    let existing_runs = run_directories(&sandbox);
+    fs::remove_file(&helper).expect("remove valid runtime helper");
+    let oversized = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&helper)
+        .expect("create sparse runtime helper collision");
+    oversized
+        .set_len(OVERSIZED_HELPER_BYTES)
+        .expect("extend sparse runtime helper collision");
+    drop(oversized);
+    let sparse_metadata = fs::metadata(&helper).expect("inspect sparse runtime helper collision");
+    assert!(
+        sparse_metadata.blocks().saturating_mul(512) <= SPARSE_HELPER_MAX_ALLOCATED_BYTES,
+        "oversized helper collision consumed physical storage instead of remaining sparse"
+    );
+
+    let bounded =
+        RunningLitci::spawn_with_address_space_limit(&sandbox, workflow, HELPER_READ_LIMIT_KIB)
+            .finish();
+    let collision_metadata =
+        fs::metadata(&helper).expect("inspect rejected sparse runtime helper collision");
+    let retained_helpers = runtime_helpers(&state);
+    fs::remove_file(&helper).expect("remove sparse runtime helper collision");
+    assert_eq!(
+        bounded.status.code(),
+        Some(1),
+        "oversized helper collision did not fail through the bounded CLI error path"
+    );
+    let stderr = String::from_utf8_lossy(&bounded.stderr);
+    assert!(
+        stderr.contains("bytes do not match the embedded helper digest")
+            && stderr.contains("remove this file and retry"),
+        "oversized helper collision lacked the bounded actionable diagnostic: {stderr}"
+    );
+    assert_eq!(
+        collision_metadata.len(),
+        OVERSIZED_HELPER_BYTES,
+        "helper staging modified the rejected sparse collision"
+    );
+    assert_eq!(
+        collision_metadata.permissions().mode() & 0o7777,
+        0o700,
+        "helper staging changed the rejected collision mode"
+    );
+    assert_eq!(
+        retained_helpers,
+        [helper],
+        "helper staging replaced the rejected collision or left a partial sibling"
+    );
+    let mut bounded_runs = run_directories(&sandbox)
+        .into_iter()
+        .filter(|candidate| !existing_runs.contains(candidate))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bounded_runs.len(),
+        1,
+        "oversized helper collision did not retain exactly one failed run identity"
+    );
+    let bounded_run = bounded_runs.pop().expect("one bounded helper run");
+    assert_result_and_journal_truth(&bounded_run, TerminalPath::PreparationFailed);
+    assert!(
+        journal_records(&bounded_run).iter().all(|record| {
+            record["type"] != "step_started" && record["type"] != "step_finished"
+        }),
+        "oversized helper collision started untrusted workflow execution"
+    );
+    let bounded_run_id = bounded_run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("bounded helper run has a UTF-8 identity");
+    let catalog = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
+    )
+    .expect("open bounded helper run catalog");
+    assert_eq!(
+        catalog
+            .run_state(bounded_run_id)
+            .expect("read bounded helper run state"),
+        Some(greenlit_store::cas::RunCatalogState::Completed),
+        "oversized helper collision did not publish authoritative preparation-failure evidence"
+    );
+    support::assert_run_resources_removed(&bounded_run);
+    assert!(
+        runtime_helpers(&state).is_empty(),
+        "sparse helper cleanup left a runtime publication behind"
     );
 }
 
