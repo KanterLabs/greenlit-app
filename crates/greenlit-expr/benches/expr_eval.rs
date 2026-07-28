@@ -3,9 +3,9 @@
 //! Per `AGENTS.md` ("Metrics"): "Micro-benchmarks (criterion) for the parser
 //! and expression evaluator live in CI from Phase 1 recording baselines;
 //! Phase 5's budget enforcement extends this harness rather than starting
-//! fresh." No performance budget is enforced yet — this only needs to
-//! compile and run cleanly under `cargo bench -p greenlit-expr`, recording a
-//! baseline for later phases to build on.
+//! fresh." This target records the measurements; the manifest-authoritative
+//! `tools/tests/check-criterion-manifest` boundary enforces the fixed-host
+//! budgets for each declared benchmark identity.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use greenlit_expr::{Context, RealFs, Value, evaluate, parse};
@@ -37,33 +37,36 @@ fn sample_context() -> Context {
         )]))
 }
 
-fn bench_parse(c: &mut Criterion) {
+fn setup_failed(stage: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!(
+        "Criterion benchmark setup failed while {stage}: {error}\n\
+         fix: repair the benchmark expression or evaluator before recording a baseline"
+    );
+    std::process::exit(2);
+}
+
+fn bench_expression_paths(c: &mut Criterion) {
+    let ctx = sample_context();
+    let expr = match parse(EXPR) {
+        Ok(expr) => expr,
+        Err(error) => setup_failed("parsing the representative expression", error),
+    };
+    if let Err(error) = evaluate(&expr, &ctx) {
+        setup_failed("evaluating the representative expression", error);
+    }
+
     c.bench_function("parse", |b| {
         b.iter(|| parse(black_box(EXPR)));
     });
-}
 
-fn bench_parse_and_evaluate(c: &mut Criterion) {
-    let ctx = sample_context();
     c.bench_function("parse_and_evaluate", |b| {
         b.iter(|| parse(black_box(EXPR)).map(|expr| evaluate(&expr, black_box(&ctx))));
     });
-}
 
-fn bench_evaluate_only(c: &mut Criterion) {
-    let ctx = sample_context();
-    let Ok(expr) = parse(EXPR) else {
-        return;
-    };
     c.bench_function("evaluate_only", |b| {
         b.iter(|| evaluate(black_box(&expr), black_box(&ctx)));
     });
 }
 
-criterion_group!(
-    benches,
-    bench_parse,
-    bench_parse_and_evaluate,
-    bench_evaluate_only
-);
+criterion_group!(benches, bench_expression_paths);
 criterion_main!(benches);

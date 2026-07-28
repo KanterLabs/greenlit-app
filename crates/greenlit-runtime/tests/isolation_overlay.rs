@@ -20,12 +20,16 @@
 //! `exec`. The engine is a true external, so it is used real, not faked
 //! (`TESTING.md`).
 //!
-//! Where even a privileged overlay mount is impossible (e.g. a rootless daemon
-//! that refuses `--privileged`, or a kernel without overlayfs), the test emits
-//! an explicit notice and returns rather than silently passing — the overlay
-//! path is reported as unexercised, never faked.
+//! A selected live-runtime job promises the privileged-container and overlayfs
+//! capabilities. Refusal of either prerequisite is therefore a hard failure,
+//! never a passing unexercised path.
 
-mod dockerkit;
+#[path = "dockerkit/engine.rs"]
+mod engine_support;
+#[path = "dockerkit/repo.rs"]
+mod repo_support;
+#[path = "dockerkit/sink.rs"]
+mod sink_support;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -39,9 +43,9 @@ use greenlit_runtime::engine::{ContainerEngine, ExecSpec};
 use greenlit_runtime::isolation::{CONTAINER_LOWER, CONTAINER_UPPER_BASE};
 use greenlit_runtime::{DockerEngine, ProgressNull, UbuntuRelease, ensure_base_image};
 
-use dockerkit::{
-    CollectSink, engine_if_reachable, notice_no_daemon, seed_repo, tree_fingerprint, unique_suffix,
-};
+use engine_support::{required_engine, unique_suffix};
+use repo_support::{seed_repo, tree_fingerprint};
+use sink_support::CollectSink;
 
 /// In-container workspace: the merged, writable checkout the job sees.
 const WORKSPACE: &str = "/workspace";
@@ -50,10 +54,7 @@ const TEST: &str = "overlay_isolation_protects_the_host";
 
 #[tokio::test]
 async fn overlay_isolation_protects_the_host() {
-    let Some(engine) = engine_if_reachable().await else {
-        notice_no_daemon(TEST);
-        return;
-    };
+    let engine = required_engine(TEST).await;
 
     let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
@@ -63,31 +64,25 @@ async fn overlay_isolation_protects_the_host() {
     let before = tree_fingerprint(&repo);
 
     // A privileged container with a tmpfs at the overlay upper base, so the
-    // kernel overlay mount can actually succeed here. If the daemon refuses a
-    // privileged container, the overlay path cannot be exercised on this host.
-    let Some((raw, id)) = create_privileged_overlay_container(&tag, &repo).await else {
-        eprintln!(
-            "{TEST}: this daemon refuses privileged containers; the overlay mount path was not \
-             exercised here (copy-in is covered by isolation.rs)"
-        );
-        let _ = std::fs::remove_dir_all(&repo);
-        return;
-    };
+    // kernel overlay mount can actually succeed here.
+    let (raw, id) = create_privileged_overlay_container(&tag, &repo)
+        .await
+        .expect("the live overlay job must allow its required privileged test container");
 
     let outcome = run_overlay_check(&engine, &id).await;
 
     // Tear down (through the raw client that owns the container) before
     // asserting, so a panic never leaks a privileged container.
-    let _ = raw
-        .remove_container(
-            &id,
-            Some(
-                bollard::query_parameters::RemoveContainerOptionsBuilder::new()
-                    .force(true)
-                    .build(),
-            ),
-        )
-        .await;
+    raw.remove_container(
+        &id,
+        Some(
+            bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                .force(true)
+                .build(),
+        ),
+    )
+    .await
+    .expect("remove the privileged overlay test container");
 
     let check = outcome.expect("overlay check ran");
 
@@ -100,16 +95,10 @@ async fn overlay_isolation_protects_the_host() {
     );
     let _ = std::fs::remove_dir_all(&repo);
 
-    if !check.overlay_mounted {
-        // The privileged container came up but the kernel still refused the
-        // overlay mount (no overlayfs, or a tmpfs-upper it rejected). Report it;
-        // do not fake a pass.
-        eprintln!(
-            "{TEST}: overlay mount unavailable even in a privileged container; the overlay path \
-             was not exercised here (copy-in is covered by isolation.rs)"
-        );
-        return;
-    }
+    assert!(
+        check.overlay_mounted,
+        "{TEST}: the live overlay job must provide an overlayfs-capable kernel and tmpfs upper"
+    );
 
     // Overlay genuinely mounted: assert the full host-protection story.
     assert!(
@@ -186,15 +175,16 @@ async fn run_overlay_check(
 
 /// Create a privileged container whose overlay upper base is a tmpfs, with the
 /// seeded repo bound read-only as the overlay lower layer. Returns the bollard
-/// client that owns it (for teardown) and the container id, or `None` if the
-/// daemon refuses a privileged container.
-async fn create_privileged_overlay_container(image: &str, repo: &Path) -> Option<(Docker, String)> {
+/// client that owns it (for teardown) and the container id.
+async fn create_privileged_overlay_container(
+    image: &str,
+    repo: &Path,
+) -> Result<(Docker, String), bollard::errors::Error> {
     let docker = Docker::connect_with_unix(
         Endpoint::DOCKER_SOCKET_PATH,
         120,
         bollard::API_DEFAULT_VERSION,
-    )
-    .ok()?;
+    )?;
 
     // A tmpfs at the upper base keeps the overlay upper/work dirs off the
     // container's own overlayfs rootfs, which the kernel refuses as an upper.
@@ -220,6 +210,6 @@ async fn create_privileged_overlay_container(image: &str, repo: &Path) -> Option
     };
     let name = format!("greenlit-ovl-{}", unique_suffix());
     let options = CreateContainerOptionsBuilder::new().name(&name).build();
-    let created = docker.create_container(Some(options), body).await.ok()?;
-    Some((docker, created.id))
+    let created = docker.create_container(Some(options), body).await?;
+    Ok((docker, created.id))
 }

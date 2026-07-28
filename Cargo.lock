@@ -724,7 +724,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tar",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
@@ -747,15 +746,12 @@ dependencies = [
  "greenlit-workflow",
  "indexmap",
  "linux-keyutils",
- "ring",
  "rustix",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "tokio",
  "ureq",
- "zip",
 ]
 
 [[package]]
@@ -769,7 +765,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -792,7 +787,6 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
- "tempfile",
  "thiserror",
 ]
 
@@ -2106,12 +2100,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
-
-[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2539,19 +2527,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "zip"
-version = "7.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path",
 ]
 
 [[package]]

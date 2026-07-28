@@ -10,57 +10,384 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  verify:
-    name: build and package release candidate
+  prepare:
+    name: tokenless build, test, and package
     runs-on: homelab-heavy
+    outputs:
+      prepared_sha256: ${{ steps.prepared_digest.outputs.sha256 }}
+    env:
+      TMPDIR: /home/runner/_work/_temp
     steps:
-      - name: Check out exact source
+      - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Provision pinned Rust toolchain
-        run: rustup show
+      - name: Prepare branch-backed source identity
+        run: git switch -C greenlit-release-prepare "$GITHUB_SHA"
 
-      - name: Run release verification
-        run: tools/release-check
+      - name: Provision pinned Rust toolchain and cargo-deny
+        run: |
+          rustup show
+          cargo install cargo-deny --locked --version 0.20.2
 
-      - name: Upload release candidate
+      - name: Run tokenless release preparation
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: tools/release-check prepare
+
+      - name: Bind exact prepared bundle
+        id: prepared_digest
+        run: |
+          set -euo pipefail
+          bundle="$GITHUB_WORKSPACE/target/release-prepared.tar"
+          digest="$(sha256sum "$bundle" | cut -d ' ' -f 1)"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact prepared bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-release-prepared
+          path: target/release-prepared.tar
+          if-no-files-found: error
+
+  local_parity:
+    name: tokenless oracle and Greenlit production
+    needs: prepare
+    runs-on: homelab-heavy
+    outputs:
+      local_sha256: ${{ steps.local_digest.outputs.sha256 }}
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact source and runtime
+        run: |
+          ! /usr/bin/git config --local --get-regexp \
+            '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+            >/dev/null 2>&1
+          git switch -C greenlit-release-local "$GITHUB_SHA"
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          command -v python3 >/dev/null
+          docker info >/dev/null
+          docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+
+      - name: Download exact prepared bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-release-prepared
+          path: ${{ runner.temp }}/greenlit-release-prepared
+
+      - name: Verify and unpack prepared binary
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/greenlit-release-prepared/release-prepared.tar"
+          output="$RUNNER_TEMP/greenlit-release-local-input"
+          chmod 0600 "$bundle"
+          test ! -e "$output"
+          /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+            unpack-prepared \
+            --bundle "$bundle" \
+            --output-root "$output" \
+            --expected-sha256 "${{ needs.prepare.outputs.prepared_sha256 }}" \
+            --expected-source "$GITHUB_SHA"
+
+      - name: Produce credential-free local evidence
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/greenlit-release-local-evidence"
+          test ! -e "$output"
+          install -d -m 0700 "$output"
+          tools/check-live-parity local \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --greenlit-binary \
+              "$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci" \
+            --output-root "$output"
+
+      - name: Seal exact local evidence
+        id: local_digest
+        run: |
+          set -euo pipefail
+          bundle="$GITHUB_WORKSPACE/target/release-local-evidence.tar"
+          binary="$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci"
+          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          digest="$(
+            /usr/bin/python3 -E -s -B \
+              tools/release_check_credential_bundle.py pack-local \
+              --input-root "$RUNNER_TEMP/greenlit-release-local-evidence" \
+              --greenlit-binary "$binary" \
+              --output "$bundle" \
+              --expected-source "$GITHUB_SHA"
+          )"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact local evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-release-local-evidence
+          path: target/release-local-evidence.tar
+          if-no-files-found: error
+
+  github_parity:
+    name: credential-only GitHub observation
+    needs: prepare
+    runs-on: homelab
+    outputs:
+      github_sha256: ${{ steps.github_digest.outputs.sha256 }}
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare credential-only source boundary
+        run: |
+          ! /usr/bin/git config --local --get-regexp \
+            '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+            >/dev/null 2>&1
+          git switch -C greenlit-release-github "$GITHUB_SHA"
+          command -v /usr/bin/python3 >/dev/null
+          command -v /usr/bin/gh >/dev/null
+          output="$RUNNER_TEMP/greenlit-release-github-evidence"
+          test ! -e "$output"
+          install -d -m 0700 "$output"
+          /usr/bin/python3 -E -s -B \
+            tools/release_check_credential.py --self-test
+
+      - name: Collect GitHub evidence with no candidate present
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: >-
+          exec /usr/bin/python3 -E -s -B
+          tools/check-live-parity github
+          --repository-root "$GITHUB_WORKSPACE"
+          --output-root "$RUNNER_TEMP/greenlit-release-github-evidence"
+
+      - name: Seal exact GitHub evidence
+        id: github_digest
+        run: |
+          set -euo pipefail
+          bundle="$GITHUB_WORKSPACE/target/release-github-evidence.tar"
+          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          digest="$(
+            /usr/bin/python3 -E -s -B \
+              tools/release_check_credential_bundle.py pack-github \
+              --input-root "$RUNNER_TEMP/greenlit-release-github-evidence" \
+              --output "$bundle" \
+              --expected-source "$GITHUB_SHA"
+          )"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact GitHub evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-release-github-evidence
+          path: target/release-github-evidence.tar
+          if-no-files-found: error
+
+  finalize:
+    name: tokenless compare, capability, and final seal
+    needs:
+      - prepare
+      - local_parity
+      - github_parity
+    runs-on: homelab-heavy
+    outputs:
+      candidate_sha256: ${{ steps.seal_candidate.outputs.sha256 }}
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact source and capabilities
+        run: |
+          git switch -C greenlit-release-finalize "$GITHUB_SHA"
+          rustup show
+          cargo fetch --locked
+          docker info >/dev/null
+          docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+
+      - name: Download prepared bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-release-prepared
+          path: ${{ runner.temp }}/greenlit-release-prepared
+
+      - name: Download local evidence bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-release-local-evidence
+          path: ${{ runner.temp }}/greenlit-release-local
+
+      - name: Download GitHub evidence bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-release-github-evidence
+          path: ${{ runner.temp }}/greenlit-release-github
+
+      - name: Reconstruct and verify exact tokenless candidate
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+          GREENLIT_PREPARED_BUNDLE: ${{ runner.temp }}/greenlit-release-prepared/release-prepared.tar
+          GREENLIT_PREPARED_SHA256: ${{ needs.prepare.outputs.prepared_sha256 }}
+          GREENLIT_LOCAL_BUNDLE: ${{ runner.temp }}/greenlit-release-local/release-local-evidence.tar
+          GREENLIT_LOCAL_SHA256: ${{ needs.local_parity.outputs.local_sha256 }}
+          GREENLIT_GITHUB_BUNDLE: ${{ runner.temp }}/greenlit-release-github/release-github-evidence.tar
+          GREENLIT_GITHUB_SHA256: ${{ needs.github_parity.outputs.github_sha256 }}
+        run: |
+          chmod 0600 \
+            "$GREENLIT_PREPARED_BUNDLE" \
+            "$GREENLIT_LOCAL_BUNDLE" \
+            "$GREENLIT_GITHUB_BUNDLE"
+          tools/release-check finalize
+
+      - name: Run manifest-owned native beyond-PATH_MAX invariant
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test -d /dev/shm
+          test -w /dev/shm
+          test "$(stat -f -c %T /dev/shm)" = tmpfs
+          tools/tests/check-capability-test-manifest --run-owner host-deep-path
+
+      - name: Provision isolated keyring prerequisites
+        run: |
+          command -v unshare >/dev/null
+          if ! command -v keyctl >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends keyutils
+          fi
+
+      - name: Run production persistent-keyring acceptance
+        run: tools/test-credential-capability
+
+      - name: Provision privileged copy-strategy prerequisites
+        run: |
+          missing_packages=()
+          command -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)
+          command -v losetup >/dev/null || missing_packages+=(util-linux)
+          if ((${#missing_packages[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+          fi
+
+      - name: Reflink and bounded-stream copy strategies
+        run: |
+          cargo build --locked -p greenlit-init
+          sudo --preserve-env=PATH \
+            tools/tests/check-greenlit-init-copy-strategies \
+            target/debug/greenlit-init
+
+      - name: Run real-daemon executor tests
+        run: tools/tests/check-capability-test-manifest --run-owner docker-runtime
+
+      - name: Direct containerd/stargz provider
+        run: tools/test-stargz-provider
+
+      - name: Clean, hermetic, and native performance policy
+        run: tools/tests/check-capability-test-manifest --run-owner docker-policy
+
+      - name: Run and verify repository gates under release litci twice
+        run: tools/check-release-dogfood target/release-candidate/target/release/litci
+
+      - name: Recompare and seal exact candidate immediately before upload
+        id: seal_candidate
+        run: |
+          set -euo pipefail
+          candidate="$GITHUB_WORKSPACE/target/release-candidate"
+          parity="$GITHUB_WORKSPACE/target/parity-evidence"
+          bundle="$GITHUB_WORKSPACE/target/greenlit-release-candidate.tar"
+          tools/compare-parity \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --repository-id KanterLabs/greenlit-app \
+            --source-commit "$GITHUB_SHA" \
+            --greenlit-binary "$candidate/target/release/litci" \
+            --capture-root "$parity" \
+            --exceptions "$GITHUB_WORKSPACE/docs/PARITY-EXCEPTIONS.md" \
+            "$parity/seed-oracle.json" \
+            "$parity/seed-github-actions.json" \
+            "$parity/seed-greenlit-release.json"
+          tools/release-provenance verify \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --candidate-root "$candidate" \
+            --parity-root "$parity" \
+            --expected-source "$GITHUB_SHA"
+          digest="$(
+            tools/release-provenance seal \
+              --repository-root "$GITHUB_WORKSPACE" \
+              --candidate-root "$candidate" \
+              --parity-root "$parity" \
+              --output "$bundle" \
+              --expected-source "$GITHUB_SHA"
+          )"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload one mode-preserving sealed release candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: greenlit-app-linux-x86_64
-          path: |
-            target/release/litci
-            target/package/*.crate
-            SHA256SUMS
+          path: target/greenlit-release-candidate.tar
           if-no-files-found: error
 
   publish:
-    name: publish crates in dependency order
+    name: refuse unverifiable publication
     if: inputs.publish
-    needs: verify
+    needs: finalize
     runs-on: homelab
     environment: release
     steps:
-      - name: Check out exact source
+      - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Provision pinned Rust toolchain
-        run: rustup show
+      - name: Resolve locked offline verification inputs
+        run: cargo fetch --locked
 
-      - name: Publish verified dependency order
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Download verified release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-app-linux-x86_64
+          path: ${{ runner.temp }}/greenlit-candidate-download
+
+      - name: Authenticate and statically verify candidate
         run: |
-          cargo publish -p greenlit-expr
-          cargo publish -p greenlit-workflow
-          cargo publish -p greenlit-engine
-          cargo publish -p greenlit-metrics
-          cargo publish -p greenlit-store
-          cargo publish -p greenlit-actions
-          cargo publish -p greenlit-runtime
-          cargo publish -p greenlit-app
+          set -euo pipefail
+          download="$RUNNER_TEMP/greenlit-candidate-download/greenlit-release-candidate.tar"
+          output="$RUNNER_TEMP/greenlit-candidate-unpacked"
+          test ! -e "$output"
+          install -d -m 0700 "$output"
+          tools/release-provenance unpack \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --bundle "$download" \
+            --output-root "$output" \
+            --expected-source "$GITHUB_SHA" \
+            --expected-sha256 "${{ needs.finalize.outputs.candidate_sha256 }}"
+
+      - name: Refuse unverified repackaging
+        run: |
+          echo "Cargo cannot publish the verified prebuilt .crate files; refusing any registry write" >&2
+          exit 1

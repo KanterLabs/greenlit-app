@@ -1,0 +1,23 @@
+[package]
+name = "greenlit-init"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ShaneKanterman04/greenlit-app"
+description = "Private container-only init helper embedded by greenlit-runtime."
+publish = false
+
+[lib]
+name = "greenlit_init"
+path = "src/lib.rs"
+
+[[bin]]
+name = "greenlit-init"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.187"
+thiserror = "2.0.19"
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[workspace]

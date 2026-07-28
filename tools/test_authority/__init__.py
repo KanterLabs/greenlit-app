@@ -1,0 +1,1 @@
+"""Test-authority gate implementation."""

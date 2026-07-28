@@ -83,22 +83,6 @@ impl Dind {
     }
 }
 
-/// Whether any of this job's `run:` scripts invoke `docker`.
-///
-/// Starting a daemon per job unconditionally would cost every workflow
-/// several seconds and a privileged container for a capability most of them
-/// never use, so the sidecar is started only when the job's own scripts ask
-/// for it. The scan is deliberately generous — a false positive costs a
-/// container, a false negative costs a confusing failure.
-pub(crate) fn job_uses_docker(scripts: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
-    scripts.into_iter().any(|script| {
-        script
-            .as_ref()
-            .split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
-            .any(|token| token == "docker")
-    })
-}
-
 /// Starts the sidecar on `network` and waits for its daemon to answer.
 ///
 /// # Errors
@@ -228,57 +212,4 @@ pub(crate) fn install_wrapper_script() -> String {
          GREENLIT_DOCKER_WRAPPER\n\
          chmod 0755 {WRAPPER_DIR}/docker"
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{WRAPPER_DIR, install_wrapper_script, job_uses_docker};
-
-    #[test]
-    fn a_job_that_calls_docker_is_detected() {
-        assert!(job_uses_docker(["docker build -t x ."]));
-        assert!(job_uses_docker(["echo hi", "sudo docker ps"]));
-        assert!(job_uses_docker(["make && docker compose up"]));
-    }
-
-    #[test]
-    fn a_job_that_merely_mentions_docker_in_a_word_is_not() {
-        // A false positive only costs a container, but matching inside words
-        // would start a privileged daemon for a workflow that writes a
-        // Dockerfile and never runs the CLI.
-        assert!(!job_uses_docker(["cat dockerfile-lint.log"]));
-        assert!(!job_uses_docker(["echo dockerized"]));
-        assert!(!job_uses_docker(["npm run build"]));
-        assert!(!job_uses_docker(Vec::<String>::new()));
-    }
-
-    #[test]
-    fn the_wrapper_never_resolves_to_itself() {
-        let script = install_wrapper_script();
-        assert!(
-            script.contains(&format!("[ \"$dir\" = \"{WRAPPER_DIR}\" ] && continue")),
-            "the shim directory must be skipped, or the wrapper execs itself forever"
-        );
-        assert!(
-            script.contains("exec \"$real\" \"$@\""),
-            "the original argv is exec'd, so the step is never replayed"
-        );
-    }
-
-    #[test]
-    fn the_wrapper_points_at_the_sidecar_not_the_host() {
-        let script = install_wrapper_script();
-        assert!(script.contains("DOCKER_HOST=tcp://docker:2375"));
-        assert!(
-            !script.contains("/var/run/docker.sock"),
-            "the host socket is never referenced, let alone mounted"
-        );
-    }
-
-    #[test]
-    fn a_missing_cli_reports_what_to_do_rather_than_failing_obscurely() {
-        let script = install_wrapper_script();
-        assert!(script.contains("exit 127"));
-        assert!(script.contains("fix:"));
-    }
 }

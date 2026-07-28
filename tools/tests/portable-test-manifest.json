@@ -1,0 +1,501 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "actions_ci_smoke",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "actions_ci_fixture_is_blocked_before_capability_side_effects"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "clean",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "an_empty_store_is_not_an_error",
+        "an_unreachable_daemon_still_reclaims_the_caches",
+        "clean_collects_unreferenced_content_but_preserves_active_leases",
+        "clean_never_touches_credentials_or_run_history",
+        "clean_removes_every_derived_store",
+        "clean_reports_what_it_will_remove_before_removing_it",
+        "declining_the_prompt_removes_nothing"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "cli_behavior",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "auth::auth_pat_rejects_empty_piped_input",
+        "auth::credential_persistence_fails_closed_without_plaintext_or_unsafe_path_writes",
+        "auth::device_flow_reports_denial_with_a_fix",
+        "discovery::ambiguous_workflows_directory_fails_and_lists_the_candidates",
+        "discovery::discovery_explicit_paths_and_dotenv_are_rooted_at_the_repository_from_a_subdirectory",
+        "discovery::missing_workflows_directory_fails_with_a_fix_naming_dash_w",
+        "discovery::readable_non_utf8_workflow_requests_encoding_repair_not_permissions",
+        "dogfood::dogfood_workflow_is_gated_to_workflow_dispatch_only",
+        "dogfood::dogfood_workflow_plans_cleanly_under_workflow_dispatch",
+        "dotenv::dotenv_file_resolution_distinguishes_values_from_io_failures",
+        "dotenv::dotenv_values_are_literal_and_repository_symlinks_cannot_read_host_files",
+        "filters::event_selection_and_invalid_filter_patterns_fail_actionably",
+        "filters::synthetic_events_honor_branch_activity_and_path_filters",
+        "git_context::default_push_context_uses_local_repository_branch_sha_and_actor",
+        "git_context::repository_state_failures_name_the_single_corrective_action",
+        "github_confirmation::export_and_confirmation_are_hard_disabled_without_filesystem_or_auth_state_changes",
+        "inspect::doctor_reports_reclaimable_bytes_without_deleting_content",
+        "inspect::inspect_rejects_path_traversal_as_a_run_identity",
+        "inspect::inspect_renders_latest_persisted_lock_and_result",
+        "logs::logs_jsonl_returns_original_matching_records",
+        "logs::logs_rejects_runs_without_an_event_journal",
+        "logs::logs_replays_latest_journal_with_job_step_and_tail_filters",
+        "repository::planning_a_partial_clone_never_lazy_fetches_missing_git_objects",
+        "repository::repository_changed_path_records_are_bounded_before_materialization",
+        "repository::repository_git_metadata_stdout_is_bounded",
+        "repository::repository_git_processes_have_a_deterministic_deadline",
+        "repository::workflow_is_discovered_when_exactly_one_exists_under_github_workflows",
+        "run_preflight::a_literal_local_variable_does_not_trigger_remote_credential_work",
+        "run_preflight::ambiguous_reachability_fails_closed_before_the_engine",
+        "run_preflight::authored_out_of_scope_behavior_is_rejected_after_source_capture_before_external_work",
+        "run_preflight::docker_text_and_commands_are_shell_degradation_not_inferred_dind",
+        "run_preflight::every_unresolved_variable_condition_remains_conservatively_reachable",
+        "run_preflight::exact_matrix_selection_uses_only_the_selected_legs_reachability",
+        "run_preflight::hidden_daemon_lifecycle_commands_are_quarantined_before_socket_or_network_work",
+        "run_preflight::metric_failure_cannot_replace_the_primary_quarantine_diagnostic",
+        "run_preflight::security_sensitive_capabilities_cannot_be_forced",
+        "run_preflight::selected_and_statically_unreachable_protected_capabilities_do_not_block",
+        "run_preflight::shell_execution_is_blocked_by_default_and_explicitly_degraded_before_engine_work",
+        "run_preflight::write_back_is_a_distinct_nonforceable_capability_before_host_or_engine_mutation",
+        "secrets::computed_dynamic_wildcard_and_bare_sensitive_contexts_fail_closed_before_preparation",
+        "secrets::github_token_is_blocked_before_cli_credentials_are_used",
+        "secrets::malformed_secret_arguments_are_redacted_in_every_supported_spelling",
+        "secrets::ordinary_secret_is_blocked_before_input_migration_or_engine_work",
+        "secrets::unused_token_permissions_cross_only_the_explicit_degraded_shell_boundary",
+        "variables_remote::remote_variable_is_blocked_before_network_or_engine_work",
+        "version_binds_the_compiled_source_identity_on_one_exact_line"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "full_ci_smoke",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "full_ci_fixture_is_blocked_before_service_and_action_side_effects"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "hash_files_deadline",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "public_hash_files_deadline_interrupts_blocked_io_and_stops_expired_streams"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "hash_files_resources",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "public_hash_files_prunes_unrelated_directories_before_opening_them",
+        "public_hash_files_streams_wide_directories_and_caps_its_alias_registry"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "matrix_contracts",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "contexts::context_shapes_distinguish_static_absence_from_runtime_slots",
+        "contexts::needs_output_matrices_and_their_job_templates_remain_explicitly_deferred",
+        "expansion::exactly_256_legs_are_accepted_and_fully_serialized",
+        "expansion::include_only_legs_resolve_strategy_controls_and_each_legs_context",
+        "expansion::matrix_values_expand_and_preserve_types_at_the_cli_boundary",
+        "expansion::omitted_max_parallel_defaults_to_job_total_in_each_strategy_context",
+        "failures::anchored_matrix_amplification_hits_the_local_plan_size_limit",
+        "failures::matrix_shape_control_cap_and_deferred_lower_bound_contracts_are_actionable"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "plan_contracts",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "controls::static_step_controls_require_githubs_documented_types_and_timeout_range",
+        "controls::workflow_and_job_concurrency_are_retained_without_inventing_dependency_values",
+        "controls::workflow_expressions_use_the_runners_template_memory_budget",
+        "dispatch::dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics",
+        "dispatch_failures::dispatch_input_failures_are_typed_named_and_actionable",
+        "pull_request::pull_request_event_exposes_the_documented_synthetic_shape",
+        "rejections::every_remaining_recognized_v0_construct_fails_at_its_authored_key",
+        "rejections::graph_failures_name_the_jobs_and_render_the_exact_span_and_fix",
+        "resource_limits::mixed_template_memory_matches_runner_argument_and_brace_segments"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "plan_matrix_needs",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "golden_plan_owns_the_matrix_needs_structure_and_is_byte_stable",
+        "human_tree_output_and_stderr_diagnostics_are_separated_and_terminal_safe",
+        "plan_appends_exactly_one_metrics_record",
+        "plan_fails_actionably_when_its_required_metrics_record_cannot_be_written",
+        "variables::an_existing_empty_dotenv_file_declares_a_complete_empty_map",
+        "variables::cli_override_wins_over_process_env_and_dotenv",
+        "variables::configuration_variable_names_follow_github_rules_and_cli_last_override_wins",
+        "variables::dynamic_vars_lookup_requires_an_explicit_complete_local_map",
+        "variables::dynamic_vars_lookup_resolves_when_the_supplied_map_covers_it",
+        "variables::missing_literal_var_fails_with_location_and_fix",
+        "variables::process_env_resolves_only_referenced_valid_configuration_variables",
+        "variables::process_env_wins_over_dotenv",
+        "variables::unknown_context_property_is_falsey_in_the_matrix_needs_plan"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "plan_rejections",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "a_failed_plan_still_appends_a_metrics_record",
+        "every_unsupported_runner_form_is_rejected_with_the_accepted_list",
+        "oidc_write_permissions_are_rejected_while_none_is_harmless",
+        "stdout_stays_empty_when_planning_fails",
+        "workflow_call_is_rejected_as_not_in_v0_with_location",
+        "yaml_depth_limit_is_actionable_before_model_recursion"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "run_evidence_permissions",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "run_evidence_is_born_private_and_unsafe_parents_are_not_repaired"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-app",
+      "selector": "test",
+      "target": "stats",
+      "test_cfgs": [
+        "litci_test_boundaries"
+      ],
+      "tests": [
+        "bounded_history::append_never_truncates_without_a_bounded_known_newline_boundary",
+        "bounded_history::stats_reads_only_the_retained_tail_and_caps_aggregate_record_bytes",
+        "concurrent_plans_preserve_every_record_while_repairing_one_torn_tail",
+        "metrics_append_refuses_preexisting_group_or_other_access",
+        "stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail",
+        "stats_keeps_tampered_local_record_fields_on_their_renderer_lines",
+        "stats_on_empty_history_reports_no_history_without_creating_the_file",
+        "stats_rejects_committed_corruption_and_unknown_schema_with_one_fix",
+        "stats_renders_recorded_invocations_and_stage_trends_without_appending"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-engine",
+      "selector": "test",
+      "target": "evidence_contracts",
+      "test_cfgs": [],
+      "tests": [
+        "external_evidence_must_match_every_equivalent_lock_field",
+        "github_confirmation_requires_hermetic_supported_evidence",
+        "job_lock_json_and_digest_are_byte_stable"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-expr",
+      "selector": "doc",
+      "target": "greenlit_expr",
+      "test_cfgs": [],
+      "tests": [
+        "crates/greenlit-expr/src/lib.rs - parse (line 79)"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-expr",
+      "selector": "lib",
+      "target": "greenlit_expr",
+      "test_cfgs": [],
+      "tests": [
+        "oracle_tests::documented_context_roots_and_missing_property_value",
+        "oracle_tests::documented_literals_and_conditional_truthiness",
+        "oracle_tests::documented_loose_equality_and_relational_coercion",
+        "oracle_tests::documented_object_filter_examples",
+        "oracle_tests::documented_operators_property_and_index_access",
+        "oracle_tests::expression_limits_reject_deep_input_without_exhausting_the_process_stack",
+        "oracle_tests::functions::documented_builtin_function_examples_and_rules",
+        "oracle_tests::functions::documented_case_examples",
+        "oracle_tests::functions::documented_status_function_examples_and_truth_table",
+        "oracle_tests::functions::evaluation_memory_limit_matches_runner_format_accounting_boundary",
+        "oracle_tests::functions::from_json::matches_newtonsoft_default_depth_limit",
+        "oracle_tests::functions::from_json::matches_newtonsoft_dotnet_8_whitespace_code_units",
+        "oracle_tests::functions::from_json::matches_newtonsoft_legacy_lexer_and_jtoken_conversion",
+        "oracle_tests::functions::from_json::matches_newtonsoft_numeric_boundaries_and_constructor_roundtrip_format",
+        "oracle_tests::hash_files::hash_files_documented_patterns_hashing_and_workspace_boundary"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-expr",
+      "selector": "test",
+      "target": "hash_files_invariants",
+      "test_cfgs": [],
+      "tests": [
+        "public_hash_files_boundary_enforces_containment_special_nodes_and_bounded_alias_graphs",
+        "public_hash_files_contains_a_held_directory_renamed_outside_the_workspace_mid_traversal",
+        "public_hash_files_matched_dangling_symlink_fails_instead_of_matching_empty"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-metrics",
+      "selector": "doc",
+      "target": "greenlit_metrics",
+      "test_cfgs": [],
+      "tests": [
+        "crates/greenlit-metrics/src/lib.rs - (line 23)"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-metrics",
+      "selector": "test",
+      "target": "invocation_record_schema",
+      "test_cfgs": [],
+      "tests": [
+        "invocation_record_json_shape_is_pinned"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-runtime",
+      "selector": "test",
+      "target": "detection",
+      "test_cfgs": [],
+      "tests": [
+        "docker_host_is_rejected_before_any_probing_when_it_points_remote",
+        "docker_host_loopback_variants_are_accepted_by_detection",
+        "docker_host_ssh_transport_is_rejected",
+        "docker_host_wins_over_socket_in_detection_order",
+        "falls_back_to_docker_socket_when_no_docker_host",
+        "falls_back_to_podman_socket_after_docker",
+        "no_engine_points_at_litci_setup",
+        "rootful_daemon_stopped_offers_sudo_systemctl",
+        "rootless_daemon_stopped_offers_user_systemctl"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-runtime",
+      "selector": "test",
+      "target": "quarantine_assessment",
+      "test_cfgs": [],
+      "tests": [
+        "authored_secret_and_github_token_shapes_are_nonforceable_with_empty_runtime_contexts",
+        "bound_assessment_drift_is_nonforceable_before_production_engine_requests",
+        "deferred_run_content_is_shell_content_not_reachability",
+        "explicit_dind_is_nonforceable_without_scanning_shell_text",
+        "github_and_action_token_shapes_fail_closed",
+        "public_bound_assessment_cannot_force_source_containment_or_unknown_findings",
+        "public_cancellable_entrypoint_independently_blocks_sensitive_plan_contexts",
+        "public_run_plan_blocks_protected_findings_before_production_engine_requests"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-store",
+      "selector": "test",
+      "target": "cas_store",
+      "test_cfgs": [],
+      "tests": [
+        "concurrent_requests_materialize_one_digest_once",
+        "corrupted_content_is_quarantined_and_can_be_refetched"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "expression_validation",
+      "test_cfgs": [],
+      "tests": [
+        "context_and_special_function_availability_is_validated_at_each_workflow_key",
+        "every_modeled_expression_site_uses_quote_aware_delimiters_and_reports_unclosed_templates",
+        "expression_errors_retain_the_modeled_field_span_and_inner_parser_detail",
+        "expressions_are_rejected_at_documented_non_expression_sites",
+        "template_synthesis::mixed_template_placeholder_count_follows_the_runner_format_arity",
+        "template_synthesis::synthetic_format_expression_obeys_runner_length_and_depth_limits"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "jobs_and_steps",
+      "test_cfgs": [],
+      "tests": [
+        "extraction::static_extraction_reports_the_complete_preflight_inventory",
+        "job_fields::container_bare_string_shorthand",
+        "job_fields::job_env_and_defaults",
+        "job_fields::job_outputs_are_retained_as_raw_expression_text",
+        "job_fields::missing_runs_on_is_a_missing_key_error",
+        "job_fields::needs_normalizes_single_string_and_list",
+        "job_fields::permission_scopes_and_levels_use_githubs_closed_schema",
+        "job_fields::reusable_call_recognizes_strategy_and_concurrency_before_v0_rejection",
+        "job_fields::runs_on_expression_is_preserved_raw",
+        "job_fields::runs_on_group_form",
+        "job_fields::runs_on_label_list",
+        "job_fields::runs_on_single_label",
+        "job_fields::services_and_container_share_the_same_shape",
+        "job_fields::workflow_and_job_permissions_support_all_and_scoped_forms",
+        "steps::job_and_step_identifiers_follow_githubs_identifier_rules",
+        "steps::job_must_have_at_least_one_step",
+        "steps::shell_only_valid_on_run_steps_and_with_only_on_uses_steps",
+        "steps::step_fields_run_form",
+        "steps::step_fields_uses_form",
+        "steps::step_must_have_exactly_one_of_run_or_uses",
+        "steps::workflow_must_have_at_least_one_job"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "matrix",
+      "test_cfgs": [],
+      "tests": [
+        "matrix_as_whole_value_expression",
+        "matrix_axes_include_exclude",
+        "matrix_axis_can_be_an_expression_backed_array",
+        "matrix_include_supports_nested_structure"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "scalar_typing",
+      "test_cfgs": [],
+      "tests": [
+        "a_missing_mapping_value_resolves_to_null",
+        "explicit_core_tag_mismatch_is_a_parse_error",
+        "explicit_core_tags_follow_runner_style_rules",
+        "hex_and_octal_integer_overflow_is_a_parse_error_not_a_string",
+        "only_unsigned_well_formed_radix_integer_literals_match",
+        "out_of_range_decimal_number_resolves_to_infinity",
+        "quoted_and_block_scalars_are_always_strings_regardless_of_content",
+        "resolves_boolean_spellings",
+        "resolves_decimal_integers",
+        "resolves_float_spellings",
+        "resolves_hex_and_octal_integers_within_i32_range",
+        "resolves_infinity_and_nan_spellings",
+        "resolves_null_spellings",
+        "two_dots_matches_neither_integer_nor_float_and_stays_a_string",
+        "unknown_yaml_tags_are_a_parse_error",
+        "yes_no_on_off_are_strings_not_booleans"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "trigger_validation",
+      "test_cfgs": [],
+      "tests": [
+        "positive_filter_lists_with_negations_require_a_positive_pattern",
+        "push_and_pull_request_use_event_specific_filter_schemas",
+        "schedule_requires_nonempty_mappings_with_string_cron_and_optional_timezone",
+        "workflow_dispatch_enforces_the_current_twenty_five_input_limit",
+        "workflow_dispatch_models_all_types_and_type_checked_defaults",
+        "workflow_dispatch_rejects_invalid_declarations_types_defaults_and_options"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "triggers",
+      "test_cfgs": [],
+      "tests": [
+        "bare_scalar_form",
+        "mapping_form_with_filters",
+        "mapping_key_with_null_value_means_no_config",
+        "mutually_exclusive_event_filter_pairs_are_rejected",
+        "repository_dispatch_with_types",
+        "sequence_form",
+        "unrecognized_event_name_falls_back_to_generic_other",
+        "workflow_call_is_recognized_but_marked_unsupported"
+      ]
+    },
+    {
+      "features": [],
+      "package": "greenlit-workflow",
+      "selector": "test",
+      "target": "yaml_syntax",
+      "test_cfgs": [],
+      "tests": [
+        "an_empty_file_is_rejected",
+        "anchors_and_aliases_are_resolved",
+        "collection_tags_are_ignored_by_the_runner_reader",
+        "duplicate_mapping_keys_are_rejected",
+        "exactly_one_document_is_required",
+        "job_permissions_are_modeled_and_unknown_job_level_keys_are_rejected",
+        "malformed_yaml_is_a_yaml_syntax_error",
+        "merge_keys_are_not_supported_and_surface_as_unknown_key",
+        "nested_anchors_at_the_depth_and_result_boundary_are_resolved",
+        "root_mapped_triggers_inputs_job_and_step_nodes_preserve_exact_source_spans",
+        "run_name_is_modeled_and_unknown_top_level_keys_are_rejected",
+        "yaml_resource_limits_match_the_pinned_github_runner"
+      ]
+    }
+  ]
+}

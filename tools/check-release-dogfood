@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+cd "$repository_root"
+
+binary="${1:-target/release/litci}"
+if [[ ! -x "$binary" ]]; then
+  echo "release-built litci is not executable at $binary" >&2
+  exit 1
+fi
+command -v docker >/dev/null
+command -v python3 >/dev/null
+docker info >/dev/null
+
+dogfood_parent="${RUNNER_TEMP:-/tmp}"
+if [[ ! -d "$dogfood_parent" || -L "$dogfood_parent" ]]; then
+  echo "dogfood temporary parent is not a real directory: $dogfood_parent" >&2
+  exit 1
+fi
+dogfood_root="$(mktemp -d "$dogfood_parent/greenlit-dogfood.XXXXXX")"
+cleanup_dogfood_root() {
+  local -a cleanup_command
+  if [[ ! -d "$dogfood_root" || -L "$dogfood_root" ]]; then
+    echo "temporary dogfood root changed identity: $dogfood_root" >&2
+    return 1
+  fi
+  if ((EUID == 0)); then
+    cleanup_command=(find)
+  else
+    if ! command -v sudo >/dev/null || ! sudo -n true; then
+      echo "passwordless sudo is required to remove root-owned dogfood cache entries" >&2
+      return 1
+    fi
+    cleanup_command=(sudo -n find)
+  fi
+  if ! "${cleanup_command[@]}" -- "$dogfood_root" -depth -delete; then
+    echo "could not remove temporary dogfood evidence $dogfood_root" >&2
+    return 1
+  fi
+}
+trap 'cleanup_status=$?; trap - EXIT; cleanup_dogfood_root || exit 1; exit "$cleanup_status"' EXIT
+
+assert_no_managed_resource() {
+  local resource="$1"
+  local run_id="$2"
+  shift 2
+  local listing
+  if ! listing="$(docker "$@")"; then
+    echo "could not verify dogfood $resource cleanup for run $run_id" >&2
+    exit 1
+  fi
+  if [[ -n "$listing" ]]; then
+    echo "dogfood run $run_id retained a managed Docker $resource: $listing" >&2
+    exit 1
+  fi
+}
+
+for attempt in 1 2; do
+  dogfood_home="$dogfood_root/home-$attempt"
+  install -d -m 0700 "$dogfood_home"
+  HOME="$dogfood_home" "$binary" run \
+    -W .github/workflows/dogfood.yml \
+    -e workflow_dispatch \
+    --no-input \
+    --allow-degraded
+
+  if [[ -e "$dogfood_home/.litci/daemon" ]]; then
+    echo "dogfood attempt $attempt created quarantined daemon state" >&2
+    exit 1
+  fi
+
+  run_id="$(
+    python3 - "$dogfood_home" "$attempt" "$repository_root/.github/workflows/dogfood.yml" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+home = pathlib.Path(sys.argv[1])
+attempt = sys.argv[2]
+workflow = pathlib.Path(sys.argv[3])
+
+
+def fail(message):
+    raise SystemExit(f"dogfood attempt {attempt}: {message}")
+
+
+def regular(path, description):
+    try:
+        mode = path.lstat().st_mode
+    except OSError as error:
+        fail(f"cannot inspect {description}: {error}")
+    if not stat.S_ISREG(mode):
+        fail(f"{description} is not a regular file")
+    return path
+
+
+def object_pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"duplicate JSON key {key!r}")
+        value[key] = item
+    return value
+
+
+def load_json(path, description):
+    regular(path, description)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=object_pairs)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot read {description}: {error}")
+
+
+def load_ndjson(path, description):
+    regular(path, description)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        fail(f"cannot read {description}: {error}")
+    if not lines:
+        fail(f"{description} is empty")
+    records = []
+    for number, line in enumerate(lines, 1):
+        try:
+            value = json.loads(line, object_pairs_hook=object_pairs)
+        except json.JSONDecodeError as error:
+            fail(f"{description} line {number} is invalid JSON: {error}")
+        if not isinstance(value, dict):
+            fail(f"{description} line {number} is not an object")
+        records.append(value)
+    return records
+
+
+def nonnegative_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+runs = home / ".litci" / "runs"
+try:
+    run_directories = [
+        entry
+        for entry in runs.iterdir()
+        if stat.S_ISDIR(entry.lstat().st_mode)
+    ]
+except OSError as error:
+    fail(f"cannot enumerate retained runs: {error}")
+if len(run_directories) != 1:
+    raise SystemExit(
+        f"dogfood attempt {attempt}: expected one retained run, "
+        f"found {len(run_directories)}"
+    )
+run = run_directories[0]
+run_id = run.name
+
+result = load_json(run / "result.json", "result.json")
+if not isinstance(result, dict) or result.get("schema_version") != 1:
+    fail("result.json is not schema version 1")
+for field, expected in (
+    ("conclusion", "passed"),
+    ("compatibility", "degraded"),
+    ("assurance", "none"),
+):
+    if result.get(field) != expected:
+        fail(f"result.json {field} was not {expected!r}")
+
+labels = [
+    "Provision toolchain components",
+    "Format check",
+    "Clippy",
+    "Install pinned cargo-deny",
+    "Dependency policy",
+    "Stub registry consistency",
+    "Stabilization ledger consistency",
+    "Test authority",
+    "Capability target command manifest",
+    "Parity comparator contract",
+    "Test",
+    "Docs (warnings denied)",
+    "Criterion benchmark manifest",
+]
+events = load_ndjson(run / "events.ndjson", "events.ndjson")
+for number, event in enumerate(events, 1):
+    if event.get("schema_version") != 1:
+        fail(f"events.ndjson line {number} is not schema version 1")
+    if event.get("sequence") != number:
+        fail(f"events.ndjson line {number} has a non-contiguous sequence")
+    if event.get("run_id") != run_id:
+        fail(f"events.ndjson line {number} has the wrong run_id")
+    if not nonnegative_integer(event.get("timestamp_unix_ms")):
+        fail(f"events.ndjson line {number} has an invalid timestamp")
+    if not nonnegative_integer(event.get("elapsed_ms")):
+        fail(f"events.ndjson line {number} has an invalid elapsed time")
+    event_type = event.get("type")
+    if event_type in {"job_skipped", "step_skipped"}:
+        fail(f"events.ndjson contains forbidden {event_type}")
+    if event_type == "preparation" and (
+        event.get("phase") == "execution"
+        or event.get("state") == "unrecognized_event"
+    ):
+        fail("events.ndjson contains an execution preparation substitute")
+
+if events[0].get("type") != "run_started":
+    fail("run_started is not the first physical journal record")
+if events[-1].get("type") != "run_finished":
+    fail("run_finished is not the last physical journal record")
+if sum(event.get("type") == "run_started" for event in events) != 1:
+    fail("events.ndjson does not contain exactly one run_started")
+if sum(event.get("type") == "run_finished" for event in events) != 1:
+    fail("events.ndjson does not contain exactly one run_finished")
+
+lifecycle_types = {
+    "run_started",
+    "job_started",
+    "step_started",
+    "step_finished",
+    "job_finished",
+    "cache_summary",
+    "run_finished",
+}
+lifecycle = [event for event in events if event.get("type") in lifecycle_types]
+expected_types = (
+    ["run_started", "job_started"]
+    + [
+        event_type
+        for _ in labels
+        for event_type in ("step_started", "step_finished")
+    ]
+    + [
+        "job_finished",
+        "cache_summary",
+        "cache_summary",
+        "cache_summary",
+        "run_finished",
+    ]
+)
+if [event.get("type") for event in lifecycle] != expected_types:
+    fail("typed lifecycle records are incomplete or out of order")
+
+job = lifecycle[1]
+job_identity = {"job_id": "gates", "instance_id": "gates-000", "display": "gates"}
+if any(job.get(key) != value for key, value in job_identity.items()):
+    fail("job_started has the wrong job identity")
+
+for index, label in enumerate(labels):
+    started = lifecycle[2 + index * 2]
+    finished = lifecycle[3 + index * 2]
+    identity = {
+        "job_id": "gates",
+        "instance_id": "gates-000",
+        "event_id": f"step-{index}",
+        "index": index,
+        "step_id": None,
+        "label": label,
+    }
+    if any(started.get(key) != value for key, value in identity.items()):
+        fail(f"step {index} start identity is not authoritative")
+    if started.get("kind") != "run" or started.get("reference") is not None:
+        fail(f"step {index} was not one ordinary run step")
+    if any(finished.get(key) != value for key, value in identity.items()):
+        fail(f"step {index} finish identity is not authoritative")
+    if (
+        finished.get("outcome") != "success"
+        or finished.get("conclusion") != "success"
+        or not nonnegative_integer(finished.get("duration_ms"))
+    ):
+        fail(f"step {index} did not finish successfully")
+
+job_finished = lifecycle[2 + len(labels) * 2]
+if any(job_finished.get(key) != value for key, value in job_identity.items()):
+    fail("job_finished has the wrong job identity")
+if (
+    job_finished.get("conclusion") != "success"
+    or not nonnegative_integer(job_finished.get("duration_ms"))
+):
+    fail("dogfood job did not finish successfully")
+
+caches = lifecycle[3 + len(labels) * 2 : 6 + len(labels) * 2]
+if [cache.get("store") for cache in caches] != [
+    "workflow cache",
+    "actions",
+    "action runtimes",
+]:
+    fail("cache summaries are incomplete or out of order")
+for cache in caches:
+    if not nonnegative_integer(cache.get("hits")) or not nonnegative_integer(
+        cache.get("misses")
+    ):
+        fail("cache summary has a non-integral count")
+
+terminal = lifecycle[-1]
+for field, expected in (
+    ("conclusion", "Passed"),
+    ("compatibility", "Degraded"),
+    ("assurance", "None"),
+    ("evidence", run_id),
+):
+    if terminal.get(field) != expected:
+        fail(f"terminal event {field} was not {expected!r}")
+
+trace = load_ndjson(run / "trace.ndjson", "trace.ndjson")
+for number, record in enumerate(trace, 1):
+    if record.get("schema_version") != 1 or record.get("sequence") != number:
+        fail(f"trace.ndjson line {number} has an invalid schema or sequence")
+completed = [record for record in trace if record.get("event") == "run_completed"]
+if len(completed) != 1 or completed[0] is not trace[-1]:
+    fail("trace.ndjson does not end in exactly one run_completed event")
+if completed[0].get("attributes") != {
+    "conclusion": "Passed",
+    "compatibility": "Degraded",
+    "assurance": "None",
+}:
+    fail("run_completed trace attributes are not authoritative")
+
+lock = load_json(run / "run-lock.json", "run-lock.json")
+if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+    fail("run-lock.json is not schema version 1")
+if (
+    lock.get("event") != "workflow_dispatch"
+    or lock.get("selected_job") is not None
+    or lock.get("selected_matrix") != {}
+    or lock.get("offline") is not False
+    or lock.get("clean") is not False
+    or lock.get("hermetic") is not False
+):
+    fail("run-lock.json does not describe the complete ordinary dogfood run")
+source = lock.get("source")
+if not isinstance(source, dict) or source.get("workflow_path") != (
+    ".github/workflows/dogfood.yml"
+):
+    fail("run-lock.json selected the wrong workflow")
+retained_workflow = regular(
+    run / "source" / ".github" / "workflows" / "dogfood.yml",
+    "retained dogfood workflow",
+)
+try:
+    if retained_workflow.read_bytes() != workflow.read_bytes():
+        fail("retained dogfood workflow differs from the checkout")
+except OSError as error:
+    fail(f"cannot compare retained dogfood workflow: {error}")
+
+print(run_id)
+PY
+  )"
+
+  assert_no_managed_resource \
+    container \
+    "$run_id" \
+    ps --all --quiet --filter "label=greenlit.run=$run_id"
+  assert_no_managed_resource \
+    network \
+    "$run_id" \
+    network ls --quiet --filter "name=greenlit-run-$run_id"
+  assert_no_managed_resource \
+    volume \
+    "$run_id" \
+    volume ls --quiet --filter "name=greenlit-run-$run_id"
+done
+
+cleanup_dogfood_root
+trap - EXIT

@@ -298,13 +298,14 @@ produce a mixed checkout. A completed writable filesystem is never reused;
 warmth comes only from immutable images/CAS content and workflow-declared
 caches.
 
-## Phase 8 daemon and recovery dataflow
+## Phase 8 daemon and recovery dataflow (historical)
 
-The optional daemon is the same `litci` binary speaking a bounded,
+Phase 8's optional daemon used the same `litci` binary and spoke a bounded,
 schema-versioned JSON protocol over a mode-0600 Unix socket. Linux peer
-credentials must match the daemon UID. A missing, stale, or incompatible
-daemon is replaced automatically; `--no-daemon` and every daemon failure use
-the same authoritative in-process resolution and execution path.
+credentials had to match the daemon UID. The diagram below records that
+historical design for the later Phase 25 recovery rewrite; Phase 12 removed
+the daemon from the executable path, so no current command starts, connects
+to, replaces, or falls back from it.
 
 ```text
 repository changes ----> low-priority watcher
@@ -338,13 +339,14 @@ reference graph: partial downloads are reclaimed before immutable objects,
 active leases and RunLock pins block deletion, and any catalog inconsistency
 blocks destructive collection.
 
-Repository-local persisted secrets are AES-256-GCM ciphertext in
-`.litci/secrets.vault`; the random 256-bit key exists only at mode 0600 under
-`~/.litci/vault.key`. Legacy plaintext dotenv secrets migrate atomically and
-are removed only after the encrypted vault is durable. Direct, multiline,
-standard/base64url, and percent-encoded variants are registered with the
-streaming masker before output reaches terminal logs, annotations, structured
-results, retained service logs, or errors.
+Phase 12 removed repository-local secret resolution and its vault/key files
+from the executable path. Any reachable `secrets.*` reference or
+`GITHUB_TOKEN` requirement is now a non-forceable pre-preparation finding;
+neither `.litci/secrets.vault` nor `~/.litci/vault.key` is created or read.
+Phase 16 owns a new trust-scoped secret inventory and retrieval design.
+Until that design is certified, the recursive retained-run scanner remains a
+last publication boundary for direct and bounded encoded sensitive values
+registered by Greenlit-owned runtime state.
 
 ## Phase 9 provider and policy dataflow
 
@@ -401,16 +403,14 @@ A run may occupy at most one fewer than the machine worker count, preserving a
 slot for competing projects while per-run and matrix limits remain nested
 inside that global bound.
 
-## Phase 10 external-evidence and release boundary
+## Phase 10 external-evidence and release boundary (historical)
 
-`litci export` reads only a completed clean run and produces a separate
-workflow. It never modifies `.github`, commits, pushes, dispatches, or sends a
-message. The exported workflow pins action commits and container digests,
-assigns deterministic names to unnamed steps, and adds one pinned
-`upload-artifact` evidence job. The evidence template carries a source
-placeholder which the GitHub job replaces with its own `GITHUB_SHA`; this
-avoids a self-referential commit identity while preserving an exact
-two-pass workflow-digest check.
+Phase 10's `litci export` design read only a completed clean run and produced a
+separate workflow. It did not modify `.github`, commit, push, dispatch, or send
+a message. The diagram and checks below record the design that Phase 27 must
+rebuild and certify. Phase 12 removed export and confirmation from the
+executable path; no current command reads a run for export, creates exported
+workflow bytes, contacts GitHub for confirmation, or upgrades assurance.
 
 ```text
 completed local run
@@ -627,16 +627,22 @@ policy actively contains. They are not deferred Greenlit behavior.
   cases surface as ordinary "not authenticated" (`auth::current_token`
   returning `None`), which every caller already handles by pointing at
   `litci auth` again — no special-case recovery path exists or is needed.
-  The documented `0600` file fallback under `~/.litci/auth.json` (with a
-  printed warning) covers the same "kernel keyring unavailable" case a
-  cross-platform crate's D-Bus backend failure would otherwise leave
-  unhandled. Compiled-binary integration tests force this same file-only
-  path via the internal `LITCI_TEST_NO_KEYRING` variable (`tests/support`'s
-  harness sets it for every sandboxed invocation) rather than exercising the
-  real kernel keyring, which is scoped to the test-runner process's UID and
-  so is not sandboxable the way a temporary `$HOME` is; the keyring code
-  path itself is instead covered by a unit test scoped to the thread-private
-  keyring identifier, which never touches persistent kernel state.
+  Phase 12 removed the former `~/.litci/auth.json` fallback because access
+  and refresh tokens must never be serialized to disk. A missing keyring now
+  fails with one action to enable kernel keyring support. Endpoint and keyring
+  environment seams exist only in binaries compiled with the explicit
+  `litci_test_boundaries` custom cfg. The manifest-owned debug test runner
+  applies that cfg only to its Cargo test subprocesses: portable compiled-CLI
+  cases set `LITCI_TEST_NO_KEYRING` and can prove only the fail-closed path.
+  Default and official release builds do not compile those environment
+  readers; their OAuth/API endpoints and `litci-github-token` production key
+  description are immutable. The capability-owning CI job installs
+  `keyutils`, enters a new user namespace and anonymous session keyring, then
+  uses a validated unique `litci-test:` description while running the complete
+  `credential_capability` target against the persistent-keyring syscalls.
+  Separate `litci` processes prove PAT, external `gh`, device-flow, and refresh
+  persistence/replacement while exact-key cleanup and namespace teardown keep
+  the host account's real keyring out of scope.
 
 - **`ring`'s own transitive pins duplicate two already-present crates at
   older versions.** `ring` (via `rustls`, via `ureq`) depends on
@@ -714,12 +720,12 @@ policy actively contains. They are not deferred Greenlit behavior.
   bind mount costs nothing beyond what copy-in isolation already does, and
   requires no change to `greenlit-init`. Writes made by a `run:` step and by
   a Docker-action sibling are therefore mutually visible for the remainder of
-  the job, proven end-to-end by
-  `crates/greenlit-runtime/tests/actions_docker.rs` against the real Docker
-  daemon (a `run:` step writes a file, a Docker action reads and appends to
-  it, and a later `run:` step reads back both halves). The tradeoff: a job
-  with a Docker action cannot use overlay isolation even if it would
-  otherwise qualify. **Phase 4 closed the cleanup half of this entry**: the
+  the job. The tradeoff: a job with a Docker action cannot use overlay
+  isolation even if it would otherwise qualify. Phase 12 removed the former
+  action-specific suite because it substituted Greenlit-owned resolution and
+  execution boundaries; this behavior is therefore quarantined, not
+  certified, until Phase 23 supplies authoritative live evidence.
+  **Phase 4 closed the cleanup half of this entry**: the
   port gained `remove_volume`, and the run-scoped volume is now removed after
   the job container's own teardown (it has to follow, because a volume still
   bound by a running container cannot be removed). Before that it leaked one
@@ -776,8 +782,10 @@ policy actively contains. They are not deferred Greenlit behavior.
   against the job's shared sibling volumes, which
   `crate::executor::actions::resolve`'s pre-pass provisions whenever a
   Docker action exists at *any* nesting depth — so the sibling apparatus is
-  already in place by the time composite recursion reaches it. Both are
-  pinned by `crates/greenlit-runtime/tests/actions_composite.rs`.
+  already in place by the time composite recursion reaches it. Phase 12
+  removed the own-code-substituting action suite that previously claimed
+  this behavior; nested actions remain non-forceably quarantined until
+  Phase 23 supplies authoritative live evidence.
 
 - **A manifest's declared input `default:` value is used as a literal
   string, not evaluated as a `${{ }}` expression.** `actions/checkout`'s own
@@ -806,30 +814,25 @@ policy actively contains. They are not deferred Greenlit behavior.
   nothing threads the job's `StepRecord` history into composite execution
   today. A top-level composite input default referencing `steps.*` is
   therefore still a narrower, separately-recorded gap rather than a revived
-  version of this one. Pinned by
-  `crates/greenlit-runtime/tests/actions_composite.rs`.
+  version of this one. Composite execution is non-forceably quarantined in
+  Phase 12, and Phase 23 owns its authoritative live certification.
 
-- **`GITHUB_TOKEN`'s reserved-name rule is reused, not special-cased, to keep
-  it out of the ordinary secrets chain.** GitHub secret and configuration
-  variable names share one documented rule: "must not start with the
-  `GITHUB_` prefix"
-  (<https://docs.github.com/en/actions/reference/security/secrets>,
-  <https://docs.github.com/en/actions/reference/workflows-and-actions/variables#naming-conventions-for-configuration-variables>).
-  A real repository can therefore never hold a user-created secret literally
-  named `GITHUB_TOKEN` — it is always the platform-populated token instead.
-  `crate::secrets::validate_name` (`crate::gh_names::validate_configuration_name`)
-  already rejects that exact name for the same reason it rejects any other
-  `GITHUB_`-prefixed one, so `crate::secrets`'s ordinary chain excludes
-  `GITHUB_TOKEN` from its candidate set outright rather than letting it reach
-  (and fail) that validator; `crate::auth::resolve_github_token` is its own,
-  separate resolution path (local override, if any, else the stored auth
-  token, else the empty string — never a hard failure, since GitHub itself
-  always provides a working token and a workflow that merely references it
-  should not be blocked from an unauthenticated local run). `github.token`
-  gets the identical treatment via a small, additive
-  `greenlit_workflow::extract::StaticExtraction::references_github_token`
-  flag (`extract::walk`), since — unlike `secrets.GITHUB_TOKEN` — no existing
-  Phase 1 extraction tracked a bare `github.*` field access at all.
+- **The former `GITHUB_TOKEN` resolver is historical and quarantined, not an
+  unauthenticated fallback contract.** GitHub reserves the `GITHUB_` prefix,
+  so the pre-stabilization implementation kept `GITHUB_TOKEN` outside the
+  ordinary user-secret chain and resolved it separately from a local override,
+  stored authentication, or an empty fallback. Phase 12 removed that resolver
+  from the executable run path. A reachable literal, computed, dynamically
+  indexed, wildcard, or bare `secrets` reference is now a non-forceable
+  `secret.context` finding; `github.token` and whole or dynamically selected
+  `github` contexts that can expose it are non-forceable
+  `credential.github` findings. The runtime derives these facts from typed
+  `DeferReason` data retained in the selected plan, so public executor callers
+  cannot bypass quarantine by supplying empty contexts or omitting a
+  caller-authored assessment. The static-extraction token flag remains useful
+  source metadata, but is not the security boundary. Credential resolution and
+  injection remain quarantined until Phase 23 supplies authoritative live
+  action-execution evidence; Phase 16 owns the preceding trust/context model.
 
 - **Every step's layered environment needs an explicit, tracked `PATH` from
   job start — ordinary Docker `exec` inheritance alone stops being enough
@@ -859,9 +862,10 @@ policy actively contains. They are not deferred Greenlit behavior.
   booted (and ready) job container, seeded into `base_env` before the step
   loop starts — container-agnostic, so it works identically for the
   locked runner profile and an arbitrary user-specified
-  `jobs.<id>.container`. `crates/greenlit-runtime/tests/actions_composite.rs`
-  pins the regression (a `run:` step's own `GITHUB_PATH` addition must not
-  break a later composite step's access to system binaries).
+  `jobs.<id>.container`. The former composite-backed regression test was not
+  authoritative because it substituted Greenlit-owned action boundaries;
+  Phase 12 quarantines that action-dependent path pending Phase 23 live
+  certification.
 
 - **A composite step's own environment must be the same job-wide
   base/workflow/job layers an ordinary top-level step sees, not just its own
@@ -881,8 +885,9 @@ policy actively contains. They are not deferred Greenlit behavior.
   (`{cmdfiles_dir}/step-<n>/script`) — meant *every* composite `run:` step
   failed outright ("no such file") before this wave, regardless of the env
   gap; no prior test had ever executed a composite action's nested `run:`
-  step against a real daemon. Both are pinned directly by
-  `crates/greenlit-runtime/tests/actions_composite.rs`.
+  step against a real daemon. Phase 12 removed the substituting composite
+  suite and blocks composite execution before side effects; Phase 23 owns the
+  replacement live evidence for both behaviors.
 
 - **A Docker action's sibling container does not receive the
   `GITHUB_ENV`/`GITHUB_OUTPUT`/`GITHUB_PATH`/`GITHUB_STEP_SUMMARY`
@@ -916,9 +921,10 @@ policy actively contains. They are not deferred Greenlit behavior.
   GitHub's handling of a failed step's files, and every step kind now folds
   them through one function, `cmdfiles::apply_effects` — closing, in
   passing, a latent drop where a *nested* JS action's `GITHUB_ENV`/
-  `GITHUB_PATH` writes were discarded instead of accumulated. Pinned by
-  `crates/greenlit-runtime/tests/actions_docker.rs` with a `USER
-  65534:65534` Dockerfile action writing all four files.
+  `GITHUB_PATH` writes were discarded instead of accumulated. Phase 12
+  blocks Docker and JavaScript action execution and deleted the substituting
+  action suite; Phase 23 must re-establish this claim through a live
+  non-root Docker-action case.
 
 - **The network policy is enforced inside each container's own namespace, not
   by host `DOCKER-USER` rules.** `PHASE-4-environment.md` names the host
@@ -953,11 +959,10 @@ policy actively contains. They are not deferred Greenlit behavior.
   `uses:` action gets its own IP on the job's network, with its own
   loopback; here the sibling shares the job container's namespace outright,
   so `127.0.0.1` inside the action is the job container's loopback rather
-  than one of its own. Every fidelity-relevant behavior — service-id
-  reachability, internet access, and the LAN/metadata block — is identical
-  either way. Pinned by
-  `crates/greenlit-runtime/tests/actions_docker.rs`'s services-and-guard
-  test.
+  than one of its own. Phase 12 no longer claims that the action-specific
+  service and guard behavior is certified: action execution is blocked
+  before side effects, and Phase 23 owns a live replacement for the deleted
+  own-code-substituting suite.
 
 - **Blob URLs authorize themselves; the bearer token does not reach them.**
   `@azure/storage-blob` treats a signed URL as self-authorizing and sends no
@@ -1019,3 +1024,62 @@ The compact renderer holds only a per-step failure tail (200 lines and 256
 KiB caps). Successful bodies remain solely in the durable journal unless
 `--log-mode full` is selected. `litci logs` is a read-only projector over that
 journal and never reconstructs lifecycle state from text.
+
+## Phase 12 containment and test-authority boundary
+
+Phase 12 treats every capability as uncertified until a later stabilization
+phase supplies authoritative evidence. `litci run` registers explicit
+command-line sensitive values before allocating evidence, captures the source
+once into the private run tree, parses the selected workflow from that captured
+tree, and applies `greenlit-app::run_quarantine` once before constructing a
+credential client, action resolver, store, network path, or container engine.
+The assessment combines source-located findings with
+`greenlit-runtime::assess_runtime_capabilities`; the executor independently
+re-derives its plan/configuration findings and rejects any assessment drift
+before the first `ContainerEngine` operation. Phase 13 still owns a shared
+no-follow loader, descriptor-pinned intake, concurrent-change detection,
+sealed-tree execution, and preservation of logical source modes.
+
+Default `litci run` blocks every reachable uncertified capability.
+`--allow-degraded` can authorize only the registered shell-execution seed and
+retains compatibility `degraded` with assurance `none`. Credential, secret,
+action, service, DinD, source-write, ambiguous-reachability, and
+security-boundary findings remain non-forceable. The optional preparation
+daemon is disabled through Phase 25, while export and confirmation are
+disabled through Phase 27; their historical implementations are not current
+certification paths.
+
+Phase 12 also removes scripted `ContainerEngine`, resolver, fetcher, runtime
+bundle, and planner substitutes from capability evidence. The portable
+pipeline executes only non-capability tests. Capability-owning
+`homelab-heavy` jobs provision their prerequisites and run whole,
+required-feature targets:
+
+- native Docker: base image, container exit, overlay/copy isolation,
+  selected-matrix evidence, and complete retained-secret scanning;
+- configured containerd/stargz plus ordinary/clean/hermetic policy and the
+  native warm-budget gate;
+- an isolated Linux persistent keyring for the production credential target;
+- reflink and bounded-stream copy strategies through the real
+  `greenlit-init`; and
+- two fresh-home dogfood invocations through the release-built `litci`.
+
+Retained run directories and physical artifacts are born with exact modes
+`0700` and `0600`. When a retained manifest describes source content, its
+logical mode may still record `100755`; executable semantics are metadata and
+do not weaken the physical artifact's host permissions.
+
+The eager Docker path reuses an already materialized exact-digest runner or
+workflow image before calling the daemon pull boundary. This is the narrow
+GL-STAB-076 repair required by the existing Phase 10 zero-download gate: the
+same resolved digest and platform are still verified afterward. Phase 12 does
+not add a CAS-only OCI resolution fast path or otherwise certify the broader
+content and provisioning semantics owned by Phases 19 and 20.
+
+`tools/tests/check-capability-test-manifest` compares every feature-gated test
+target in locked Cargo metadata with the committed command manifest, then
+lists each whole target and requires its exact nonzero test set. A target that
+silently selects zero cases cannot satisfy the CI route. Action execution has
+no Phase 12 live capability gate and is therefore blocked rather than
+represented by the deleted substitute-backed suites; Phase 23 owns its
+replacement certification.

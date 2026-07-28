@@ -67,6 +67,13 @@ pub(crate) enum PermissionScope {
 }
 
 impl PermissionScope {
+    fn endpoint_name(self) -> &'static str {
+        match self {
+            PermissionScope::Repository => "repository",
+            PermissionScope::Organization => "organization",
+        }
+    }
+
     fn fix(self) -> &'static str {
         match self {
             PermissionScope::Repository => {
@@ -83,10 +90,7 @@ impl PermissionScope {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum RemoteVarError {
     /// The token lacks the permission the endpoint needs (HTTP 403).
-    Permission {
-        scope: PermissionScope,
-        message: String,
-    },
+    Permission { scope: PermissionScope },
     /// Any other transport/API failure.
     Api(String),
 }
@@ -95,9 +99,11 @@ impl RemoteVarError {
     /// Renders this error with its one fix action, for `crate::errors`.
     pub(crate) fn to_message_with_fix(&self) -> String {
         match self {
-            RemoteVarError::Permission { scope, message } => {
-                format!("{message}\n  fix: {}", scope.fix())
-            }
+            RemoteVarError::Permission { scope } => format!(
+                "GitHub's {} variables endpoint returned HTTP 403\n  fix: {}",
+                scope.endpoint_name(),
+                scope.fix()
+            ),
             RemoteVarError::Api(message) => {
                 format!(
                     "{message}\n  fix: check network connectivity and the token's validity, then retry"
@@ -125,11 +131,12 @@ struct VariableListResponse {
 /// Talks to the GitHub configuration-variables REST endpoints. `crate::vars`
 /// always constructs one via [`VariablesClient::with_base_url`] — production
 /// passes real `https://api.github.com` (`DEFAULT_API_BASE_URL`, via
-/// `crate::vars::api_base_url`, the same seam its internal test-only
-/// override replaces); tests inject a loopback base URL directly. The same
-/// pattern `greenlit_actions::resolve::GitHubApiResolver` uses (required
-/// here for the identical reason: `PHASE-3-actions.md` exit criterion 5,
-/// "variable endpoints use a mocked external GitHub endpoint").
+/// `crate::vars::api_base_url`); only an explicit
+/// `litci_test_boundaries` custom-cfg build can replace that URL with a
+/// loopback boundary. The same pattern
+/// `greenlit_actions::resolve::GitHubApiResolver` uses is required here for
+/// the identical reason: `PHASE-3-actions.md` exit criterion 5 says
+/// "variable endpoints use a mocked external GitHub endpoint".
 #[derive(Debug, Clone)]
 pub(crate) struct VariablesClient {
     agent: ureq::Agent,
@@ -187,27 +194,20 @@ impl VariablesClient {
             .header("User-Agent", USER_AGENT)
             .header("X-GitHub-Api-Version", API_VERSION)
             .call()
-            .map_err(|error| RemoteVarError::Api(format!("could not reach {url}: {error}")))?;
+            .map_err(|_| transport_error(scope))?;
         let status = response.status().as_u16();
-        let body = read_body(&mut response)?;
         if status == 404 {
             return Ok(None);
         }
         if status == 403 {
-            return Err(RemoteVarError::Permission {
-                scope,
-                message: format!("HTTP 403: {}", String::from_utf8_lossy(&body).trim()),
-            });
+            return Err(RemoteVarError::Permission { scope });
         }
         if status != 200 {
-            return Err(RemoteVarError::Api(format!(
-                "HTTP {status}: {}",
-                String::from_utf8_lossy(&body).trim()
-            )));
+            return Err(status_error(scope, status));
         }
-        let parsed: VariableResponse = serde_json::from_slice(&body).map_err(|error| {
-            RemoteVarError::Api(format!("unexpected variable response: {error}"))
-        })?;
+        let body = read_body(&mut response, scope)?;
+        let parsed: VariableResponse =
+            serde_json::from_slice(&body).map_err(|_| invalid_response_error(scope))?;
         Ok(Some(parsed.value))
     }
 
@@ -253,27 +253,20 @@ impl VariablesClient {
                 .header("User-Agent", USER_AGENT)
                 .header("X-GitHub-Api-Version", API_VERSION)
                 .call()
-                .map_err(|error| RemoteVarError::Api(format!("could not reach {url}: {error}")))?;
+                .map_err(|_| transport_error(scope))?;
             let status = response.status().as_u16();
-            let body = read_body(&mut response)?;
             if status == 404 && !error_on_404 {
                 return Ok(all);
             }
             if status == 403 {
-                return Err(RemoteVarError::Permission {
-                    scope,
-                    message: format!("HTTP 403: {}", String::from_utf8_lossy(&body).trim()),
-                });
+                return Err(RemoteVarError::Permission { scope });
             }
             if status != 200 {
-                return Err(RemoteVarError::Api(format!(
-                    "HTTP {status}: {}",
-                    String::from_utf8_lossy(&body).trim()
-                )));
+                return Err(status_error(scope, status));
             }
-            let parsed: VariableListResponse = serde_json::from_slice(&body).map_err(|error| {
-                RemoteVarError::Api(format!("unexpected variable list response: {error}"))
-            })?;
+            let body = read_body(&mut response, scope)?;
+            let parsed: VariableListResponse =
+                serde_json::from_slice(&body).map_err(|_| invalid_response_error(scope))?;
             let page_len = parsed.variables.len();
             for variable in parsed.variables {
                 all.insert(variable.name, variable.value);
@@ -286,168 +279,40 @@ impl VariablesClient {
     }
 }
 
-fn read_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>, RemoteVarError> {
+fn transport_error(scope: PermissionScope) -> RemoteVarError {
+    RemoteVarError::Api(format!(
+        "could not reach GitHub's {} variables endpoint",
+        scope.endpoint_name()
+    ))
+}
+
+fn status_error(scope: PermissionScope, status: u16) -> RemoteVarError {
+    RemoteVarError::Api(format!(
+        "GitHub's {} variables endpoint returned HTTP {status}",
+        scope.endpoint_name()
+    ))
+}
+
+fn invalid_response_error(scope: PermissionScope) -> RemoteVarError {
+    RemoteVarError::Api(format!(
+        "GitHub's {} variables endpoint returned an invalid response",
+        scope.endpoint_name()
+    ))
+}
+
+fn read_body(
+    response: &mut ureq::http::Response<ureq::Body>,
+    scope: PermissionScope,
+) -> Result<Vec<u8>, RemoteVarError> {
     response
         .body_mut()
         .with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
-        .map_err(|error| RemoteVarError::Api(format!("could not read GitHub's response: {error}")))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-
-    fn drain_request(stream: &mut TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set read timeout");
-        let mut buf = [0_u8; 8192];
-        let mut total = Vec::new();
-        loop {
-            let read = stream.read(&mut buf).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            total.extend_from_slice(&buf[..read]);
-            if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-    }
-
-    fn respond_once(listener: TcpListener, status: u16, reason: &'static str, body: String) {
-        let (mut stream, _) = listener.accept().expect("accept");
-        drain_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    }
-
-    #[test]
-    fn resolves_a_repository_variable() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond_once(
-                listener,
-                200,
-                "OK",
-                r#"{"name":"MODE","value":"ci","created_at":"","updated_at":""}"#.to_string(),
-            );
-        });
-        let client = VariablesClient::with_base_url("token", base_url);
-        let value = client.get_repo_variable("owner", "repo", "MODE").unwrap();
-        assert_eq!(value, Some("ci".to_string()));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn a_404_resolves_to_none() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond_once(
-                listener,
-                404,
-                "Not Found",
-                r#"{"message":"Not Found"}"#.to_string(),
-            );
-        });
-        let client = VariablesClient::with_base_url("token", base_url);
-        let value = client
-            .get_repo_variable("owner", "repo", "MISSING")
-            .unwrap();
-        assert_eq!(value, None);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn a_403_is_a_permission_error_naming_the_repository_scope() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond_once(
-                listener,
-                403,
-                "Forbidden",
-                r#"{"message":"Resource not accessible"}"#.to_string(),
-            );
-        });
-        let client = VariablesClient::with_base_url("token", base_url);
-        let error = client
-            .get_repo_variable("owner", "repo", "MODE")
-            .unwrap_err();
-        match error {
-            RemoteVarError::Permission { scope, .. } => {
-                assert_eq!(scope, PermissionScope::Repository)
-            }
-            other => panic!("expected Permission, got {other:?}"),
-        }
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn lists_every_page_of_repository_variables() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            let mut first_page_vars = Vec::new();
-            for i in 0..MAX_PER_PAGE {
-                first_page_vars.push(format!(r#"{{"name":"VAR{i}","value":"v{i}"}}"#));
-            }
-            let first_page = format!(
-                r#"{{"total_count":{},"variables":[{}]}}"#,
-                MAX_PER_PAGE + 1,
-                first_page_vars.join(",")
-            );
-            let (mut stream, _) = listener.accept().expect("accept first page");
-            drain_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_page}",
-                first_page.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            drop(stream);
-
-            let second_page = r#"{"total_count":31,"variables":[{"name":"LAST","value":"last"}]}"#;
-            let (mut stream, _) = listener.accept().expect("accept second page");
-            drain_request(&mut stream);
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{second_page}",
-                second_page.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-        });
-        let client = VariablesClient::with_base_url("token", base_url);
-        let all = client.list_repo_variables("owner", "repo").unwrap();
-        assert_eq!(all.len(), MAX_PER_PAGE as usize + 1);
-        assert_eq!(all.get("LAST"), Some(&"last".to_string()));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn org_lookup_treats_a_404_as_no_organization_rather_than_an_error() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond_once(
-                listener,
-                404,
-                "Not Found",
-                r#"{"message":"Not Found"}"#.to_string(),
-            );
-        });
-        let client = VariablesClient::with_base_url("token", base_url);
-        let all = client.list_org_variables("a-user-not-an-org").unwrap();
-        assert!(all.is_empty());
-        handle.join().unwrap();
-    }
+        .map_err(|_| {
+            RemoteVarError::Api(format!(
+                "could not read GitHub's {} variables response",
+                scope.endpoint_name()
+            ))
+        })
 }

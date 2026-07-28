@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Create, verify, seal, and safely unpack Greenlit release provenance."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from release_provenance import ProvenanceError
+from release_provenance.bundle import seal, unpack
+from release_provenance.candidate import create, verify
+from release_provenance.common import (
+    DIGEST_PATTERN,
+    MANIFEST_NAME,
+    validated_directory,
+)
+
+
+def _source_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--expected-source", required=True)
+
+
+def _candidate_arguments(parser: argparse.ArgumentParser) -> None:
+    _source_arguments(parser)
+    parser.add_argument("--candidate-root", type=Path, required=True)
+    parser.add_argument("--parity-root", type=Path, required=True)
+
+
+def parser() -> argparse.ArgumentParser:
+    """Build the deliberately closed public command surface."""
+
+    result = argparse.ArgumentParser(
+        description="manage an exact source-derived Greenlit release bundle"
+    )
+    commands = result.add_subparsers(dest="command", required=True)
+    for name in ("create", "verify"):
+        _candidate_arguments(commands.add_parser(name))
+    seal_parser = commands.add_parser("seal")
+    _candidate_arguments(seal_parser)
+    seal_parser.add_argument("--output", type=Path, required=True)
+    unpack_parser = commands.add_parser("unpack")
+    _source_arguments(unpack_parser)
+    unpack_parser.add_argument("--bundle", type=Path, required=True)
+    unpack_parser.add_argument("--output-root", type=Path, required=True)
+    unpack_parser.add_argument("--expected-sha256", required=True)
+    return result
+
+
+def _directory(path: Path, label: str) -> Path:
+    return validated_directory(path, label)
+
+
+def main() -> int:
+    """Dispatch one provenance operation."""
+
+    arguments = parser().parse_args()
+    try:
+        repository = _directory(arguments.repository_root, "repository root")
+        if arguments.command in {"create", "verify", "seal"}:
+            candidate = _directory(arguments.candidate_root, "candidate root")
+            parity = _directory(arguments.parity_root, "parity root")
+            if arguments.command == "create":
+                create(
+                    repository,
+                    candidate,
+                    parity,
+                    arguments.expected_source,
+                )
+                print(f"created release provenance: {candidate / MANIFEST_NAME}")
+            elif arguments.command == "verify":
+                verify(
+                    repository,
+                    candidate,
+                    parity,
+                    arguments.expected_source,
+                )
+                print(f"verified release provenance: {candidate / MANIFEST_NAME}")
+            else:
+                output = Path(arguments.output).absolute()
+                digest = seal(
+                    repository,
+                    candidate,
+                    parity,
+                    output,
+                    arguments.expected_source,
+                )
+                print(digest)
+        else:
+            if DIGEST_PATTERN.fullmatch(arguments.expected_sha256) is None:
+                raise ProvenanceError(
+                    "--expected-sha256 must be exactly 64 lowercase hexadecimal characters"
+                )
+            output_root = _directory(arguments.output_root, "bundle output root")
+            unpack(
+                repository,
+                Path(arguments.bundle).absolute(),
+                output_root,
+                arguments.expected_source,
+                arguments.expected_sha256,
+            )
+            print(f"verified and unpacked release bundle: {output_root}")
+    except ProvenanceError as error:
+        print(f"release provenance error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

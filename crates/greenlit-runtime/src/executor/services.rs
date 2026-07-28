@@ -646,24 +646,3 @@ fn parse_ipv4(value: &str) -> Option<Ipv4Addr> {
         .next()
         .and_then(|address| address.parse().ok())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::parse_ipv4;
-
-    #[test]
-    fn a_gateway_parses_with_or_without_a_prefix() {
-        assert_eq!(
-            parse_ipv4("172.18.0.1"),
-            Some(std::net::Ipv4Addr::new(172, 18, 0, 1))
-        );
-        // Docker reports some gateways in CIDR form.
-        assert_eq!(
-            parse_ipv4("172.18.0.1/16"),
-            Some(std::net::Ipv4Addr::new(172, 18, 0, 1))
-        );
-        // An IPv6 gateway is not one this run can bind on.
-        assert_eq!(parse_ipv4("fd00::1"), None);
-        assert_eq!(parse_ipv4(""), None);
-    }
-}

@@ -25,9 +25,20 @@ fn metrics_record(version: u32, started_at: u128) -> String {
 }
 
 fn write_metrics(sandbox: &Sandbox, contents: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+
     let path = sandbox.metrics_file();
     std::fs::create_dir_all(path.parent().expect("metrics parent")).expect("create metrics dir");
-    std::fs::write(path, contents).expect("write metrics history");
+    std::fs::write(&path, contents).expect("write metrics history");
+    for directory in [
+        sandbox.home().join(".litci"),
+        sandbox.home().join(".litci/metrics"),
+    ] {
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict metrics directory");
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict metrics history");
 }
 
 #[test]
@@ -100,6 +111,42 @@ fn stats_renders_recorded_invocations_and_stage_trends_without_appending() {
     let after = std::fs::read_to_string(sandbox.metrics_file()).expect("metrics file exists");
     let lines_after = after.lines().filter(|l| !l.trim().is_empty()).count();
     assert_eq!(lines_after, lines_before);
+}
+
+#[test]
+fn metrics_append_refuses_preexisting_group_or_other_access() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let broad_directory = Sandbox::new();
+    broad_directory.write("wf.yml", WORKFLOW);
+    broad_directory.init_git();
+    let litci = broad_directory.home().join(".litci");
+    std::fs::create_dir(&litci).expect("create broad .litci");
+    std::fs::set_permissions(&litci, std::fs::Permissions::from_mode(0o755))
+        .expect("set broad directory mode");
+    let output = broad_directory.run(&["plan", "-W", "wf.yml"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("unsafe mode 0o755"), "{stderr}");
+    assert!(
+        stderr.contains("restrict the directory to 0700"),
+        "{stderr}"
+    );
+
+    let broad_file = Sandbox::new();
+    broad_file.write("wf.yml", WORKFLOW);
+    broad_file.init_git();
+    write_metrics(&broad_file, []);
+    std::fs::set_permissions(
+        broad_file.metrics_file(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("set broad file mode");
+    let output = broad_file.run(&["plan", "-W", "wf.yml"]);
+    assert!(!output.status.success());
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("unsafe mode 0o644"), "{stderr}");
+    assert!(stderr.contains("or the file to 0600"), "{stderr}");
 }
 
 #[test]
@@ -265,7 +312,8 @@ fn stats_rejects_committed_corruption_and_unknown_schema_with_one_fix() {
     )
     .expect("write redirected history");
     let path = linked.metrics_file();
-    std::fs::create_dir_all(path.parent().expect("metrics parent")).expect("create metrics parent");
+    write_metrics(&linked, []);
+    std::fs::remove_file(&path).expect("remove secure placeholder");
     std::os::unix::fs::symlink(&target, &path).expect("link metrics file");
     let output = linked.run(&["stats"]);
     assert!(!output.status.success());
@@ -279,7 +327,8 @@ fn stats_rejects_committed_corruption_and_unknown_schema_with_one_fix() {
     // allowing a regression to hang the test process forever.
     let fifo = Sandbox::new();
     let path = fifo.metrics_file();
-    std::fs::create_dir_all(path.parent().expect("metrics parent")).expect("create metrics parent");
+    write_metrics(&fifo, []);
+    std::fs::remove_file(&path).expect("remove secure placeholder");
     let status = std::process::Command::new("mkfifo")
         .arg(&path)
         .status()

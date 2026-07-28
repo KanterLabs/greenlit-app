@@ -6,7 +6,7 @@ Tests exist to pin GitHub's behavior and Greenlit's invariants. They do not exis
 
 1. **Oracle tests** (`greenlit-expr`, `greenlit-workflow`) — table-driven tests transcribing GitHub's documented rules: expression grammar, functions, coercion, workflow semantics. One table row per documented rule plus its edge cases. This is the moat; high volume *here* is correct. When GitHub's docs are ambiguous, the row cites an observed-behavior run on GitHub instead.
 2. **Integration tests** (`crates/greenlit-app/tests/` + `fixtures/`) — fixture workflows through `litci plan`/`litci run`, asserting step outcomes, outputs, and end state. Few rich fixtures over many tiny ones: extend an existing fixture before creating a new one. The phase files' named fixtures (`matrix-needs`, `shell-ci`, `actions-ci`, `full-ci`) are the backbone; each phase grows them. Behavior tests that inject a true external boundary such as the engine prober, GitHub API, or clock belong here; calling one a "unit test" does not create a fifth class.
-3. **Invariant tests** — the fixed security/fidelity set, listed exhaustively: host tree unchanged after hostile step; frozen source unaffected by later edits; no cross-job writable state; no host Docker socket, privileged workflow container, host mount, host network, or device in any sandbox; LAN blocked / shim reachable / internet policy enforced; direct, encoded, chunk-split, structured-error, and service secret values absent from all output; `hashFiles` stays inside its supplied workspace, skips special nodes, streams wide-directory enumeration with depth-proportional state, enforces fixed entry and retained-byte ceilings on its symbolic-link alias registry, bounds alias traversal, returns at its fixed deadline, and bounds abandoned workers within a fixed live-worker cap; immutable CAS objects are verified and corruption is quarantined; one concurrent download per digest; active leases block deletion; no dirty sandbox survives or is reused after termination; cold/eager/lazy/daemon/in-process runs have identical semantic evidence; zero Greenlit network fetches on unchanged re-run; user steps never replay; unsupported behavior never passes; GitHub confirmation requires matching external evidence; stub checker clean. New invariant tests require a new invariant in AGENTS.md first.
+3. **Invariant tests** — the fixed security/fidelity set, listed exhaustively: host tree unchanged after hostile step; frozen source unaffected by later edits; no cross-job writable state; no host Docker socket, privileged workflow container, host mount, host network, or device in any sandbox; LAN blocked / shim reachable / internet policy enforced; direct, encoded, chunk-split, structured-error, and service secret values absent from all output; `hashFiles` stays inside its supplied workspace, skips special nodes, streams wide-directory enumeration with depth-proportional state, enforces fixed entry and retained-byte ceilings on its symbolic-link alias registry, bounds alias traversal, returns at its fixed deadline, and bounds abandoned workers within a fixed live-worker cap; immutable CAS objects are verified and corruption is quarantined; one concurrent download per digest; active leases block deletion; no dirty sandbox survives or is reused after termination; cold/eager/lazy/in-process runs have identical semantic evidence; zero Greenlit network fetches on unchanged re-run; user steps never replay; unsupported behavior never passes; when Phase 27 re-enables GitHub confirmation it requires matching external evidence; stub and stabilization-ledger checkers clean. Daemon equivalence is quarantined with the daemon until Phase 25. New invariant tests require a new invariant in AGENTS.md first.
 4. **External oracles** — GitHub confirmation/parity cases and criterion/whole-run benchmarks. These judge the whole; they are not duplicated in miniature elsewhere.
 
 ## Banned — the anti-bloat rules
@@ -33,13 +33,26 @@ Every PR, in order, fail-fast:
 2. `cargo clippy --all-targets -- -D warnings`
 3. `cargo deny check` — RustSec advisories, license allowlist, duplicate versions
 4. `tools/check-stubs` — exact marker/registry validation and no active-or-earlier owned stubs
-5. `cargo test --workspace` (oracle + integration + invariant)
-6. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
-7. Criterion and whole-run benches — record through Phase 9, budget-enforced
+5. `tools/check-stabilization-ledger` — defect/exception schema, ownership,
+   closure, approval, and wildcard validation, including its malformed-ledger
+   negative gate
+6. `tools/check-test-authority` — no private-helper test homes, ignored or
+   self-skipping capability cases, or Greenlit-owned runtime substitutes,
+   including its command-boundary negative gate
+7. `tools/tests/check-capability-test-manifest` — every feature-gated
+   capability target selects its exact nonzero declared case set
+8. `tools/compare-parity --self-test` and
+   `tools/tests/check-parity-producer` — canonical comparison and producer
+   command boundaries, including intentional exact-field mismatch rejection
+9. `tools/tests/check-portable-test-manifest --run` — exact non-capability
+   oracle, integration, and invariant target/case inventory
+10. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
+11. Criterion and whole-run benches — record through Phase 9, budget-enforced
    in Phase 10
 
-On main after Phase 10: GitHub-confirmation/parity suite and benchmark budget
-gate. Dashboard publication is a separately authorized operation.
+On main after Phase 10: live GitHub parity suite and benchmark budget gate.
+GitHub confirmation remains hard-disabled and is deferred to Phase 27.
+Dashboard publication is a separately authorized operation.
 
 **Snapshotter-path coverage:** CI must force and exercise reflink and bounded
 copy workspace materialization, eager Docker preparation, and the configured

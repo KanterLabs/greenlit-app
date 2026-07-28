@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Public command-boundary canary for release-version temporary confinement."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+
+PYTHON = "/usr/bin/python3"
+ROOT = Path(__file__).resolve().parents[2]
+CHILD = r"""
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from release_provenance.common import ProvenanceError
+from release_provenance.version_execution import run_trusted_version
+try:
+    run_trusted_version(Path(sys.argv[2]), b"litci canary\n")
+except ProvenanceError as error:
+    print(f"release provenance error: {error}", file=sys.stderr)
+    raise SystemExit(1)
+"""
+
+
+class CanaryError(Exception):
+    """The public temporary-confinement command boundary failed."""
+
+
+def _write_probe(path: Path, runner_temp: Path, *, fail: bool) -> None:
+    failure = """
+home = Path(os.environ["HOME"])
+(home / "nested").mkdir()
+(home / "nested/payload").write_bytes(b"cleanup")
+(home / "outside-link").symlink_to(expected / "outside-sentinel")
+sys.stderr.write("intentional failure\\n")
+raise SystemExit(9)
+""" if fail else 'sys.stdout.write("litci canary\\n")\n'
+    source = f"""#!/usr/bin/python3
+import os
+import sys
+from pathlib import Path
+expected = Path({str(runner_temp)!r}).resolve(strict=True)
+paths = [
+    Path.cwd(),
+    Path(os.environ["HOME"]).resolve(strict=True),
+    Path(os.environ["RUNNER_TEMP"]).resolve(strict=True),
+    Path(os.environ["TMPDIR"]).resolve(strict=True),
+    Path(os.environ["TEMP"]).resolve(strict=True),
+    Path(os.environ["TMP"]).resolve(strict=True),
+    Path(os.readlink("/proc/self/fd/1")).resolve(strict=True),
+    Path(os.readlink("/proc/self/fd/2")).resolve(strict=True),
+]
+if any(expected != item and expected not in item.parents for item in paths):
+    sys.stderr.write("temporary path escaped validated RUNNER_TEMP\\n")
+    raise SystemExit(91)
+{failure}"""
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+
+
+def _snapshot(directory: Path) -> tuple[tuple[str, str], ...]:
+    result: list[tuple[str, str]] = []
+    for path in sorted(directory.rglob("*")):
+        relative = path.relative_to(directory).as_posix()
+        if path.is_symlink():
+            value = "link:" + os.readlink(path)
+        elif path.is_file():
+            value = hashlib.sha256(path.read_bytes()).hexdigest()
+        else:
+            value = "directory"
+        result.append((relative, value))
+    return tuple(result)
+
+
+def _environment(
+    runner_temp: Path | None,
+    hostile: tuple[Path, Path, Path],
+) -> dict[str, str]:
+    environment = {
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": str(hostile[0]),
+        "TEMP": str(hostile[1]),
+        "TMP": str(hostile[2]),
+    }
+    if runner_temp is not None:
+        environment["RUNNER_TEMP"] = str(runner_temp)
+    return environment
+
+
+def _invoke(
+    probe: Path,
+    runner_temp: Path | None,
+    hostile: tuple[Path, Path, Path],
+    *,
+    accepted: bool,
+) -> subprocess.CompletedProcess[bytes]:
+    result = subprocess.run(
+        [PYTHON, "-E", "-s", "-B", "-c", CHILD, str(ROOT / "tools"), str(probe)],
+        cwd=ROOT,
+        env=_environment(runner_temp, hostile),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=20,
+        check=False,
+    )
+    if accepted and (result.returncode != 0 or result.stdout or result.stderr):
+        raise CanaryError(
+            "valid private RUNNER_TEMP was rejected: "
+            + result.stderr.decode("utf-8", errors="replace").strip()
+        )
+    if not accepted and (
+        result.returncode == 0
+        or result.stdout
+        or not result.stderr.startswith(b"release provenance error:")
+    ):
+        raise CanaryError("temporary confinement did not fail closed")
+    return result
+
+
+def _directory(path: Path, mode: int) -> None:
+    path.mkdir()
+    path.chmod(mode)
+
+
+def run_canary() -> None:
+    """Exercise every temporary boundary through a fresh public process."""
+
+    previous_umask = os.umask(0o077)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="greenlit-provenance-temp-canary."
+        ) as raw_root:
+            root = Path(raw_root)
+            root.chmod(0o700)
+            hostile = tuple(
+                root / name
+                for name in ("hostile-tmpdir", "hostile-temp", "hostile-tmp")
+            )
+            for directory in hostile:
+                _directory(directory, 0o700)
+                (directory / "sentinel").write_bytes(b"unchanged")
+            before = tuple(_snapshot(directory) for directory in hostile)
+
+            runner_temp = root / "runner-temp"
+            _directory(runner_temp, 0o700)
+            success = root / "success"
+            _write_probe(success, runner_temp, fail=False)
+            _invoke(success, runner_temp, hostile, accepted=True)
+            if any(runner_temp.iterdir()):
+                raise CanaryError("successful version probe left private staging")
+
+            failure = root / "failure"
+            _write_probe(failure, runner_temp, fail=True)
+            (runner_temp / "outside-sentinel").write_bytes(b"outside")
+            outside_before = (runner_temp / "outside-sentinel").read_bytes()
+            _invoke(failure, runner_temp, hostile, accepted=False)
+            if (
+                (runner_temp / "outside-sentinel").read_bytes() != outside_before
+                or set(path.name for path in runner_temp.iterdir()) != {"outside-sentinel"}
+            ):
+                raise CanaryError("failed version probe did not clean its exact staging")
+            (runner_temp / "outside-sentinel").unlink()
+
+            symlink_target = root / "symlink-target"
+            _directory(symlink_target, 0o700)
+            symlink_parent = root / "symlink-parent"
+            symlink_parent.symlink_to(symlink_target, target_is_directory=True)
+            _invoke(success, symlink_parent, hostile, accepted=False)
+            if any(symlink_target.iterdir()):
+                raise CanaryError("symlink RUNNER_TEMP received staging")
+
+            public_parent = root / "public-parent"
+            _directory(public_parent, 0o755)
+            _invoke(success, public_parent, hostile, accepted=False)
+            if any(public_parent.iterdir()):
+                raise CanaryError("non-private RUNNER_TEMP received staging")
+
+            _invoke(success, None, hostile, accepted=False)
+            if tuple(_snapshot(directory) for directory in hostile) != before:
+                raise CanaryError("ambient temporary directories received staging")
+    finally:
+        os.umask(previous_umask)
+
+
+def main() -> int:
+    """Run the public temporary-confinement gate."""
+
+    try:
+        run_canary()
+    except (CanaryError, OSError, subprocess.TimeoutExpired) as error:
+        print(f"release provenance temp self-test failed: {error}", file=sys.stderr)
+        return 1
+    print(
+        "release provenance temp self-test passed: private descriptor-bound "
+        "RUNNER_TEMP; hostile ambient temps; symlink/mode/failure cleanup negatives"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

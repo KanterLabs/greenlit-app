@@ -5,9 +5,11 @@ name: CI
 #   2. cargo clippy --all-targets -- -D warnings
 #   3. cargo deny check
 #   4. tools/check-stubs
-#   5. cargo test --workspace
-#   6. cargo doc --workspace --no-deps (warnings denied)
-#   7. criterion benches plus the required native whole-run budget gate
+#   5. tools/check-stabilization-ledger
+#   6. tools/tests/check-portable-test-manifest --run
+#   7. cargo doc --workspace --no-deps (warnings denied)
+#   8. the manifest-authoritative Criterion gate plus the required native
+#      whole-run budget gate
 #
 # Plus the `dogfood` job below: from Phase 4 onward TESTING.md makes running
 # this repository's own gates under Greenlit itself a *required* CI step.
@@ -22,21 +24,31 @@ env:
   # created under the runner container's private /tmp are invisible to Docker.
   TMPDIR: /home/runner/_work/_temp
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   ci:
-    name: fmt, clippy, deny, stubs, test, doc, bench
+    name: portable fmt, clippy, deny, checkers, test, doc, bench
     runs-on: homelab-heavy
+    env:
+      # The host-only DinD path above is not translated into a job container.
+      TMPDIR: /tmp
     # Keep the portable gates independent of whatever happens to be installed
-    # on a runner host. Greenlit resolves this tag to an immutable digest in
-    # the RunLock, and both GitHub and local runs see the same Rust userspace.
+    # on a runner host. The exact digest is also retained in Greenlit's
+    # RunLock, so both GitHub and local runs see the same Rust userspace.
     container:
-      image: rust:1.96.0
+      image: rust:1.96.0@sha256:58fe97504a0e4cbba5d85599619a589923d3e779472a6fb0840d58d1c4ba99d7
     defaults:
       run:
         shell: bash
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       # rust-toolchain.toml pins the components and musl target used by the
       # workspace. The image already supplies the exact Rust release.
@@ -47,7 +59,7 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
       # 1. cargo fmt --check
       - name: Format check
@@ -55,11 +67,11 @@ jobs:
 
       # 2. cargo clippy --all-targets -- -D warnings
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       # 3. cargo deny check
-      - name: Install cargo-deny
-        uses: taiki-e/install-action@cargo-deny
+      - name: Install pinned cargo-deny
+        run: cargo install cargo-deny --locked --version 0.20.2
 
       - name: Dependency policy (licenses, advisories, bans, sources)
         run: cargo deny check
@@ -73,25 +85,50 @@ jobs:
           }
           python3 tools/check-stubs
 
-      # 5. cargo test --workspace (oracle + integration + invariant)
-      # Real-daemon acceptance has its own host runner below. GitHub exposes
-      # its Docker daemon inside job containers, but the locked runner image is
-      # deliberately prepared only in that dedicated acceptance job.
-      - name: Test
-        env:
-          LITCI_TEST_DISABLE_REAL_DOCKER: "1"
-        run: cargo test --workspace
+      # 5. stabilization defect and parity-exception ledgers
+      - name: Stabilization ledger consistency
+        run: |
+          python3 tools/check-stabilization-ledger
+          python3 tools/check-stabilization-ledger --self-test-negative
 
-      # 6. RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+      - name: Test authority
+        run: |
+          tools/check-test-authority
+          tools/check-test-authority --self-test-negative
+
+      - name: Capability target command manifest
+        run: |
+          tools/tests/check-portable-test-manifest
+          tools/tests/check-portable-test-manifest --self-test-negative
+          tools/tests/check-capability-test-manifest
+          tools/tests/check-capability-test-manifest --self-test-negative
+
+      - name: Parity comparator contract
+        run: |
+          /usr/bin/python3 -E -s -B \
+            tools/release_check_credential.py --self-test
+          tools/tests/check-release-transfer-bundles
+          tools/tests/check-release-provenance-temp
+          tools/compare-parity --self-test
+          tools/tests/check-parity-producer
+
+      # 6. The exact manifest-derived portable oracle, integration, and
+      # invariant targets. Capability-owned targets run in the host jobs below.
+      # Docker-dependent app targets require the `live-runtime-tests` feature
+      # and are owned by the host capability jobs below.
+      - name: Test
+        run: tools/tests/check-portable-test-manifest --run
+
+      # 7. RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - name: Docs (warnings denied)
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
 
-      # 7. Criterion microbenchmarks retain trend baselines; the
-      # provider-and-policy job below enforces whole-run Phase 10 budgets.
-      - name: Criterion benchmarks
-        run: cargo bench --workspace
+      # 8. The manifest gate lists and samples every declared Criterion name;
+      # the provider-and-policy job below owns whole-run Phase 10 budgets.
+      - name: Criterion benchmark manifest
+        run: tools/tests/check-criterion-manifest
 
   # A workflow job container intentionally cannot receive the host Docker
   # socket. Keep the real-daemon acceptance on the heavy runner, while the
@@ -102,13 +139,48 @@ jobs:
     runs-on: homelab-heavy
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Provision pinned Rust toolchain
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Require native Docker capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          docker info >/dev/null
+
+      - name: Provision privileged copy-strategy prerequisites
+        run: |
+          command -v python3 >/dev/null
+          missing_packages=()
+          command -v mkfs.btrfs >/dev/null || missing_packages+=(btrfs-progs)
+          if ! command -v losetup >/dev/null \
+            || ! command -v mount >/dev/null \
+            || ! command -v umount >/dev/null; then
+            missing_packages+=(util-linux)
+          fi
+          if ((${#missing_packages[@]})); then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+          fi
+          command -v mkfs.btrfs >/dev/null
+          command -v losetup >/dev/null
+          command -v mount >/dev/null
+          command -v umount >/dev/null
+
+      - name: Reflink and bounded-stream copy strategies
+        run: |
+          cargo build --locked -p greenlit-init
+          sudo --preserve-env=PATH \
+            tools/tests/check-greenlit-init-copy-strategies \
+            target/debug/greenlit-init
 
       # The real-daemon executor tests begin at the post-RunLock boundary.
       # Provision the exact locked profile up front: once execution begins,
@@ -117,16 +189,65 @@ jobs:
         run: docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
 
       - name: Run real-daemon executor tests
+        run: tools/tests/check-capability-test-manifest --run-owner docker-runtime
+
+  credential-capability:
+    name: isolated persistent-keyring acceptance
+    needs: ci
+    runs-on: homelab-heavy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Provision isolated keyring prerequisites
         run: |
-          cargo test -p greenlit-runtime \
-            --test actions_composite \
-            --test actions_docker \
-            --test actions_nodejs \
-            --test base_image \
-            --test engine_surface \
-            --test isolation \
-            --test isolation_overlay \
-            --test shell_ci_smoke
+          test "$(uname -s)" = Linux
+          command -v unshare >/dev/null
+          if ! command -v keyctl >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends keyutils
+          fi
+          command -v keyctl >/dev/null
+
+      - name: Run production persistent-keyring acceptance
+        run: tools/test-credential-capability
+
+  host-deep-path:
+    name: native beyond-PATH_MAX filesystem invariant
+    needs: ci
+    runs-on: homelab-heavy
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Require native writable tmpfs
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          test -d /dev/shm
+          test -w /dev/shm
+          test "$(stat -f -c %T /dev/shm)" = tmpfs
+
+      - name: Run manifest-owned beyond-PATH_MAX invariant
+        run: tools/tests/check-capability-test-manifest --run-owner host-deep-path
 
   # TESTING.md snapshotter-path coverage forbids capability self-skips. This
   # job provisions a real, isolated containerd/stargz stack and runs the direct
@@ -137,26 +258,249 @@ jobs:
     runs-on: homelab-heavy
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Provision pinned Rust toolchain
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+
+      - name: Require native Docker capability
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          docker info >/dev/null
 
       - name: Direct containerd/stargz provider
         run: tools/test-stargz-provider
 
-      - name: Clean and hermetic policy modes
-        env:
-          LITCI_TEST_LIVE_FULL_CI: "1"
-        run: cargo test -p greenlit-app --test cli_behavior policy_modes -- --nocapture
+      - name: Clean, hermetic, and native performance policy
+        run: tools/tests/check-capability-test-manifest --run-owner docker-policy
 
-      - name: Enforced native warm performance budgets
+  live_parity_local:
+    name: tokenless same-SHA oracle and Greenlit evidence
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/stabilization/'))
+    needs: ci
+    runs-on: homelab-heavy
+    outputs:
+      local_sha256: ${{ steps.local_digest.outputs.sha256 }}
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare branch-backed source identity
+        run: |
+          ! /usr/bin/git config --local --get-regexp \
+            '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+            >/dev/null 2>&1
+          git switch -C greenlit-live-local "$GITHUB_SHA"
+
+      - name: Provision pinned Rust toolchain
+        run: rustup show
+
+      - name: Require live parity capabilities
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          command -v python3 >/dev/null
+          docker info >/dev/null
+          docker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16
+
+      - name: Build exact release binary outside the checkout
         env:
-          LITCI_TEST_PERFORMANCE: "1"
-        run: cargo test -p greenlit-app --test performance_budgets -- --nocapture
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
+          test ! -e "$parity_target"
+          install -d -m 0700 "$parity_target"
+          CARGO_TARGET_DIR="$parity_target" \
+            cargo build --locked --release -p greenlit-app --bin litci
+
+      - name: Produce tokenless local evidence
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          parity_target="${RUNNER_TEMP}/greenlit-parity-release-target"
+          parity_output="${RUNNER_TEMP}/greenlit-live-local"
+          test ! -e "$parity_output"
+          install -d -m 0700 "$parity_output"
+          tools/check-live-parity local \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --greenlit-binary "$parity_target/release/litci" \
+            --output-root "$parity_output"
+
+      - name: Seal local evidence and binary
+        id: local_digest
+        run: |
+          set -euo pipefail
+          bundle="$GITHUB_WORKSPACE/target/ci-live-local.tar"
+          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          digest="$(
+            /usr/bin/python3 -E -s -B \
+              tools/release_check_credential_bundle.py pack-local \
+              --input-root "$RUNNER_TEMP/greenlit-live-local" \
+              --greenlit-binary \
+                "$RUNNER_TEMP/greenlit-parity-release-target/release/litci" \
+              --output "$bundle" \
+              --expected-source "$GITHUB_SHA"
+          )"
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact local evidence bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-ci-live-local
+          path: target/ci-live-local.tar
+          if-no-files-found: error
+
+  live_parity_github:
+    name: credential-only same-SHA GitHub observation
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/stabilization/'))
+    needs: ci
+    runs-on: homelab
+    outputs:
+      github_sha256: ${{ steps.github_digest.outputs.sha256 }}
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare credential-only boundary
+        run: |
+          ! /usr/bin/git config --local --get-regexp \
+            '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+            >/dev/null 2>&1
+          git switch -C greenlit-live-github "$GITHUB_SHA"
+          command -v /usr/bin/python3 >/dev/null
+          command -v /usr/bin/gh >/dev/null
+          output="$RUNNER_TEMP/greenlit-live-github"
+          test ! -e "$output"
+          install -d -m 0700 "$output"
+          /usr/bin/python3 -E -s -B \
+            tools/release_check_credential.py --self-test
+
+      - name: Collect GitHub evidence with no candidate present
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: >-
+          exec /usr/bin/python3 -E -s -B
+          tools/check-live-parity github
+          --repository-root "$GITHUB_WORKSPACE"
+          --output-root "$RUNNER_TEMP/greenlit-live-github"
+
+      - name: Seal GitHub evidence
+        id: github_digest
+        run: |
+          set -euo pipefail
+          bundle="$GITHUB_WORKSPACE/target/ci-live-github.tar"
+          install -d -m 0700 "$GITHUB_WORKSPACE/target"
+          digest="$(
+            /usr/bin/python3 -E -s -B \
+              tools/release_check_credential_bundle.py pack-github \
+              --input-root "$RUNNER_TEMP/greenlit-live-github" \
+              --output "$bundle" \
+              --expected-source "$GITHUB_SHA"
+          )"
+          printf 'sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact GitHub evidence bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-ci-live-github
+          path: target/ci-live-github.tar
+          if-no-files-found: error
+
+  live_parity_compare:
+    name: tokenless same-SHA parity comparison
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/heads/stabilization/'))
+    needs:
+      - live_parity_local
+      - live_parity_github
+    runs-on: homelab-heavy
+    steps:
+      - name: Check out exact source without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare exact comparison source
+        run: |
+          ! /usr/bin/git config --local --get-regexp \
+            '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+            >/dev/null 2>&1
+          git switch -C greenlit-live-compare "$GITHUB_SHA"
+
+      - name: Download local evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-ci-live-local
+          path: ${{ runner.temp }}/greenlit-ci-live-local
+
+      - name: Download GitHub evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: greenlit-ci-live-github
+          path: ${{ runner.temp }}/greenlit-ci-live-github
+
+      - name: Verify, merge, and compare exact evidence
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          local_bundle="$RUNNER_TEMP/greenlit-ci-live-local/ci-live-local.tar"
+          github_bundle="$RUNNER_TEMP/greenlit-ci-live-github/ci-live-github.tar"
+          local_root="$RUNNER_TEMP/greenlit-ci-live-local-unpacked"
+          github_root="$RUNNER_TEMP/greenlit-ci-live-github-unpacked"
+          output="$RUNNER_TEMP/greenlit-live-parity"
+          chmod 0600 "$local_bundle" "$github_bundle"
+          /usr/bin/python3 -E -s -B \
+            tools/release_check_credential_bundle.py unpack-local \
+            --bundle "$local_bundle" \
+            --output-root "$local_root" \
+            --expected-sha256 "${{ needs.live_parity_local.outputs.local_sha256 }}" \
+            --expected-source "$GITHUB_SHA"
+          /usr/bin/python3 -E -s -B \
+            tools/release_check_credential_bundle.py unpack-github \
+            --bundle "$github_bundle" \
+            --output-root "$github_root" \
+            --expected-sha256 "${{ needs.live_parity_github.outputs.github_sha256 }}" \
+            --expected-source "$GITHUB_SHA"
+          mv "$local_root/parity" "$output"
+          mv "$github_root/parity/seed-github-actions.json" "$output/"
+          mv \
+            "$github_root/parity/captures/shell-only-seed-github-actions.json" \
+            "$output/captures/"
+          tools/check-live-parity compare \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --greenlit-binary "$local_root/binary/litci" \
+            --output-root "$output"
+
+      - name: Upload exact compared live parity evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: greenlit-live-parity
+          path: ${{ runner.temp }}/greenlit-live-parity/
+          if-no-files-found: error
 
   # TESTING.md "Dogfood clause": "from Phase 2 onward this repo's own workflow
   # must run green under Greenlit itself, and that run is a required CI step
@@ -168,11 +512,18 @@ jobs:
   # intentionally not inferred to contain GitHub-hosted runner toolcache
   # contents such as rustup.
   dogfood:
-    name: this repo's own gates, under litci
+    name: two release-built degraded dogfood runs
+    needs:
+      - provider-and-policy
+      - credential-capability
+      - host-deep-path
     runs-on: homelab-heavy
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       # Pull-request checkouts are detached merge commits. A synthetic manual
       # dispatch still has a selected ref, so give that exact SHA a local
@@ -184,15 +535,17 @@ jobs:
         run: rustup show
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
 
       - name: Build litci
-        run: cargo build --release -p greenlit-app
+        env:
+          GREENLIT_BUILD_COMMIT: ${{ github.sha }}
+        run: cargo build --locked --release -p greenlit-app
 
-      # A separate target dir keeps the inner run's build off the outer one:
-      # the host repo's `target/` is in the read-only lower layer, and
-      # building over it fights stale fingerprints.
-      - name: Run repository gates under Greenlit
+      # Each invocation gets a fresh host evidence home. The inner workflow
+      # runs the complete portable TESTING.md pipeline, while its target dir
+      # stays off the read-only source lower layer.
+      - name: Run and verify repository gates under Greenlit twice
         env:
           CARGO_TARGET_DIR: /tmp/dogfood-target
-        run: ./target/release/litci run -W .github/workflows/dogfood.yml -e workflow_dispatch --no-input
+        run: tools/check-release-dogfood target/release/litci

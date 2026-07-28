@@ -11,8 +11,7 @@ const LARGE_RECORD_PADDING_BYTES: usize = 6 * 1024 * 1024;
 fn stats_reads_only_the_retained_tail_and_caps_aggregate_record_bytes() {
     let sparse = Sandbox::new();
     let path = sparse.metrics_file();
-    std::fs::create_dir_all(path.parent().expect("metrics parent"))
-        .expect("create metrics directory");
+    write_metrics(&sparse, []);
     let mut file = File::create(&path).expect("create sparse metrics history");
     file.write_all(b"old-corruption\n")
         .expect("write old corrupt record");
@@ -42,8 +41,7 @@ fn stats_reads_only_the_retained_tail_and_caps_aggregate_record_bytes() {
     // fields let the fixture stay large without making renderer output large.
     let aggregate = Sandbox::new();
     let path = aggregate.metrics_file();
-    std::fs::create_dir_all(path.parent().expect("metrics parent"))
-        .expect("create metrics directory");
+    write_metrics(&aggregate, []);
     let mut file = File::create(path).expect("create large metrics history");
     for started_at in 1..=3 {
         write_padded_record(&mut file, started_at, LARGE_RECORD_PADDING_BYTES);

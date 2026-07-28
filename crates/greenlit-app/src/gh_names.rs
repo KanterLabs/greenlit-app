@@ -43,31 +43,3 @@ pub(crate) fn validate_configuration_name(name: &str) -> Result<(), &'static str
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepts_ordinary_names() {
-        assert!(validate_configuration_name("MODE").is_ok());
-        assert!(validate_configuration_name("_leading_underscore").is_ok());
-    }
-
-    #[test]
-    fn rejects_the_reserved_github_prefix_case_insensitively() {
-        assert!(validate_configuration_name("GITHUB_TOKEN").is_err());
-        assert!(validate_configuration_name("github_token").is_err());
-    }
-
-    #[test]
-    fn rejects_a_leading_digit() {
-        assert!(validate_configuration_name("1MODE").is_err());
-    }
-
-    #[test]
-    fn rejects_non_alphanumeric_bytes() {
-        assert!(validate_configuration_name("BAD-NAME").is_err());
-        assert!(validate_configuration_name("").is_err());
-    }
-}

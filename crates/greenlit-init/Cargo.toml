@@ -9,22 +9,19 @@ publish = false
 
 [lib]
 name = "greenlit_init"
-path = "src/lib.rs"
+path = "../greenlit-runtime/embedded-init/src/lib.rs"
 
 [[bin]]
 name = "greenlit-init"
-path = "src/main.rs"
+path = "../greenlit-runtime/embedded-init/src/main.rs"
 
 [dependencies]
 # The kernel `mount(2)` surface this helper wraps. `libc` links cleanly against
 # musl, keeping the embedded binary static and dependency-free (see the
-# embedding contract in `src/lib.rs`).
+# embedding contract in
+# `../greenlit-runtime/embedded-init/src/lib.rs`).
 libc = "0.2.187"
 thiserror = "2.0.19"
 # Safe FICLONE wrapper for reflink-first workspace materialization. This is
 # already pinned by the workspace and keeps ioctl unsafety out of this module.
 rustix = { version = "1.1.4", features = ["fs"] }
-
-[dev-dependencies]
-# Status-file and copy-progress tests write into isolated temp directories.
-tempfile = "3.27.0"

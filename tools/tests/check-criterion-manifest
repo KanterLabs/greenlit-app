@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Run every declared Criterion target and enforce its fixed-host budget.
+
+The schema-v2 ceilings are rounded to roughly 2.3--2.7 times the conservative
+Criterion slope upper bounds measured on the pinned Linux x86_64 benchmark
+host. That margin absorbs ordinary host noise while still rejecting a material
+micro-benchmark regression.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+
+sys.dont_write_bytecode = True
+
+from criterion_budget_gate import (
+    GateError,
+    Observation,
+    enforce_budgets,
+    listed_names,
+    load_manifest,
+    load_measurements,
+    parse_json,
+)
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MANIFEST = Path(__file__).with_name("criterion-manifest.json")
+FAILURE_CANARY_ARGUMENT = "--budget-failure-canary"
+
+
+def declared_bench_targets() -> set[tuple[str, str]]:
+    command = [
+        "cargo",
+        "metadata",
+        "--locked",
+        "--no-deps",
+        "--format-version",
+        "1",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise GateError(
+            f"could not execute {' '.join(command)}: {error}"
+        ) from error
+    if completed.returncode != 0:
+        details = "\n".join(
+            part for part in (completed.stdout.strip(), completed.stderr.strip()) if part
+        )
+        suffix = f"\n{details}" if details else ""
+        raise GateError(
+            f"Cargo metadata exited {completed.returncode}{suffix}"
+        )
+    metadata = parse_json(completed.stdout, "Cargo metadata")
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("packages"), list):
+        raise GateError("Cargo metadata omitted its packages array")
+
+    declared: set[tuple[str, str]] = set()
+    for package in metadata["packages"]:
+        if not isinstance(package, dict):
+            raise GateError("Cargo metadata contains a malformed package")
+        package_name = package.get("name")
+        targets = package.get("targets")
+        if not isinstance(package_name, str) or not isinstance(targets, list):
+            raise GateError("Cargo metadata contains a malformed package identity")
+        for target in targets:
+            if not isinstance(target, dict):
+                raise GateError(
+                    f"Cargo metadata contains a malformed target in {package_name}"
+                )
+            target_name = target.get("name")
+            kinds = target.get("kind")
+            if not isinstance(target_name, str) or not isinstance(kinds, list):
+                raise GateError(
+                    f"Cargo metadata contains a malformed target in {package_name}"
+                )
+            if "bench" in kinds:
+                declared.add((package_name, target_name))
+    if not declared:
+        raise GateError("Cargo metadata declares no benchmark targets")
+    return declared
+
+
+def run_cargo(
+    package: str,
+    target: str,
+    criterion_home: Path,
+    arguments: list[str],
+) -> str:
+    command = [
+        "cargo",
+        "bench",
+        "--locked",
+        "-p",
+        package,
+        "--bench",
+        target,
+        "--",
+        *arguments,
+    ]
+    environment = os.environ.copy()
+    environment["CRITERION_HOME"] = str(criterion_home)
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise GateError(
+            f"could not execute {' '.join(command)}: {error}"
+        ) from error
+    if completed.returncode != 0:
+        details = "\n".join(
+            part for part in (completed.stdout.strip(), completed.stderr.strip()) if part
+        )
+        suffix = f"\n{details}" if details else ""
+        raise GateError(
+            f"Criterion target {package}/{target} exited "
+            f"{completed.returncode}{suffix}"
+        )
+    return completed.stdout
+
+
+def check_target(
+    package: str,
+    target: str,
+    entries: list[dict[str, Any]],
+    criterion_home: Path,
+) -> tuple[int, list[Observation]]:
+    expected_names = {entry["name"] for entry in entries}
+    sample_counts = {entry["samples"] for entry in entries}
+    if len(sample_counts) != 1:
+        raise GateError(
+            f"{package}/{target}: every benchmark must declare the same sample count"
+        )
+    sample_count = sample_counts.pop()
+
+    output = run_cargo(
+        package,
+        target,
+        criterion_home,
+        ["--list", "--format", "terse"],
+    )
+    names = listed_names(output)
+    if len(names) != len(set(names)):
+        raise GateError(f"{package}/{target}: Criterion listed duplicate names")
+    actual_names = set(names)
+    if actual_names != expected_names:
+        raise GateError(
+            f"{package}/{target}: listed benchmarks differ from manifest; "
+            f"missing={sorted(expected_names - actual_names)!r}, "
+            f"unexpected={sorted(actual_names - expected_names)!r}"
+        )
+
+    run_cargo(
+        package,
+        target,
+        criterion_home,
+        [
+            "--sample-size",
+            str(sample_count),
+            "--warm-up-time",
+            "0.01",
+            "--measurement-time",
+            "0.05",
+            "--noplot",
+            "--quiet",
+        ],
+    )
+    measurements = load_measurements(criterion_home)
+    return enforce_budgets(
+        package,
+        target,
+        entries,
+        sample_count,
+        measurements,
+    )
+
+
+def run_budget_failure_canary(entry: dict[str, Any]) -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), FAILURE_CANARY_ARGUMENT]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as error:
+        raise GateError(
+            f"could not execute budget failure canary: {error}"
+        ) from error
+    expected_identity = (
+        f"{entry['package']}/{entry['target']}/{entry['name']}: "
+        "Criterion slope upper confidence bound"
+    )
+    if (
+        completed.returncode != 1
+        or expected_identity not in completed.stderr
+        or "exceeds the fixed-host budget" not in completed.stderr
+    ):
+        details = "\n".join(
+            part for part in (completed.stdout.strip(), completed.stderr.strip()) if part
+        )
+        suffix = f"\n{details}" if details else ""
+        raise GateError(
+            "public command-boundary budget failure canary did not reject "
+            f"{expected_identity!r}{suffix}"
+        )
+
+
+def main() -> int:
+    arguments = sys.argv[1:]
+    if arguments not in ([], [FAILURE_CANARY_ARGUMENT]):
+        print(
+            f"usage: {Path(sys.argv[0]).name} [{FAILURE_CANARY_ARGUMENT}]",
+            file=sys.stderr,
+        )
+        return 2
+    failure_canary = bool(arguments)
+    try:
+        entries = load_manifest(MANIFEST)
+        if failure_canary:
+            entries[0]["max_time_ns"] = 1
+        by_target: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for entry in entries:
+            by_target[(entry["package"], entry["target"])].append(entry)
+        manifest_targets = set(by_target)
+        cargo_targets = declared_bench_targets()
+        if manifest_targets != cargo_targets:
+            raise GateError(
+                "benchmark targets differ from Cargo metadata; "
+                f"missing={sorted(cargo_targets - manifest_targets)!r}, "
+                f"unexpected={sorted(manifest_targets - cargo_targets)!r}"
+            )
+
+        total_samples = 0
+        observations: list[Observation] = []
+        with tempfile.TemporaryDirectory(prefix="greenlit-criterion-gate-") as directory:
+            root = Path(directory)
+            for index, ((package, target), target_entries) in enumerate(
+                sorted(by_target.items())
+            ):
+                criterion_home = root / str(index)
+                criterion_home.mkdir()
+                target_samples, target_observations = check_target(
+                    package,
+                    target,
+                    target_entries,
+                    criterion_home,
+                )
+                total_samples += target_samples
+                observations.extend(target_observations)
+    except GateError as error:
+        print(f"benchmark manifest gate failed: {error}", file=sys.stderr)
+        return 1
+
+    if failure_canary:
+        print(
+            "benchmark manifest gate failed: over-budget canary unexpectedly passed",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        run_budget_failure_canary(entries[0])
+    except GateError as error:
+        print(f"benchmark manifest gate failed: {error}", file=sys.stderr)
+        return 1
+
+    print("Criterion slope upper confidence bounds / fixed-host budgets:")
+    for package, target, name, upper_bound, budget in observations:
+        print(
+            f"  {package}/{target}/{name}: "
+            f"{upper_bound:.2f} / {budget:.2f} ns"
+        )
+    print(
+        f"benchmark manifest gate passed: {len(entries)} names, "
+        f"{total_samples} samples, all latency budgets met, "
+        "over-budget command canary rejected"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

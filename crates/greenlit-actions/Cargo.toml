@@ -95,10 +95,3 @@ flate2 = "1.1.9"
 # extraction can be validated (path traversal, symlink escape, size bound)
 # before any file lands on disk.
 tar = { version = "0.4.46", default-features = false }
-
-[dev-dependencies]
-# Store and parser tests run against isolated temp directories.
-tempfile = "3.27.0"
-# Drives the async `RefResolver`/`ActionFetcher` trait surface in tests
-# without a real container/async-app runtime around them.
-tokio = { version = "1.48.0", features = ["rt", "macros", "time"] }

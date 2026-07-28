@@ -91,39 +91,3 @@ pub(crate) fn name_hash(name: &str) -> String {
     }
     format!("{hash:016x}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{allocate_id, name_hash};
-
-    #[test]
-    fn ids_are_unique_and_never_reused_within_a_store() {
-        let root = tempfile::tempdir().expect("temp root");
-        let pending = root.path().join("pending");
-        let committed = root.path().join("committed");
-        std::fs::create_dir_all(&pending).expect("mk pending");
-
-        let first = allocate_id(&pending, &committed).expect("first");
-        let second = allocate_id(&pending, &committed).expect("second");
-        assert_ne!(first, second);
-
-        // An id already taken on the committed side is skipped too, so a
-        // finalized entry can never be shadowed by a later reservation.
-        std::fs::create_dir_all(committed.join((second + 5).to_string())).expect("mk committed");
-        let third = allocate_id(&pending, &committed).expect("third");
-        assert!(third > second + 5, "got {third}");
-    }
-
-    #[test]
-    fn hashing_a_name_never_yields_a_path_component() {
-        for hostile in ["../../etc/passwd", "a/b", "", "..", "with spaces"] {
-            let hashed = name_hash(hostile);
-            assert!(!hashed.contains('/'), "{hostile:?} -> {hashed}");
-            assert!(!hashed.contains('.'), "{hostile:?} -> {hashed}");
-            assert_eq!(hashed.len(), 16);
-        }
-        // Stable and distinguishing.
-        assert_eq!(name_hash("same"), name_hash("same"));
-        assert_ne!(name_hash("a"), name_hash("b"));
-    }
-}

@@ -11,10 +11,7 @@ use crate::sha::CommitSha;
 ///
 /// Implementations perform real I/O (a tarball download, a `git clone`);
 /// [`crate::store::ActionStore::ensure_fetched`] drives this trait rather
-/// than owning the fetch strategy itself, so tests can inject a fake that
-/// writes a few files directly, exercising the store's presence-check/
-/// atomic-install/hit-miss-counting logic without any network or `git`
-/// process at all.
+/// than owning either external fetch strategy.
 #[async_trait]
 pub trait ActionFetcher: Send + Sync {
     /// Fetches `owner/repo` at `sha` into `dest`, which

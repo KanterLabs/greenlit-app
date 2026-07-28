@@ -121,15 +121,20 @@ pub(super) async fn resolve_image(
                 identity.matrix_index,
                 profile.image,
             )?;
-            if !shared.engine.image_exists(&tag).await? {
-                return Err(ExecError::Infrastructure {
-                    message: format!(
-                        "locked runner profile '{tag}' disappeared before job startup"
-                    ),
-                    fix: "retry to prepare the exact runner profile again; do not prune Docker images during an active run"
-                        .to_string(),
-                });
+            async {
+                if !shared.engine.image_exists(&tag).await? {
+                    return Err(ExecError::Infrastructure {
+                        message: format!(
+                            "locked runner profile '{tag}' disappeared before job startup"
+                        ),
+                        fix: "retry to prepare the exact runner profile again; do not prune Docker images during an active run"
+                            .to_string(),
+                    });
+                }
+                Ok::<_, ExecError>(())
             }
+            .instrument(stage_span("image-ensure"))
+            .await?;
             Ok(ResolvedImage {
                 tag,
                 in_container: false,

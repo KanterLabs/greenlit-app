@@ -2,16 +2,19 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MAX_PATHS: usize = 1_000_000;
-const MAX_PATH_BYTES: usize = 64 * 1024;
+mod git;
+mod remote;
+
+use git::{clone_git_metadata, git_paths, git_status, git_text};
+
 const CAPTURE_ATTEMPTS: usize = 3;
+const MAX_PATH_BYTES: usize = 64 * 1024;
 
 /// Type of one canonical source-tree entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +95,12 @@ pub enum SourceSnapshotError {
         /// Maximum accepted path count.
         limit: usize,
     },
+    /// The configured origin cannot be retained without risking credential
+    /// persistence or changing an ambiguous transport into another identity.
+    #[error(
+        "could not freeze repository source because remote.origin.url is credential-bearing or uses an ambiguous transport"
+    )]
+    UnsafeRemote,
 }
 
 impl SourceSnapshot {
@@ -215,37 +224,6 @@ fn capture_once(
     })
 }
 
-fn clone_git_metadata(repo_root: &Path, destination: &Path) -> Result<(), SourceSnapshotError> {
-    let original_origin = git_optional_text(repo_root, &["config", "--get", "remote.origin.url"])?;
-    let output = Command::new("git")
-        .args([
-            "clone",
-            "--no-hardlinks",
-            "--no-checkout",
-            "--no-tags",
-            "--quiet",
-        ])
-        .arg(repo_root)
-        .arg(destination)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| git_error(&["clone"], error.to_string()))?;
-    if output.status.success() {
-        if let Some(origin) = original_origin {
-            git_output(destination, &["remote", "set-url", "origin", &origin])?;
-        }
-        Ok(())
-    } else {
-        Err(git_error(
-            &["clone"],
-            bounded_stderr(&output.stderr, output.status.to_string()),
-        ))
-    }
-}
-
 fn copy_and_hash(
     repo_root: &Path,
     destination: &Path,
@@ -264,25 +242,26 @@ fn copy_and_hash(
             let link_target = fs::read_link(&source).map_err(|error| io_error(&source, error))?;
             let bytes = link_target.as_os_str().as_encoded_bytes();
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+                create_private_dir_all(parent)?;
             }
             symlink(&link_target, &target).map_err(|error| io_error(&target, error))?;
             entries.push(entry(relative, SourceEntryKind::Symlink, 0o120000, bytes));
         } else if metadata.is_file() {
             if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+                create_private_dir_all(parent)?;
             }
             let mut input = File::open(&source).map_err(|error| io_error(&source, error))?;
-            let mut output = create_new_file(&target)?;
+            let mut output = create_private_file(&target)?;
             let (digest, size) = copy_hash(&mut input, &mut output, &source)?;
-            let executable = metadata.mode() & 0o111 != 0;
-            let mode = if executable { 0o100755 } else { 0o100644 };
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o777))
-                .map_err(|error| io_error(&target, error))?;
+            let manifest_mode = if metadata.mode() & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            };
             entries.push(SourceEntry {
                 path: relative.clone(),
                 kind: SourceEntryKind::File,
-                mode,
+                mode: manifest_mode,
                 digest,
                 size,
             });
@@ -389,101 +368,18 @@ fn hash_reader(input: &mut File, source: &Path) -> Result<(String, u64), SourceS
     Ok((format!("sha256:{}", hex_digest(&hasher.finalize())), size))
 }
 
-fn git_text(repo_root: &Path, args: &[&str]) -> Result<String, SourceSnapshotError> {
-    let output = git_output(repo_root, args)?;
-    String::from_utf8(output)
-        .map(|value| value.trim().to_string())
-        .map_err(|error| git_error(args, format!("stdout was not UTF-8: {error}")))
+fn create_private_dir_all(path: &Path) -> Result<(), SourceSnapshotError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(path).map_err(|error| io_error(path, error))
 }
 
-fn git_optional_text(
-    repo_root: &Path,
-    args: &[&str],
-) -> Result<Option<String>, SourceSnapshotError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| git_error(args, error.to_string()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| {
-            let trimmed = value.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .map_err(|error| git_error(args, format!("stdout was not UTF-8: {error}")))
-}
-
-fn git_status(repo_root: &Path) -> Result<Vec<u8>, SourceSnapshotError> {
-    git_output(
-        repo_root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )
-}
-
-fn git_paths(repo_root: &Path, args: &[&str]) -> Result<Vec<String>, SourceSnapshotError> {
-    let bytes = git_output(repo_root, args)?;
-    let mut paths = Vec::new();
-    for raw in bytes
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-    {
-        if paths.len() == MAX_PATHS {
-            return Err(SourceSnapshotError::PathLimit { limit: MAX_PATHS });
-        }
-        if raw.len() > MAX_PATH_BYTES {
-            return Err(SourceSnapshotError::Io {
-                path: repo_root.display().to_string(),
-                message: format!("one source path exceeds {MAX_PATH_BYTES} bytes"),
-            });
-        }
-        let path = std::str::from_utf8(raw).map_err(|_| SourceSnapshotError::NonUtf8Path)?;
-        if path == ".litci" || path.starts_with(".litci/") {
-            continue;
-        }
-        paths.push(path.to_string());
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-
-fn git_output(repo_root: &Path, args: &[&str]) -> Result<Vec<u8>, SourceSnapshotError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never")
-        .env("GIT_PAGER", "cat")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| git_error(args, error.to_string()))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(git_error(
-            args,
-            bounded_stderr(&output.stderr, output.status.to_string()),
-        ))
-    }
-}
-
-fn create_new_file(path: &Path) -> Result<File, SourceSnapshotError> {
+fn create_private_file(path: &Path) -> Result<File, SourceSnapshotError> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|error| io_error(path, error))
 }
@@ -493,19 +389,6 @@ fn remove_exact_tree_if_present(path: &Path) -> Result<(), SourceSnapshotError> 
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io_error(path, error)),
-    }
-}
-
-fn bounded_stderr(stderr: &[u8], fallback: String) -> String {
-    let retained = &stderr[..stderr.len().min(64 * 1024)];
-    let text = String::from_utf8_lossy(retained).trim().to_string();
-    if text.is_empty() { fallback } else { text }
-}
-
-fn git_error(args: &[&str], message: String) -> SourceSnapshotError {
-    SourceSnapshotError::Git {
-        args: args.join(" "),
-        message,
     }
 }
 

@@ -21,3 +21,4 @@ __pycache__/
 !PHASE-*.md
 !docs/STABILIZATION-*.md
 !docs/PARITY-EXCEPTIONS.md
+!docs/parity/*.md

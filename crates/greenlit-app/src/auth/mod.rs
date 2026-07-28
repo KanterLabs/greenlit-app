@@ -12,15 +12,10 @@
 mod device_flow;
 mod gh_cli;
 mod pat;
-mod permission_notice;
 mod refresh;
 mod token_store;
 
-pub(crate) use permission_notice::token_permission_notice;
-
 use std::path::PathBuf;
-
-use greenlit_expr::Value;
 
 use token_store::{StoredToken, TokenSource};
 
@@ -30,29 +25,76 @@ use token_store::{StoredToken, TokenSource};
 /// `Iv23liyZuAdn5DSMxtyh`").
 pub(crate) const GITHUB_APP_CLIENT_ID: &str = "Iv23liyZuAdn5DSMxtyh";
 
-/// Internal test-only override: forces every credential-store access in
-/// this process to skip the kernel keyring, using only the `0600` file
-/// fallback. See `crate::auth::token_store`'s module doc comment for why —
-/// the kernel keyring is scoped to the real test-runner process UID, not to
-/// the sandboxed `$HOME` the integration tests otherwise isolate everything
-/// through, so exercising it for real from an automated test would read or
-/// write the *actual* developer/CI account's persistent keyring. Not a
-/// documented user-facing flag.
+/// Internal test-boundary override: forces every credential-store access in
+/// this process to report the kernel keyring as unavailable. This constant
+/// and its reader do not exist in ordinary or release builds.
+#[cfg(litci_test_boundaries)]
 const TEST_NO_KEYRING_ENV: &str = "LITCI_TEST_NO_KEYRING";
 
-/// Internal test-only override for the device-flow/token-exchange base URL
-/// (`https://github.com` in production). Lets the compiled-binary
-/// integration tests point `litci auth` at a loopback fake without any
-/// production configuration surface.
+/// Internal test-boundary override used only by the credential capability
+/// target. The capability retains the production keyring syscalls while
+/// isolating fake credentials under a non-production description.
+#[cfg(litci_test_boundaries)]
+const TEST_KEYRING_DESCRIPTION_ENV: &str = "LITCI_TEST_KEYRING_DESCRIPTION";
+
+/// Internal test-boundary override for the OAuth base URL. Ordinary and
+/// release builds are immutably bound to GitHub.
+#[cfg(litci_test_boundaries)]
 const TEST_OAUTH_BASE_URL_ENV: &str = "LITCI_TEST_GITHUB_OAUTH_BASE_URL";
 
+#[cfg(litci_test_boundaries)]
 fn allow_keyring() -> bool {
     std::env::var_os(TEST_NO_KEYRING_ENV).is_none()
 }
 
+#[cfg(not(litci_test_boundaries))]
+fn allow_keyring() -> bool {
+    true
+}
+
+#[cfg(litci_test_boundaries)]
+fn keyring_description() -> Result<String, String> {
+    if !allow_keyring() {
+        return Ok("litci-test:disabled".to_string());
+    }
+
+    let raw = std::env::var_os(TEST_KEYRING_DESCRIPTION_ENV).ok_or_else(|| {
+        "the credential test boundary enabled keyring access without a unique key description"
+            .to_string()
+    })?;
+    let value = raw.into_string().map_err(|_| {
+        "the internal credential-test key description is not valid UTF-8".to_string()
+    })?;
+    let valid = value
+        .strip_prefix("litci-test:")
+        .is_some_and(|suffix| !suffix.is_empty())
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte));
+    if !valid {
+        return Err(
+            "the internal credential-test key description is invalid; expected a unique `litci-test:` name"
+                .to_string(),
+        );
+    }
+    Ok(value)
+}
+
+#[cfg(not(litci_test_boundaries))]
+fn keyring_description() -> Result<String, String> {
+    Ok(token_store::DEFAULT_KEYRING_DESCRIPTION.to_string())
+}
+
+#[cfg(litci_test_boundaries)]
 fn oauth_base_url() -> String {
     std::env::var(TEST_OAUTH_BASE_URL_ENV)
         .unwrap_or_else(|_| device_flow::DEFAULT_OAUTH_BASE_URL.to_string())
+}
+
+#[cfg(not(litci_test_boundaries))]
+fn oauth_base_url() -> String {
+    device_flow::DEFAULT_OAUTH_BASE_URL.to_string()
 }
 
 /// Resolves the user-local state directory (`~/.litci`'s parent, i.e.
@@ -86,7 +128,8 @@ fn home_dir() -> Result<PathBuf, String> {
 /// which backend it came from or whether a refresh just happened.
 pub(crate) fn current_token() -> Result<Option<String>, String> {
     let home = home_dir()?;
-    let Some(stored) = token_store::load(&home, allow_keyring()) else {
+    let description = keyring_description()?;
+    let Some(stored) = token_store::load(&home, allow_keyring(), &description) else {
         return Ok(None);
     };
     let needs_refresh = stored
@@ -119,49 +162,16 @@ pub(crate) fn current_token() -> Result<Option<String>, String> {
                 )),
                 source: TokenSource::DeviceFlow,
             };
-            let _ = token_store::save(&home, &updated, allow_keyring());
+            token_store::save(&home, &updated, allow_keyring(), &description).map_err(|error| {
+                format!(
+                    "could not persist the refreshed GitHub credential: {error}\n  fix: run `litci auth` again"
+                )
+            })?;
             Ok(Some(refreshed.access_token))
         }
         // A refresh failure means re-authentication is required; the stale
         // access token is not returned since it is already known-expired.
         Err(_) => Ok(None),
-    }
-}
-
-/// Resolves `secrets.GITHUB_TOKEN`/`github.token` for a workflow that
-/// references either. `local_override` is the value from the ordinary
-/// `-s`/env/`.litci/secrets` chain for the literal name `GITHUB_TOKEN`
-/// (`crate::secrets::local_override_for`), ranked above the stored auth
-/// token — the same "local overrides remote" precedence every other
-/// resolution chain in this tool uses.
-///
-/// Never fails the run: an unresolved token (nothing local, nobody
-/// authenticated) resolves to an empty string, mirroring the vars chain's
-/// GitHub-parity rule that an absent name resolves to `""` rather than
-/// stopping — `PHASE-3-actions.md` only requires *variable* lookups to stop
-/// before planning on missing auth, since (unlike a variable) GitHub itself
-/// always provides a working `GITHUB_TOKEN`, so v0 degrading gracefully to
-/// "no token" for the *host-simulated* case is closer to observed
-/// expectations than blocking every workflow that merely references it.
-pub(crate) fn resolve_github_token(local_override: Option<String>) -> (String, Option<String>) {
-    if let Some(value) = local_override {
-        return (value, None);
-    }
-    match current_token() {
-        Ok(Some(token)) => (token, None),
-        Ok(None) => (
-            String::new(),
-            Some(
-                "note: this workflow references the GitHub token (`secrets.GITHUB_TOKEN`/`github.token`) but no local token is configured, so it resolves to an empty string\n  fix: run `litci auth` (or `litci auth --pat`/`--gh`) to supply one"
-                    .to_string(),
-            ),
-        ),
-        Err(message) => (
-            String::new(),
-            Some(format!(
-                "note: could not obtain the stored GitHub token, so `secrets.GITHUB_TOKEN`/`github.token` resolves to an empty string: {message}\n  fix: run `litci auth` again"
-            )),
-        ),
     }
 }
 
@@ -232,74 +242,17 @@ pub(crate) fn run_gh_flow(out: &mut impl std::io::Write) -> Result<(), String> {
 
 fn store_and_report(out: &mut impl std::io::Write, stored: &StoredToken) -> Result<(), String> {
     let home = home_dir()?;
-    // Replace any previous credential outright so a stale keyring entry and
-    // a freshly written file (or vice versa) can never both resolve.
-    token_store::clear(&home, allow_keyring());
-    let backend = token_store::save(&home, stored, allow_keyring())
+    let description = keyring_description()?;
+    // `add_key` updates an existing user key by description. Do not invalidate
+    // the working credential first: validation or keyring failure while
+    // replacing it must leave the previous login usable.
+    token_store::save(&home, stored, allow_keyring(), &description)
         .map_err(|error| format!("could not store the credential: {error}"))?;
-    match backend {
-        token_store::StoreBackend::Keyring => {
-            writeln!(out, "Stored the token in the system keyring.").ok();
-        }
-        token_store::StoreBackend::File => {
-            writeln!(
-                out,
-                "Warning: the system keyring was unavailable, so the token was written to ~/.litci/auth.json (mode 0600) instead. Anyone who can read that file as you can read the token."
-            )
-            .ok();
-        }
-    }
+    writeln!(out, "Stored the token in the system keyring.").ok();
     writeln!(
         out,
         "Authenticated. `litci run`/`litci plan` will now use this token for GitHub lookups."
     )
     .ok();
     Ok(())
-}
-
-/// Injects `token` as `github.token` into an already-built `github` context
-/// object, for a workflow that references it
-/// (`greenlit_workflow::extract::StaticExtraction::references_github_token`).
-/// Host-side lookup and action-source fetching never call this — only
-/// `crate::run_cmd`, and only when the reference actually exists
-/// (`PHASE-3-actions.md` Auth: "Inject `GITHUB_TOKEN`/`github.token` only
-/// into workflows that reference them").
-pub(crate) fn inject_github_token(github: Value, token: &str) -> Value {
-    match github {
-        Value::Object(object) => {
-            let mut entries: Vec<(String, Value)> = object
-                .iter()
-                .map(|(key, value)| (key.to_string(), value.clone()))
-                .collect();
-            entries.push(("token".to_string(), Value::String(token.to_string())));
-            Value::object(entries)
-        }
-        other => other,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use greenlit_expr::Value;
-
-    #[test]
-    fn inject_github_token_adds_a_token_field_without_disturbing_others() {
-        let github = Value::object(vec![
-            ("event_name".to_string(), Value::String("push".to_string())),
-            ("repository".to_string(), Value::String("o/r".to_string())),
-        ]);
-        let injected = inject_github_token(github, "ghu_abc");
-        let Value::Object(object) = injected else {
-            panic!("expected object");
-        };
-        assert_eq!(
-            object.get("token"),
-            Some(&Value::String("ghu_abc".to_string()))
-        );
-        assert_eq!(
-            object.get("event_name"),
-            Some(&Value::String("push".to_string()))
-        );
-    }
 }

@@ -8,11 +8,13 @@
 //! links `greenlit-runtime`, the bytes travel into the one distributable host
 //! binary transitively; nothing writes the helper to a host executable path.
 //!
-//! The helper is built with the workspace `init` profile for the musl target
-//! (`crates/greenlit-init/src/lib.rs` embedding contract): a small, static,
-//! dependency-free binary that runs in a minimal image context. The sub-build
-//! uses a private target directory under `OUT_DIR` so it never contends with
-//! the outer build's target-dir lock.
+//! The helper is built with an explicitly configured `init` profile for the
+//! musl target (`embedded-init/src/lib.rs` embedding contract): a small,
+//! static, dependency-free binary that runs in a minimal image context. The
+//! explicit Cargo configuration is required when `greenlit-runtime` is
+//! verified from its standalone package, where the workspace profile table is
+//! unavailable. The sub-build uses a private target directory under `OUT_DIR`
+//! so it never contends with the outer build's target-dir lock.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,6 +23,33 @@ use std::process::Command;
 const INIT_TARGET: &str = "x86_64-unknown-linux-musl";
 /// The workspace profile that strips + LTO-shrinks the helper.
 const INIT_PROFILE: &str = "init";
+/// Complete standalone definition of the workspace's `[profile.init]`.
+///
+/// Cargo package verification builds this script outside the workspace, so
+/// every inherited and overridden setting must travel with the nested command.
+const INIT_PROFILE_CONFIG: &[&str] = &[
+    r#"profile.init.inherits="release""#,
+    r#"profile.init.opt-level="z""#,
+    "profile.init.lto=true",
+    "profile.init.codegen-units=1",
+    r#"profile.init.panic="abort""#,
+    "profile.init.strip=true",
+];
+/// Canonical helper source files packaged inside `greenlit-runtime`.
+const INIT_SOURCE_FILES: &[&str] = &[
+    "cli.rs",
+    "copy_in.rs",
+    "error.rs",
+    "lib.rs",
+    "main.rs",
+    "mount.rs",
+    "run.rs",
+    "status.rs",
+    "strategy.rs",
+];
+/// Standalone helper manifest stored with a non-Cargo name so Cargo does not
+/// treat the packaged source as a nested package and omit it.
+const INIT_MANIFEST: &str = include_str!("embedded-init/Cargo.init.toml");
 
 fn main() {
     if let Err(message) = build_and_stage_init() {
@@ -40,24 +69,58 @@ fn build_and_stage_init() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
 
-    // The init crate sits beside this one in the workspace.
-    let init_dir = manifest_dir
-        .parent()
-        .map(|crates| crates.join("greenlit-init"))
-        .ok_or("could not locate the greenlit-init crate beside greenlit-runtime")?;
-    let init_manifest = init_dir.join("Cargo.toml");
-
-    // Only re-run when the helper's sources or manifest change; otherwise the
-    // staged binary in OUT_DIR is reused and the sub-build is skipped.
-    rerun_if_changed(&init_dir.join("src"));
-    rerun_if_changed(&init_manifest);
+    let packaged_init = manifest_dir.join("embedded-init");
+    let packaged_sources = packaged_init.join("src");
+    let packaged_manifest = packaged_init.join("Cargo.init.toml");
+    let packaged_lock = packaged_init.join("Cargo.init.lock");
+    rerun_if_changed(&packaged_sources);
+    rerun_if_changed(&packaged_manifest);
+    rerun_if_changed(&packaged_lock);
 
     // A private target directory so the nested cargo never blocks on the outer
     // build's `target/` lock.
     let sub_target = out_dir.join("init-target");
+    let init_dir = out_dir.join("init-crate");
+    let init_sources = init_dir.join("src");
+    std::fs::create_dir_all(&init_sources).map_err(|error| {
+        format!(
+            "failed to create the packaged greenlit-init build tree at {}: {error}",
+            init_sources.display()
+        )
+    })?;
+    for name in INIT_SOURCE_FILES {
+        let source = packaged_sources.join(name);
+        let destination = init_sources.join(name);
+        std::fs::copy(&source, &destination).map_err(|error| {
+            format!(
+                "failed to stage packaged greenlit-init source {} at {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    let init_manifest = init_dir.join("Cargo.toml");
+    std::fs::write(&init_manifest, INIT_MANIFEST).map_err(|error| {
+        format!(
+            "failed to stage the packaged greenlit-init manifest at {}: {error}",
+            init_manifest.display()
+        )
+    })?;
+    let init_lock = init_dir.join("Cargo.lock");
+    std::fs::copy(&packaged_lock, &init_lock).map_err(|error| {
+        format!(
+            "failed to stage the packaged greenlit-init lock from {} at {}: {error}",
+            packaged_lock.display(),
+            init_lock.display()
+        )
+    })?;
 
-    let status = Command::new(&cargo)
-        .arg("build")
+    let mut command = Command::new(&cargo);
+    command.arg("build").arg("--locked");
+    for config in INIT_PROFILE_CONFIG {
+        command.arg("--config").arg(config);
+    }
+    let status = command
         .arg("--manifest-path")
         .arg(&init_manifest)
         .arg("--profile")

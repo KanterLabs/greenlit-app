@@ -1,14 +1,13 @@
-//! Integration oracle for the secrets resolution chain reaching `litci run`
-//! before any container work, and the reserved `GITHUB_TOKEN` special case
-//! (`PHASE-3-actions.md` Secrets/Auth). Every case uses the same
-//! `DOCKER_HOST`-rejection trick `cli_behavior::run_preflight` already
-//! establishes: a run that fails with the `DOCKER_HOST` message got past
-//! secrets resolution; a run that fails some other way never reached engine
-//! detection at all.
+//! Compiled-CLI coverage for Phase 12 secret containment.
+//!
+//! A reachable `secrets.*` reference is non-forceable. Source is captured
+//! privately before assessment; quarantine must then win over local-input
+//! collection, legacy-secret migration, daemon startup, and engine detection.
+//! The dedicated credential-capability target owns successful persistent-
+//! keyring behavior.
 
 use super::support;
 use super::support::Sandbox;
-use std::os::unix::fs::PermissionsExt;
 
 const SSH_DOCKER_HOST: (&str, &str) = ("DOCKER_HOST", "ssh://example");
 
@@ -34,24 +33,6 @@ jobs:
       - run: echo hi
 ";
 
-// `write-all`/`read-all` imply `id-token: write`, which v0 rejects outright
-// as out-of-scope OIDC before planning even reaches the permission notice
-// (`fixtures`/`plan_rejections.rs`'s `oidc_write_permissions_are_rejected`).
-// An explicit `contents: write` exceeds the local token's read-only grant
-// without touching that rejected scope.
-const GITHUB_TOKEN_WORKFLOW_WITH_CONTENTS_WRITE: &str = "\
-on: push
-permissions:
-  contents: write
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    env:
-      TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - run: echo hi
-";
-
 fn sandbox_with(workflow: &str) -> Sandbox {
     let sandbox = Sandbox::new();
     sandbox.write("wf.yml", workflow);
@@ -59,167 +40,288 @@ fn sandbox_with(workflow: &str) -> Sandbox {
     sandbox
 }
 
-#[test]
-fn cli_secret_override_reaches_engine_detection_and_never_leaks() {
-    const SENTINEL: &str = "cli-secret-value-must-not-leak-7391";
-    let sandbox = sandbox_with(SECRET_WORKFLOW);
-    let output = sandbox.run_with_env(
-        &[
-            "run",
-            "-W",
-            "wf.yml",
-            "-s",
-            &format!("API_TOKEN={SENTINEL}"),
-        ],
-        &[SSH_DOCKER_HOST],
-    );
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains(SENTINEL), "{stderr}");
-    assert!(!support::stdout_text(&output).contains(SENTINEL));
-}
-
-#[test]
-fn process_env_and_dotenv_secrets_also_reach_engine_detection() {
-    const LEGACY_SECRET: &str = "from-legacy-dotenv-migrate-7391";
-    let sandbox = sandbox_with(SECRET_WORKFLOW);
-    sandbox.write(".litci/secrets", &format!("API_TOKEN={LEGACY_SECRET}\n"));
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml"], &[SSH_DOCKER_HOST]);
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains(LEGACY_SECRET), "{stderr}");
-
-    let legacy = sandbox.root().join(".litci/secrets");
-    let vault = sandbox.root().join(".litci/secrets.vault");
-    let key = sandbox.home().join(".litci/vault.key");
-    assert!(!legacy.exists(), "plaintext legacy file survived migration");
-    let ciphertext = std::fs::read(&vault).expect("read encrypted vault");
-    assert!(ciphertext.starts_with(b"greenlit-vault-v1\0"));
+fn assert_captured_blocked_run(sandbox: &Sandbox) {
+    let mut runs = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("secret quarantine retained run evidence")
+        .map(|entry| entry.expect("read retained run entry").path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1, "one invocation retained exactly one run");
+    let run = runs.pop().expect("one retained run");
     assert!(
-        !ciphertext
-            .windows(LEGACY_SECRET.len())
-            .any(|window| window == LEGACY_SECRET.as_bytes()),
-        "vault contains the secret in plaintext"
+        run.join("source/wf.yml").is_file(),
+        "the retained run did not contain the captured workflow"
     );
-    assert_eq!(
-        std::fs::metadata(&vault)
-            .expect("stat encrypted vault")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-    assert_eq!(
-        std::fs::metadata(&key)
-            .expect("stat vault key")
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
-
-    let second = sandbox.run_with_env(&["run", "-W", "wf.yml"], &[SSH_DOCKER_HOST]);
-    let second_stderr = support::stderr_text(&second);
-    assert!(second_stderr.contains("DOCKER_HOST"), "{second_stderr}");
-    assert!(!second_stderr.contains(LEGACY_SECRET), "{second_stderr}");
+    let result: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run.join("result.json")).expect("read retained terminal result"),
+    )
+    .expect("parse retained terminal result");
+    assert_eq!(result["conclusion"], "blocked");
+    assert_eq!(result["compatibility"], "unsupported");
+    assert_eq!(result["assurance"], "none");
 }
 
-#[test]
-fn no_input_fails_fast_listing_the_missing_secret_name_before_engine_detection() {
-    let sandbox = sandbox_with(SECRET_WORKFLOW);
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml", "--no-input"], &[SSH_DOCKER_HOST]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("API_TOKEN"), "{stderr}");
-    assert!(stderr.contains("fix:"), "{stderr}");
+fn assert_secret_quarantine(sandbox: &Sandbox, output: &std::process::Output, name: &str) {
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(output);
+    assert!(
+        stderr.contains("uncertified capability `secret.context`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(&format!("secrets.{name}")), "{stderr}");
     assert!(
         !stderr.contains("DOCKER_HOST"),
-        "must fail before engine detection: {stderr}"
+        "secret quarantine reached engine detection: {stderr}"
     );
-}
-
-#[test]
-fn github_token_secret_never_blocks_a_no_input_run_the_way_an_ordinary_secret_does() {
-    // Unlike an ordinary secret, `secrets.GITHUB_TOKEN` never fails a
-    // `--no-input` run just because no local override/auth exists — it
-    // resolves to the empty string instead
-    // (`crate::auth::resolve_github_token`), so the run still reaches
-    // engine detection.
-    let sandbox = sandbox_with(GITHUB_TOKEN_WORKFLOW);
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml", "--no-input"], &[SSH_DOCKER_HOST]);
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
     assert!(
-        !stderr.contains("could not be prompted for"),
-        "must not be treated as an ordinary missing secret: {stderr}"
+        !sandbox.home().join(".litci/daemon/v1.sock").exists(),
+        "secret quarantine started the daemon"
     );
+    assert_captured_blocked_run(sandbox);
 }
 
 #[test]
-fn github_token_resolves_from_the_stored_auth_token_without_leaking_it() {
-    let sandbox = sandbox_with(GITHUB_TOKEN_WORKFLOW);
-    sandbox.seed_auth_token("ghu_should_never_appear_in_output");
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml", "--no-input"], &[SSH_DOCKER_HOST]);
+fn ordinary_secret_is_blocked_before_input_migration_or_engine_work() {
+    const SENTINEL: &str = "legacy-secret-must-not-be-read-7391";
+    let sandbox = sandbox_with(SECRET_WORKFLOW);
+    sandbox.write(".litci/secrets", &format!("API_TOKEN={SENTINEL}\n"));
+
+    let output = sandbox.run_with_env(
+        &["run", "-W", "wf.yml", "--allow-degraded"],
+        &[SSH_DOCKER_HOST],
+    );
+    assert_secret_quarantine(&sandbox, &output, "API_TOKEN");
+
+    let stdout = support::stdout_text(&output);
     let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert!(!stdout.contains(SENTINEL), "{stdout}");
+    assert!(!stderr.contains(SENTINEL), "{stderr}");
     assert!(
-        !stderr.contains("ghu_should_never_appear_in_output"),
-        "{stderr}"
+        sandbox.root().join(".litci/secrets").exists(),
+        "quarantine read and migrated the legacy secret file"
     );
-    // A real token was available and the workflow references it, so no
-    // "no local token configured" notice should fire.
-    assert!(!stderr.contains("no local token is configured"), "{stderr}");
-    assert!(!support::stdout_text(&output).contains("ghu_should_never_appear_in_output"));
+    assert!(
+        !sandbox.root().join(".litci/secrets.vault").exists(),
+        "quarantine created a secret vault"
+    );
+    assert!(
+        !sandbox.home().join(".litci/vault.key").exists(),
+        "quarantine created secret key material"
+    );
 }
 
 #[test]
-fn a_local_override_for_github_token_wins_over_the_stored_auth_token() {
+fn github_token_is_blocked_before_cli_credentials_are_used() {
+    const CLI_SENTINEL: &str = "cli-token-must-not-be-read-7391";
     let sandbox = sandbox_with(GITHUB_TOKEN_WORKFLOW);
-    sandbox.seed_auth_token("ghu_stored_token_must_not_be_used");
+
     let output = sandbox.run_with_env(
         &[
             "run",
             "-W",
             "wf.yml",
+            "--no-input",
+            "--allow-degraded",
             "-s",
-            "GITHUB_TOKEN=locally-overridden-token",
+            &format!("GITHUB_TOKEN={CLI_SENTINEL}"),
         ],
         &[SSH_DOCKER_HOST],
     );
+    assert_secret_quarantine(&sandbox, &output, "GITHUB_TOKEN");
+
+    let stdout = support::stdout_text(&output);
     let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains("locally-overridden-token"), "{stderr}");
+    assert!(!stdout.contains(CLI_SENTINEL), "{stdout}");
+    assert!(!stderr.contains(CLI_SENTINEL), "{stderr}");
     assert!(
-        !stderr.contains("ghu_stored_token_must_not_be_used"),
-        "{stderr}"
+        !stderr.contains("cannot narrow"),
+        "credential permissions were inspected before quarantine: {stderr}"
     );
 }
 
 #[test]
-fn a_permissions_block_exceeding_the_local_token_grant_prints_one_notice() {
-    // `PHASE-3-actions.md` Auth: "when a workflow requests more than the
-    // token grants or more than `contents: read`, print one actionable
-    // notice naming the difference." `contents: write` exceeds it.
-    let sandbox = sandbox_with(GITHUB_TOKEN_WORKFLOW_WITH_CONTENTS_WRITE);
-    sandbox.seed_auth_token("ghu_permission_notice_probe");
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml", "--no-input"], &[SSH_DOCKER_HOST]);
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(stderr.contains("cannot narrow"), "{stderr}");
-    assert!(stderr.contains("write access"), "{stderr}");
-    assert!(!stderr.contains("ghu_permission_notice_probe"), "{stderr}");
+fn computed_dynamic_wildcard_and_bare_sensitive_contexts_fail_closed_before_preparation() {
+    let cases = [
+        (
+            "computed secret",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ secrets[format('API_{0}', 'TOKEN')] }}\n",
+            "secret.context",
+        ),
+        (
+            "matrix-selected secret",
+            "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        secret_name: [API_TOKEN]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ secrets[matrix.secret_name] }}\n",
+            "secret.context",
+        ),
+        (
+            "wildcard secrets",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ toJSON(secrets.*) }}\n",
+            "secret.context",
+        ),
+        (
+            "bare secrets",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ toJSON(secrets) }}\n",
+            "secret.context",
+        ),
+        (
+            "computed GitHub token",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ github[format('to{0}', 'ken')] }}\n",
+            "credential.github",
+        ),
+        (
+            "matrix-selected GitHub token",
+            "on: push\njobs:\n  build:\n    strategy:\n      matrix:\n        token_key: [token]\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ github[matrix.token_key] }}\n",
+            "credential.github",
+        ),
+        (
+            "wildcard GitHub context",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ toJSON(github.*) }}\n",
+            "credential.github",
+        ),
+        (
+            "bare GitHub context",
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{ toJSON(github) }}\n",
+            "credential.github",
+        ),
+    ];
+
+    for (case, workflow, capability) in cases {
+        let sandbox = sandbox_with(workflow);
+        let output = sandbox.run_with_env(
+            &["run", "-W", "wf.yml", "--no-input", "--allow-degraded"],
+            &[SSH_DOCKER_HOST],
+        );
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains(&format!("uncertified capability `{capability}`")),
+            "{case}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("DOCKER_HOST"),
+            "{case} reached engine detection: {stderr}"
+        );
+        assert!(
+            !sandbox.home().join(".litci/daemon").exists(),
+            "{case} started the daemon"
+        );
+        assert_captured_blocked_run(&sandbox);
+    }
 }
 
 #[test]
-fn a_permissions_block_never_notices_when_the_token_is_not_even_used() {
-    // The same excessive `permissions:` block on a workflow that never
-    // references the token at all must stay silent — the notice only
-    // matters for a run that actually injects one.
+fn malformed_secret_arguments_are_redacted_in_every_supported_spelling() {
+    const SENTINEL: &str = "malformed_cli_secret_must_not_render_9374";
+    let sandbox = sandbox_with(SECRET_WORKFLOW);
+    let cases: [&[&str]; 4] = [
+        &["run", "-W", "wf.yml", "--secret", SENTINEL],
+        &[
+            "run",
+            "-W",
+            "wf.yml",
+            "--secret=malformed_cli_secret_must_not_render_9374",
+        ],
+        &["run", "-W", "wf.yml", "-s", SENTINEL],
+        &[
+            "run",
+            "-W",
+            "wf.yml",
+            "-smalformed_cli_secret_must_not_render_9374",
+        ],
+    ];
+
+    for arguments in cases {
+        let output = sandbox.run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        let stdout = support::stdout_text(&output);
+        let stderr = support::stderr_text(&output);
+        assert!(!stdout.contains(SENTINEL), "{arguments:?}: {stdout}");
+        assert!(!stderr.contains(SENTINEL), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("pass each -s/--secret as KEY=VALUE"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+
+    let valid_secret = format!("API_TOKEN={SENTINEL}");
+    let long_attached = format!("--secret={valid_secret}");
+    let short_attached = format!("-s{valid_secret}");
+    let cases: [&[&str]; 4] = [
+        &[
+            "run",
+            "-W",
+            "wf.yml",
+            "--secret",
+            &valid_secret,
+            "--unknown",
+        ],
+        &["run", "-W", "wf.yml", &long_attached, "--unknown"],
+        &["run", "-W", "wf.yml", "-s", &valid_secret, "--unknown"],
+        &["run", "-W", "wf.yml", &short_attached, "--unknown"],
+    ];
+    for arguments in cases {
+        let output = sandbox.run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        let stdout = support::stdout_text(&output);
+        let stderr = support::stderr_text(&output);
+        assert!(!stdout.contains(SENTINEL), "{arguments:?}: {stdout}");
+        assert!(!stderr.contains(SENTINEL), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("pass each -s/--secret as KEY=VALUE"),
+            "{arguments:?}: {stderr}"
+        );
+    }
+
+    let typo_value = format!("API_TOKEN={SENTINEL}");
+    let typo_cases = [
+        ("--secre", format!("--secre={typo_value}")),
+        ("--secretx", format!("--secretx={typo_value}")),
+    ];
+    for (typo, argument) in &typo_cases {
+        let output = sandbox.run(&["run", "-W", "wf.yml", argument]);
+        assert_eq!(output.status.code(), Some(2), "{argument}");
+        let stdout = support::stdout_text(&output);
+        let stderr = support::stderr_text(&output);
+        assert!(!stdout.contains(SENTINEL), "{argument}: {stdout}");
+        assert!(!stderr.contains(SENTINEL), "{argument}: {stderr}");
+        assert!(
+            stderr.contains("unexpected argument") && stderr.contains(typo),
+            "the sanitized typo lost clap's ordinary argument diagnostic: {stderr}"
+        );
+    }
+
+    const ORDINARY_VALUE: &str = "ordinary_nonsecret_argument_value_2816";
+    let ordinary_argument = format!("--unknown={ORDINARY_VALUE}");
+    let output = sandbox.run(&["run", "-W", "wf.yml", &ordinary_argument]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("unexpected argument")
+            && stderr.contains("--unknown")
+            && !stderr.contains("arguments containing a secret value"),
+        "ordinary argument diagnostics were weakened: {stderr}"
+    );
+}
+
+#[test]
+fn unused_token_permissions_cross_only_the_explicit_degraded_shell_boundary() {
     let sandbox = sandbox_with(
         "on: push\npermissions:\n  contents: write\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n",
     );
-    let output = sandbox.run_with_env(&["run", "-W", "wf.yml"], &[SSH_DOCKER_HOST]);
+    let output = sandbox.run_with_env(
+        &["run", "-W", "wf.yml", "--allow-degraded"],
+        &[SSH_DOCKER_HOST],
+    );
     let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains("cannot narrow"), "{stderr}");
+    assert!(
+        stderr.contains("`--allow-degraded` forced 1 uncertified capability"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("DOCKER_HOST"),
+        "the explicitly degraded shell run did not reach engine detection: {stderr}"
+    );
+    assert!(
+        !stderr.contains("cannot narrow"),
+        "an unused GitHub token triggered credential inspection: {stderr}"
+    );
 }

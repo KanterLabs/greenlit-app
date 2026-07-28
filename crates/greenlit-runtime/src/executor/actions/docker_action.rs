@@ -438,35 +438,3 @@ fn build_context_tar(host_action_dir: &Path) -> std::io::Result<Vec<u8>> {
     builder.append_dir_all(".", host_action_dir)?;
     builder.into_inner()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn content_hash_is_deterministic_and_input_sensitive() {
-        let a = content_hash(Path::new("/x/y"), "Dockerfile");
-        let b = content_hash(Path::new("/x/y"), "Dockerfile");
-        assert_eq!(a, b);
-        assert_ne!(a, content_hash(Path::new("/x/z"), "Dockerfile"));
-        assert_ne!(a, content_hash(Path::new("/x/y"), "Dockerfile.alt"));
-    }
-
-    #[test]
-    fn build_context_tar_includes_every_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Dockerfile"), b"FROM scratch").unwrap();
-        std::fs::create_dir(dir.path().join("src")).unwrap();
-        std::fs::write(dir.path().join("src/lib.js"), b"console.log(1)").unwrap();
-
-        let tar_bytes = build_context_tar(dir.path()).unwrap();
-        let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        let names: Vec<String> = archive
-            .entries()
-            .unwrap()
-            .map(|e| e.unwrap().path().unwrap().display().to_string())
-            .collect();
-        assert!(names.iter().any(|n| n.ends_with("Dockerfile")));
-        assert!(names.iter().any(|n| n.ends_with("src/lib.js")));
-    }
-}

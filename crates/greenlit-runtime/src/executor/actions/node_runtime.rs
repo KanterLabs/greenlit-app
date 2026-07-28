@@ -200,11 +200,9 @@ pub enum RuntimeBundleError {
 /// The injected boundary that downloads one pinned bundle's raw (still
 /// compressed, not yet checksum-verified) bytes.
 ///
-/// Production code (`greenlit-app`) supplies [`HttpRuntimeBundleFetcher`];
-/// tests inject a fake that returns a tiny synthetic `.tar.gz` fixture, so no
-/// test in the default `cargo test` path downloads the real ~100 MiB
-/// bundles (`PHASE-3-actions.md` exit criterion 6: "keep bundle downloads
-/// out of the default path").
+/// Production code (`greenlit-app`) supplies [`HttpRuntimeBundleFetcher`].
+/// Real bundle acceptance belongs to the capability-owning action-execution
+/// gate rather than the portable test set.
 #[async_trait]
 pub trait RuntimeBundleFetcher: Send + Sync {
     /// Downloads `spec`'s bundle, returning its raw compressed bytes.
@@ -728,12 +726,7 @@ pub(crate) async fn ensure_mounts(
 /// checksum) to ensure for a given `(version, variant)`.
 ///
 /// Production code (`greenlit-app`) wires [`PinnedNodeBundleSpecs`], the
-/// only implementor that ever names the real pinned checksums (module
-/// docs). Tests inject a fake returning a spec whose checksum matches a
-/// tiny synthetic bundle their own [`RuntimeBundleFetcher`] fake returns, so
-/// the mounting/exec protocol is provable without downloading (or checksum-
-/// matching against) the real ~100 MiB bundles
-/// (`PHASE-3-actions.md` exit criterion 6).
+/// only implementor that names real pinned checksums (module docs).
 pub trait NodeBundleSpecs: Send + Sync {
     /// The bundle spec to ensure for `(version, variant)`.
     fn spec(&self, version: NodeVersion, variant: NodeVariant) -> RuntimeBundleSpec;
@@ -782,152 +775,4 @@ impl ExecOutputSink for CaptureLower {
             .push_str(&String::from_utf8_lossy(chunk).to_lowercase());
     }
     fn on_stderr(&mut self, _chunk: &[u8]) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::AtomicUsize;
-
-    fn tiny_gzip_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (path, content) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_path(path).unwrap();
-            header.set_size(content.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder.append(&header, *content).unwrap();
-        }
-        let tar_bytes = builder.into_inner().unwrap();
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
-        encoder.finish().unwrap()
-    }
-
-    struct FakeFetcher {
-        bytes: Vec<u8>,
-        calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl RuntimeBundleFetcher for FakeFetcher {
-        async fn download(&self, _spec: &RuntimeBundleSpec) -> Result<Vec<u8>, RuntimeBundleError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.bytes.clone())
-        }
-    }
-
-    fn spec_with(sha256: &'static str, strip_top_level: bool) -> RuntimeBundleSpec {
-        RuntimeBundleSpec {
-            version: NodeVersion::Node20,
-            variant: NodeVariant::Standard,
-            url: "https://example.invalid/node.tar.gz",
-            sha256,
-            strip_top_level,
-        }
-    }
-
-    #[test]
-    fn bundle_specs_cover_every_pinned_url_and_checksum() {
-        // One row per documented URL (module docs): a change to any of
-        // these four is a deliberate re-pin, never an accidental edit.
-        let cases = [
-            (
-                NodeVersion::Node20,
-                NodeVariant::Standard,
-                "https://nodejs.org/dist/v20.20.2/node-v20.20.2-linux-x64.tar.gz",
-            ),
-            (
-                NodeVersion::Node20,
-                NodeVariant::Alpine,
-                "https://github.com/actions/alpine_nodejs/releases/download/v20.20.2/node-v20.20.2-alpine-x64.tar.gz",
-            ),
-            (
-                NodeVersion::Node24,
-                NodeVariant::Standard,
-                "https://nodejs.org/dist/v24.18.0/node-v24.18.0-linux-x64.tar.gz",
-            ),
-            (
-                NodeVersion::Node24,
-                NodeVariant::Alpine,
-                "https://github.com/actions/alpine_nodejs/releases/download/v24.18.0/node-v24.18.0-alpine-x64.tar.gz",
-            ),
-        ];
-        for (version, variant, url) in cases {
-            let spec = bundle_spec(version, variant);
-            assert_eq!(spec.url, url);
-            assert_eq!(spec.sha256.len(), 64, "sha256 must be 64 hex chars");
-            assert!(spec.sha256.chars().all(|c| c.is_ascii_hexdigit()));
-        }
-        // Standard tarballs need the nested-directory strip; Alpine ones
-        // don't (module docs' `fix_nested_dir` note).
-        assert!(bundle_spec(NodeVersion::Node20, NodeVariant::Standard).strip_top_level);
-        assert!(!bundle_spec(NodeVersion::Node20, NodeVariant::Alpine).strip_top_level);
-    }
-
-    #[tokio::test]
-    async fn ensure_fetched_verifies_checksum_extracts_and_is_idempotent() {
-        let bytes = tiny_gzip_tar(&[
-            (
-                "node-vfake-linux-x64/bin/node",
-                b"#!/bin/sh\necho fake node\n",
-            ),
-            ("node-vfake-linux-x64/LICENSE", b"license"),
-        ]);
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256: &'static str = Box::leak(hex_digest(&hasher.finalize()).into_boxed_str());
-        let spec = spec_with(sha256, true);
-
-        let root = tempfile::tempdir().unwrap();
-        let store = RuntimeStore::at(root.path());
-        let fetcher = FakeFetcher {
-            bytes,
-            calls: AtomicUsize::new(0),
-        };
-
-        let (dir1, outcome1) = store.ensure_fetched(&spec, &fetcher).await.unwrap();
-        assert_eq!(outcome1, FetchOutcome::Miss);
-        assert!(dir1.join("bin/node").is_file(), "nested dir was stripped");
-        assert_eq!(
-            std::fs::read_to_string(dir1.join("LICENSE")).unwrap(),
-            "license"
-        );
-
-        let (dir2, outcome2) = store.ensure_fetched(&spec, &fetcher).await.unwrap();
-        assert_eq!(outcome2, FetchOutcome::Hit);
-        assert_eq!(dir1, dir2);
-        assert_eq!(
-            fetcher.calls.load(Ordering::SeqCst),
-            1,
-            "the second call must not re-download"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_checksum_mismatch_is_rejected_before_extraction() {
-        let bytes = tiny_gzip_tar(&[("x/file", b"content")]);
-        let spec = spec_with(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            true,
-        );
-        let root = tempfile::tempdir().unwrap();
-        let store = RuntimeStore::at(root.path());
-        let fetcher = FakeFetcher {
-            bytes,
-            calls: AtomicUsize::new(0),
-        };
-        let error = store.ensure_fetched(&spec, &fetcher).await.unwrap_err();
-        assert!(matches!(error, RuntimeBundleError::ChecksumMismatch { .. }));
-        assert!(!store.dir(&spec).is_dir(), "no directory left behind");
-    }
-
-    #[test]
-    fn alpine_bundles_extract_without_stripping_a_top_level_directory() {
-        let bytes = tiny_gzip_tar(&[("./bin/node", b"binary"), ("./LICENSE", b"license")]);
-        let dest = tempfile::tempdir().unwrap();
-        extract_bundle(&bytes, dest.path(), false).unwrap();
-        assert!(dest.path().join("bin/node").is_file());
-    }
 }

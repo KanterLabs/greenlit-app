@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+"""Behavior gate for canonical oracle/GitHub capture production and replay."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from parity_producer_bounds import run_bounds_canaries
+
+
+REPOSITORY_ID = "KanterLabs/greenlit-app"
+RUN_ID = 987654321
+
+
+def main() -> int:
+    root = Path(__file__).resolve().parents[2]
+    tool = root / "tools" / "collect-parity-observation"
+    with tempfile.TemporaryDirectory(prefix="greenlit-parity-producer-test-") as name:
+        test_root = Path(name)
+        checkout = test_root / "checkout"
+        output_root = test_root / "output"
+        checkout.mkdir()
+        output_root.mkdir(mode=0o700)
+        workflow = checkout / ".github/workflows/parity-seed.yml"
+        workflow.parent.mkdir(parents=True)
+        (checkout / "fixtures/stabilization/parity").mkdir(parents=True)
+        shutil.copyfile(root / ".github/workflows/parity-seed.yml", workflow)
+        _git(checkout, "init", "-q")
+        _git(checkout, "config", "user.name", "Parity Producer Test")
+        _git(checkout, "config", "user.email", "parity@example.invalid")
+        _git(checkout, "add", ".github/workflows/parity-seed.yml")
+        _git(checkout, "commit", "-qm", "test: parity source")
+        source_commit = _git(checkout, "rev-parse", "HEAD").stdout.strip()
+
+        trusted = [
+            "--checkout",
+            str(checkout),
+            "--repository-id",
+            REPOSITORY_ID,
+            "--source-commit",
+            source_commit,
+        ]
+        production = [*trusted, "--output-root", str(output_root)]
+        _run(_tool_command(tool, "oracle", *production))
+        poison = test_root / "bash-environment-poison"
+        poison.write_text(f"touch {test_root / 'poison-ran'}\n", encoding="utf-8")
+        _run(
+            _tool_command(tool, "oracle", *production),
+            environment_overrides={
+                "BASH_ENV": str(poison),
+                "GIT_DIR": str(test_root / "missing-git-directory"),
+                "LD_PRELOAD": str(test_root / "missing-preload.so"),
+            },
+        )
+        if (test_root / "poison-ran").exists():
+            raise RuntimeError("oracle inherited a forbidden shell execution hook")
+
+        _git(
+            checkout,
+            "update-index",
+            "--skip-worktree",
+            ".github/workflows/parity-seed.yml",
+        )
+        failed = _run(_tool_command(tool, "oracle", *production), success=False)
+        if "forbids skip-worktree" not in failed.stderr:
+            raise RuntimeError("skip-worktree source concealment was not rejected")
+        _git(
+            checkout,
+            "update-index",
+            "--no-skip-worktree",
+            ".github/workflows/parity-seed.yml",
+        )
+
+        raw = test_root / "raw-api"
+        raw.mkdir()
+        inputs = _github_inputs(raw, workflow.read_bytes(), source_commit)
+        github = _tool_command(
+            tool,
+            "github-actions",
+            *production,
+            "--run-id",
+            str(RUN_ID),
+            "--run-json",
+            str(inputs["run"]),
+            "--jobs-json",
+            str(inputs["jobs"]),
+            "--content-json",
+            str(inputs["content"]),
+            "--logs-zip",
+            str(inputs["logs"]),
+            "--self-test-raw-evidence",
+        )
+        _run(github)
+        failed = _run(github[:-1], success=False)
+        if "raw GitHub evidence is restricted" not in failed.stderr:
+            raise RuntimeError("canonical GitHub producer accepted raw evidence")
+        original_run = inputs["run"].read_bytes()
+        inputs["run"].write_text(
+            '{"id":' + "9" * 5000 + "}",
+            encoding="utf-8",
+        )
+        failed = _run(github, success=False)
+        if "Traceback" in failed.stderr or "missing field" not in failed.stderr:
+            raise RuntimeError("unbounded JSON integer escaped fail-closed validation")
+        inputs["run"].write_bytes(original_run)
+        run_bounds_canaries(
+            tool=tool,
+            test_root=test_root,
+            checkout=checkout,
+            output_root=output_root,
+            trusted=trusted,
+            source_commit=source_commit,
+            github_inputs=inputs,
+            run_id=RUN_ID,
+        )
+        private_paths = [
+            (output_root, 0o700),
+            (output_root / "captures", 0o700),
+            (output_root / "seed-oracle.json", 0o600),
+            (output_root / "seed-github-actions.json", 0o600),
+            (
+                output_root
+                / "captures/shell-only-seed-oracle.json",
+                0o600,
+            ),
+            (
+                output_root
+                / "captures/shell-only-seed-github-actions.json",
+                0o600,
+            ),
+        ]
+        for path, expected_mode in private_paths:
+            metadata = path.lstat()
+            expected_kind = stat.S_ISDIR if expected_mode == 0o700 else stat.S_ISREG
+            if (
+                not expected_kind(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != expected_mode
+                or metadata.st_uid != os.geteuid()
+            ):
+                raise RuntimeError(f"private output mode drifted for {path}")
+
+        alias_parent = test_root / "alias-parent"
+        alias_parent.mkdir()
+        internal_output = checkout / ".git/parity-output"
+        internal_output.mkdir(mode=0o700)
+        lexical_internal = alias_parent / ".." / "checkout/.git/parity-output"
+        failed = _run(
+            _tool_command(
+                tool,
+                "oracle",
+                *trusted,
+                "--output-root",
+                str(lexical_internal),
+            ),
+            success=False,
+        )
+        if "outside and disjoint" not in failed.stderr:
+            raise RuntimeError("lexical parent traversal bypassed output containment")
+
+        unsafe_output = test_root / "unsafe-output"
+        unsafe_output.mkdir(mode=0o700)
+        escaped = test_root / "escaped-captures"
+        escaped.mkdir(mode=0o700)
+        (unsafe_output / "captures").symlink_to(
+            escaped, target_is_directory=True
+        )
+        unsafe_production = [
+            *trusted,
+            "--output-root",
+            str(unsafe_output),
+        ]
+        failed = _run(
+            _tool_command(tool, "oracle", *unsafe_production),
+            success=False,
+        )
+        if "captures directory must be a real mode-0700" not in failed.stderr:
+            raise RuntimeError(
+                "symlinked capture parent was not rejected: " + failed.stderr
+            )
+
+        _duplicate_marker_archive(inputs["logs"])
+        failed = _run(github, success=False)
+        if "authored job/step identity order" not in failed.stderr:
+            raise RuntimeError("duplicate marker did not fail at exact identity mapping")
+
+        fixture_root = checkout / "fixtures/stabilization/parity"
+        shutil.copytree(output_root / "captures", fixture_root / "captures")
+        for role in ("oracle", "github-actions"):
+            shutil.copyfile(
+                output_root / f"seed-{role}.json",
+                fixture_root / f"seed-{role}.json",
+            )
+        _git(checkout, "add", "fixtures/stabilization/parity")
+        _git(checkout, "commit", "-qm", "test: parity captures")
+        _run(_tool_command(tool, "verify", *trusted, "--role", "oracle"))
+        _run(
+            _tool_command(
+                tool,
+                "verify",
+                *trusted,
+                "--role",
+                "github-actions",
+            )
+        )
+
+        capture = (
+            checkout
+            / "fixtures/stabilization/parity/captures"
+            / "shell-only-seed-github-actions.json"
+        )
+        original = capture.read_bytes()
+        capture.write_bytes(original.replace(b'"run_attempt":1', b'"run_attempt":2', 1))
+        failed = _run(
+            _tool_command(
+                tool,
+                "verify",
+                *trusted,
+                "--role",
+                "github-actions",
+            ),
+            success=False,
+        )
+        if not any(
+            marker in failed.stderr
+            for marker in (
+                "differs from committed HEAD bytes",
+                "drifted",
+                "bind API run identity",
+            )
+        ):
+            raise RuntimeError("capture mutation did not fail at replay authority")
+        capture.write_bytes(original)
+
+    print("parity producer behavior gate passed: oracle + GitHub + replay negatives")
+    return 0
+
+
+def _github_inputs(
+    directory: Path,
+    workflow: bytes,
+    source_commit: str,
+) -> dict[str, Path]:
+    run = {
+        "id": RUN_ID,
+        "name": "Parity seed",
+        "event": "push",
+        "status": "completed",
+        "conclusion": "success",
+        "head_sha": source_commit,
+        "path": ".github/workflows/parity-seed.yml",
+        "run_attempt": 1,
+        "run_started_at": "2026-07-28T10:00:00Z",
+        "updated_at": "2026-07-28T10:00:04Z",
+        "html_url": f"https://github.com/{REPOSITORY_ID}/actions/runs/{RUN_ID}",
+        "repository": {"full_name": REPOSITORY_ID},
+    }
+    step_values = (
+        (1, "Set up job", "00", "01"),
+        (2, "Emit deterministic output", "01", "02"),
+        (3, "Verify shell and filesystem behavior", "02", "03"),
+        (4, "Complete job", "03", "04"),
+    )
+    steps = [
+        {
+            "name": step_name,
+            "status": "completed",
+            "conclusion": "success",
+            "number": number,
+            "started_at": f"2026-07-28T10:00:{started}Z",
+            "completed_at": f"2026-07-28T10:00:{completed}Z",
+        }
+        for number, step_name, started, completed in step_values
+    ]
+    jobs = {
+        "total_count": 1,
+        "jobs": [
+            {
+                "name": "Shell-only parity seed",
+                "status": "completed",
+                "conclusion": "success",
+                "head_sha": source_commit,
+                "run_attempt": 1,
+                "started_at": "2026-07-28T10:00:00Z",
+                "completed_at": "2026-07-28T10:00:04Z",
+                "labels": ["homelab"],
+                "steps": steps,
+            }
+        ],
+    }
+    content = {
+        "type": "file",
+        "path": ".github/workflows/parity-seed.yml",
+        "encoding": "base64",
+        "content": base64.b64encode(workflow).decode("ascii"),
+    }
+    paths = {
+        "run": directory / "run.json",
+        "jobs": directory / "jobs.json",
+        "content": directory / "content.json",
+        "logs": directory / "logs.zip",
+    }
+    for key, document in (("run", run), ("jobs", jobs), ("content", content)):
+        paths[key].write_text(
+            json.dumps(document, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    _write_log_archive(paths["logs"], duplicate=False)
+    return paths
+
+
+def _write_log_archive(path: Path, *, duplicate: bool) -> None:
+    digest = hashlib.sha256(b"greenlit\n").hexdigest()
+    lines = [
+        "2026-07-28T10:00:01Z PARITY_IDENTITY job=shell step=emit",
+        "2026-07-28T10:00:02Z PARITY_IDENTITY job=shell step=verify",
+        "2026-07-28T10:00:02Z PARITY_OUTPUT seed_value=greenlit",
+        "2026-07-28T10:00:02Z PARITY_CONTEXT github.job=shell",
+        "2026-07-28T10:00:02Z PARITY_CONTEXT github.workflow=Parity seed",
+        "2026-07-28T10:00:02Z PARITY_CONTEXT runner.arch=X64",
+        "2026-07-28T10:00:02Z PARITY_CONTEXT runner.os=Linux",
+        "2026-07-28T10:00:02Z PARITY_TEMPORARY_DIRECTORY /runner/_temp/seed",
+        f"2026-07-28T10:00:02Z PARITY_PROBE parity-seed-file mode=0644 sha256={digest}",
+    ]
+    if duplicate:
+        lines.insert(1, lines[0])
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("shell.txt", "\n".join(lines) + "\n")
+
+
+def _duplicate_marker_archive(path: Path) -> None:
+    _write_log_archive(path, duplicate=True)
+
+
+def _git(checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return _run(["git", "-C", str(checkout), *arguments])
+
+
+def _run(
+    command: list[str],
+    *,
+    success: bool = True,
+    environment_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().endswith("_TOKEN")
+        and all(
+            fragment not in key.upper()
+            for fragment in ("SECRET", "PASSWORD", "CREDENTIAL")
+        )
+    }
+    environment.update(environment_overrides or {})
+    result = subprocess.run(
+        command,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if success and result.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {' '.join(command)}\n{result.stderr}"
+        )
+    if not success and result.returncode == 0:
+        raise RuntimeError(f"command unexpectedly passed: {' '.join(command)}")
+    return result
+
+
+def _tool_command(tool: Path, *arguments: str) -> list[str]:
+    """Invoke a Python tool even when a private snapshot strips host modes."""
+
+    return [sys.executable, "-B", str(tool), *arguments]
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"parity producer behavior gate failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from error

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Run the live, same-commit Phase 12 parity certification boundary."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+if Path(__file__).is_symlink():
+    print("live parity gate failed: launcher must not be a symbolic link", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def _credential_safe_reexec() -> None:
+    credential_fd = "GREENLIT_GITHUB_CREDENTIAL_FD"
+    first = os.environ.get("GH_TOKEN")
+    second = os.environ.get("GITHUB_TOKEN")
+    if first is None and second is None:
+        return
+    if len(sys.argv) < 2 or sys.argv[1] not in ("github", "credential-canary"):
+        print(
+            "live parity gate failed: only github mode may receive a credential",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    parent = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / "stat").read_bytes()
+            values = fields[fields.rfind(b")") + 2 :].split()
+            if int(values[1], 10) == parent:
+                print(
+                    "live parity gate failed: credential boundary has a preexisting child",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+        except (OSError, ValueError, IndexError):
+            continue
+    if first is not None and second is not None and first != second:
+        print(
+            "live parity gate failed: GH_TOKEN and GITHUB_TOKEN disagree",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    token = first if first is not None else second
+    if token is None or not token or len(token.encode("utf-8")) > 4095:
+        print("live parity gate failed: GitHub token is empty or oversized", file=sys.stderr)
+        raise SystemExit(1)
+    inherited = tuple(
+        int(entry.name)
+        for entry in Path("/proc/self/fd").iterdir()
+        if entry.name.isdecimal() and int(entry.name) > 2
+    )
+    for descriptor in inherited:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    descriptor, writer = os.pipe2(os.O_CLOEXEC)
+    raw = token.encode("utf-8")
+    if os.write(writer, raw) != len(raw):
+        print("live parity gate failed: credential pipe write was incomplete", file=sys.stderr)
+        raise SystemExit(1)
+    os.close(writer)
+    os.set_inheritable(descriptor, True)
+    environment = os.environ.copy()
+    for key in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_HOST",
+        "BASH_ENV",
+        "ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "BASH_XTRACEFD",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "PYTHONPATH",
+        "PYTHONHOME",
+    ):
+        environment.pop(key, None)
+    for key in tuple(environment):
+        if key.startswith("BASH_FUNC_"):
+            environment.pop(key, None)
+    environment[credential_fd] = str(descriptor)
+    executable = "/usr/bin/python3"
+    script = str(Path(__file__).resolve())
+    os.execve(
+        executable,
+        [executable, "-E", "-s", "-B", script, *sys.argv[1:]],
+        environment,
+    )
+
+
+_credential_safe_reexec()
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from live_parity.cli import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

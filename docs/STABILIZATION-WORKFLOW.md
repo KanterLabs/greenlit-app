@@ -372,7 +372,7 @@ For every phase, the head agent must run:
 3. `cargo deny check`
 4. `python3 tools/check-stubs`
 5. The stabilization-ledger checker introduced in Phase 12
-6. `cargo test --workspace`
+6. `tools/tests/check-portable-test-manifest --run`
 7. `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 8. The active component's capability-owning integration and invariant jobs
 9. The compiled-Greenlit and GitHub Actions comparison gate where applicable

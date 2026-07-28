@@ -6,19 +6,20 @@
 //! with the label and a content hash, and contains the slim tool set plus the
 //! `greenlit-init` entrypoint.
 
-mod dockerkit;
+#[path = "dockerkit/engine.rs"]
+mod engine_support;
+#[path = "dockerkit/sink.rs"]
+mod sink_support;
 
 use greenlit_runtime::engine::{ContainerEngine, ContainerSpec, ExecSpec};
 use greenlit_runtime::{ProgressNull, UbuntuRelease, ensure_base_image};
 
-use dockerkit::{CollectSink, engine_if_reachable, notice_no_daemon, unique_suffix};
+use engine_support::{required_engine, unique_suffix};
+use sink_support::CollectSink;
 
 #[tokio::test]
 async fn base_image_builds_reuses_and_carries_the_toolset() {
-    let Some(engine) = engine_if_reachable().await else {
-        notice_no_daemon("base_image_builds_reuses_and_carries_the_toolset");
-        return;
-    };
+    let engine = required_engine("base_image_builds_reuses_and_carries_the_toolset").await;
 
     // First use builds it; the tag carries the resolved label.
     let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)

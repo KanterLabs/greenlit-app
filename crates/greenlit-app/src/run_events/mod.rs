@@ -9,7 +9,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use greenlit_runtime::JobScope;
@@ -70,6 +73,7 @@ struct State {
     tails: HashMap<(String, String), TailBuffer>,
     failure: Option<String>,
     terminal_written: bool,
+    result_publication_abandoned: Arc<AtomicBool>,
 }
 
 /// Cloneable recorder handle used simultaneously as all runtime output ports.
@@ -85,15 +89,21 @@ impl RunEventRecorder {
         format: RunFormatArg,
         log_mode: LogModeArg,
         color: ColorArg,
+        result_publication_abandoned: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
-        Self::create_with_output(
+        let recorder = Self::create_with_output(
             directory,
             run_id,
             format,
             log_mode,
             color,
             Box::new(io::stdout()),
-        )
+            Arc::clone(&result_publication_abandoned),
+        );
+        if recorder.is_err() {
+            result_publication_abandoned.store(true, Ordering::Release);
+        }
+        recorder
     }
 
     fn create_with_output(
@@ -103,6 +113,7 @@ impl RunEventRecorder {
         log_mode: LogModeArg,
         color: ColorArg,
         output: Box<dyn Write + Send>,
+        result_publication_abandoned: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let path = directory.join("events.ndjson");
         let journal = OpenOptions::new()
@@ -136,6 +147,7 @@ impl RunEventRecorder {
                 tails: HashMap::new(),
                 failure: None,
                 terminal_written: false,
+                result_publication_abandoned,
             })),
         };
         recorder.record(RunEvent::RunStarted)?;
@@ -158,28 +170,49 @@ impl RunEventRecorder {
         })?;
         let mut state = self.lock();
         state.terminal_written = true;
-        state.journal.sync_all().map_err(|error| {
-            anyhow::anyhow!(
+        if let Err(error) = state.journal.sync_all() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            return Err(anyhow::anyhow!(
                 "could not make the completed run event journal durable: {error}\n  fix: ensure HOME has free space, then retry"
-            )
-        })?;
-        state.output.flush().map_err(|error| {
-            anyhow::anyhow!("could not flush run output: {error}\n  fix: ensure stdout is writable")
-        })?;
+            ));
+        }
+        if let Err(error) = state.output.flush() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            return Err(anyhow::anyhow!(
+                "could not flush run output: {error}\n  fix: ensure stdout is writable"
+            ));
+        }
         if let Some(message) = state.failure.take() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
             anyhow::bail!("{message}");
         }
         Ok(())
     }
 
+    pub(crate) fn flush_pending_logs(&self) -> anyhow::Result<()> {
+        self.flush_partial_lines()
+    }
+
     pub(crate) fn verify_durable(&self) -> anyhow::Result<()> {
         let mut state = self.lock();
-        state.journal.sync_all().map_err(|error| {
-            anyhow::anyhow!(
+        if let Err(error) = state.journal.sync_all() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            return Err(anyhow::anyhow!(
                 "could not make the run event journal durable: {error}\n  fix: ensure HOME has free space, then retry"
-            )
-        })?;
+            ));
+        }
         if let Some(message) = state.failure.take() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
             anyhow::bail!("{message}");
         }
         Ok(())
@@ -199,6 +232,21 @@ impl RunEventRecorder {
             hits,
             misses,
         })
+    }
+
+    pub(crate) fn compatibility_findings(
+        &self,
+        report: &greenlit_engine::SupportReport,
+    ) -> anyhow::Result<()> {
+        for finding in &report.findings {
+            self.record(RunEvent::CompatibilityFinding {
+                code: finding.code.clone(),
+                disposition: finding.disposition,
+                scope: finding.scope.clone(),
+                reason: finding.reason.clone(),
+            })?;
+        }
+        Ok(())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -280,6 +328,9 @@ impl RunEventRecorder {
 
     fn remember_failure(&self, error: io::Error) {
         let mut state = self.lock();
+        state
+            .result_publication_abandoned
+            .store(true, Ordering::Release);
         if state.failure.is_none() {
             state.failure = Some(format!(
                 "could not record run output: {error}\n  fix: ensure stdout and HOME are writable"
@@ -300,12 +351,26 @@ impl Drop for State {
             evidence: self.run_id.clone(),
         };
         self.terminal_written = true;
-        let _record = write_record(self, event);
-        let _sync = self.journal.sync_all();
+        let record = write_record(self, event);
+        let sync = self.journal.sync_all();
+        if record.is_err() || sync.is_err() {
+            self.result_publication_abandoned
+                .store(true, Ordering::Release);
+        }
     }
 }
 
 fn write_record(state: &mut State, event: RunEvent) -> io::Result<()> {
+    let result = write_record_inner(state, event);
+    if result.is_err() {
+        state
+            .result_publication_abandoned
+            .store(true, Ordering::Release);
+    }
+    result
+}
+
+fn write_record_inner(state: &mut State, event: RunEvent) -> io::Result<()> {
     let timestamp_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
