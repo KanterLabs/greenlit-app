@@ -13,6 +13,46 @@ RUN_ID = 987654321
 JOB_ID = 123456789
 
 
+def github_endpoints() -> dict[str, str]:
+    """Return the exact Phase 12 GitHub API boundary endpoints."""
+    return {
+        "run": f"repos/{REPOSITORY_ID}/actions/runs/{RUN_ID}",
+        "jobs": (
+            f"repos/{REPOSITORY_ID}/actions/runs/{RUN_ID}"
+            "/attempts/1/jobs?per_page=100"
+        ),
+        "content": (
+            f"repos/{REPOSITORY_ID}/contents/"
+            ".github/workflows/parity-seed.yml"
+        ),
+        "log": f"repos/{REPOSITORY_ID}/actions/jobs/{JOB_ID}/logs",
+    }
+
+
+def expected_gh_calls(executable: Path, source_commit: str) -> list[list[str]]:
+    """Return the exact argument vectors required at the fake GitHub boundary."""
+    endpoints = github_endpoints()
+    prefix = [
+        str(executable),
+        "api",
+        "--hostname",
+        "github.com",
+        "--method",
+        "GET",
+    ]
+    return [
+        [*prefix, endpoints["run"]],
+        [*prefix, endpoints["jobs"]],
+        [
+            *prefix,
+            endpoints["content"],
+            "--field",
+            f"ref={source_commit}",
+        ],
+        [*prefix, endpoints["log"]],
+    ]
+
+
 def github_inputs(
     directory: Path,
     workflow: bytes,

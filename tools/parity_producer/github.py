@@ -31,6 +31,7 @@ from parity_producer.host_environment import trusted_system_tools
 GH_TIMEOUT_SECONDS = 120
 TOKEN_DESCRIPTOR = "GREENLIT_GITHUB_PRODUCER_CREDENTIAL_FD"
 MAX_TOKEN_BYTES = 64 * 1024
+_LIVE_SYSTEM_GH_CERTIFYING_WITNESS = object()
 
 
 def produce_github(
@@ -52,6 +53,7 @@ def produce_github(
         )
     if COMMIT.fullmatch(trusted_source_commit) is None:
         raise ProducerError("trusted source commit must be full lowercase SHA")
+    certifying_witness: object | None = None
     raw_paths = (run_json, jobs_json, content_json, job_log_path)
     if self_test_gh_executable is not None and (
         not self_test_raw_evidence or any(path is not None for path in raw_paths)
@@ -59,6 +61,15 @@ def produce_github(
         raise ProducerError(
             "the behavior-gate gh executable requires the self-test flag "
             "without raw evidence files"
+        )
+    if (
+        self_test_raw_evidence
+        and not all(path is not None for path in raw_paths)
+        and self_test_gh_executable is None
+    ):
+        raise ProducerError(
+            "self-test GitHub acquisition requires a complete raw evidence "
+            "bundle or custom gh executable"
         )
     if any(path is not None for path in raw_paths):
         if not self_test_raw_evidence:
@@ -81,11 +92,11 @@ def produce_github(
         job_log = read_job_log(job_log_path)
     else:
         token = _read_github_token()
-        gh = (
-            _self_test_executable(self_test_gh_executable)
-            if self_test_gh_executable is not None
-            else trusted_system_tools(("gh",))["gh"]
-        )
+        if self_test_gh_executable is not None:
+            gh = _self_test_executable(self_test_gh_executable)
+        else:
+            gh = trusted_system_tools(("gh",))["gh"]
+            certifying_witness = _LIVE_SYSTEM_GH_CERTIFYING_WITNESS
         run = require_object(
             load_json_bytes(
                 _gh_api(
@@ -142,7 +153,7 @@ def produce_github(
             output_limit=MAX_JOB_LOG_BYTES,
         )
 
-    return project_github_evidence(
+    projection = project_github_evidence(
         repository=repository,
         requested_run_id=run_id,
         run=run,
@@ -150,6 +161,11 @@ def produce_github(
         content_response=content,
         job_log=job_log,
         trusted_source_commit=trusted_source_commit,
+    )
+    return Production(
+        observation=projection.observation,
+        authority=projection.authority,
+        _certifying_witness=certifying_witness,
     )
 
 

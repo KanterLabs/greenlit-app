@@ -45,6 +45,7 @@ from parity_producer.oracle_workflow import (
 
 
 RUN_TIMEOUT_SECONDS = 60
+_ORACLE_CERTIFYING_WITNESS = object()
 
 
 def produce_oracle(
@@ -189,7 +190,11 @@ def produce_oracle(
                 ],
             },
         )
-        return Production(observation=observation, authority=authority)
+        return Production(
+            observation=observation,
+            authority=authority,
+            _certifying_witness=_ORACLE_CERTIFYING_WITNESS,
+        )
 
 
 def _run_block(
