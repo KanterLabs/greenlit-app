@@ -54,9 +54,14 @@
         "git_context::default_push_context_uses_local_repository_branch_sha_and_actor",
         "git_context::repository_state_failures_name_the_single_corrective_action",
         "github_confirmation::export_and_confirmation_are_hard_disabled_without_filesystem_or_auth_state_changes",
+        "inspect::doctor_reports_an_inactive_orphan_without_mutating_it",
         "inspect::doctor_reports_reclaimable_bytes_without_deleting_content",
+        "inspect::inspect_rejects_a_completed_catalog_row_without_matching_composite_artifacts",
+        "inspect::inspect_rejects_completed_looking_files_for_noncompleted_catalog_states",
         "inspect::inspect_rejects_path_traversal_as_a_run_identity",
-        "inspect::inspect_renders_latest_persisted_lock_and_result",
+        "inspect::inspect_renders_only_composite_authoritative_terminal_evidence",
+        "logs::logs_follow_reports_catalog_abort_instead_of_accepting_run_finished",
+        "logs::logs_follow_waits_past_uncommitted_run_finished_then_accepts_composite_commit",
         "logs::logs_jsonl_returns_original_matching_records",
         "logs::logs_rejects_runs_without_an_event_journal",
         "logs::logs_replays_latest_journal_with_job_step_and_tail_filters",
@@ -70,8 +75,8 @@
         "run_preflight::authored_out_of_scope_behavior_is_rejected_after_source_capture_before_external_work",
         "run_preflight::docker_text_and_commands_are_shell_degradation_not_inferred_dind",
         "run_preflight::every_unresolved_variable_condition_remains_conservatively_reachable",
-        "run_preflight::explicit_variables_are_nonforceable_before_host_source_or_engine_work",
         "run_preflight::exact_matrix_selection_uses_only_the_selected_legs_reachability",
+        "run_preflight::explicit_variables_are_nonforceable_before_host_source_or_engine_work",
         "run_preflight::hidden_daemon_lifecycle_commands_are_quarantined_before_socket_or_network_work",
         "run_preflight::metric_failure_cannot_replace_the_primary_quarantine_diagnostic",
         "run_preflight::security_sensitive_capabilities_cannot_be_forced",
@@ -176,8 +181,8 @@
         "human_tree_output_and_stderr_diagnostics_are_separated_and_terminal_safe",
         "plan_appends_exactly_one_metrics_record",
         "plan_fails_actionably_when_its_required_metrics_record_cannot_be_written",
-        "variables::unknown_context_property_is_falsey_in_the_matrix_needs_plan",
-        "variables::explicit_plan_variables_are_quarantined_without_retention"
+        "variables::explicit_plan_variables_are_quarantined_without_retention",
+        "variables::unknown_context_property_is_falsey_in_the_matrix_needs_plan"
       ]
     },
     {
@@ -350,7 +355,9 @@
       "test_cfgs": [],
       "tests": [
         "concurrent_requests_materialize_one_digest_once",
-        "corrupted_content_is_quarantined_and_can_be_refetched"
+        "corrupted_content_is_quarantined_and_can_be_refetched",
+        "recovery_never_follows_quarantine_links_or_resurrects_aborted_runs",
+        "recovery_revokes_every_incomplete_publication_window_before_quarantine"
       ]
     },
     {
