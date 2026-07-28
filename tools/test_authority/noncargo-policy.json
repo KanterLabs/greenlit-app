@@ -174,7 +174,7 @@
       "import_roots": [],
       "inventory_roots": [],
       "sources": ["tools/check-release-dogfood"],
-      "closure_sha256": "5de99c001aace0d1d27551bb376c5d6bb8338df8e916d6b8114fc460e2c8a9a9",
+      "closure_sha256": "87ad647e206f8fa54048b3e4de800662be248422f532e676368e02d3cc65614f",
       "dynamic_sources": [],
       "delegates": [],
       "import_targets": [],
