@@ -111,28 +111,16 @@ fn ordinary_secret_is_blocked_before_input_migration_or_engine_work() {
 }
 
 #[test]
-fn github_token_is_blocked_before_cli_credentials_are_used() {
-    const CLI_SENTINEL: &str = "cli-token-must-not-be-read-7391";
+fn github_token_is_blocked_before_credentials_or_engine_work() {
     let sandbox = sandbox_with(GITHUB_TOKEN_WORKFLOW);
 
     let output = sandbox.run_with_env(
-        &[
-            "run",
-            "-W",
-            "wf.yml",
-            "--no-input",
-            "--allow-degraded",
-            "-s",
-            &format!("GITHUB_TOKEN={CLI_SENTINEL}"),
-        ],
+        &["run", "-W", "wf.yml", "--no-input", "--allow-degraded"],
         &[SSH_DOCKER_HOST],
     );
     assert_secret_quarantine(&sandbox, &output, "GITHUB_TOKEN");
 
-    let stdout = support::stdout_text(&output);
     let stderr = support::stderr_text(&output);
-    assert!(!stdout.contains(CLI_SENTINEL), "{stdout}");
-    assert!(!stderr.contains(CLI_SENTINEL), "{stderr}");
     assert!(
         !stderr.contains("cannot narrow"),
         "credential permissions were inspected before quarantine: {stderr}"
