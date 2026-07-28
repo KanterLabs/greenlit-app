@@ -95,6 +95,7 @@ commit.
 | GL-STAB-084 | high | 12 | The isolated copy gate pins a private runner image that the job's credential-free DinD daemon cannot pull, so filesystem capability assertions never execute. | Public digest-pinned child image plus exact native CI execution of the real reflink and bounded-stream gate | open | — |
 | GL-STAB-085 | high | 12 | Same-SHA local parity passes Cargo's final hard-linked binary directly to a single-link identity boundary, so valid release builds are rejected before execution. | Separately installed single-link release binary plus exact live local parity production | open | — |
 | GL-STAB-086 | high | 12 | A standalone parity binary installed directly beneath its private root makes the sibling isolated HOME appear nested within the binary target boundary, so local evidence fails before execution. | Canonical private target/release binary layout plus exact live local parity production | open | — |
+| GL-STAB-087 | critical | 12 | Retained run directories inherit SGID from the runner while evidence creation ignores special bits, so the terminal secret scanner rejects and may remove otherwise valid evidence. | Compiled-CLI SGID-HOME creation and pre-existing-special-bit rejection case plus real retained-secret capability owner | open | — |
 
 ## Field contract
 

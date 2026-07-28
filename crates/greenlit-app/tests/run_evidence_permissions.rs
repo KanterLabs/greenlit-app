@@ -48,7 +48,7 @@ fn assert_mode(path: &Path, expected: u32) {
         path.display()
     );
     assert_eq!(
-        metadata.permissions().mode() & 0o777,
+        metadata.permissions().mode() & 0o7777,
         expected,
         "{} has the wrong mode",
         path.display()
@@ -72,11 +72,11 @@ fn manifest_mode(manifest: &[serde_json::Value], path: &str) -> u64 {
         .unwrap_or_else(|| panic!("source manifest is missing {path}"))
 }
 
-fn assert_unsafe_mode_diagnostic(stderr: &str, path: &str) {
+fn assert_unsafe_mode_diagnostic(stderr: &str, path: &str, actual_mode: &str) {
     assert!(
         stderr.to_ascii_lowercase().contains("unsafe")
             && stderr.contains(path)
-            && stderr.contains("755")
+            && stderr.contains(actual_mode)
             && stderr.contains("700"),
         "unsafe path needs one actionable diagnostic: {stderr}"
     );
@@ -89,7 +89,7 @@ fn assert_private_tree(root: &Path) {
         if metadata.file_type().is_symlink() {
             continue;
         }
-        let mode = metadata.permissions().mode() & 0o777;
+        let mode = metadata.permissions().mode() & 0o7777;
         if metadata.is_dir() {
             assert_eq!(mode, 0o700, "{} is not a private directory", path.display());
             pending.extend(
@@ -111,6 +111,9 @@ fn assert_private_tree(root: &Path) {
 #[test]
 fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
     let sandbox = Sandbox::new();
+    std::fs::set_permissions(sandbox.home(), std::fs::Permissions::from_mode(0o2700))
+        .expect("make the isolated HOME inherit SGID");
+    assert_mode(sandbox.home(), 0o2700);
     sandbox.write(".github/workflows/ci.yml", WORKFLOW);
     let executable = sandbox.write("scripts/check.sh", "#!/bin/sh\nexit 0\n");
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
@@ -183,7 +186,7 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
     let unsafe_state = run_with_permissive_umask(&sandbox);
     assert!(!unsafe_state.status.success());
     let unsafe_state_stderr = support::stderr_text(&unsafe_state);
-    assert_unsafe_mode_diagnostic(&unsafe_state_stderr, ".litci");
+    assert_unsafe_mode_diagnostic(&unsafe_state_stderr, ".litci", "755");
     assert_mode(&litci, 0o755);
     assert_eq!(
         run_directories(&runs).len(),
@@ -198,11 +201,26 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
     let unsafe_runs = run_with_permissive_umask(&sandbox);
     assert!(!unsafe_runs.status.success());
     let unsafe_runs_stderr = support::stderr_text(&unsafe_runs);
-    assert_unsafe_mode_diagnostic(&unsafe_runs_stderr, ".litci/runs");
+    assert_unsafe_mode_diagnostic(&unsafe_runs_stderr, ".litci/runs", "755");
     assert_mode(&runs, 0o755);
     assert_eq!(
         run_directories(&runs).len(),
         1,
         "rejection must not create or repair a run directory"
+    );
+
+    std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the private runs parent");
+    std::fs::set_permissions(&litci, std::fs::Permissions::from_mode(0o2700))
+        .expect("add SGID to the existing state parent");
+    let unsafe_sgid_state = run_with_permissive_umask(&sandbox);
+    assert!(!unsafe_sgid_state.status.success());
+    let unsafe_sgid_stderr = support::stderr_text(&unsafe_sgid_state);
+    assert_unsafe_mode_diagnostic(&unsafe_sgid_stderr, ".litci", "2700");
+    assert_mode(&litci, 0o2700);
+    assert_eq!(
+        run_directories(&runs).len(),
+        1,
+        "rejection must not repair an existing SGID state directory"
     );
 }

@@ -20,7 +20,7 @@ use greenlit_engine::{
     TraceEventV1, opaque_revision,
 };
 use indexmap::IndexMap;
-use rustix::fs::{Mode, OFlags, mkdirat, open, openat, renameat};
+use rustix::fs::{Mode, OFlags, fchmod, mkdirat, open, openat, renameat};
 use rustix::io::Errno;
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -121,7 +121,8 @@ impl RunEvidence {
                 Mode::RUSR | Mode::WUSR | Mode::XUSR,
             ) {
                 Ok(()) => {
-                    let handle = open_private_directory_at(&runs_handle, &runs, run_id.as_str())?;
+                    let handle =
+                        open_new_private_directory_at(&runs_handle, &runs, run_id.as_str())?;
                     selected = Some((run_id, directory, handle));
                     break;
                 }
@@ -936,7 +937,8 @@ fn create_or_open_private_directory(
     name: &str,
 ) -> anyhow::Result<File> {
     match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-        Ok(()) | Err(Errno::EXIST) => open_private_directory_at(parent, parent_path, name),
+        Ok(()) => open_new_private_directory_at(parent, parent_path, name),
+        Err(Errno::EXIST) => open_private_directory_at(parent, parent_path, name),
         Err(error) => Err(evidence_write_error(&parent_path.join(name), error)),
     }
 }
@@ -948,7 +950,7 @@ fn create_new_private_directory(
 ) -> anyhow::Result<File> {
     let path = parent_path.join(name);
     match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
-        Ok(()) => open_private_directory_at(parent, parent_path, name),
+        Ok(()) => open_new_private_directory_at(parent, parent_path, name),
         Err(Errno::EXIST) => {
             let existing = open_private_directory_at(parent, parent_path, name)?;
             drop(existing);
@@ -961,22 +963,57 @@ fn create_new_private_directory(
     }
 }
 
+fn open_new_private_directory_at(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+) -> anyhow::Result<File> {
+    let path = parent_path.join(name);
+    let file = open_directory_at(parent, &path, name)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| evidence_write_error(&path, error))?;
+    if !metadata.is_dir() {
+        return Err(unsafe_path_error(&path, "path is not a directory"));
+    }
+    validate_current_owner(&path, &metadata)?;
+    let mode = metadata.mode() & 0o7777;
+    if mode & !0o2700 != 0 {
+        return Err(unsafe_path_error(
+            &path,
+            format!("new private directory has unexpected mode 0{mode:03o}"),
+        ));
+    }
+    // Linux inherits SGID from a parent directory even when mkdirat requests
+    // 0700. Clear that inherited bit on the descriptor for this newly created
+    // inode before any retained child is written. Existing paths take the
+    // strict open path below and are never repaired.
+    fchmod(&file, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+        .map_err(|error| evidence_write_error(&path, error))?;
+    validate_private_directory(&path, &file)?;
+    Ok(file)
+}
+
 fn open_private_directory_at(
     parent: &File,
     parent_path: &Path,
     name: &str,
 ) -> anyhow::Result<File> {
     let path = parent_path.join(name);
-    let file = openat(
+    let file = open_directory_at(parent, &path, name)?;
+    validate_private_directory(&path, &file)?;
+    Ok(file)
+}
+
+fn open_directory_at(parent: &File, path: &Path, name: &str) -> anyhow::Result<File> {
+    openat(
         parent,
         name,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map(File::from)
-    .map_err(|error| unsafe_path_error(&path, error))?;
-    validate_private_directory(&path, &file)?;
-    Ok(file)
+    .map_err(|error| unsafe_path_error(path, error))
 }
 
 fn create_private_file_at(
@@ -1061,8 +1098,8 @@ fn validate_private_metadata(
     required_mode: u32,
 ) -> anyhow::Result<()> {
     validate_current_owner(path, metadata)?;
-    let mode = metadata.mode() & 0o777;
-    if mode & 0o077 != 0 {
+    let mode = metadata.mode() & 0o7777;
+    if mode != required_mode {
         anyhow::bail!(
             "refused unsafe run evidence path {} because its mode is 0{mode:03o}\n  fix: change its mode to 0{required_mode:03o} and ensure it is owned by the current user, then retry",
             path.display()
