@@ -8,11 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use greenlit_engine::{
-    CAPABILITY_ACTION_USES, CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_EVIDENCE_INTEGRITY,
-    CAPABILITY_EXECUTION_SHELL, CAPABILITY_INFRASTRUCTURE_DIND, CAPABILITY_REACHABILITY_AMBIGUOUS,
-    CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY, CAPABILITY_SOURCE_CONTAINMENT,
-    CAPABILITY_SOURCE_WRITE_BACK, CapabilityFinding, EventKind, ExecutionPlan, PlanOptions,
-    QuarantineOutcome, SyntheticEvent, plan,
+    CAPABILITY_ACTION_USES, CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_DISPATCH_INPUT,
+    CAPABILITY_EVIDENCE_INTEGRITY, CAPABILITY_EXECUTION_SHELL, CAPABILITY_INFRASTRUCTURE_DIND,
+    CAPABILITY_REACHABILITY_AMBIGUOUS, CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY,
+    CAPABILITY_SOURCE_CONTAINMENT, CAPABILITY_SOURCE_WRITE_BACK, CAPABILITY_VARIABLE_CONTEXT,
+    CapabilityFinding, EventKind, ExecutionPlan, PlanOptions, QuarantineOutcome, SyntheticEvent,
+    plan,
 };
 use greenlit_expr::Value;
 use greenlit_runtime::{
@@ -59,6 +60,7 @@ fn github_and_action_token_shapes_fail_closed() {
         &[],
     );
     let empty_secrets = Value::object(Vec::<(String, Value)>::new());
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
 
     for (github, action_token, expected) in [
         (
@@ -85,8 +87,15 @@ fn github_and_action_token_shapes_fail_closed() {
             CAPABILITY_SECURITY_BOUNDARY,
         ),
     ] {
-        let inputs =
-            RuntimeCapabilityInputs::new(&github, &empty_secrets, action_token, false, false);
+        let inputs = RuntimeCapabilityInputs::new(
+            &github,
+            &empty_contexts,
+            &empty_contexts,
+            &empty_secrets,
+            action_token,
+            false,
+            false,
+        );
         let assessment = assess_runtime_capabilities(&plan, &inputs, &[], true);
         assert_eq!(assessment.decision().outcome(), QuarantineOutcome::Blocked);
         assert_eq!(ids(&assessment), vec![expected]);
@@ -101,7 +110,16 @@ fn explicit_dind_is_nonforceable_without_scanning_shell_text() {
     );
     let github = Value::object(Vec::<(String, Value)>::new());
     let secrets = Value::object(Vec::<(String, Value)>::new());
-    let inputs = RuntimeCapabilityInputs::new(&github, &secrets, None, true, false);
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
+    let inputs = RuntimeCapabilityInputs::new(
+        &github,
+        &empty_contexts,
+        &empty_contexts,
+        &secrets,
+        None,
+        true,
+        false,
+    );
     let assessment = assess_runtime_capabilities(&plan, &inputs, &[], true);
     assert_eq!(assessment.decision().outcome(), QuarantineOutcome::Blocked);
     let ids = ids(&assessment);
@@ -117,7 +135,16 @@ fn deferred_run_content_is_shell_content_not_reachability() {
     );
     let github = Value::object(Vec::<(String, Value)>::new());
     let secrets = Value::object(Vec::<(String, Value)>::new());
-    let inputs = RuntimeCapabilityInputs::new(&github, &secrets, None, false, false);
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
+    let inputs = RuntimeCapabilityInputs::new(
+        &github,
+        &empty_contexts,
+        &empty_contexts,
+        &secrets,
+        None,
+        false,
+        false,
+    );
     let assessment = assess_runtime_capabilities(&plan, &inputs, &[], true);
     assert_eq!(assessment.decision().outcome(), QuarantineOutcome::Degraded);
     let forced = assessment
@@ -176,10 +203,19 @@ fn authored_secret_and_github_token_shapes_are_nonforceable_with_empty_runtime_c
     ];
     let github = Value::object(Vec::<(String, Value)>::new());
     let secrets = Value::object(Vec::<(String, Value)>::new());
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
 
     for (workflow, expected) in cases {
         let plan = planned(workflow, &[]);
-        let inputs = RuntimeCapabilityInputs::new(&github, &secrets, None, false, false);
+        let inputs = RuntimeCapabilityInputs::new(
+            &github,
+            &empty_contexts,
+            &empty_contexts,
+            &secrets,
+            None,
+            false,
+            false,
+        );
         let assessment = assess_runtime_capabilities(&plan, &inputs, &[], true);
         assert_eq!(
             assessment.decision().outcome(),
@@ -267,6 +303,8 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_ACTION_USES,
         ),
         (
@@ -275,6 +313,8 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             true,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_SOURCE_WRITE_BACK,
         ),
         (
@@ -283,6 +323,8 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_SECRET_CONTEXT,
         ),
         (
@@ -291,6 +333,8 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_CREDENTIAL_GITHUB,
         ),
         (
@@ -299,6 +343,8 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_SECRET_CONTEXT,
         ),
         (
@@ -307,10 +353,58 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
                 &[],
             ),
             false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(Vec::<(String, Value)>::new()),
             CAPABILITY_CREDENTIAL_GITHUB,
         ),
+        (
+            planned(
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo retained\n",
+                &[],
+            ),
+            false,
+            Value::object(vec![(
+                "UNUSED_VARIABLE".to_string(),
+                Value::String("credential-bearing-value".to_string()),
+            )]),
+            Value::object(Vec::<(String, Value)>::new()),
+            CAPABILITY_VARIABLE_CONTEXT,
+        ),
+        (
+            planned(
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo retained\n",
+                &[],
+            ),
+            false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::object(vec![(
+                "dispatch_value".to_string(),
+                Value::String("credential-bearing-value".to_string()),
+            )]),
+            CAPABILITY_DISPATCH_INPUT,
+        ),
+        (
+            planned(
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo retained\n",
+                &[],
+            ),
+            false,
+            Value::String("malformed-variable-context".to_string()),
+            Value::object(Vec::<(String, Value)>::new()),
+            CAPABILITY_SECURITY_BOUNDARY,
+        ),
+        (
+            planned(
+                "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo retained\n",
+                &[],
+            ),
+            false,
+            Value::object(Vec::<(String, Value)>::new()),
+            Value::String("malformed-input-context".to_string()),
+            CAPABILITY_SECURITY_BOUNDARY,
+        ),
     ];
-    for (plan, write_back, expected_capability) in cases {
+    for (plan, write_back, vars, inputs, expected_capability) in cases {
         let recorder = RecordingDockerApi::start();
         let engine =
             DockerEngine::connect(&recorder.endpoint).expect("construct production Docker engine");
@@ -321,10 +415,10 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
             strategy: IsolationStrategy::default(),
             runner_env: Default::default(),
             github: Value::object(Vec::<(String, Value)>::new()),
-            vars: Value::object(Vec::<(String, Value)>::new()),
-            inputs: Value::object(Vec::<(String, Value)>::new()),
+            vars,
+            inputs,
             secrets: Value::object(Vec::<(String, Value)>::new()),
-            initial_masks: Vec::new(),
+            masker: greenlit_engine::execution::Masker::new(),
             volume_namespace: "quarantine-boundary".to_string(),
             locked_images: None,
             write_back,
@@ -332,6 +426,7 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
             readiness: ReadinessConfig::default(),
             actions: action_config::unreachable_action_config(),
             store: None,
+            allow_external_network: true,
             resources: ResourceLimits::default(),
         };
         let mut output = Vec::new();
@@ -365,7 +460,16 @@ async fn bound_assessment_drift_is_nonforceable_before_production_engine_request
     );
     let github = Value::object(Vec::<(String, Value)>::new());
     let secrets = Value::object(Vec::<(String, Value)>::new());
-    let inputs = RuntimeCapabilityInputs::new(&github, &secrets, None, false, false);
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
+    let inputs = RuntimeCapabilityInputs::new(
+        &github,
+        &empty_contexts,
+        &empty_contexts,
+        &secrets,
+        None,
+        false,
+        false,
+    );
     let assessment = assess_runtime_capabilities(&plan, &inputs, &[], true);
     assert_eq!(assessment.decision().outcome(), QuarantineOutcome::Degraded);
 
@@ -382,7 +486,7 @@ async fn bound_assessment_drift_is_nonforceable_before_production_engine_request
         vars: Value::object(Vec::<(String, Value)>::new()),
         inputs: Value::object(Vec::<(String, Value)>::new()),
         secrets,
-        initial_masks: Vec::new(),
+        masker: greenlit_engine::execution::Masker::new(),
         volume_namespace: "quarantine-assessment-drift".to_string(),
         locked_images: None,
         write_back: true,
@@ -390,6 +494,7 @@ async fn bound_assessment_drift_is_nonforceable_before_production_engine_request
         readiness: ReadinessConfig::default(),
         actions: action_config::unreachable_action_config(),
         store: None,
+        allow_external_network: true,
         resources: ResourceLimits::default(),
     };
     let cancellation = Cancellation::new();
@@ -441,7 +546,16 @@ async fn public_bound_assessment_cannot_force_source_containment_or_unknown_find
     );
     let github = Value::object(Vec::<(String, Value)>::new());
     let secrets = Value::object(Vec::<(String, Value)>::new());
-    let inputs = RuntimeCapabilityInputs::new(&github, &secrets, None, false, false);
+    let empty_contexts = Value::object(Vec::<(String, Value)>::new());
+    let inputs = RuntimeCapabilityInputs::new(
+        &github,
+        &empty_contexts,
+        &empty_contexts,
+        &secrets,
+        None,
+        false,
+        false,
+    );
     let cases = [
         (
             CapabilityFinding::new(
@@ -486,7 +600,7 @@ async fn public_bound_assessment_cannot_force_source_containment_or_unknown_find
             vars: Value::object(Vec::<(String, Value)>::new()),
             inputs: Value::object(Vec::<(String, Value)>::new()),
             secrets: secrets.clone(),
-            initial_masks: Vec::new(),
+            masker: greenlit_engine::execution::Masker::new(),
             volume_namespace: format!("quarantine-bound-{expected_capability}"),
             locked_images: None,
             write_back: false,
@@ -494,6 +608,7 @@ async fn public_bound_assessment_cannot_force_source_containment_or_unknown_find
             readiness: ReadinessConfig::default(),
             actions: action_config::unreachable_action_config(),
             store: None,
+            allow_external_network: true,
             resources: ResourceLimits::default(),
         };
         let cancellation = Cancellation::new();
@@ -568,7 +683,7 @@ async fn public_cancellable_entrypoint_independently_blocks_sensitive_plan_conte
             vars: Value::object(Vec::<(String, Value)>::new()),
             inputs: Value::object(Vec::<(String, Value)>::new()),
             secrets: Value::object(Vec::<(String, Value)>::new()),
-            initial_masks: Vec::new(),
+            masker: greenlit_engine::execution::Masker::new(),
             volume_namespace: "quarantine-cancellable-boundary".to_string(),
             locked_images: None,
             write_back: false,
@@ -576,6 +691,7 @@ async fn public_cancellable_entrypoint_independently_blocks_sensitive_plan_conte
             readiness: ReadinessConfig::default(),
             actions: action_config::unreachable_action_config(),
             store: None,
+            allow_external_network: true,
             resources: ResourceLimits::default(),
         };
         let mut output = Vec::new();

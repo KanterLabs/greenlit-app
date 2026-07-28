@@ -1,18 +1,15 @@
 //! `litci auth`: GitHub App device-flow login, PAT paste, and `gh` CLI
-//! passthrough, plus transparent token storage/refresh consumed by the
-//! variables (`crate::vars`) and secrets (`crate::secrets`) resolution
-//! chains.
+//! passthrough and credential storage. Phase 12 deliberately exposes no
+//! production credential-loading API: selected workflows are quarantined
+//! before credential retrieval until Phase 16 certifies the trust boundary.
 //!
 //! `PHASE-3-actions.md` Auth: device flow using the embedded public client
-//! ID, `--pat`, `--gh`, keyring-first storage, and transparent refresh on
-//! expiry. See `crates/greenlit-app/src/auth/device_flow.rs` for the
-//! doc-verified device-flow wire details and `refresh.rs` for the refresh
-//! exchange.
+//! ID, `--pat`, and `--gh`. See `crates/greenlit-app/src/auth/device_flow.rs`
+//! for the doc-verified device-flow wire details.
 
 mod device_flow;
 mod gh_cli;
 mod pat;
-mod refresh;
 mod token_store;
 
 use std::path::PathBuf;
@@ -116,65 +113,6 @@ fn home_dir() -> Result<PathBuf, String> {
     Ok(home)
 }
 
-/// The currently valid access token, if any, refreshing transparently when
-/// the stored token is a device-flow token past its known expiry.
-///
-/// Returns `Ok(None)` for "not authenticated" (never stored, or a refresh
-/// that itself failed/expired) — every caller treats that identically to
-/// having never called `litci auth`, pointing back at it as the fix. This
-/// is the single entry point `crate::vars`/`crate::secrets` (and, in a
-/// later phase, action resolution's `GitHubApiResolver`/`RefResolver`
-/// construction) call to obtain a token without any of them needing to know
-/// which backend it came from or whether a refresh just happened.
-pub(crate) fn current_token() -> Result<Option<String>, String> {
-    let home = home_dir()?;
-    let description = keyring_description()?;
-    let Some(stored) = token_store::load(&home, allow_keyring(), &description) else {
-        return Ok(None);
-    };
-    let needs_refresh = stored
-        .access_token_expires_at
-        .is_some_and(token_store::is_expired);
-    if !needs_refresh {
-        return Ok(Some(stored.access_token));
-    }
-    let Some(refresh_token) = stored.refresh_token.clone() else {
-        // No refresh token (a PAT/`gh` token past a *known* expiry never
-        // happens today — those sources never set an expiry — but stay
-        // total): fall back to using the possibly-stale access token and
-        // let the API itself report the auth failure.
-        return Ok(Some(stored.access_token));
-    };
-    if stored
-        .refresh_token_expires_at
-        .is_some_and(token_store::is_expired)
-    {
-        return Ok(None);
-    }
-    match refresh::refresh_access_token(&oauth_base_url(), GITHUB_APP_CLIENT_ID, &refresh_token) {
-        Ok(refreshed) => {
-            let updated = StoredToken {
-                access_token: refreshed.access_token.clone(),
-                refresh_token: Some(refreshed.refresh_token),
-                access_token_expires_at: Some(token_store::expires_in(refreshed.expires_in)),
-                refresh_token_expires_at: Some(token_store::expires_in(
-                    refreshed.refresh_token_expires_in,
-                )),
-                source: TokenSource::DeviceFlow,
-            };
-            token_store::save(&home, &updated, allow_keyring(), &description).map_err(|error| {
-                format!(
-                    "could not persist the refreshed GitHub credential: {error}\n  fix: run `litci auth` again"
-                )
-            })?;
-            Ok(Some(refreshed.access_token))
-        }
-        // A refresh failure means re-authentication is required; the stale
-        // access token is not returned since it is already known-expired.
-        Err(_) => Ok(None),
-    }
-}
-
 /// Runs the device-flow login: prints the user code and verification URL,
 /// polls until authorized (or the code expires/is denied), and stores the
 /// resulting token.
@@ -251,7 +189,7 @@ fn store_and_report(out: &mut impl std::io::Write, stored: &StoredToken) -> Resu
     writeln!(out, "Stored the token in the system keyring.").ok();
     writeln!(
         out,
-        "Authenticated. `litci run`/`litci plan` will now use this token for GitHub lookups."
+        "Credential use remains quarantined until stabilization Phase 16 certifies trust and input preflight."
     )
     .ok();
     Ok(())

@@ -7,11 +7,8 @@
 //! so the same phrasing is used regardless of which pipeline stage failed.
 
 use greenlit_engine::{EventError, GitError, GraphError, PlanError};
-use greenlit_expr::Value;
 use greenlit_metrics::MetricsError;
 use greenlit_workflow::ParseError;
-
-use crate::vars::{VarResolutionError, VarsOutcome};
 
 fn safe_text(text: &str) -> String {
     crate::render::terminal::inline_escape(text)
@@ -131,86 +128,6 @@ pub(crate) fn event_error(e: &EventError) -> anyhow::Error {
     anyhow::anyhow!("{}\n  fix: {fix}", safe_error(e))
 }
 
-/// Renders a variable-resolution failure. `suggest_auth` adds `litci auth`
-/// as the fix for every still-unresolved literal name/dynamic lookup
-/// (`PHASE-3-actions.md` Variables: "stop before engine detection with
-/// `litci auth` as the single fix action") — set only for
-/// [`crate::vars::VarsOutcome::AuthRequired`], never for a hard local error
-/// (invalid/oversized/ambiguous/non-Unicode), which no amount of
-/// authentication could fix.
-pub(crate) fn vars_resolution(failure: &VarResolutionError, suggest_auth: bool) -> anyhow::Error {
-    let mut message = String::new();
-    for invalid in &failure.invalid {
-        let span = safe_text(&invalid.first_use.to_string());
-        let name = safe_text(&invalid.name);
-        message.push_str(&format!(
-            "{}: 'vars.{}' is not a valid GitHub configuration variable name: {}\n  fix: rename the reference to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_\n",
-            span, name, invalid.reason
-        ));
-    }
-    for oversized in &failure.oversized {
-        let name = safe_text(&oversized.name);
-        message.push_str(&format!(
-            "configuration variable 'vars.{}' has a {}-byte value, exceeding GitHub's 48 KiB per-variable limit\n  fix: shorten the value supplied through --var, the process environment, or .litci/vars\n",
-            name, oversized.bytes
-        ));
-    }
-    for ambiguous in &failure.ambiguous_process {
-        let name = safe_text(&ambiguous.name);
-        let spellings = safe_text(&ambiguous.spellings.join(", "));
-        message.push_str(&format!(
-            "process environment defines case-insensitive configuration variable 'vars.{}' more than once ({})\n  fix: remove the duplicate case variants, or pass --var {}=<value> to choose explicitly\n",
-            name, spellings, name
-        ));
-    }
-    for non_unicode in &failure.non_unicode_process {
-        let spelling = safe_text(&non_unicode.spelling);
-        let name = safe_text(&non_unicode.name);
-        message.push_str(&format!(
-            "process environment variable '{}' for 'vars.{}' is not valid UTF-8\n  fix: remove it, or pass --var {}=<value> with a UTF-8 value\n",
-            spelling, name, name
-        ));
-    }
-    for m in &failure.missing {
-        let span = safe_text(&m.first_use.to_string());
-        let name = safe_text(&m.name);
-        let auth_fix = if suggest_auth {
-            " or run `litci auth` to look it up from GitHub"
-        } else {
-            ""
-        };
-        message.push_str(&format!(
-            "{span}: variable 'vars.{name}' is not set\n  fix: pass --var {name}=<value>, set ${name} in the environment, or add {name}=<value> to .litci/vars{auth_fix}\n"
-        ));
-    }
-    if let Some(span) = &failure.dynamic_lookup {
-        let span = safe_text(&span.to_string());
-        let auth_fix = if suggest_auth {
-            ", or run `litci auth` to fetch the complete repository/organization map from GitHub"
-        } else {
-            ""
-        };
-        message.push_str(&format!(
-            "{span}: dynamic `vars[...]` lookup requires a complete local variable map\n  fix: pass at least one --var KEY=VALUE, or create .litci/vars (an empty file declares an empty map){auth_fix}\n"
-        ));
-    }
-    anyhow::anyhow!(message.trim_end().to_string())
-}
-
-/// Resolves a [`VarsOutcome`] into the `vars` context `Value` or the one
-/// `anyhow::Error` to report — the single call site both `crate::plan_cmd`
-/// and `crate::run_cmd` share so the local/auth-required/remote-error
-/// renderings stay identical between the two commands
-/// (`PHASE-3-actions.md`: "keep plan and run behavior consistent").
-pub(crate) fn vars_outcome(outcome: VarsOutcome) -> anyhow::Result<Value> {
-    match outcome {
-        VarsOutcome::Resolved(value) => Ok(value),
-        VarsOutcome::LocalError(failure) => Err(vars_resolution(&failure, false)),
-        VarsOutcome::AuthRequired(failure) => Err(vars_resolution(&failure, true)),
-        VarsOutcome::RemoteError(message) => Err(anyhow::anyhow!(safe_text(&message))),
-    }
-}
-
 pub(crate) fn metrics_error(error: &MetricsError) -> anyhow::Error {
     let fix = match error {
         MetricsError::HomeDirUnavailable | MetricsError::InvalidHomeDir => {
@@ -226,7 +143,7 @@ pub(crate) fn metrics_error(error: &MetricsError) -> anyhow::Error {
         MetricsError::InvalidPathComponent { .. } => {
             "replace the listed symbolic link or special file with a real directory or regular file, then retry"
         }
-        MetricsError::UnsafePermissions { .. } => {
+        MetricsError::UnsafePermissions { .. } | MetricsError::UnsafeOwner { .. } => {
             "restrict the listed directory to 0700 or file to 0600, then retry"
         }
         MetricsError::Serialize { .. } => "update litci and retry the command",

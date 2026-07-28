@@ -10,8 +10,6 @@ mod common;
 mod discovery;
 #[path = "cli_behavior/dogfood.rs"]
 mod dogfood;
-#[path = "cli_behavior/dotenv.rs"]
-mod dotenv;
 #[path = "cli_behavior/filters.rs"]
 mod filters;
 #[path = "cli_behavior/git_context.rs"]

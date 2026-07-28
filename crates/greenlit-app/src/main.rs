@@ -10,7 +10,6 @@ mod auth_cmd;
 mod clean_cmd;
 mod cli;
 mod doctor_cmd;
-mod dotenv_format;
 mod errors;
 mod gh_names;
 mod inspect_cmd;
@@ -23,7 +22,6 @@ mod run_events;
 mod run_evidence;
 mod run_quarantine;
 mod run_selection;
-mod runtime_token;
 mod secrets;
 mod setup_cmd;
 mod stats_cmd;
@@ -83,13 +81,24 @@ fn parse_cli() -> Result<cli::Cli, std::process::ExitCode> {
 
             // clap includes invalid argument text in its diagnostic. Parse a
             // display-only copy whose untrusted OS arguments have already
-            // been made terminal-safe. Secret-option values are replaced
-            // before this second parse so malformed `KEY=VALUE` input cannot
-            // be reflected through clap. The original values remain the only
-            // values used after a successful parse.
-            let (safe_arguments, contained_exact_secret) = display_safe_arguments(&arguments);
+            // been made terminal-safe. Secret, dispatch-input, and variable
+            // option values are replaced before this second parse so malformed
+            // `KEY=VALUE` input cannot be reflected through clap. The original
+            // values remain the only values used after a successful parse.
+            let (
+                safe_arguments,
+                contained_exact_secret,
+                contained_exact_key_value,
+                contained_sensitive_option,
+            ) = display_safe_arguments(&arguments);
             let rendered = if contained_exact_secret {
                 "could not parse command-line arguments containing a secret value\n  fix: pass each -s/--secret as KEY=VALUE, then retry\n"
+                    .to_string()
+            } else if contained_exact_key_value {
+                "could not parse command-line arguments containing an input or variable value\n  fix: pass each --input/--var as KEY=VALUE with a non-empty valid name, then retry\n"
+                    .to_string()
+            } else if contained_sensitive_option {
+                "could not parse command-line arguments containing a value for a secret-like, input-like, or variable-like option\n  fix: correct the option name and pass its value as KEY=VALUE, then retry\n"
                     .to_string()
             } else {
                 cli::Cli::try_parse_from(safe_arguments).map_or_else(
@@ -115,18 +124,21 @@ fn parse_cli() -> Result<cli::Cli, std::process::ExitCode> {
 
 /// Produces arguments safe to hand back to clap for diagnostic rendering.
 ///
-/// Every supported spelling of the secret option is recognized:
-/// `--secret VALUE`, `--secret=VALUE`, `-s VALUE`, and `-sVALUE`. Values are
-/// never decoded or retained in the display copy. A long option name one
-/// edit away from `secret` is treated as an intended secret option too, but
-/// its typoed name is retained so clap can still render the useful unknown
-/// argument and nearest-option diagnostic.
-fn display_safe_arguments(arguments: &[OsString]) -> (Vec<OsString>, bool) {
+/// Every supported spelling of `--secret`, `--input`, and `--var` is
+/// recognized, including the secret option's short spellings. Values are
+/// never retained in the display copy. A long option name one edit away from
+/// any of those names is treated as an intended sensitive option too. Once
+/// any such option appears, parse failure uses a fixed opaque diagnostic
+/// rather than asking clap to reconstruct an argument sequence whose
+/// missing-value state could associate a credential with the wrong option.
+fn display_safe_arguments(arguments: &[OsString]) -> (Vec<OsString>, bool, bool, bool) {
     const REDACTED: &str = "GREENLIT_REDACTED=redacted";
 
     let mut safe = Vec::with_capacity(arguments.len());
     let mut redact_next = false;
     let mut contained_exact_secret = false;
+    let mut contained_exact_key_value = false;
+    let mut contained_sensitive_option = false;
 
     for (index, argument) in arguments.iter().enumerate() {
         if index == 0 {
@@ -144,23 +156,41 @@ fn display_safe_arguments(arguments: &[OsString]) -> (Vec<OsString>, bool) {
         let rendered = argument.to_string_lossy();
         if rendered == "--secret" || rendered == "-s" {
             contained_exact_secret = true;
+            contained_sensitive_option = true;
             redact_next = true;
             safe.push(OsString::from(rendered.as_ref()));
         } else if rendered.starts_with("--secret=") {
             contained_exact_secret = true;
+            contained_sensitive_option = true;
             safe.push(OsString::from(format!("--secret={REDACTED}")));
         } else if rendered.starts_with("-s") && rendered.len() > 2 {
             contained_exact_secret = true;
+            contained_sensitive_option = true;
             safe.push(OsString::from(format!("-s{REDACTED}")));
+        } else if rendered == "--input" || rendered == "--var" {
+            contained_exact_key_value = true;
+            contained_sensitive_option = true;
+            redact_next = true;
+            safe.push(OsString::from(rendered.as_ref()));
+        } else if rendered.starts_with("--input=") {
+            contained_exact_key_value = true;
+            contained_sensitive_option = true;
+            safe.push(OsString::from(format!("--input={REDACTED}")));
+        } else if rendered.starts_with("--var=") {
+            contained_exact_key_value = true;
+            contained_sensitive_option = true;
+            safe.push(OsString::from(format!("--var={REDACTED}")));
         } else if let Some((name, _)) = rendered
             .strip_prefix("--")
             .and_then(|long_option| long_option.split_once('='))
-            && resembles_secret_option(name)
+            && resembles_sensitive_option(name)
         {
+            contained_sensitive_option = true;
             safe.push(OsString::from(format!("--{name}={REDACTED}")));
         } else if let Some(name) = rendered.strip_prefix("--")
-            && resembles_secret_option(name)
+            && resembles_sensitive_option(name)
         {
+            contained_sensitive_option = true;
             redact_next = true;
             safe.push(OsString::from(rendered.as_ref()));
         } else {
@@ -168,37 +198,47 @@ fn display_safe_arguments(arguments: &[OsString]) -> (Vec<OsString>, bool) {
         }
     }
 
-    (safe, contained_exact_secret)
+    (
+        safe,
+        contained_exact_secret,
+        contained_exact_key_value,
+        contained_sensitive_option,
+    )
+}
+
+/// Whether `name` resembles a long option whose value may carry credentials.
+fn resembles_sensitive_option(name: &str) -> bool {
+    [b"secret".as_slice(), b"input".as_slice(), b"var".as_slice()]
+        .into_iter()
+        .any(|expected| resembles_long_option(name, expected))
 }
 
 /// Whether `name` is no more than one insertion, deletion, substitution, or
-/// adjacent transposition away from the ASCII long-option name `secret`.
-fn resembles_secret_option(name: &str) -> bool {
-    const EXPECTED: &[u8] = b"secret";
-
+/// adjacent transposition away from one ASCII long-option name.
+fn resembles_long_option(name: &str, expected: &[u8]) -> bool {
     let candidate = name.as_bytes();
     if !candidate.is_ascii() {
         return false;
     }
-    match candidate.len().cmp(&EXPECTED.len()) {
-        std::cmp::Ordering::Less if candidate.len() + 1 == EXPECTED.len() => {
-            one_insertion_apart(candidate, EXPECTED)
+    match candidate.len().cmp(&expected.len()) {
+        std::cmp::Ordering::Less if candidate.len() + 1 == expected.len() => {
+            one_insertion_apart(candidate, expected)
         }
-        std::cmp::Ordering::Greater if candidate.len() == EXPECTED.len() + 1 => {
-            one_insertion_apart(EXPECTED, candidate)
+        std::cmp::Ordering::Greater if candidate.len() == expected.len() + 1 => {
+            one_insertion_apart(expected, candidate)
         }
         std::cmp::Ordering::Equal => {
             let differences = candidate
                 .iter()
-                .zip(EXPECTED)
+                .zip(expected)
                 .enumerate()
                 .filter_map(|(index, (actual, expected))| (actual != expected).then_some(index))
                 .collect::<Vec<_>>();
             differences.len() <= 1
                 || (differences.len() == 2
                     && differences[1] == differences[0] + 1
-                    && candidate[differences[0]] == EXPECTED[differences[1]]
-                    && candidate[differences[1]] == EXPECTED[differences[0]])
+                    && candidate[differences[0]] == expected[differences[1]]
+                    && candidate[differences[1]] == expected[differences[0]])
         }
         _ => false,
     }

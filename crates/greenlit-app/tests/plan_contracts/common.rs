@@ -10,16 +10,18 @@ pub(super) const RICH_WORKFLOW: &str = r#"on:
       required_text:
         required: true
         type: string
+        default: hello
       enabled:
         required: true
         type: boolean
+        default: true
       count:
         type: number
-        default: 3
+        default: 2.5
       mode:
         type: choice
         options: [fast, slow]
-        default: slow
+        default: fast
 env:
   LEVEL: workflow
 jobs:

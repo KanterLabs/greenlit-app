@@ -84,11 +84,12 @@ pub use runner::{
 };
 pub use source::{SourceEntry, SourceEntryKind, SourceSnapshot, SourceSnapshotError};
 pub use stabilization::{
-    CAPABILITY_ACTION_USES, CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_EVIDENCE_INTEGRITY,
-    CAPABILITY_EXECUTION_SHELL, CAPABILITY_INFRASTRUCTURE_DIND, CAPABILITY_REACHABILITY_AMBIGUOUS,
-    CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY, CAPABILITY_SERVICE_CONTAINER,
-    CAPABILITY_SOURCE_CONTAINMENT, CAPABILITY_SOURCE_WRITE_BACK, CAPABILITY_VARIABLE_REMOTE,
-    CapabilityCertification, CapabilityClass, CapabilityFinding, CertificationState, Forceability,
-    QuarantineDecision, QuarantineOutcome, ResolvedCapabilityFinding, capability_certification,
+    CAPABILITY_ACTION_USES, CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_DISPATCH_INPUT,
+    CAPABILITY_EVIDENCE_INTEGRITY, CAPABILITY_EXECUTION_SHELL, CAPABILITY_INFRASTRUCTURE_DIND,
+    CAPABILITY_REACHABILITY_AMBIGUOUS, CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY,
+    CAPABILITY_SERVICE_CONTAINER, CAPABILITY_SOURCE_CONTAINMENT, CAPABILITY_SOURCE_WRITE_BACK,
+    CAPABILITY_VARIABLE_CONTEXT, CAPABILITY_VARIABLE_REMOTE, CapabilityCertification,
+    CapabilityClass, CapabilityFinding, CertificationState, Forceability, QuarantineDecision,
+    QuarantineOutcome, ResolvedCapabilityFinding, capability_certification,
     capability_certifications, decide_capability_quarantine,
 };

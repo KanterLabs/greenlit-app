@@ -44,12 +44,11 @@ fn read_stdin_line() -> Result<String, String> {
     Ok(line)
 }
 
-/// Guidance printed alongside every `--pat` prompt, naming the exact
-/// fine-grained permissions the resulting token needs for the endpoints
-/// this crate calls (`crate::vars::remote`): read-only repository
-/// "Contents" (action/checkout-adjacent lookups) and "Variables"
-/// permissions, plus organization-level "Variables" read access when the
-/// workflow references organization configuration variables.
+/// Guidance printed alongside every `--pat` prompt for the least-privilege
+/// credential Phase 16's trust-scoped input preflight is expected to use:
+/// read-only repository "Contents" and "Variables" permissions, plus
+/// organization-level "Variables" read access when needed. Phase 12 stores
+/// the credential in the kernel keyring but exposes no workflow consumer.
 /// <https://docs.github.com/en/rest/actions/variables>
 pub(crate) fn print_permission_guidance(out: &mut impl Write) {
     writeln!(

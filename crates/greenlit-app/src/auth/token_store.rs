@@ -19,10 +19,9 @@
 //! a host reboot clears it exactly like any in-memory session credential
 //! cache, and the kernel expires it automatically after
 //! `/proc/sys/kernel/keys/persistent_keyring_expiry` seconds of disuse
-//! (refreshed on every successful access). Either case surfaces to the user
-//! as an ordinary "not authenticated" state — [`load`] returning `None` —
-//! which every caller already handles by pointing at `litci auth`, so no
-//! special-case recovery is needed.
+//! (refreshed on every successful access). Phase 12 intentionally provides
+//! no reader for this key: Phase 16 must introduce a trust-scoped acquisition
+//! path before a workflow can consume it.
 //!
 //! # `allow_keyring`
 //!
@@ -43,7 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use linux_keyutils::{KeyRing, KeyRingIdentifier};
 use rustix::fs::{Mode, OFlags, openat};
 use rustix::io::Errno;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 /// Production key description inside the current user's persistent keyring.
 #[cfg(not(litci_test_boundaries))]
@@ -54,10 +53,8 @@ const AUTH_FILE_NAME: &str = "auth.json";
 /// `user` keys accept at most 32,767 payload bytes.
 const MAX_STORED_BYTES: usize = 32_767;
 
-/// How a stored access token was obtained — governs whether a refresh
-/// attempt applies (device-flow only; PAT/`gh` tokens carry no refresh
-/// token).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How a stored access token was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TokenSource {
     /// Obtained via the GitHub App device flow (`litci auth`).
@@ -69,15 +66,14 @@ pub(crate) enum TokenSource {
 }
 
 /// The complete persisted credential state for one authenticated identity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct StoredToken {
-    /// The bearer token used for API requests.
+    /// Bearer token retained for a future Phase 16 trust-scoped consumer.
     pub(crate) access_token: String,
     /// The device-flow refresh token, when one exists.
     pub(crate) refresh_token: Option<String>,
-    /// Unix seconds at which `access_token` expires. `None` means litci has
-    /// no reliable expiry to check (a pasted PAT or a `gh`-sourced token) —
-    /// callers then rely on the API itself reporting an auth failure.
+    /// Unix seconds at which `access_token` expires. `None` means the stored
+    /// source did not provide a reliable expiry.
     pub(crate) access_token_expires_at: Option<u64>,
     /// Unix seconds at which `refresh_token` itself expires.
     pub(crate) refresh_token_expires_at: Option<u64>,
@@ -95,14 +91,6 @@ fn now_unix() -> u64 {
 /// Computes an absolute expiry timestamp `seconds_from_now` in the future.
 pub(crate) fn expires_in(seconds_from_now: u64) -> u64 {
     now_unix().saturating_add(seconds_from_now)
-}
-
-/// Whether `expires_at` (a stored expiry) has already passed, with a small
-/// safety margin so a token is refreshed slightly before the exact instant
-/// it stops working rather than racing it.
-pub(crate) fn is_expired(expires_at: u64) -> bool {
-    const SAFETY_MARGIN_SECS: u64 = 60;
-    now_unix().saturating_add(SAFETY_MARGIN_SECS) >= expires_at
 }
 
 /// Persists `token` in the kernel persistent keyring.
@@ -135,18 +123,6 @@ pub(crate) fn save(
     Ok(())
 }
 
-/// Loads the currently stored token from the kernel persistent keyring.
-///
-/// Returns `None` when keyring use is disabled or unavailable, the keyring
-/// payload is invalid, `home` is unsafe, or a legacy plaintext credential
-/// file exists. Callers already map this state to re-running `litci auth`.
-pub(crate) fn load(home: &Path, allow_keyring: bool, description: &str) -> Option<StoredToken> {
-    if !allow_keyring || !home.is_absolute() || ensure_legacy_file_absent(home).is_err() {
-        return None;
-    }
-    load_from_keyring(description)
-}
-
 fn persistent_ring() -> Result<KeyRing, linux_keyutils::KeyError> {
     // Links the per-UID persistent keyring into the session keyring so it
     // stays reachable for the lifetime of this process and is discoverable
@@ -159,18 +135,6 @@ fn save_to_keyring(description: &str, payload: &[u8]) -> Result<(), linux_keyuti
     let ring = persistent_ring()?;
     ring.add_key(description, payload)?;
     Ok(())
-}
-
-fn load_from_keyring(description: &str) -> Option<StoredToken> {
-    let ring = persistent_ring().ok()?;
-    let key = ring.search(description).ok()?;
-    let bytes = key.read_to_vec().ok()?;
-    if bytes.len() > MAX_STORED_BYTES {
-        return None;
-    }
-    let token: StoredToken = serde_json::from_slice(&bytes).ok()?;
-    validate_token(&token).ok()?;
-    Some(token)
 }
 
 fn validate_home(home: &Path) -> Result<(), String> {

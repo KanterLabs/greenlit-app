@@ -56,16 +56,17 @@ fn trimmed_git_output(cwd: &Path, args: &[&str], input: &[u8]) -> String {
 #[test]
 fn workflow_is_discovered_when_exactly_one_exists_under_github_workflows() {
     let sandbox = Sandbox::new();
-    sandbox.write(".github/workflows/ci.yml", LITERAL_VAR_WORKFLOW);
+    let workflow = workflow_with_trigger("  push:\n");
+    sandbox.write(".github/workflows/ci.yml", &workflow);
     sandbox.init_git();
 
-    let output = sandbox.run(&["plan", "--var", "MODE=ci"]);
+    let output = sandbox.run(&["plan"]);
     assert!(output.status.success(), "{}", support::stderr_text(&output));
     assert!(support::stdout_text(&output).contains("event: push"));
 
     let external = tempfile::tempdir().expect("external workflow directory");
     let external_workflow = external.path().join("outside.yml");
-    std::fs::write(&external_workflow, LITERAL_VAR_WORKFLOW).expect("write outside workflow");
+    std::fs::write(&external_workflow, &workflow).expect("write outside workflow");
     let linked = Sandbox::new();
     let placeholder = linked.write(".github/workflows/.keep", "");
     std::fs::remove_file(&placeholder).expect("remove workflow placeholder");
@@ -79,7 +80,7 @@ fn workflow_is_discovered_when_exactly_one_exists_under_github_workflows() {
     .expect("link outside workflow");
     linked.init_git();
 
-    let output = linked.run(&["plan", "--var", "MODE=ci"]);
+    let output = linked.run(&["plan"]);
     assert!(!output.status.success());
     let stderr = support::stderr_text(&output);
     assert!(stderr.contains("resolves outside repository"), "{stderr}");

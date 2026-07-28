@@ -284,8 +284,12 @@ fn malformed_secret_arguments_are_redacted_in_every_supported_spelling() {
         assert!(!stdout.contains(SENTINEL), "{argument}: {stdout}");
         assert!(!stderr.contains(SENTINEL), "{argument}: {stderr}");
         assert!(
-            stderr.contains("unexpected argument") && stderr.contains(typo),
-            "the sanitized typo lost clap's ordinary argument diagnostic: {stderr}"
+            stderr.contains("secret-like, input-like, or variable-like option"),
+            "the sensitive near-miss did not use the opaque diagnostic: {stderr}"
+        );
+        assert!(
+            !stderr.contains(typo),
+            "the near-miss was reflected: {stderr}"
         );
     }
 
@@ -300,6 +304,108 @@ fn malformed_secret_arguments_are_redacted_in_every_supported_spelling() {
             && !stderr.contains("arguments containing a secret value"),
         "ordinary argument diagnostics were weakened: {stderr}"
     );
+    assert_input_and_var_diagnostics_are_opaque();
+}
+
+fn assert_input_and_var_diagnostics_are_opaque() {
+    const SENTINEL: &str = "ghp_GL_STAB_INPUT_VAR_SENTINEL_027";
+    const KEY_SENTINEL: &str = "github_pat_GL_STAB_KEY_SENTINEL_027";
+    let sandbox = sandbox_with(SECRET_WORKFLOW);
+
+    for option in ["input", "var"] {
+        let exact = format!("--{option}");
+        let attached_malformed = format!("--{option}={SENTINEL}");
+        let valid = format!("TOKEN={SENTINEL}");
+        let attached_valid = format!("--{option}={valid}");
+        let near_miss = if option == "input" {
+            "--inpu".to_string()
+        } else {
+            "--vra".to_string()
+        };
+        let near_miss_attached = format!("{near_miss}={valid}");
+        let cases = [
+            vec!["run".to_string(), exact.clone(), SENTINEL.to_string()],
+            vec!["run".to_string(), attached_malformed],
+            vec![
+                "run".to_string(),
+                exact.clone(),
+                valid,
+                "--unknown".to_string(),
+            ],
+            vec!["run".to_string(), attached_valid, "--unknown".to_string()],
+            vec!["run".to_string(), near_miss.clone(), SENTINEL.to_string()],
+            vec!["run".to_string(), near_miss_attached],
+        ];
+
+        for arguments in cases {
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = sandbox.run(&arguments);
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+            let stdout = support::stdout_text(&output);
+            let stderr = support::stderr_text(&output);
+            assert!(!stdout.contains(SENTINEL), "{arguments:?}: {stdout}");
+            assert!(!stderr.contains(SENTINEL), "{arguments:?}: {stderr}");
+            assert!(
+                stderr.contains("error:") || stderr.contains("could not parse"),
+                "{arguments:?}: {stderr}"
+            );
+        }
+
+        let key_assignment = format!("{KEY_SENTINEL}=ordinary");
+        let attached_key = format!("--{option}={key_assignment}");
+        let invalid_key_assignment = format!("{KEY_SENTINEL}-BAD=ordinary");
+        for arguments in [
+            vec![
+                "run".to_string(),
+                exact.clone(),
+                key_assignment,
+                "--unknown".to_string(),
+            ],
+            vec!["run".to_string(), attached_key, "--unknown".to_string()],
+            vec![
+                "run".to_string(),
+                exact.clone(),
+                invalid_key_assignment,
+                "--unknown".to_string(),
+            ],
+        ] {
+            let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+            let output = sandbox.run(&arguments);
+            assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+            let stdout = support::stdout_text(&output);
+            let stderr = support::stderr_text(&output);
+            assert!(!stdout.contains(KEY_SENTINEL), "{arguments:?}: {stdout}");
+            assert!(!stderr.contains(KEY_SENTINEL), "{arguments:?}: {stderr}");
+        }
+    }
+
+    let assignment = format!("TOKEN={SENTINEL}");
+    let crossed_cases = [
+        vec!["run", "--input", "--var", assignment.as_str(), "--unknown"],
+        vec!["run", "--var", "--input", assignment.as_str(), "--unknown"],
+        vec!["run", "--input", "--vra", assignment.as_str(), "--unknown"],
+        vec!["run", "--var", "--inpu", assignment.as_str(), "--unknown"],
+        vec![
+            "run",
+            "--input",
+            "--secret",
+            assignment.as_str(),
+            "--unknown",
+        ],
+        vec!["run", "--secret", "--var", assignment.as_str(), "--unknown"],
+    ];
+    for arguments in crossed_cases {
+        let output = sandbox.run(&arguments);
+        assert_eq!(output.status.code(), Some(2), "{arguments:?}");
+        let stdout = support::stdout_text(&output);
+        let stderr = support::stderr_text(&output);
+        assert!(!stdout.contains(SENTINEL), "{arguments:?}: {stdout}");
+        assert!(!stderr.contains(SENTINEL), "{arguments:?}: {stderr}");
+        assert!(
+            stderr.contains("could not parse command-line arguments"),
+            "{arguments:?}: {stderr}"
+        );
+    }
 }
 
 #[test]

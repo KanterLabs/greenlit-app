@@ -11,21 +11,21 @@ pub(crate) fn reachable_workflow(
     workflow: &Workflow,
     plan: &ExecutionPlan,
     extraction: &greenlit_workflow::StaticExtraction,
-    unresolved: Option<&vars::VarResolutionError>,
+    unresolved: Option<&vars::UnresolvedPlanningVars>,
 ) -> Workflow {
     let reachability = greenlit_runtime::plan_reachability(plan);
     let unresolved_spans = unresolved.map_or_else(HashSet::new, |error| {
         let mut spans = HashSet::new();
-        for missing in &error.missing {
+        for name in &error.names {
             for (_, occurrences) in extraction
                 .vars
                 .iter()
-                .filter(|(name, _)| name.eq_ignore_ascii_case(&missing.name))
+                .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
             {
                 spans.extend(occurrences.iter().map(ToString::to_string));
             }
         }
-        if error.dynamic_lookup.is_some() {
+        if error.has_dynamic_lookup {
             spans.extend(extraction.dynamic_vars.iter().map(ToString::to_string));
         }
         spans

@@ -10,6 +10,16 @@ use crate::support::Sandbox;
 
 static DESCRIPTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub struct CredentialPayload {
+    bytes: Vec<u8>,
+}
+
+impl Drop for CredentialPayload {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
 pub struct PersistentCredential {
     ring: KeyRing,
     description: String,
@@ -49,10 +59,35 @@ impl PersistentCredential {
         &self.description
     }
 
-    pub fn assert_present(&self) {
-        self.ring
+    pub fn capture_payload(&self) -> CredentialPayload {
+        let key = self
+            .ring
             .search(&self.description)
             .expect("compiled litci did not create the expected persistent credential key");
+        let bytes = key
+            .read_to_vec()
+            .expect("could not read the compiled litci persistent credential payload");
+        assert!(
+            !bytes.is_empty(),
+            "compiled litci created an empty persistent credential key"
+        );
+        CredentialPayload { bytes }
+    }
+
+    pub fn assert_payload_unchanged(&self, expected: &CredentialPayload) {
+        let actual = self.capture_payload();
+        assert!(
+            actual.bytes == expected.bytes,
+            "failed or quarantined work changed the opaque persistent credential payload"
+        );
+    }
+
+    pub fn assert_payload_changed(&self, previous: &CredentialPayload) {
+        let actual = self.capture_payload();
+        assert!(
+            actual.bytes != previous.bytes,
+            "successful replacement did not change the opaque persistent credential payload"
+        );
     }
 
     pub fn cleanup(mut self) {
@@ -136,33 +171,6 @@ pub fn assert_request_path(request: &str, expected: &str) {
     assert!(
         request.lines().next().is_some_and(|line| line == expected),
         "compiled litci called the wrong external endpoint"
-    );
-}
-
-pub fn assert_bearer(request: &str, token: &str) {
-    let expected = format!("Bearer {token}");
-    let matched = request.lines().any(|line| {
-        let Some((name, value)) = line.trim_end_matches('\r').split_once(':') else {
-            return false;
-        };
-        name.eq_ignore_ascii_case("authorization") && value.trim() == expected
-    });
-    assert!(
-        matched,
-        "compiled litci did not use the credential loaded from the persistent keyring"
-    );
-}
-
-pub fn assert_form_value(request: &str, name: &str, value: &str) {
-    let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
-    let matched = body.split('&').any(|field| {
-        field
-            .split_once('=')
-            .is_some_and(|(field_name, field_value)| field_name == name && field_value == value)
-    });
-    assert!(
-        matched,
-        "compiled litci sent the wrong value to the external OAuth boundary"
     );
 }
 

@@ -1,9 +1,9 @@
 //! Compiled-CLI coverage for Phase 12 remote-variable containment.
 //!
-//! Remote repository and organization variables are temporarily
-//! non-forceable. This recording boundary proves source capture happens first
-//! and quarantine then wins before GitHub API traffic, daemon startup, and
-//! engine detection.
+//! Every reachable `vars` context is temporarily non-forceable until Phase 16.
+//! This retains the remote-variable recording boundary and proves source
+//! capture happens first, then quarantine wins before GitHub API traffic,
+//! daemon startup, and engine detection.
 
 use std::io::ErrorKind;
 use std::net::TcpListener;
@@ -38,10 +38,22 @@ fn remote_variable_is_blocked_before_network_or_engine_work() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = support::stderr_text(&output);
     assert!(
-        stderr.contains("uncertified capability `variable.remote`"),
+        stderr.contains("uncertified capability `variable.context` at `wf.yml:5:9`"),
         "{stderr}"
     );
-    assert!(stderr.contains("vars.MODE"), "{stderr}");
+    assert!(
+        stderr.contains(
+            "the workflow's `vars` context use has not completed trust and input preflight \
+             (stabilization Phase 16)"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "fix: remove the reachable `vars` context reference before running or planning locally"
+        ),
+        "{stderr}"
+    );
     assert!(
         !stderr.contains("DOCKER_HOST"),
         "remote-variable quarantine reached engine detection: {stderr}"

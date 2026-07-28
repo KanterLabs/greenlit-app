@@ -6,27 +6,13 @@ use super::support;
 #[test]
 fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics() {
     let sandbox = sandbox_with_workflow(RICH_WORKFLOW);
-    let (plan, stdout, stderr) = plan_json(
-        &sandbox,
-        &[
-            "-e",
-            "workflow_dispatch",
-            "--input",
-            "required_text=hello",
-            "--input",
-            "enabled=true",
-            "--input",
-            "count=2.5",
-            "--input",
-            "mode=fast",
-        ],
-    );
+    let (plan, stdout, stderr) = plan_json(&sandbox, &["-e", "workflow_dispatch"]);
 
     assert_eq!(plan["event_name"], "workflow_dispatch");
     assert_eq!(
         plan["run_name"],
         serde_json::json!({
-            "span": "contracts.yml:200:11",
+            "span": "contracts.yml:202:11",
             "source": "Run ${{ inputs.mode }} by ${{ github.actor }}",
             "evaluation": "static",
             "value": "Run fast by litci tests"
@@ -210,13 +196,13 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
     assert_eq!(static_runner["source"], "ubuntu-latest");
     assert_eq!(static_runner["evaluation"], "static");
     assert_eq!(static_runner["value"], "ubuntu-24.04");
-    assert_eq!(static_runner["span"], "contracts.yml:65:15");
+    assert_eq!(static_runner["span"], "contracts.yml:67:15");
 
     let deferred_runner = &job(&plan, "deferred_runner")["runner"];
     assert_eq!(
         deferred_runner,
         &serde_json::json!({
-            "span": "contracts.yml:77:14",
+            "span": "contracts.yml:79:14",
             "source": "${{ needs.runner_source.outputs.label }}",
             "evaluation": "deferred",
             "residual": "needs.runner_source.outputs.label",
@@ -257,21 +243,7 @@ fn dispatch_plan_pins_typed_inputs_layers_skips_zero_legs_and_json_diagnostics()
     );
     assert!(stderr.contains("stage timings (plan):"), "{stderr}");
 
-    let human = sandbox.run(&[
-        "plan",
-        "-W",
-        "contracts.yml",
-        "-e",
-        "workflow_dispatch",
-        "--input",
-        "required_text=hello",
-        "--input",
-        "enabled=true",
-        "--input",
-        "count=2.5",
-        "--input",
-        "mode=fast",
-    ]);
+    let human = sandbox.run(&["plan", "-W", "contracts.yml", "-e", "workflow_dispatch"]);
     assert!(human.status.success());
     let human_stdout = support::stdout_text(&human);
     let human_stderr = support::stderr_text(&human);

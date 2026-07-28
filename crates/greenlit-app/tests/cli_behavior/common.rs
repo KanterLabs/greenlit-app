@@ -10,26 +10,6 @@ jobs:
       - run: echo hi
 ";
 
-pub(super) const DISPLAY_VAR_WORKFLOW: &str = "\
-on: push
-jobs:
-  build:
-    name: ${{ vars.LEAK }}
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-";
-
-pub(super) const SUBDIRECTORY_WORKFLOW: &str = "\
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    if: vars.MODE == 'ci' && github.workflow == '.github/workflows/ci.yml' && github.workflow_ref == format('{0}/.github/workflows/ci.yml@refs/heads/main', github.repository)
-    steps:
-      - run: echo hi
-";
-
 pub(super) const PR_TYPE_FILTER_WORKFLOW: &str = "\
 on:
   pull_request:
@@ -70,11 +50,4 @@ pub(super) fn workflow_with_trigger(trigger: &str) -> String {
     format!(
         "on:\n{trigger}jobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
     )
-}
-
-pub(super) fn condition_line(stdout: &str) -> &str {
-    stdout
-        .lines()
-        .find(|l| l.trim_start().starts_with("if:"))
-        .unwrap_or_else(|| panic!("no 'if:' line in stdout: {stdout}"))
 }

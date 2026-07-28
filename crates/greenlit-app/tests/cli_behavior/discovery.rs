@@ -29,10 +29,10 @@ fn readable_non_utf8_workflow_requests_encoding_repair_not_permissions() {
 }
 
 #[test]
-fn discovery_explicit_paths_and_dotenv_are_rooted_at_the_repository_from_a_subdirectory() {
+fn discovery_explicit_paths_are_rooted_at_the_repository_from_a_subdirectory() {
     let sandbox = Sandbox::new();
-    sandbox.write(".github/workflows/ci.yml", SUBDIRECTORY_WORKFLOW);
-    sandbox.write(".litci/vars", "mode=ci\n");
+    let workflow = workflow_with_trigger("  push:\n");
+    sandbox.write(".github/workflows/ci.yml", &workflow);
     sandbox.write("packages/api/.keep", "");
     sandbox.init_git();
 
@@ -42,7 +42,11 @@ fn discovery_explicit_paths_and_dotenv_are_rooted_at_the_repository_from_a_subdi
     ] {
         let output = sandbox.run_from("packages/api", &args);
         assert!(output.status.success(), "{}", support::stderr_text(&output));
-        assert!(condition_line(&support::stdout_text(&output)).contains("static(true)"));
+        assert!(
+            support::stdout_text(&output).contains("event: push"),
+            "{}",
+            support::stdout_text(&output)
+        );
     }
 }
 
@@ -70,8 +74,9 @@ fn missing_workflows_directory_fails_with_a_fix_naming_dash_w() {
 #[test]
 fn ambiguous_workflows_directory_fails_and_lists_the_candidates() {
     let sandbox = Sandbox::new();
-    sandbox.write(".github/workflows/a.yml", LITERAL_VAR_WORKFLOW);
-    sandbox.write(".github/workflows/b.yml", LITERAL_VAR_WORKFLOW);
+    let workflow = workflow_with_trigger("  push:\n");
+    sandbox.write(".github/workflows/a.yml", &workflow);
+    sandbox.write(".github/workflows/b.yml", &workflow);
     sandbox.init_git();
 
     let output = sandbox.run(&["plan"]);
@@ -85,7 +90,7 @@ fn ambiguous_workflows_directory_fails_and_lists_the_candidates() {
     for index in 0..25 {
         many.write(
             &format!(".github/workflows/workflow-{index:02}.yml"),
-            LITERAL_VAR_WORKFLOW,
+            &workflow,
         );
     }
     many.init_git();
