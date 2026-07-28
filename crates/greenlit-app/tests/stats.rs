@@ -278,6 +278,8 @@ fn stats_bounds_history_and_the_next_append_repairs_an_unterminated_tail() {
 
 #[test]
 fn stats_rejects_committed_corruption_and_unknown_schema_with_one_fix() {
+    use std::os::unix::fs::PermissionsExt;
+
     const MAX_METRICS_RECORD_BYTES: usize = 8 * 1024 * 1024;
     let mut oversized_record = vec![b'x'; MAX_METRICS_RECORD_BYTES + 1];
     oversized_record.push(b'\n');
@@ -334,6 +336,8 @@ fn stats_rejects_committed_corruption_and_unknown_schema_with_one_fix() {
         .status()
         .expect("spawn mkfifo");
     assert!(status.success(), "mkfifo failed");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .expect("restrict FIFO mode so the node-type rejection is authoritative");
     let writer_path = path.clone();
     let writer = std::thread::spawn(move || {
         for _ in 0..100 {

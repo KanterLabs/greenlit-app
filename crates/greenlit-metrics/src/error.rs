@@ -73,6 +73,20 @@ pub enum MetricsError {
         mode: u32,
     },
 
+    /// A persistent metrics path is owned by another user. Greenlit never
+    /// repairs or writes through such a path.
+    #[error(
+        "metrics path component {path} is owned by uid {owner}, not current uid {expected} — move it aside or restore the expected owner, then retry"
+    )]
+    UnsafeOwner {
+        /// The path with the unexpected owner.
+        path: PathBuf,
+        /// Owner recorded on the inode.
+        owner: u32,
+        /// Effective uid of the current process.
+        expected: u32,
+    },
+
     /// Acquiring the cross-process lock that serializes append/repair and
     /// excludes readers during mutation failed.
     #[error("failed to lock metrics file {path}: {source}")]
