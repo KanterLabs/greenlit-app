@@ -29,6 +29,53 @@ fn run_workflow(workflow: &str, args: &[&str]) -> (Sandbox, std::process::Output
     (sandbox, output)
 }
 
+fn assert_value_absent_from_outputs_metrics_and_runs(
+    sandbox: &Sandbox,
+    output: &std::process::Output,
+    sentinel: &str,
+) {
+    assert!(
+        !output
+            .stdout
+            .windows(sentinel.len())
+            .any(|w| w == sentinel.as_bytes())
+    );
+    assert!(
+        !output
+            .stderr
+            .windows(sentinel.len())
+            .any(|w| w == sentinel.as_bytes())
+    );
+    for root in [
+        sandbox.home().join(".litci/metrics"),
+        sandbox.home().join(".litci/runs"),
+    ] {
+        if !root.exists() {
+            continue;
+        }
+        let mut pending = vec![root];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path).expect("inspect retained path");
+            if metadata.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .expect("walk retained directory")
+                        .map(|entry| entry.expect("read retained entry").path()),
+                );
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).expect("read retained file");
+                assert!(
+                    !bytes
+                        .windows(sentinel.len())
+                        .any(|window| window == sentinel.as_bytes()),
+                    "credential-shaped value reached {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 fn assert_retained_result(
     sandbox: &Sandbox,
     workflow: &str,
@@ -55,6 +102,36 @@ fn assert_retained_result(
     assert_eq!(result["conclusion"], expected_conclusion);
     assert_eq!(result["compatibility"], expected_compatibility);
     assert_eq!(result["assurance"], "none");
+    let expected_event_conclusion = match expected_conclusion {
+        "blocked" => "Blocked",
+        "preparation_failed" => "PreparationFailed",
+        other => panic!("unmapped retained-result conclusion {other}"),
+    };
+    let expected_event_compatibility = match expected_compatibility {
+        "unsupported" => "Unsupported",
+        other => panic!("unmapped retained-result compatibility {other}"),
+    };
+    let terminal_events = std::fs::read_to_string(run.join("events.ndjson"))
+        .expect("read retained terminal journal")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse run event"))
+        .filter(|event| event["type"] == "run_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_events.len(),
+        1,
+        "retained journal must contain exactly one terminal event"
+    );
+    let terminal = &terminal_events[0];
+    assert_eq!(terminal["conclusion"], expected_event_conclusion);
+    assert_eq!(terminal["compatibility"], expected_event_compatibility);
+    assert_eq!(terminal["assurance"], "None");
+    assert_eq!(
+        terminal["evidence"],
+        run.file_name()
+            .and_then(|name| name.to_str())
+            .expect("UTF-8 run id")
+    );
     assert!(
         !sandbox.home().join(".litci/daemon").exists(),
         "preflight started or prepared daemon state"
@@ -97,6 +174,59 @@ fn shell_execution_is_blocked_by_default_and_explicitly_degraded_before_engine_w
     );
 }
 
+fn assert_dispatch_inputs_are_nonforceable() {
+    const SENTINEL: &str = "ghp_GL_STAB_DISPATCH_SENTINEL_027";
+    let workflow = "\
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_token:
+        type: string
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ inputs.deployment_token }}
+";
+
+    for allow_degraded in [false, true] {
+        let assignment = format!("deployment_token={SENTINEL}");
+        let mut arguments = vec!["-e", "workflow_dispatch", "--input", assignment.as_str()];
+        if allow_degraded {
+            arguments.push("--allow-degraded");
+        }
+        let (sandbox, output) = run_workflow(workflow, &arguments);
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains("uncertified capability `input.dispatch`"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("stabilization Phase 16"), "{stderr}");
+        assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+        assert!(
+            !sandbox.home().join(".litci/runs").exists(),
+            "explicit inputs reached source-evidence creation"
+        );
+        assert_value_absent_from_outputs_metrics_and_runs(&sandbox, &output, SENTINEL);
+
+        let mut implicit_arguments = vec!["-e", "workflow_dispatch"];
+        if allow_degraded {
+            implicit_arguments.push("--allow-degraded");
+        }
+        let (sandbox, output) = run_workflow(workflow, &implicit_arguments);
+        assert_eq!(output.status.code(), Some(1));
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains("uncertified capability `input.dispatch`"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("stabilization Phase 16"), "{stderr}");
+        assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+        assert_retained_result(&sandbox, workflow, "blocked", "unsupported");
+    }
+}
+
 #[test]
 fn security_sensitive_capabilities_cannot_be_forced() {
     let cases = [
@@ -123,18 +253,6 @@ jobs:
       - run: echo ${{ github.token }}
 ",
             "credential.github",
-        ),
-        (
-            "remote variable",
-            "\
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ${{ vars.REMOTE_ONLY }}
-",
-            "variable.remote",
         ),
         (
             "action",
@@ -183,6 +301,7 @@ jobs:
             "{name} did not append the explicitly permitted sanitized metric"
         );
     }
+    assert_dispatch_inputs_are_nonforceable();
 }
 
 #[test]
@@ -221,24 +340,69 @@ jobs:
         uses: actions/checkout@v4
       - if: false
         run: echo ${{ secrets.UNREACHABLE }}
+      - if: false
+        run: echo ${{ vars.UNSELECTED }}
       - run: echo selected
   unselected:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: echo ${{ github.token }}
+      - run: echo ${{ vars.UNSELECTED }}
 ";
     let (_sandbox, output) = run_workflow(workflow, &["--job", "selected", "--allow-degraded"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = support::stderr_text(&output);
     assert!(stderr.contains("forced: execution.shell"), "{stderr}");
-    for protected in ["action.uses", "secret.context", "credential.github"] {
+    for protected in [
+        "action.uses",
+        "secret.context",
+        "credential.github",
+        "variable.context",
+    ] {
         assert!(
             !stderr.contains(protected),
             "unreachable {protected} blocked selection: {stderr}"
         );
     }
     assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
+}
+
+#[test]
+fn explicit_variables_are_nonforceable_before_host_source_or_engine_work() {
+    const SENTINEL: &str = "github_pat_GL_STAB_EXPLICIT_VAR_SENTINEL_027";
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", SHELL_WORKFLOW);
+    sandbox.write("source-sentinel.txt", SENTINEL);
+    sandbox.init_git();
+    let assignment = format!("UNUSED={SENTINEL}");
+    let output = sandbox.run_with_env(
+        &[
+            "run",
+            "--no-input",
+            "--allow-degraded",
+            "--var",
+            assignment.as_str(),
+        ],
+        &[SSH_DOCKER_HOST],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("uncertified capability `variable.context`")
+            && stderr.contains("command-line.--var")
+            && stderr.contains("stabilization Phase 16"),
+        "explicit variable did not hit the Phase 16 quarantine: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "explicit-variable quarantine reached host validation: {stderr}"
+    );
+    assert!(
+        !sandbox.home().join(".litci/runs").exists(),
+        "explicit-variable quarantine captured source evidence"
+    );
+    assert_value_absent_from_outputs_metrics_and_runs(&sandbox, &output, SENTINEL);
 }
 
 #[test]
@@ -308,15 +472,14 @@ jobs:
       - if: vars.REMOTE_FLAG == 'enabled'
         uses: actions/checkout@v4
 ";
-    let (sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
+    let (_sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = support::stderr_text(&output);
     assert!(
-        stderr.contains("variable.remote"),
+        stderr.contains("variable.context"),
         "a later unresolved-variable condition was incorrectly pruned: {stderr}"
     );
     assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert_retained_result(&sandbox, workflow, "blocked", "unsupported");
 }
 
 #[test]
@@ -343,19 +506,67 @@ fn hidden_daemon_lifecycle_commands_are_quarantined_before_socket_or_network_wor
 
 #[test]
 fn a_literal_local_variable_does_not_trigger_remote_credential_work() {
-    let workflow = "\
+    const SENTINEL: &str = "github_pat_GL_STAB_VAR_SENTINEL_027";
+    let literal_workflow = "\
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - run: echo ${{ vars.LOCAL_ONLY }}
+      - run: echo ${{ vars.DEPLOY_VALUE }}
 ";
-    let (_sandbox, output) =
-        run_workflow(workflow, &["--var", "LOCAL_ONLY=value", "--allow-degraded"]);
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
-    assert!(!stderr.contains("variable.remote"), "{stderr}");
+    let dynamic_workflow = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ vars[github.event_name] }}
+";
+
+    for allow_degraded in [false, true] {
+        let cli_assignment = format!("DEPLOY_VALUE={SENTINEL}");
+        let mut cli_args = vec!["--var", cli_assignment.as_str()];
+        if allow_degraded {
+            cli_args.push("--allow-degraded");
+        }
+        let (sandbox, output) = run_workflow(literal_workflow, &cli_args);
+        assert_vars_context_block(&sandbox, &output, SENTINEL);
+
+        let sandbox = Sandbox::new();
+        sandbox.write(".github/workflows/ci.yml", literal_workflow);
+        sandbox.init_git();
+        let mut env_args = vec!["run", "--no-input"];
+        if allow_degraded {
+            env_args.push("--allow-degraded");
+        }
+        let output =
+            sandbox.run_with_env(&env_args, &[SSH_DOCKER_HOST, ("DEPLOY_VALUE", SENTINEL)]);
+        assert_vars_context_block(&sandbox, &output, SENTINEL);
+
+        let sandbox = Sandbox::new();
+        sandbox.write(".github/workflows/ci.yml", dynamic_workflow);
+        sandbox.write(".litci/vars", &format!("push={SENTINEL}\n"));
+        sandbox.init_git();
+        let mut dotenv_args = vec!["run", "--no-input"];
+        if allow_degraded {
+            dotenv_args.push("--allow-degraded");
+        }
+        let output = sandbox.run_with_env(&dotenv_args, &[SSH_DOCKER_HOST]);
+        assert_vars_context_block(&sandbox, &output, SENTINEL);
+    }
+}
+
+fn assert_vars_context_block(sandbox: &Sandbox, output: &std::process::Output, sentinel: &str) {
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(output);
+    assert!(
+        stderr.contains("uncertified capability `variable.context`"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("stabilization Phase 16"), "{stderr}");
+    assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert_value_absent_from_outputs_metrics_and_runs(sandbox, output, sentinel);
 }
 
 #[test]
@@ -443,11 +654,44 @@ fn metric_failure_cannot_replace_the_primary_quarantine_diagnostic() {
     );
     assert!(
         stderr.contains("could not append the sanitized local run metric"),
-        "metric failure was not reported as a secondary warning: {stderr}"
+        "metric failure was not reported as a publication failure: {stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("could not append the sanitized local run metric")
+            .count(),
+        1,
+        "one failed append was reported more than once: {stderr}"
     );
     assert!(
         !stderr.contains("DOCKER_HOST"),
         "quarantine reached engine detection: {stderr}"
     );
-    assert_retained_result(&sandbox, SHELL_WORKFLOW, "blocked", "unsupported");
+    let mut runs = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("read retained unpublished run")
+        .map(|entry| entry.expect("read retained run entry").path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1, "one invocation retained one run");
+    let run = runs.pop().expect("one retained unpublished run");
+    assert!(
+        !run.join("result.json").exists(),
+        "metrics failure published a terminal result"
+    );
+    let run_id = run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("UTF-8 run id");
+    let store = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
+    )
+    .expect("open content catalog");
+    assert!(
+        store
+            .reclaimable_run_ids()
+            .expect("read terminal catalog runs")
+            .iter()
+            .any(|candidate| candidate == run_id),
+        "unpublished run was not marked aborted in the content catalog"
+    );
 }

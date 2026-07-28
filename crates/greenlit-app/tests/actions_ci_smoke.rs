@@ -73,7 +73,7 @@ fn actions_ci_fixture_is_blocked_before_capability_side_effects() {
     let stdout = support::stdout_text(&output);
     let stderr = support::stderr_text(&output);
     assert!(
-        ["secret.context", "variable.remote", "action.uses"]
+        ["secret.context", "variable.context", "action.uses"]
             .iter()
             .any(|capability| stderr.contains(&format!("uncertified capability `{capability}`"))),
         "the rich fixture did not report a non-forceable capability: {stderr}"

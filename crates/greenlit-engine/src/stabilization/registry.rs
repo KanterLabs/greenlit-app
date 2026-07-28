@@ -2,8 +2,12 @@
 pub const CAPABILITY_EXECUTION_SHELL: &str = "execution.shell";
 /// GitHub credential access or injection.
 pub const CAPABILITY_CREDENTIAL_GITHUB: &str = "credential.github";
+/// An explicit command-line workflow-dispatch input.
+pub const CAPABILITY_DISPATCH_INPUT: &str = "input.dispatch";
 /// A reachable `secrets.*` context reference.
 pub const CAPABILITY_SECRET_CONTEXT: &str = "secret.context";
+/// A reachable or ambiguous `vars` context reference.
+pub const CAPABILITY_VARIABLE_CONTEXT: &str = "variable.context";
 /// Repository- or organization-backed configuration variable lookup.
 pub const CAPABILITY_VARIABLE_REMOTE: &str = "variable.remote";
 /// A reachable `uses:` action.
@@ -26,7 +30,11 @@ pub const CAPABILITY_SECURITY_BOUNDARY: &str = "security.boundary";
 const SHELL_ACTION: &str = "rerun with `--allow-degraded` to execute without assurance";
 const CREDENTIAL_ACTION: &str =
     "remove the reachable GitHub credential dependency before running locally";
+const DISPATCH_INPUT_ACTION: &str =
+    "remove every `--input` argument before running or planning locally";
 const SECRET_ACTION: &str = "remove the reachable `secrets.*` reference before running locally";
+const VARIABLE_CONTEXT_ACTION: &str =
+    "remove the reachable `vars` context reference before running or planning locally";
 const VARIABLE_ACTION: &str =
     "provide every referenced variable locally so no repository or organization lookup is required";
 const USES_ACTION: &str = "remove the reachable `uses:` action before running locally";
@@ -196,11 +204,25 @@ const CERTIFICATIONS: &[CapabilityCertification] = &[
         CREDENTIAL_ACTION
     ),
     uncertified!(
+        CAPABILITY_DISPATCH_INPUT,
+        16,
+        Credential,
+        NonForceable,
+        DISPATCH_INPUT_ACTION
+    ),
+    uncertified!(
         CAPABILITY_SECRET_CONTEXT,
         16,
         Secret,
         NonForceable,
         SECRET_ACTION
+    ),
+    uncertified!(
+        CAPABILITY_VARIABLE_CONTEXT,
+        16,
+        Credential,
+        NonForceable,
+        VARIABLE_CONTEXT_ACTION
     ),
     uncertified!(
         CAPABILITY_VARIABLE_REMOTE,

@@ -2,7 +2,9 @@
 //! synthetic trigger event, assemble the resolved
 //! [`greenlit_engine::ExecutionPlan`], and render it -- tree to stdout by
 //! default, stable JSON with `--json`. Stage timings go to stderr and one
-//! NDJSON record is appended per invocation, success or failure
+//! NDJSON record is appended per accepted invocation, success or failure.
+//! Phase 12 credential-bearing argument quarantine runs first and retains no
+//! metric because even a common supplied value can collide with metric text
 //! (`PHASE-1-engine-core.md` greenlit-app/greenlit-metrics sections;
 //! `AGENTS.md` Metrics: "every `plan` or `run` invocation appends one NDJSON
 //! record").
@@ -14,9 +16,10 @@ use greenlit_engine::{PlanOptions, build_synthetic_event, plan, validate_v0_supp
 use greenlit_metrics::{Invocation, MetricsStore};
 
 use crate::cli::PlanArgs;
-use crate::{errors, render, vars, workflow_discovery, workflow_picker};
+use crate::{errors, render, workflow_discovery, workflow_picker};
 
 pub(crate) fn run(args: PlanArgs) -> anyhow::Result<()> {
+    reject_credential_bearing_arguments(&args)?;
     let invocation = Invocation::start("plan");
     let result = invocation.with_timing_subscriber(|| execute(&args, &invocation));
 
@@ -45,6 +48,20 @@ pub(crate) fn run(args: PlanArgs) -> anyhow::Result<()> {
         append_failure(&mut failure, error);
     }
     failure.map_or(Ok(()), Err)
+}
+
+fn reject_credential_bearing_arguments(args: &PlanArgs) -> anyhow::Result<()> {
+    let masker = greenlit_engine::execution::Masker::new();
+    for (_, value) in args.inputs.iter().chain(&args.vars) {
+        masker.add(value).map_err(|_| {
+            anyhow::anyhow!(
+                "could not safely quarantine credential-bearing plan arguments\n  fix: omit --input and --var until stabilization Phase 16 certifies their preflight"
+            )
+        })?;
+    }
+    crate::run_quarantine::reject_explicit_dispatch_inputs(&args.inputs, false)
+        .and_then(|()| crate::run_quarantine::reject_explicit_variables(&args.vars, false))
+        .map_err(|error| anyhow::anyhow!(masker.apply(&error.to_string())))
 }
 
 fn append_failure(failure: &mut Option<anyhow::Error>, additional: anyhow::Error) {
@@ -77,46 +94,30 @@ fn execute(args: &PlanArgs, invocation: &Invocation) -> anyhow::Result<()> {
         .map_err(|e| errors::parse_error(&e))?;
     validate_v0_support(&workflow).map_err(|error| errors::plan_error(&error))?;
 
-    let (plan_options, event) = (|| -> anyhow::Result<_> {
-        let extraction = greenlit_workflow::extract_static(&workflow)
-            .map_err(|error| errors::parse_error(&error))?;
-        // `litci plan` resolves `vars` through the same remote-augmented
-        // chain `litci run` does (`PHASE-3-actions.md`: "keep plan and run
-        // behavior consistent") but never touches secrets/`GITHUB_TOKEN` —
-        // "plan never prompts for secrets", and `plan()` has no secrets
-        // input at all, so nothing here could leak one into
-        // `litci plan --json` even by mistake.
-        let event_kind: greenlit_engine::EventKind = args.event.into();
-        let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
-        let event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
-            .map_err(|e| errors::event_error(&e))?;
-        let dotenv_vars = vars::read_dotenv_vars(&repo_root).map_err(|s| anyhow::anyhow!(s))?;
-        let git = greenlit_engine::git::collect_git_context(&repo_root)
-            .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
-        let repo_leaf = git
-            .repository
-            .rsplit('/')
-            .next()
-            .unwrap_or(&git.repository)
-            .to_string();
-        let vars_outcome = vars::resolve_vars_with_remote(
-            &extraction,
-            &args.vars,
-            dotenv_vars.as_deref().unwrap_or_default(),
-            dotenv_vars.is_some(),
-            &git.repository_owner,
-            &repo_leaf,
-        );
-        let vars_value = errors::vars_outcome(vars_outcome)?;
-        let plan_options = PlanOptions {
-            vars: vars_value,
-            max_matrix_legs: greenlit_engine::DEFAULT_MAX_MATRIX_LEGS,
-        };
-        Ok((plan_options, event))
-    })()?;
+    let extraction = greenlit_workflow::extract_static(&workflow)
+        .map_err(|error| errors::parse_error(&error))?;
+    let (planning_vars, unresolved) =
+        crate::run_quarantine::conservative_planning_variables(&extraction);
+    let event_kind: greenlit_engine::EventKind = args.event.into();
+    let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
+    let event = build_synthetic_event(event_kind, &repo_root, &workflow, &dispatch_inputs)
+        .map_err(|e| errors::event_error(&e))?;
+    let plan_options = PlanOptions {
+        vars: planning_vars,
+        max_matrix_legs: greenlit_engine::DEFAULT_MAX_MATRIX_LEGS,
+    };
 
     let execution_plan =
         plan(&workflow, &event, &plan_options).map_err(|e| errors::plan_error(&e))?;
+    let reachable = crate::run_selection::reachable_workflow(
+        &workflow,
+        &execution_plan,
+        &extraction,
+        unresolved.as_ref(),
+    );
+    let reachable_extraction = greenlit_workflow::extract_static(&reachable)
+        .map_err(|error| errors::parse_error(&error))?;
+    crate::run_quarantine::reject_vars_context(&reachable_extraction, false)?;
 
     if args.json {
         let stdout = std::io::stdout();

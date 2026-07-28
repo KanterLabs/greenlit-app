@@ -17,11 +17,11 @@
 
 /// Validates a configuration-variable or secret name against GitHub's
 /// shared naming rule. GitHub stores/compares names case-insensitively; this
-/// function validates the character set and prefix only (case folding is
-/// each caller's own concern — see `crate::vars::canonical`/
-/// `crate::secrets::canonical`), and deliberately invents no name-length
-/// cap since GitHub documents only a value-size limit, not a name-length
-/// one.
+/// function validates the character set and prefix only. Phase 12 uses it at
+/// the explicit CLI boundary; Phase 16 owns case folding when it introduces
+/// the certified variable/secret input preflight. It deliberately invents no
+/// name-length cap since GitHub documents only a value-size limit, not a
+/// name-length one.
 pub(crate) fn validate_configuration_name(name: &str) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("the name must not be empty");

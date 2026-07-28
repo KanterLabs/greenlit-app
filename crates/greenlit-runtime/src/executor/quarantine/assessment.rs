@@ -1,7 +1,8 @@
 use greenlit_engine::{
-    CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_EVIDENCE_INTEGRITY, CAPABILITY_INFRASTRUCTURE_DIND,
-    CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY, CAPABILITY_SOURCE_WRITE_BACK,
-    CapabilityFinding, ExecutionPlan, QuarantineDecision, decide_capability_quarantine,
+    CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_DISPATCH_INPUT, CAPABILITY_EVIDENCE_INTEGRITY,
+    CAPABILITY_INFRASTRUCTURE_DIND, CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY,
+    CAPABILITY_SOURCE_WRITE_BACK, CAPABILITY_VARIABLE_CONTEXT, CapabilityFinding, ExecutionPlan,
+    QuarantineDecision, decide_capability_quarantine,
 };
 use greenlit_expr::Value;
 
@@ -80,6 +81,8 @@ impl<'a> RuntimeControl<'a> {
 /// retrieve credentials, contact a network, or access the container engine.
 pub struct RuntimeCapabilityInputs<'a> {
     github: &'a Value,
+    vars: &'a Value,
+    inputs: &'a Value,
     secrets: &'a Value,
     action_github_token: Option<&'a str>,
     dind: bool,
@@ -92,6 +95,8 @@ impl<'a> RuntimeCapabilityInputs<'a> {
     #[must_use]
     pub const fn new(
         github: &'a Value,
+        vars: &'a Value,
+        inputs: &'a Value,
         secrets: &'a Value,
         action_github_token: Option<&'a str>,
         dind: bool,
@@ -99,6 +104,8 @@ impl<'a> RuntimeCapabilityInputs<'a> {
     ) -> Self {
         Self {
             github,
+            vars,
+            inputs,
             secrets,
             action_github_token,
             dind,
@@ -109,6 +116,8 @@ impl<'a> RuntimeCapabilityInputs<'a> {
     fn from_config(config: &'a RunConfig) -> Self {
         Self {
             github: &config.github,
+            vars: &config.vars,
+            inputs: &config.inputs,
             secrets: &config.secrets,
             action_github_token: config.actions.github_token.as_deref(),
             dind: config.dind,
@@ -184,11 +193,13 @@ pub(in crate::executor) fn enforce_runtime_quarantine(
         fallback = decide_capability_quarantine(&current_findings, authorization.allows_degraded());
         &fallback
     };
-    let Some(blocked) = decision.blocking_findings().first() else {
-        return Ok(());
-    };
+    blocking_error(decision).map_or(Ok(()), Err)
+}
+
+fn blocking_error(decision: &QuarantineDecision) -> Option<ExecError> {
+    let blocked = decision.blocking_findings().first()?;
     let finding = blocked.finding();
-    Err(ExecError::CapabilityQuarantined {
+    Some(ExecError::CapabilityQuarantined {
         capability_id: finding.capability_id().to_string(),
         scope: finding.scope().to_string(),
         reason: finding.reason().to_string(),
@@ -196,11 +207,45 @@ pub(in crate::executor) fn enforce_runtime_quarantine(
     })
 }
 
+fn collect_runtime_context_findings(
+    vars: &Value,
+    inputs: &Value,
+    findings: &mut Vec<CapabilityFinding>,
+) {
+    match inputs {
+        Value::Object(inputs) if inputs.is_empty() => {}
+        Value::Object(_) => findings.push(CapabilityFinding::new(
+            CAPABILITY_DISPATCH_INPUT,
+            "run-config.inputs",
+            "the runtime received a non-empty input context before credential-bearing input preflight was certified",
+        )),
+        _ => findings.push(CapabilityFinding::new(
+            CAPABILITY_SECURITY_BOUNDARY,
+            "run-config.inputs",
+            "the runtime cannot prove that a non-object input context is empty",
+        )),
+    }
+    match vars {
+        Value::Object(vars) if vars.is_empty() => {}
+        Value::Object(_) => findings.push(CapabilityFinding::new(
+            CAPABILITY_VARIABLE_CONTEXT,
+            "run-config.vars",
+            "the runtime received a non-empty variable context before trust and input preflight was certified",
+        )),
+        _ => findings.push(CapabilityFinding::new(
+            CAPABILITY_SECURITY_BOUNDARY,
+            "run-config.vars",
+            "the runtime cannot prove that a non-object variable context is empty",
+        )),
+    }
+}
+
 fn runtime_capability_findings(
     plan: &ExecutionPlan,
     inputs: &RuntimeCapabilityInputs<'_>,
 ) -> Vec<CapabilityFinding> {
     let mut findings = Vec::new();
+    collect_runtime_context_findings(inputs.vars, inputs.inputs, &mut findings);
     match inputs.secrets {
         Value::Object(secrets) if secrets.is_empty() => {}
         Value::Object(_) => findings.push(CapabilityFinding::new(

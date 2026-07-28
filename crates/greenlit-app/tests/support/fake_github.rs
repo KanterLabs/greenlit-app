@@ -1,11 +1,10 @@
 //! A minimal sequential-response loopback HTTP server standing in for
-//! GitHub's device-flow/token-exchange host and REST API host in
-//! integration tests that spawn the real `litci` binary — and so cannot
-//! inject a Rust trait fake the way `crate::auth::device_flow`'s and
-//! `crate::vars::remote`'s own unit tests do (see those modules' doc
-//! comments for why a real, if local and minimal, HTTP server is the
-//! correct boundary to fake at all). `litci` is pointed at one of these via
-//! `LITCI_TEST_GITHUB_OAUTH_BASE_URL`/`LITCI_TEST_GITHUB_API_BASE_URL`.
+//! GitHub's device-flow/token-exchange host in integration tests that spawn
+//! the real `litci` binary. A loopback listener also serves as the Phase 12
+//! no-request tripwire for quarantined GitHub REST work. OAuth traffic is
+//! redirected with `LITCI_TEST_GITHUB_OAUTH_BASE_URL`; the legacy
+//! `LITCI_TEST_GITHUB_API_BASE_URL` value remains useful only as a tripwire
+//! because Phase 12 compiles no REST credential consumer.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -60,9 +59,8 @@ impl FakeGitHub {
         self.serve_requests(responses, false)
     }
 
-    /// Serves canned responses while retaining each bounded request head.
-    /// Credential capability tests use this true external boundary to prove
-    /// which bearer value a later compiled `litci` process actually loaded.
+    /// Serves canned responses while retaining each bounded request head for
+    /// endpoint and request-shape assertions at the true HTTP boundary.
     pub fn serve_recorded(self, responses: Vec<Canned>) -> JoinHandle<Vec<String>> {
         self.serve_requests(responses, true)
     }

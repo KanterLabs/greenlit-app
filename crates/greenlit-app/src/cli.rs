@@ -148,7 +148,8 @@ pub(crate) struct RunArgs {
     #[arg(long = "matrix", value_name = "KEY=JSON_VALUE", value_parser = parse_key_val)]
     pub(crate) matrix: Vec<(String, String)>,
 
-    /// A local variable override, `KEY=VALUE`. Repeatable.
+    /// A local variable override, `KEY=VALUE`. Phase 12 rejects explicit
+    /// variables until Phase 16 certifies credential-bearing preflight.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     pub(crate) vars: Vec<(String, String)>,
 
@@ -371,9 +372,8 @@ pub(crate) struct PlanArgs {
     #[arg(short = 'W', long = "workflow")]
     pub(crate) workflow: Option<PathBuf>,
 
-    /// A local variable override, `KEY=VALUE`. Repeatable; the highest
-    /// priority source in the `vars.*` resolution chain (CLI override, then
-    /// same-named process environment variable, then `.litci/vars`).
+    /// A local variable override, `KEY=VALUE`. Phase 12 rejects explicit
+    /// variables until Phase 16 certifies credential-bearing preflight.
     #[arg(long = "var", value_name = "KEY=VALUE", value_parser = parse_var)]
     pub(crate) vars: Vec<(String, String)>,
 
