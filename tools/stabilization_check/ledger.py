@@ -33,16 +33,6 @@ COMMIT_CHECK_TIMEOUT_SECONDS = 5
 GIT_EXECUTABLE = "/usr/bin/git"
 
 
-def _repository_root(path: Path) -> Path:
-    """Return the nearest worktree root containing the checked ledger."""
-
-    resolved = path.resolve()
-    for candidate in resolved.parents:
-        if (candidate / ".git").exists():
-            return candidate
-    return resolved.parent
-
-
 def require_text(
     value: str,
     path: Path,
@@ -99,8 +89,7 @@ def parse_phase_statuses(path: Path, problems: list[str]) -> dict[int, str]:
     return phases
 
 
-def _commit_exists_locally(path: Path, commit: str) -> bool:
-    repository = _repository_root(path)
+def _commit_exists_locally(repository: Path, commit: str) -> bool:
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -142,13 +131,14 @@ def verify_resolving_commit(
     path: Path,
     line: int,
     commit: str,
+    repository: Path,
     problems: list[str],
 ) -> None:
     """Require a resolving hash to identify a local commit object."""
 
     label = f"{path}:{line}"
     try:
-        exists = _commit_exists_locally(path, commit)
+        exists = _commit_exists_locally(repository, commit)
     except FileNotFoundError:
         problems.append(
             f"{label}: cannot verify Resolving commit {commit!r} because Git "
@@ -180,6 +170,7 @@ def verify_resolving_commit(
 def validate_ledger(
     path: Path,
     phases: dict[int, str],
+    repository: Path,
     problems: list[str],
 ) -> int:
     """Validate every stabilization-defect row and return the row count."""
@@ -256,6 +247,7 @@ def validate_ledger(
                     path,
                     row.line,
                     resolving_commit,
+                    repository,
                     problems,
                 )
         elif status in {"open", "contained"} and resolving_commit != PLACEHOLDER:
