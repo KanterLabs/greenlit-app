@@ -31,6 +31,7 @@ mod job;
 mod logsink;
 mod netguard;
 mod preflight;
+mod private_state;
 mod quarantine;
 mod readiness;
 mod report;
@@ -47,7 +48,6 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use greenlit_engine::execution::Masker;
 use greenlit_engine::execution::contexts::merge_matrix_outputs;
 use greenlit_engine::{Conclusion, EnvValue, ExecutionPlan};
 use greenlit_expr::RealFs;
@@ -194,10 +194,8 @@ pub async fn run_plan_with_events_cancellable(
     )?;
     let cancellation = control.cancellation;
 
-    let mut masker = Masker::new();
-    for value in &config.initial_masks {
-        masker.add(value);
-    }
+    let masker = config.masker.clone();
+    masker.ensure_healthy()?;
 
     let groups = instance::expand(plan)?;
     let fs = Arc::new(RealFs::new(config.repo_host_path.clone()));

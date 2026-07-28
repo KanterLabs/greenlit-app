@@ -68,7 +68,7 @@ tar = "0.4.46"
 # (`greenlit-expr`'s `hashFiles` hardening); reused here at the same version
 # rather than hand-rolling raw libc FFI, which would need `unsafe` in a crate
 # that forbids it.
-rustix = { version = "1.1.4", features = ["fs"] }
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 # `uses:` resolution/fetch/manifest types this crate's executor drives to turn
 # a resolved action into a ready-to-mount source tree
 # (`crates/greenlit-runtime/src/executor/actions`). The dataflow stays

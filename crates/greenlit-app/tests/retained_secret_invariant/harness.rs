@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -18,23 +17,46 @@ pub(super) struct RunningLitci {
 
 impl RunningLitci {
     pub(super) fn spawn(sandbox: &Sandbox, workflow: &str) -> Self {
-        Self::spawn_inner(sandbox, workflow, None)
+        Self::spawn_inner(sandbox, workflow, &[])
     }
 
-    pub(super) fn spawn_with_secret(
+    pub(super) fn spawn_with_env(
         sandbox: &Sandbox,
         workflow: &str,
-        name: &str,
-        value: &str,
+        extra_env: &[(&str, &str)],
     ) -> Self {
-        Self::spawn_inner(sandbox, workflow, Some((name, value)))
+        Self::spawn_inner(sandbox, workflow, extra_env)
     }
 
-    fn spawn_inner(sandbox: &Sandbox, workflow: &str, secret: Option<(&str, &str)>) -> Self {
+    pub(super) fn spawn_under_restrictive_umask(sandbox: &Sandbox, workflow: &str) -> Self {
+        Self::spawn_inner_with_options(sandbox, workflow, Stdio::piped(), true, &[])
+    }
+
+    fn spawn_inner(sandbox: &Sandbox, workflow: &str, extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn_inner_with_options(sandbox, workflow, Stdio::piped(), false, extra_env)
+    }
+
+    fn spawn_inner_with_options(
+        sandbox: &Sandbox,
+        workflow: &str,
+        stdout: Stdio,
+        restrictive_umask: bool,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         sandbox.write(".github/workflows/retained-secret.yml", workflow);
         sandbox.init_git();
         let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
-        let mut command = Command::new(env!("CARGO_BIN_EXE_litci"));
+        let mut command = if restrictive_umask {
+            let mut command = Command::new("sh");
+            command
+                .arg("-c")
+                .arg("umask 0777; exec \"$@\"")
+                .arg("litci-restrictive-umask")
+                .arg(env!("CARGO_BIN_EXE_litci"));
+            command
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_litci"))
+        };
         command
             .args([
                 "run",
@@ -55,11 +77,11 @@ impl RunningLitci {
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0");
-        if let Some((name, value)) = secret {
-            command.arg("--secret").arg(format!("{name}={value}"));
+        for (name, value) in extra_env {
+            command.env(name, value);
         }
         let child = command
-            .stdout(Stdio::piped())
+            .stdout(stdout)
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn compiled litci");
@@ -71,6 +93,13 @@ impl RunningLitci {
         let pid = Pid::from_raw(raw.try_into().expect("litci pid fits RawPid"))
             .expect("litci pid is nonzero");
         kill_process(pid, Signal::INT).expect("send SIGINT to litci");
+    }
+
+    pub(super) fn signal_kill(&self) {
+        let raw = self.child.as_ref().expect("running litci").id();
+        let pid = Pid::from_raw(raw.try_into().expect("litci pid fits RawPid"))
+            .expect("litci pid is nonzero");
+        kill_process(pid, Signal::KILL).expect("send SIGKILL to litci");
     }
 
     pub(super) fn close_stdout(&mut self) {
@@ -187,18 +216,17 @@ pub(super) fn assert_real_docker() {
     );
 }
 
-pub(super) fn observe_runtime_token(sandbox: &Sandbox) -> (String, String, String) {
+pub(super) fn observe_running_container(sandbox: &Sandbox) -> (String, String) {
     let deadline = Instant::now() + RUN_TIMEOUT;
     loop {
         if let Some(run_id) = current_run_id(sandbox)
             && let Some(container) = running_container(&run_id)
-            && let Some(token) = token_from_step_process(&container)
         {
-            return (run_id, container, token);
+            return (run_id, container);
         }
         assert!(
             Instant::now() < deadline,
-            "litci did not expose a live runtime-token step before the deadline"
+            "litci did not expose a live workflow container before the deadline"
         );
         thread::sleep(Duration::from_millis(50));
     }
@@ -221,36 +249,19 @@ pub(super) fn wait_for_container_path(container: &str, path: &str) {
     }
 }
 
-pub(super) fn write_container_path(container: &str, path: &str, bytes: &[u8]) {
-    let mut child = Command::new("docker")
-        .args([
-            "exec",
-            "-i",
-            container,
-            "sh",
-            "-c",
-            "umask 077; cat > \"$1\"",
-            "greenlit-invariant",
-            path,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("write live invariant container path");
-    child
-        .stdin
-        .take()
-        .expect("piped Docker stdin")
-        .write_all(bytes)
-        .expect("send invariant bytes to container");
-    let output = child
-        .wait_with_output()
-        .expect("finish live container write");
+pub(super) fn read_container_text(container: &str, path: &str) -> String {
+    wait_for_container_path(container, path);
+    let output = docker(["exec", container, "cat", path]);
     assert!(
         output.status.success(),
-        "could not inject live invariant bytes into the workflow container"
+        "could not read the runtime-generated dynamic mask"
     );
+    let value = String::from_utf8(output.stdout).expect("dynamic mask is UTF-8");
+    assert!(
+        !value.is_empty(),
+        "runtime-generated dynamic mask was unexpectedly empty"
+    );
+    value
 }
 
 pub(super) fn one_run_directory(sandbox: &Sandbox) -> PathBuf {
@@ -296,20 +307,6 @@ fn running_container(run_id: &str) -> Option<String> {
         .ok()?
         .lines()
         .find(|line| !line.is_empty())
-        .map(str::to_string)
-}
-
-fn token_from_step_process(container: &str) -> Option<String> {
-    let script = r#"for file in /proc/[0-9]*/environ; do tr '\000' '\n' < "$file" 2>/dev/null || true; done"#;
-    let output = docker(["exec", container, "sh", "-c", script]);
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("ACTIONS_RUNTIME_TOKEN="))
-        .filter(|token| !token.is_empty())
         .map(str::to_string)
 }
 

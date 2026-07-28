@@ -8,11 +8,28 @@
 //! emitted *after* the command is redacted.
 //! <https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands>
 
+use std::sync::{Arc, RwLock};
+use std::{error::Error, fmt};
+
 /// The token GitHub substitutes for a masked value in log output.
 pub const MASK_TOKEN: &str = "***";
 
+/// The only diagnostic exposed when sensitive-value registration cannot be
+/// completed safely.
+///
+/// The rejected value and its dimensions are deliberately absent: this text
+/// can be rendered and retained even when the rejected value was itself a
+/// credential.
+pub const MASK_REGISTRATION_FAILURE_DIAGNOSTIC: &str = "sensitive-value registration failed; subsequent output was suppressed\n  fix: use a mask of at least four bytes and reduce the number or size of masks, then retry";
+
+const MIN_DYNAMIC_VALUE_BYTES: usize = 4;
+const MAX_SENSITIVE_VALUES: usize = 256;
+const MAX_SENSITIVE_VALUE_BYTES: usize = 64 * 1024;
+const MAX_PATTERN_COUNT: usize = 1_024;
+const MAX_PATTERN_BYTES: usize = 4 * 1024 * 1024;
+
 /// One recognized workflow command, or a plain output line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LogLine {
     /// A normal output line (not a workflow command).
     Output(String),
@@ -32,16 +49,42 @@ pub enum LogLine {
     AddMask(String),
 }
 
+impl fmt::Debug for LogLine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Output(_) => "Output",
+            Self::StartGroup(_) => "StartGroup",
+            Self::EndGroup => "EndGroup",
+            Self::Error(_) => "Error",
+            Self::Warning(_) => "Warning",
+            Self::Notice(_) => "Notice",
+            Self::Debug(_) => "Debug",
+            Self::AddMask(_) => "AddMask",
+        };
+        formatter.debug_tuple(name).field(&"[redacted]").finish()
+    }
+}
+
 /// The message of an annotation command. GitHub also carries `file`,
 /// `line`, `col`, and `title` parameters; v0 keeps the raw parameter string
 /// so nothing is lost, plus the decoded message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Annotation {
     /// The raw, still-encoded parameter string between the command name and
     /// the `::` (empty when no parameters were given).
     pub parameters: String,
     /// The decoded annotation message.
     pub message: String,
+}
+
+impl fmt::Debug for Annotation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Annotation")
+            .field("parameters", &"[redacted]")
+            .field("message", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Parses one raw output line into a [`LogLine`]. A line that does not match
@@ -94,6 +137,270 @@ fn decode_data(value: &str) -> String {
         .replace("%25", "%")
 }
 
+/// A bounded, in-memory authority for values that must never reach rendered
+/// or retained output.
+///
+/// Clones address the same synchronized state. The type intentionally has no
+/// `Debug` or serialization implementation because it owns raw sensitive
+/// values. Callers may take an in-memory snapshot for a final retained-tree
+/// scan, but must never persist that snapshot.
+#[derive(Clone)]
+pub struct SensitiveValueRegistry {
+    inner: Arc<RwLock<SensitiveValueState>>,
+}
+
+struct SensitiveValueState {
+    /// Original registered values. Encodings are derived again by retained
+    /// scanners rather than being serialized from this registry.
+    values: Vec<String>,
+    value_bytes: usize,
+    /// Longest first, so overlapping masks redact the widest match.
+    patterns: Vec<String>,
+    pattern_bytes: usize,
+    failed: bool,
+    failure_diagnostic: String,
+}
+
+impl Default for SensitiveValueState {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            value_bytes: 0,
+            patterns: Vec::new(),
+            pattern_bytes: 0,
+            failed: false,
+            failure_diagnostic: MASK_REGISTRATION_FAILURE_DIAGNOSTIC.to_string(),
+        }
+    }
+}
+
+/// A fallible, opaque in-memory view of all accepted sensitive source values.
+///
+/// This type deliberately implements neither `Debug` nor serialization.
+/// Consumers use it only while screening bytes that are about to be retained.
+pub struct SensitiveValueSnapshot {
+    values: Vec<String>,
+}
+
+impl SensitiveValueSnapshot {
+    /// Borrows the accepted values for an in-memory retained-byte scan.
+    pub fn values(&self) -> &[String] {
+        &self.values
+    }
+}
+
+impl Default for SensitiveValueRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(SensitiveValueState::default())),
+        }
+    }
+}
+
+impl SensitiveValueRegistry {
+    /// Creates an empty run-level registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a value known before workflow output begins.
+    ///
+    /// Empty and whitespace-only values retain the historical no-op behavior.
+    /// All other values and their bounded common encodings are registered
+    /// atomically. A failure latches the registry into its fail-closed state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, value-independent error if a safety bound is exceeded
+    /// or the synchronized registry cannot be trusted.
+    pub fn register(&self, value: &str) -> Result<(), MaskRegistrationError> {
+        self.register_inner(value, RegistrationKind::Initial)
+    }
+
+    /// Registers a workflow-provided `::add-mask::` value.
+    ///
+    /// Dynamic values must be non-whitespace and every non-empty line must be
+    /// at least four bytes. Short masks are rejected because their bounded
+    /// common encodings cannot be retained safely without matching ordinary
+    /// output pervasively. Rejection latches the whole run authority failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, value-independent error for invalid input, an exceeded
+    /// bound, or an untrusted synchronized registry.
+    pub fn register_dynamic(&self, value: &str) -> Result<(), MaskRegistrationError> {
+        self.register_inner(value, RegistrationKind::Dynamic)
+    }
+
+    /// Returns a healthy snapshot for an in-memory retained-tree scan.
+    ///
+    /// The returned values remain sensitive and must never be persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed, already-redacted registration error instead of an
+    /// empty snapshot when the authority has failed or its lock was poisoned.
+    pub fn healthy_snapshot(&self) -> Result<SensitiveValueSnapshot, MaskRegistrationError> {
+        match self.inner.read() {
+            Ok(state) if !state.failed => Ok(SensitiveValueSnapshot {
+                values: state.values.clone(),
+            }),
+            Ok(state) => Err(state.error()),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                Err(self.latch_failed())
+            }
+        }
+    }
+
+    /// Fails if any registration or synchronization error has made this
+    /// authority unsafe for terminal publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed registration error after the failure latch is set.
+    pub fn ensure_healthy(&self) -> Result<(), MaskRegistrationError> {
+        match self.inner.read() {
+            Ok(state) if !state.failed => Ok(()),
+            Ok(state) => Err(state.error()),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                Err(self.latch_failed())
+            }
+        }
+    }
+
+    fn register_inner(
+        &self,
+        value: &str,
+        kind: RegistrationKind,
+    ) -> Result<(), MaskRegistrationError> {
+        if value.trim().is_empty() {
+            return match kind {
+                RegistrationKind::Initial => Ok(()),
+                RegistrationKind::Dynamic => self.fail(value),
+            };
+        }
+        if value.len() > MAX_SENSITIVE_VALUE_BYTES {
+            return self.fail(value);
+        }
+        if kind == RegistrationKind::Dynamic
+            && std::iter::once(value)
+                .chain(value.lines())
+                .filter(|candidate| !candidate.is_empty())
+                .any(|candidate| {
+                    candidate.trim().is_empty() || candidate.len() < MIN_DYNAMIC_VALUE_BYTES
+                })
+        {
+            return self.fail(value);
+        }
+
+        let candidates = match mask_candidates(value) {
+            Ok(candidates) => candidates,
+            Err(_) => return self.fail(value),
+        };
+        let mut state = match self.inner.write() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                return Err(state.fail(Some(value)));
+            }
+        };
+        if state.failed {
+            return Err(state.fail(Some(value)));
+        }
+        if state.values.iter().any(|registered| registered == value) {
+            return Ok(());
+        }
+
+        let additions = candidates
+            .into_iter()
+            .filter(|candidate| !state.patterns.contains(candidate))
+            .collect::<Vec<_>>();
+        let added_pattern_bytes = additions.iter().try_fold(0_usize, |total, candidate| {
+            total.checked_add(candidate.len())
+        });
+        let value_count = state.values.len().checked_add(1);
+        let value_bytes = state.value_bytes.checked_add(value.len());
+        let pattern_count = state.patterns.len().checked_add(additions.len());
+        let pattern_bytes =
+            added_pattern_bytes.and_then(|added| state.pattern_bytes.checked_add(added));
+        if value_count.is_none_or(|count| count > MAX_SENSITIVE_VALUES)
+            || value_bytes.is_none_or(|bytes| bytes > MAX_PATTERN_BYTES)
+            || pattern_count.is_none_or(|count| count > MAX_PATTERN_COUNT)
+            || pattern_bytes.is_none_or(|bytes| bytes > MAX_PATTERN_BYTES)
+        {
+            return Err(state.fail(Some(value)));
+        }
+
+        state.values.push(value.to_string());
+        state.values.sort();
+        state.value_bytes = value_bytes.unwrap_or_default();
+        state.patterns.extend(additions);
+        state
+            .patterns
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        state.pattern_bytes = pattern_bytes.unwrap_or_default();
+        Ok(())
+    }
+
+    fn fail<T>(&self, rejected: &str) -> Result<T, MaskRegistrationError> {
+        let error = match self.inner.write() {
+            Ok(mut state) => state.fail(Some(rejected)),
+            Err(poisoned) => poisoned.into_inner().fail(Some(rejected)),
+        };
+        Err(error)
+    }
+
+    fn latch_failed(&self) -> MaskRegistrationError {
+        match self.inner.write() {
+            Ok(mut state) => state.fail(None),
+            Err(poisoned) => poisoned.into_inner().fail(None),
+        }
+    }
+}
+
+impl SensitiveValueState {
+    fn error(&self) -> MaskRegistrationError {
+        MaskRegistrationError {
+            diagnostic: self.failure_diagnostic.clone(),
+        }
+    }
+
+    fn fail(&mut self, rejected: Option<&str>) -> MaskRegistrationError {
+        self.failure_diagnostic =
+            sanitized_failure_diagnostic(&self.patterns, rejected, &self.failure_diagnostic);
+        self.failed = true;
+        self.error()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationKind {
+    Initial,
+    Dynamic,
+}
+
+/// Fixed, value-independent sensitive-value registration failure.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaskRegistrationError {
+    diagnostic: String,
+}
+
+impl fmt::Debug for MaskRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MaskRegistrationError")
+    }
+}
+
+impl fmt::Display for MaskRegistrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.diagnostic)
+    }
+}
+
+impl Error for MaskRegistrationError {}
+
 /// Accumulates values that must be redacted from all subsequent output, and
 /// applies the redaction. Fed by `::add-mask::` commands and by every
 /// registered secret value at the start of a run.
@@ -101,10 +408,12 @@ fn decode_data(value: &str) -> String {
 /// GitHub masks the exact string, and — for a multiline value — each of its
 /// individual lines, so a partial echo of a secret is still redacted.
 /// <https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions#masking-secrets>
-#[derive(Debug, Clone, Default)]
+///
+/// Clones share a [`SensitiveValueRegistry`], making accepted dynamic masks
+/// visible immediately across parallel jobs and caller-side renderers.
+#[derive(Clone, Default)]
 pub struct Masker {
-    /// Longest first, so overlapping masks redact the widest match.
-    masks: Vec<String>,
+    registry: SensitiveValueRegistry,
 }
 
 impl Masker {
@@ -113,42 +422,161 @@ impl Masker {
         Masker::default()
     }
 
+    /// Creates a masker backed by `registry`.
+    pub fn with_registry(registry: SensitiveValueRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Returns the shared in-memory registry backing this masker.
+    pub fn registry(&self) -> SensitiveValueRegistry {
+        self.registry.clone()
+    }
+
     /// Registers a value to redact. Empty or whitespace-only values are
     /// ignored (GitHub does not mask them, to avoid redacting every space in
     /// the log). Both the full value and each of its non-empty lines are
     /// registered.
-    pub fn add(&mut self, value: &str) {
-        for candidate in std::iter::once(value).chain(value.lines()) {
-            if candidate.trim().is_empty() {
-                continue;
-            }
-            let variants = encoded_variants(candidate);
-            for variant in std::iter::once(candidate.to_string()).chain(variants) {
-                if !self.masks.contains(&variant) {
-                    self.masks.push(variant);
-                }
-            }
-        }
-        // Redact wider matches first so a full multiline secret is replaced
-        // before its component lines.
-        self.masks.sort_by_key(|mask| std::cmp::Reverse(mask.len()));
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, value-independent error if a safety bound is exceeded.
+    pub fn add(&self, value: &str) -> Result<(), MaskRegistrationError> {
+        self.registry.register(value)
+    }
+
+    /// Registers an untrusted workflow `::add-mask::` value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fixed, value-independent error if the value is invalid or a
+    /// safety bound is exceeded.
+    pub fn add_dynamic(&self, value: &str) -> Result<(), MaskRegistrationError> {
+        self.registry.register_dynamic(value)
+    }
+
+    /// Returns a healthy, opaque snapshot for an in-memory retained-tree scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed registration error if this run-level authority has
+    /// failed.
+    pub fn healthy_snapshot(&self) -> Result<SensitiveValueSnapshot, MaskRegistrationError> {
+        self.registry.healthy_snapshot()
+    }
+
+    /// Refuses terminal publication after any registration failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed registration error if this run-level authority has
+    /// failed.
+    pub fn ensure_healthy(&self) -> Result<(), MaskRegistrationError> {
+        self.registry.ensure_healthy()
+    }
+
+    /// Latches the authority failed after a surrounding redaction boundary
+    /// can no longer guarantee bounded processing.
+    ///
+    /// The returned error contains only the fixed, already-redacted
+    /// diagnostic.
+    pub fn fail_closed(&self) -> MaskRegistrationError {
+        self.registry.latch_failed()
     }
 
     /// Whether any value is registered.
     pub fn is_empty(&self) -> bool {
-        self.masks.is_empty()
+        match self.registry.inner.read() {
+            Ok(state) => state.patterns.is_empty(),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                let _ = self.registry.latch_failed();
+                false
+            }
+        }
     }
 
     /// Returns `line` with every registered value replaced by [`MASK_TOKEN`].
     pub fn apply(&self, line: &str) -> String {
+        let state = match self.registry.inner.read() {
+            Ok(state) if !state.failed => state,
+            Ok(state) => return state.failure_diagnostic.clone(),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                return self.registry.latch_failed().to_string();
+            }
+        };
         let mut redacted = line.to_string();
-        for mask in &self.masks {
+        for mask in &state.patterns {
             if redacted.contains(mask.as_str()) {
                 redacted = redacted.replace(mask.as_str(), MASK_TOKEN);
             }
         }
         redacted
     }
+}
+
+fn mask_candidates(value: &str) -> Result<Vec<String>, MaskRegistrationError> {
+    let mut candidates = Vec::new();
+    let mut pattern_bytes = 0_usize;
+    for candidate in std::iter::once(value).chain(value.lines()) {
+        if candidate.trim().is_empty() {
+            continue;
+        }
+        let variants = encoded_variants(candidate);
+        for variant in std::iter::once(candidate.to_string()).chain(variants) {
+            push_candidate(variant, &mut candidates, &mut pattern_bytes)?;
+        }
+    }
+    Ok(candidates)
+}
+
+fn push_candidate(
+    candidate: String,
+    candidates: &mut Vec<String>,
+    pattern_bytes: &mut usize,
+) -> Result<(), MaskRegistrationError> {
+    if candidates.contains(&candidate) {
+        return Ok(());
+    }
+    let next_bytes =
+        pattern_bytes
+            .checked_add(candidate.len())
+            .ok_or_else(|| MaskRegistrationError {
+                diagnostic: MASK_REGISTRATION_FAILURE_DIAGNOSTIC.to_string(),
+            })?;
+    if candidates.len() >= MAX_PATTERN_COUNT || next_bytes > MAX_PATTERN_BYTES {
+        return Err(MaskRegistrationError {
+            diagnostic: MASK_REGISTRATION_FAILURE_DIAGNOSTIC.to_string(),
+        });
+    }
+    *pattern_bytes = next_bytes;
+    candidates.push(candidate);
+    Ok(())
+}
+
+fn sanitized_failure_diagnostic(
+    patterns: &[String],
+    rejected: Option<&str>,
+    current: &str,
+) -> String {
+    let mut diagnostic = current.to_string();
+    for pattern in patterns {
+        diagnostic = diagnostic.replace(pattern, MASK_TOKEN);
+    }
+    if let Some(value) = rejected {
+        for candidate in std::iter::once(value).chain(value.lines()) {
+            if candidate.is_empty() {
+                continue;
+            }
+            diagnostic = diagnostic.replace(candidate, MASK_TOKEN);
+            if candidate.len() <= MAX_SENSITIVE_VALUE_BYTES {
+                for variant in encoded_variants(candidate) {
+                    diagnostic = diagnostic.replace(&variant, MASK_TOKEN);
+                }
+            }
+        }
+    }
+    diagnostic
 }
 
 fn encoded_variants(value: &str) -> Vec<String> {

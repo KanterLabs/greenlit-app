@@ -1,6 +1,7 @@
 //! Winding a job instance down: release the container, Docker-sibling
 //! volumes, DinD sidecar, services, and finally the job's own network.
 
+use crate::executor::ExecError;
 use crate::executor::Shared;
 use crate::executor::actions::docker_action;
 use crate::executor::container::namespaced_volume_name;
@@ -11,8 +12,16 @@ use crate::executor::services;
 /// after the run to export the diff (`PHASE-2-execution.md` "Overlay
 /// isolation": "export the upper-layer diff ... after the run"); the caller
 /// (`litci run`) removes it once write-back has processed this job.
-/// Otherwise, best-effort teardown here and now: a leaked container is not a
-/// run failure, and it must not mask the job's real result or error.
+/// Otherwise, removal of the main job container is mandatory before an
+/// `Ok(JobReport)` can be returned. Phase 12's reachable shell path can retain
+/// dynamically masked bytes in that writable layer, so a cleanup failure may
+/// not coexist with a publishable report. The remaining, quarantined resource
+/// classes stay best-effort until their owning stabilization phases.
+///
+/// # Errors
+///
+/// Returns a fixed, identifier-free infrastructure error when the main job
+/// container could not be removed.
 pub(super) async fn teardown(
     shared: &Shared<'_>,
     container: &str,
@@ -21,9 +30,10 @@ pub(super) async fn teardown(
     services_started: &[services::StartedService],
     job_network: services::JobNetwork,
     keep_container: bool,
-) {
+) -> Result<(), ExecError> {
+    let mut main_container_removed = Ok(());
     if !keep_container {
-        let _ = shared.engine.remove_container(container).await;
+        main_container_removed = shared.engine.remove_container(container).await;
         // The Docker-sibling volumes outlive the container that bound them,
         // so removing the container is not enough. Before `remove_volume`
         // existed on the port these accumulated on the host until an
@@ -46,4 +56,10 @@ pub(super) async fn teardown(
     }
     services::stop(shared.engine, services_started).await;
     job_network.teardown(shared.engine).await;
+    main_container_removed.map_err(|_| ExecError::Infrastructure {
+        message: "could not remove the completed job container before result publication"
+            .to_string(),
+        fix: "restore Docker cleanup access, remove the retained job container, and retry"
+            .to_string(),
+    })
 }

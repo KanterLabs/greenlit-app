@@ -1,17 +1,20 @@
 //! Race-checked, Git-aware source snapshot capture.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod git;
+mod private_fs;
 mod remote;
+mod sensitive;
 
 use git::{clone_git_metadata, git_paths, git_status, git_text};
+use sensitive::SensitiveGuard;
 
 const CAPTURE_ATTEMPTS: usize = 3;
 const MAX_PATH_BYTES: usize = 64 * 1024;
@@ -95,6 +98,16 @@ pub enum SourceSnapshotError {
         /// Maximum accepted path count.
         limit: usize,
     },
+    /// A caller-declared sensitive value or bounded transport encoding was
+    /// found before the corresponding source byte could be published.
+    #[error("source contains credential-bearing data")]
+    SensitiveValue,
+    /// The caller-declared sensitive pattern set exceeded its fixed bound.
+    #[error("source credential guard exceeded its {resource} safety limit")]
+    SensitiveValueLimit {
+        /// Fixed resource whose bound was exceeded.
+        resource: &'static str,
+    },
     /// The configured origin cannot be retained without risking credential
     /// persistence or changing an ambiguous transport into another identity.
     #[error(
@@ -107,11 +120,35 @@ impl SourceSnapshot {
     /// Captures current tracked bytes plus untracked nonignored files into
     /// `destination`. The destination must not already exist.
     pub fn capture(repo_root: &Path, destination: &Path) -> Result<Self, SourceSnapshotError> {
+        Self::capture_guarded(repo_root, destination, None)
+    }
+
+    /// Captures a snapshot while refusing caller-declared sensitive values and
+    /// their bounded common encodings before source bytes enter the snapshot.
+    ///
+    /// Phase 12 uses this containment API before adopting a privately staged
+    /// snapshot into retained run evidence. Each regular file is screened from
+    /// the same opened byte stream that is copied, with possible cross-chunk
+    /// prefixes held back until they can no longer complete a match.
+    pub fn capture_with_sensitive_values(
+        repo_root: &Path,
+        destination: &Path,
+        sensitive_values: &[Vec<u8>],
+    ) -> Result<Self, SourceSnapshotError> {
+        let guard = SensitiveGuard::new(sensitive_values)?;
+        Self::capture_guarded(repo_root, destination, Some(&guard))
+    }
+
+    fn capture_guarded(
+        repo_root: &Path,
+        destination: &Path,
+        guard: Option<&SensitiveGuard>,
+    ) -> Result<Self, SourceSnapshotError> {
         for attempt in 0..CAPTURE_ATTEMPTS {
             let temp =
                 destination.with_extension(format!("capture-{}-{attempt}", std::process::id()));
             remove_exact_tree_if_present(&temp)?;
-            match capture_once(repo_root, &temp) {
+            match capture_once(repo_root, &temp, guard) {
                 Ok(snapshot) => {
                     if destination.exists() {
                         remove_exact_tree_if_present(&temp)?;
@@ -189,6 +226,7 @@ impl SourceSnapshot {
 fn capture_once(
     repo_root: &Path,
     destination: &Path,
+    guard: Option<&SensitiveGuard>,
 ) -> Result<SourceSnapshot, SourceSnapshotError> {
     let commit_before = git_text(repo_root, &["rev-parse", "HEAD"])?;
     let paths = git_paths(
@@ -201,9 +239,14 @@ fn capture_once(
             "--exclude-standard",
         ],
     )?;
+    if let Some(guard) = guard {
+        for path in &paths {
+            guard.reject(path.as_bytes())?;
+        }
+    }
 
     clone_git_metadata(repo_root, destination)?;
-    let entries = copy_and_hash(repo_root, destination, &paths)?;
+    let entries = copy_and_hash(repo_root, destination, &paths, guard)?;
     let verified = hash_live_entries(repo_root, &paths)?;
     let commit_after = git_text(repo_root, &["rev-parse", "HEAD"])?;
     if entries != verified || commit_before != commit_after {
@@ -214,6 +257,9 @@ fn capture_once(
         path: destination.display().to_string(),
         message: format!("could not serialize source manifest: {error}"),
     })?;
+    if let Some(guard) = guard {
+        guard.reject(&manifest)?;
+    }
     let digest = sha256_identity(&manifest);
     Ok(SourceSnapshot {
         commit: commit_before,
@@ -228,11 +274,13 @@ fn copy_and_hash(
     repo_root: &Path,
     destination: &Path,
     paths: &[String],
+    guard: Option<&SensitiveGuard>,
 ) -> Result<Vec<SourceEntry>, SourceSnapshotError> {
+    let frozen_tree = private_fs::PrivateTree::open(destination)?;
     let mut entries = Vec::with_capacity(paths.len());
     for relative in paths {
         let source = repo_root.join(relative);
-        let target = destination.join(relative);
+        let target = frozen_tree.target(relative)?;
         let metadata = match fs::symlink_metadata(&source) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -241,18 +289,15 @@ fn copy_and_hash(
         if metadata.file_type().is_symlink() {
             let link_target = fs::read_link(&source).map_err(|error| io_error(&source, error))?;
             let bytes = link_target.as_os_str().as_encoded_bytes();
-            if let Some(parent) = target.parent() {
-                create_private_dir_all(parent)?;
+            if let Some(guard) = guard {
+                guard.reject(bytes)?;
             }
-            symlink(&link_target, &target).map_err(|error| io_error(&target, error))?;
+            target.create_symlink(&link_target)?;
             entries.push(entry(relative, SourceEntryKind::Symlink, 0o120000, bytes));
         } else if metadata.is_file() {
-            if let Some(parent) = target.parent() {
-                create_private_dir_all(parent)?;
-            }
             let mut input = File::open(&source).map_err(|error| io_error(&source, error))?;
-            let mut output = create_private_file(&target)?;
-            let (digest, size) = copy_hash(&mut input, &mut output, &source)?;
+            let mut output = target.create_file()?;
+            let (digest, size) = copy_hash(&mut input, &mut output, &source, guard)?;
             let manifest_mode = if metadata.mode() & 0o111 != 0 {
                 0o100755
             } else {
@@ -331,10 +376,13 @@ fn copy_hash(
     input: &mut File,
     output: &mut File,
     source: &Path,
+    guard: Option<&SensitiveGuard>,
 ) -> Result<(String, u64), SourceSnapshotError> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
+    let mut pending = Vec::new();
+    let mut stream = guard.map(SensitiveGuard::stream);
     loop {
         let read = input
             .read(&mut buffer)
@@ -342,11 +390,31 @@ fn copy_hash(
         if read == 0 {
             break;
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|error| io_error(source, error))?;
+        if let Some(stream) = &mut stream {
+            stream.reject(&buffer[..read])?;
+            pending.extend_from_slice(&buffer[..read]);
+            let retained = guard
+                .map(SensitiveGuard::retained_prefix_bytes)
+                .unwrap_or_default();
+            let publish = pending.len().saturating_sub(retained);
+            if publish > 0 {
+                output
+                    .write_all(&pending[..publish])
+                    .map_err(|error| io_error(source, error))?;
+                pending.drain(..publish);
+            }
+        } else {
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| io_error(source, error))?;
+        }
         hasher.update(&buffer[..read]);
         size = size.saturating_add(read as u64);
+    }
+    if !pending.is_empty() {
+        output
+            .write_all(&pending)
+            .map_err(|error| io_error(source, error))?;
     }
     Ok((format!("sha256:{}", hex_digest(&hasher.finalize())), size))
 }
@@ -366,22 +434,6 @@ fn hash_reader(input: &mut File, source: &Path) -> Result<(String, u64), SourceS
         size = size.saturating_add(read as u64);
     }
     Ok((format!("sha256:{}", hex_digest(&hasher.finalize())), size))
-}
-
-fn create_private_dir_all(path: &Path) -> Result<(), SourceSnapshotError> {
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true);
-    builder.mode(0o700);
-    builder.create(path).map_err(|error| io_error(path, error))
-}
-
-fn create_private_file(path: &Path) -> Result<File, SourceSnapshotError> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|error| io_error(path, error))
 }
 
 fn remove_exact_tree_if_present(path: &Path) -> Result<(), SourceSnapshotError> {

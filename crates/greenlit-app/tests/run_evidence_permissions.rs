@@ -18,11 +18,11 @@ jobs:
       - run: echo private evidence
 ";
 
-fn run_with_permissive_umask(sandbox: &Sandbox) -> Output {
+fn run_with_umask(sandbox: &Sandbox, umask: &str) -> Output {
     let path = std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin"));
     Command::new("sh")
         .arg("-c")
-        .arg("umask 000; exec \"$@\"")
+        .arg(format!("umask {umask}; exec \"$@\""))
         .arg("litci-permission-test")
         .arg(env!("CARGO_BIN_EXE_litci"))
         .args(["run", "--no-daemon", "--no-input", "--allow-degraded"])
@@ -37,7 +37,7 @@ fn run_with_permissive_umask(sandbox: &Sandbox) -> Output {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("DOCKER_HOST", "ssh://example")
         .output()
-        .expect("spawn litci under a permissive umask")
+        .expect("spawn litci under the selected umask")
 }
 
 fn assert_mode(path: &Path, expected: u32) {
@@ -98,10 +98,21 @@ fn assert_private_tree(root: &Path) {
                     .map(|entry| entry.expect("read retained entry").path()),
             );
         } else {
+            let expected = if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("greenlit-init-"))
+                && path
+                    .parent()
+                    .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "runtime"))
+            {
+                0o700
+            } else {
+                0o600
+            };
             assert_eq!(
                 mode,
-                0o600,
-                "{} is not a private retained file",
+                expected,
+                "{} is not a private Greenlit file",
                 path.display()
             );
         }
@@ -126,7 +137,7 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
         "https://example.invalid/greenlit/private-source.git",
     ]);
 
-    let first = run_with_permissive_umask(&sandbox);
+    let first = run_with_umask(&sandbox, "000");
     assert!(
         !first.status.success(),
         "the deliberately unreachable container endpoint unexpectedly succeeded"
@@ -180,10 +191,44 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
                 .contains(".tmp-")),
         "atomic publication must not leave a temporary artifact behind"
     );
+    assert_private_tree(&litci);
+
+    for umask in ["0077", "0777"] {
+        let matrix_sandbox = Sandbox::new();
+        std::fs::set_permissions(
+            matrix_sandbox.home(),
+            std::fs::Permissions::from_mode(0o2700),
+        )
+        .expect("make the matrix HOME inherit SGID");
+        matrix_sandbox.write(".github/workflows/ci.yml", WORKFLOW);
+        let executable = matrix_sandbox.write("scripts/check.sh", "#!/bin/sh\nexit 0\n");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("make the matrix fixture executable");
+        matrix_sandbox.init_git();
+        matrix_sandbox.git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/greenlit/private-source.git",
+        ]);
+
+        let output = run_with_umask(&matrix_sandbox, umask);
+        assert!(
+            !output.status.success(),
+            "the deliberately unreachable container endpoint unexpectedly succeeded under umask {umask}"
+        );
+        let matrix_litci = matrix_sandbox.home().join(".litci");
+        assert_private_tree(&matrix_litci);
+        assert_eq!(
+            run_directories(&matrix_litci.join("runs")).len(),
+            1,
+            "umask {umask} did not retain exactly one private run"
+        );
+    }
 
     std::fs::set_permissions(&litci, std::fs::Permissions::from_mode(0o755))
         .expect("make the state parent unsafe");
-    let unsafe_state = run_with_permissive_umask(&sandbox);
+    let unsafe_state = run_with_umask(&sandbox, "000");
     assert!(!unsafe_state.status.success());
     let unsafe_state_stderr = support::stderr_text(&unsafe_state);
     assert_unsafe_mode_diagnostic(&unsafe_state_stderr, ".litci", "755");
@@ -198,7 +243,7 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
         .expect("restore the private state parent");
     std::fs::set_permissions(&runs, std::fs::Permissions::from_mode(0o755))
         .expect("make the runs parent unsafe");
-    let unsafe_runs = run_with_permissive_umask(&sandbox);
+    let unsafe_runs = run_with_umask(&sandbox, "000");
     assert!(!unsafe_runs.status.success());
     let unsafe_runs_stderr = support::stderr_text(&unsafe_runs);
     assert_unsafe_mode_diagnostic(&unsafe_runs_stderr, ".litci/runs", "755");
@@ -213,7 +258,7 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
         .expect("restore the private runs parent");
     std::fs::set_permissions(&litci, std::fs::Permissions::from_mode(0o2700))
         .expect("add SGID to the existing state parent");
-    let unsafe_sgid_state = run_with_permissive_umask(&sandbox);
+    let unsafe_sgid_state = run_with_umask(&sandbox, "000");
     assert!(!unsafe_sgid_state.status.success());
     let unsafe_sgid_stderr = support::stderr_text(&unsafe_sgid_state);
     assert_unsafe_mode_diagnostic(&unsafe_sgid_stderr, ".litci", "2700");

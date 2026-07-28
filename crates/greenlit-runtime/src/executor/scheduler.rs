@@ -195,6 +195,7 @@ pub(super) async fn run(
     let max_wave = groups.iter().map(|group| group.wave).max().unwrap_or(0);
 
     for wave in 0..=max_wave {
+        baseline_masker.ensure_healthy()?;
         let wave_dependencies = completed.clone();
         let mut running = FuturesUnordered::new();
         for group in groups.iter().filter(|group| group.wave == wave) {
@@ -222,12 +223,17 @@ pub(super) async fn run(
                 Err(error) if first_error.is_none() => first_error = Some(error),
                 Err(_) => {}
             }
+            if let Err(error) = baseline_masker.ensure_healthy() {
+                first_error = Some(error.into());
+            }
         }
+        baseline_masker.ensure_healthy()?;
         if let Some(error) = first_error {
             return Err(error);
         }
     }
 
+    baseline_masker.ensure_healthy()?;
     let mut reports = Vec::new();
     for group in groups {
         if let Some(mut group_reports) = reports_by_group.remove(&group.id.0) {
@@ -403,6 +409,9 @@ async fn run_group(
             Err(error) if first_error.is_none() => first_error = Some(error),
             Err(_) => {}
         }
+        if let Err(error) = baseline_masker.ensure_healthy() {
+            first_error = Some(error.into());
+        }
         if !fail_fast_triggered
             && first_error.is_none()
             && let Some((index, instance)) = pending.next()
@@ -410,6 +419,7 @@ async fn run_group(
             running.push(make_leg(index, instance));
         }
     }
+    baseline_masker.ensure_healthy()?;
     if let Some(error) = first_error {
         return Err(error);
     }

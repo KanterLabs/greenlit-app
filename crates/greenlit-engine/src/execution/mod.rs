@@ -58,6 +58,9 @@ pub struct StepInvocation {
 }
 
 pub use contexts::{NeedRecord, StepRecord, build_needs_context, build_steps_context};
-pub use log_commands::{LogLine, Masker};
+pub use log_commands::{
+    LogLine, MASK_REGISTRATION_FAILURE_DIAGNOSTIC, MaskRegistrationError, Masker,
+    SensitiveValueRegistry, SensitiveValueSnapshot,
+};
 pub use outcome::{Conclusion, StepExit, StepResult};
 pub use shell::{ShellInvocation as ResolvedShell, ShellSelection};

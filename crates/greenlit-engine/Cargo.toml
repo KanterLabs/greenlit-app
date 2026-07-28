@@ -40,3 +40,6 @@ regex = "1.13.1"
 # Canonical source trees, locks, and result evidence use SHA-256 identities.
 # The same version is already pinned by greenlit-expr and greenlit-runtime.
 sha2 = "0.11.0"
+# Linux descriptor-relative source creation keeps retained snapshot paths
+# private without changing the multithreaded process's ambient umask.
+rustix = { version = "1.1.4", features = ["fs", "process"] }

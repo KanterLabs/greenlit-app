@@ -139,8 +139,13 @@ pub(crate) async fn run_instance(
         shared.config.volume_namespace, identity.instance_key
     );
     let network_name = format!("greenlit-run-{job_namespace}");
-    let job_network =
-        services::create(shared.engine, &network_name, shared.config.store.as_ref()).await?;
+    let job_network = services::create(
+        shared.engine,
+        &network_name,
+        shared.config.store.as_ref(),
+        shared.config.allow_external_network,
+    )
+    .await?;
     runner_env.actions_service = job_network.actions_service().cloned();
 
     let mut base_env = runner_env.clone().into_map();
@@ -588,7 +593,7 @@ pub(crate) async fn run_instance(
         ),
     };
 
-    teardown::teardown(
+    let teardown_result = teardown::teardown(
         shared,
         &container,
         docker_volumes,
@@ -599,7 +604,13 @@ pub(crate) async fn run_instance(
     )
     .await;
 
-    let (step_reports, outputs, result) = outcome?;
+    let (step_reports, outputs, result) = match outcome {
+        Ok(outcome) => {
+            teardown_result?;
+            outcome
+        }
+        Err(error) => return Err(error),
+    };
     let duration = started.elapsed();
     step_output.events.on_event(ExecutionEvent::JobFinished {
         scope: step_output.scope,
@@ -949,7 +960,7 @@ fn resolve_services(
     for (id, plan) in instance.services {
         let request = resolve_container(plan, &ctx)?;
         if let Some(credentials) = &request.credentials {
-            masker.add(&credentials.password);
+            masker.add(&credentials.password)?;
         }
         let mut additions =
             validate_container(&request, &shared.config.workspace, shared.namespace).map_err(

@@ -79,6 +79,24 @@ where
     )
 }
 
+/// Refuses sensitive values in exact bytes before a retained writer receives
+/// them. This is the pre-write half of the full retained-tree invariant.
+pub(crate) fn scan_prepared_bytes_for_sensitive_values<I, V>(
+    sensitive_values: I,
+    prepared_bytes: &[&[u8]],
+) -> Result<()>
+where
+    I: IntoIterator<Item = V>,
+    V: AsRef<[u8]>,
+{
+    let matcher = Matcher::new(sensitive_values)?;
+    let mut budget = ScanBudget::default();
+    for bytes in prepared_bytes {
+        scan_prepared_bytes(bytes, &matcher, &mut budget)?;
+    }
+    Ok(())
+}
+
 fn scan_prepared_bytes(bytes: &[u8], matcher: &Matcher, budget: &mut ScanBudget) -> Result<()> {
     let bytes_len =
         u64::try_from(bytes.len()).map_err(|_| resource_error("retained-file-bytes"))?;

@@ -5,9 +5,9 @@
 //! output can never impersonate Greenlit lifecycle events.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -68,10 +68,14 @@ struct State {
     format: RunFormatArg,
     log_mode: LogModeArg,
     styled: bool,
+    masker: greenlit_engine::execution::Masker,
     active_steps: HashMap<String, ActiveStep>,
     line_buffers: HashMap<String, LineBuffer>,
     tails: HashMap<(String, String), TailBuffer>,
     failure: Option<String>,
+    terminal_attempted: bool,
+    terminal_persisted: bool,
+    terminal_committed: bool,
     terminal_written: bool,
     result_publication_abandoned: Arc<AtomicBool>,
 }
@@ -82,6 +86,12 @@ pub(crate) struct RunEventRecorder {
     state: Arc<Mutex<State>>,
 }
 
+pub(crate) struct PreparedRunFinish {
+    record: RunEventRecord,
+    bytes: Vec<u8>,
+    journal_offset: u64,
+}
+
 impl RunEventRecorder {
     pub(crate) fn create(
         directory: &Path,
@@ -89,6 +99,7 @@ impl RunEventRecorder {
         format: RunFormatArg,
         log_mode: LogModeArg,
         color: ColorArg,
+        masker: greenlit_engine::execution::Masker,
         result_publication_abandoned: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let recorder = Self::create_with_output(
@@ -97,7 +108,7 @@ impl RunEventRecorder {
             format,
             log_mode,
             color,
-            Box::new(io::stdout()),
+            masker,
             Arc::clone(&result_publication_abandoned),
         );
         if recorder.is_err() {
@@ -112,21 +123,18 @@ impl RunEventRecorder {
         format: RunFormatArg,
         log_mode: LogModeArg,
         color: ColorArg,
-        output: Box<dyn Write + Send>,
+        masker: greenlit_engine::execution::Masker,
         result_publication_abandoned: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let path = directory.join("events.ndjson");
-        let journal = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "could not create run event journal {}: {error}\n  fix: ensure the run directory is writable, then retry",
-                    path.display()
-                )
-            })?;
+        let journal =
+            crate::run_evidence::create_private_artifact(directory, OsStr::new("events.ndjson"), true)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not create run event journal {}: {error}\n  fix: ensure the run directory is private and writable, then retry",
+                        path.display()
+                    )
+                })?;
         let styled = match color {
             ColorArg::Always => true,
             ColorArg::Never => false,
@@ -138,14 +146,18 @@ impl RunEventRecorder {
                 started: Instant::now(),
                 sequence: 1,
                 journal,
-                output,
+                output: Box::new(io::stdout()),
                 format,
                 log_mode,
                 styled,
+                masker,
                 active_steps: HashMap::new(),
                 line_buffers: HashMap::new(),
                 tails: HashMap::new(),
                 failure: None,
+                terminal_attempted: false,
+                terminal_persisted: false,
+                terminal_committed: false,
                 terminal_written: false,
                 result_publication_abandoned,
             })),
@@ -154,44 +166,170 @@ impl RunEventRecorder {
         Ok(recorder)
     }
 
-    pub(crate) fn finish(
+    pub(crate) fn prepare_finish(
         &self,
         conclusion: impl Into<String>,
         compatibility: impl Into<String>,
         assurance: impl Into<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PreparedRunFinish> {
         self.flush_partial_lines()?;
-        let run_id = self.lock().run_id.clone();
-        self.record(RunEvent::RunFinished {
+        let mut state = self.lock();
+        if state.terminal_persisted || state.terminal_committed || state.terminal_written {
+            anyhow::bail!(
+                "could not prepare a second terminal run event\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+        let run_id = state.run_id.clone();
+        let prepared = prepare_record(
+            &mut state,
+            RunEvent::RunFinished {
             conclusion: conclusion.into(),
             compatibility: compatibility.into(),
             assurance: assurance.into(),
             evidence: run_id,
+            },
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not prepare the terminal run event: {error}\n  fix: preserve the run directory and retry"
+            )
         })?;
+        let journal_offset = state
+            .journal
+            .metadata()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not inspect the terminal journal commit point: {error}\n  fix: ensure HOME is readable, then retry"
+                )
+            })?
+            .len();
+        Ok(PreparedRunFinish {
+            record: prepared.record,
+            bytes: prepared.bytes,
+            journal_offset,
+        })
+    }
+
+    pub(crate) fn persist_finish(&self, prepared: &PreparedRunFinish) -> anyhow::Result<()> {
         let mut state = self.lock();
-        state.terminal_written = true;
+        if let Err(error) = state.masker.ensure_healthy() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            return Err(anyhow::anyhow!("{error}"));
+        }
+        if state.terminal_persisted
+            || state.terminal_attempted
+            || state.terminal_committed
+            || state.terminal_written
+            || state.sequence != prepared.record.sequence
+        {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            anyhow::bail!(
+                "could not persist the prepared terminal run event because journal authority changed\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+        let current_offset = state
+            .journal
+            .metadata()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not inspect the terminal journal before publication: {error}\n  fix: ensure HOME is readable, then retry"
+                )
+            })?
+            .len();
+        if current_offset != prepared.journal_offset {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            anyhow::bail!(
+                "could not persist the prepared terminal run event because its durable journal offset changed\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+        state.terminal_attempted = true;
+        if let Err(error) = state.journal.write_all(&prepared.bytes) {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            let primary = anyhow::anyhow!(
+                "could not persist the terminal run event: {error}\n  fix: ensure HOME has free space, then retry"
+            );
+            return Err(rollback_terminal_attempt(&mut state, prepared, primary));
+        }
+        #[cfg(litci_test_boundaries)]
+        if std::env::var_os("LITCI_TEST_TERMINAL_SYNC_FAILURE").as_deref()
+            == Some(OsStr::new("after-write"))
+        {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            let primary = anyhow::anyhow!(
+                "could not make the completed run event journal durable: injected sync failure after terminal write\n  fix: ensure HOME has free space, then retry"
+            );
+            return Err(rollback_terminal_attempt(&mut state, prepared, primary));
+        }
         if let Err(error) = state.journal.sync_all() {
             state
                 .result_publication_abandoned
                 .store(true, Ordering::Release);
-            return Err(anyhow::anyhow!(
+            let primary = anyhow::anyhow!(
                 "could not make the completed run event journal durable: {error}\n  fix: ensure HOME has free space, then retry"
-            ));
+            );
+            return Err(rollback_terminal_attempt(&mut state, prepared, primary));
         }
-        if let Err(error) = state.output.flush() {
+        state.sequence = state.sequence.saturating_add(1);
+        state.terminal_persisted = true;
+        Ok(())
+    }
+
+    pub(crate) fn render_finish(&self, prepared: PreparedRunFinish) -> anyhow::Result<()> {
+        let mut state = self.lock();
+        if !state.terminal_persisted
+            || state.terminal_committed
+            || state.terminal_written
+            || state.sequence != prepared.record.sequence.saturating_add(1)
+        {
             state
                 .result_publication_abandoned
                 .store(true, Ordering::Release);
+            anyhow::bail!(
+                "could not render the committed terminal run event because journal authority changed\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+        // `render_finish` is called only after result, trace, and catalog
+        // completion are durable. From this point output failure can fail the
+        // command, but it cannot revoke or delete already-authoritative
+        // evidence.
+        state.terminal_committed = true;
+        #[cfg(litci_test_boundaries)]
+        if std::env::var_os("LITCI_TEST_TERMINAL_RENDER_FAILURE").as_deref()
+            == Some(OsStr::new("after-catalog"))
+        {
+            anyhow::bail!(
+                "could not render the committed terminal run event: injected post-catalog render failure\n  fix: ensure stdout is writable"
+            );
+        }
+        let rendered = if state.format == RunFormatArg::Jsonl {
+            state.output.write_all(&prepared.bytes)
+        } else {
+            terminal::render(&mut state, &prepared.record)
+        };
+        if let Err(error) = rendered {
+            return Err(anyhow::anyhow!(
+                "could not render the committed terminal run event: {error}\n  fix: ensure stdout is writable"
+            ));
+        }
+        if let Err(error) = state.output.flush() {
             return Err(anyhow::anyhow!(
                 "could not flush run output: {error}\n  fix: ensure stdout is writable"
             ));
         }
         if let Some(message) = state.failure.take() {
-            state
-                .result_publication_abandoned
-                .store(true, Ordering::Release);
             anyhow::bail!("{message}");
         }
+        state.terminal_written = true;
         Ok(())
     }
 
@@ -201,6 +339,12 @@ impl RunEventRecorder {
 
     pub(crate) fn verify_durable(&self) -> anyhow::Result<()> {
         let mut state = self.lock();
+        if let Err(error) = state.masker.ensure_healthy() {
+            state
+                .result_publication_abandoned
+                .store(true, Ordering::Release);
+            return Err(anyhow::anyhow!("{error}"));
+        }
         if let Err(error) = state.journal.sync_all() {
             state
                 .result_publication_abandoned
@@ -260,7 +404,7 @@ impl RunEventRecorder {
         let mut state = self.lock();
         write_record(&mut state, event).map_err(|error| {
             anyhow::anyhow!(
-                "could not persist the run event journal: {error}\n  fix: ensure HOME has free space, then retry"
+                "could not persist or render the run event: {error}\n  fix: ensure HOME has free space and stdout is writable, then retry"
             )
         })
     }
@@ -300,6 +444,7 @@ impl RunEventRecorder {
 
     fn record_log_line(&self, scope: &JobScope, text: String, partial: bool) -> io::Result<()> {
         let mut state = self.lock();
+        let masked_text = state.masker.apply(&text);
         let event_id = state
             .active_steps
             .get(&scope.instance_id)
@@ -317,10 +462,10 @@ impl RunEventRecorder {
                 .tails
                 .entry((scope.instance_id.clone(), event_id))
                 .or_default()
-                .push(text.clone());
+                .push(masked_text.clone());
         }
         if state.format == RunFormatArg::Plain && state.log_mode == LogModeArg::Full {
-            let escaped = crate::render::terminal::inline_escape(&text);
+            let escaped = crate::render::terminal::inline_escape(&masked_text);
             writeln!(state.output, "    {escaped}")?;
         }
         Ok(())
@@ -341,7 +486,14 @@ impl RunEventRecorder {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if self.terminal_written {
+        if self.terminal_written || self.terminal_committed {
+            return;
+        }
+        if self.terminal_persisted || self.terminal_attempted {
+            if !self.terminal_written {
+                self.result_publication_abandoned
+                    .store(true, Ordering::Release);
+            }
             return;
         }
         let event = RunEvent::RunFinished {
@@ -360,6 +512,26 @@ impl Drop for State {
     }
 }
 
+fn rollback_terminal_attempt(
+    state: &mut State,
+    prepared: &PreparedRunFinish,
+    primary: anyhow::Error,
+) -> anyhow::Error {
+    let rollback = state
+        .journal
+        .set_len(prepared.journal_offset)
+        .and_then(|()| state.journal.sync_all());
+    match rollback {
+        Ok(()) => {
+            state.terminal_attempted = false;
+            primary
+        }
+        Err(error) => anyhow::anyhow!(
+            "{primary}\nadditionally, could not roll the terminal journal back to its durable offset: {error}"
+        ),
+    }
+}
+
 fn write_record(state: &mut State, event: RunEvent) -> io::Result<()> {
     let result = write_record_inner(state, event);
     if result.is_err() {
@@ -371,6 +543,33 @@ fn write_record(state: &mut State, event: RunEvent) -> io::Result<()> {
 }
 
 fn write_record_inner(state: &mut State, event: RunEvent) -> io::Result<()> {
+    let prepared = prepare_record(state, event)?;
+    state.journal.write_all(&prepared.bytes)?;
+    state.sequence = state.sequence.saturating_add(1);
+    if state.format == RunFormatArg::Jsonl {
+        state.output.write_all(&prepared.bytes)?;
+        state.output.flush()?;
+    } else {
+        terminal::render(state, &prepared.record)?;
+    }
+    Ok(())
+}
+
+struct PreparedRecord {
+    record: RunEventRecord,
+    bytes: Vec<u8>,
+}
+
+fn prepare_record(state: &mut State, event: RunEvent) -> io::Result<PreparedRecord> {
+    state.masker.ensure_healthy().map_err(io::Error::other)?;
+    if state.masker.apply(&state.run_id) != state.run_id
+        || event.protected_value_collision(&state.masker)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refused run-event publication because a sensitive value collides with a protected evidence identity",
+        ));
+    }
     let timestamp_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
@@ -387,20 +586,18 @@ fn write_record_inner(state: &mut State, event: RunEvent) -> io::Result<()> {
         timestamp_unix_ms,
         elapsed_ms,
         run_id: state.run_id.clone(),
-        event,
+        event: event.masked(&state.masker),
     };
-    state.sequence = state.sequence.saturating_add(1);
-    serde_json::to_writer(&mut state.journal, &record).map_err(io::Error::other)?;
-    state.journal.write_all(b"\n")?;
-    state.journal.flush()?;
-    if state.format == RunFormatArg::Jsonl {
-        serde_json::to_writer(&mut state.output, &record).map_err(io::Error::other)?;
-        state.output.write_all(b"\n")?;
-        state.output.flush()?;
-    } else {
-        terminal::render(state, &record)?;
+    let mut bytes = serde_json::to_vec(&record).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    let text = std::str::from_utf8(&bytes).map_err(io::Error::other)?;
+    if state.masker.apply(text) != text {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refused credential-bearing run-event bytes before journal publication",
+        ));
     }
-    Ok(())
+    Ok(PreparedRecord { record, bytes })
 }
 
 fn preparation(phase: &str, state: &str, detail: Option<String>) -> RunEvent {
