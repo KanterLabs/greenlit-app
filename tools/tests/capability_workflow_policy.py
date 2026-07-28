@@ -19,7 +19,7 @@ REQUIRED_ROUTE_POLICY_SHA256 = (
 # auto-update path: any workflow byte change requires a code-reviewed rebind.
 REQUIRED_WORKFLOW_POLICY_SHA256 = {
     ".github/workflows/ci.yml": (
-        "46ed4a6aeb81c1122a5f706aed932c4eb147dd02a0bd288b906c7dcdcad6aa32"
+        "03a6fee0bfc4c955773594cd68f3607896289b031066bfe9278d194f1cd26131"
     ),
     ".github/workflows/release.yml": (
         "0bf17d0a1f11ce9f7f646045068a286571f1e24e3819ff94c13b0f63f693a101"

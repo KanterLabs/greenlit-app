@@ -281,9 +281,6 @@ jobs:
       - name: Provision pinned Rust toolchain
         run: rustup show
 
-      - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-
       - name: Require native Docker capability
         run: |
           test "$(uname -s)" = Linux
