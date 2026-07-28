@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavior gate for canonical oracle/GitHub capture production and replay."""
+"""Behavior gate for canonical live oracle/GitHub capture production."""
 
 from __future__ import annotations
 
@@ -35,7 +35,6 @@ def main() -> int:
         output_root.mkdir(mode=0o700)
         workflow = checkout / ".github/workflows/parity-seed.yml"
         workflow.parent.mkdir(parents=True)
-        (checkout / "fixtures/stabilization/parity").mkdir(parents=True)
         shutil.copyfile(root / ".github/workflows/parity-seed.yml", workflow)
         _git(checkout, "init", "-q")
         _git(checkout, "config", "user.name", "Parity Producer Test")
@@ -224,55 +223,21 @@ def main() -> int:
                 raise RuntimeError(f"job-log identity accepted mutated {field}")
         inputs["jobs"].write_bytes(original_jobs)
 
-        fixture_root = checkout / "fixtures/stabilization/parity"
-        shutil.copytree(output_root / "captures", fixture_root / "captures")
-        for role in ("oracle", "github-actions"):
-            shutil.copyfile(
-                output_root / f"seed-{role}.json",
-                fixture_root / f"seed-{role}.json",
-            )
-        _git(checkout, "add", "fixtures/stabilization/parity")
-        _git(checkout, "commit", "-qm", "test: parity captures")
-        _run(_tool_command(tool, "verify", *trusted, "--role", "oracle"))
-        _run(
-            _tool_command(
-                tool,
-                "verify",
-                *trusted,
-                "--role",
-                "github-actions",
-            )
-        )
-
-        capture = (
-            checkout
-            / "fixtures/stabilization/parity/captures"
-            / "shell-only-seed-github-actions.json"
-        )
-        original = capture.read_bytes()
-        capture.write_bytes(original.replace(b'"run_attempt":1', b'"run_attempt":2', 1))
-        failed = _run(
-            _tool_command(
-                tool,
-                "verify",
-                *trusted,
-                "--role",
-                "github-actions",
-            ),
+        retired = _run(
+            _tool_command(tool, "verify", *trusted, "--role", "oracle"),
             success=False,
         )
-        if not any(
-            marker in failed.stderr
-            for marker in (
-                "differs from committed HEAD bytes",
-                "drifted",
-                "bind API run identity",
-            )
-        ):
-            raise RuntimeError("capture mutation did not fail at replay authority")
-        capture.write_bytes(original)
+        if "invalid choice: 'verify'" not in retired.stderr:
+            raise RuntimeError("historical fixed-capture replay remains routable")
 
-    print("parity producer behavior gate passed: oracle + GitHub + replay negatives")
+        (checkout / "ancestor-marker").write_text("new HEAD\n", encoding="utf-8")
+        _git(checkout, "add", "ancestor-marker")
+        _git(checkout, "commit", "-qm", "test: advance parity source")
+        failed = _run(_tool_command(tool, "oracle", *production), success=False)
+        if "HEAD differs from trusted source commit" not in failed.stderr:
+            raise RuntimeError("live producer accepted an ancestor source commit")
+
+    print("parity producer behavior gate passed: exact-HEAD oracle + GitHub")
     return 0
 
 
