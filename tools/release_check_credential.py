@@ -62,7 +62,16 @@ def _sanitized_environment() -> dict[str, str]:
 def _repository() -> tuple[Path, str]:
     root = Path(__file__).resolve().parent.parent
     result = subprocess.run(
-        ["/usr/bin/git", "-c", "credential.helper=", "rev-parse", "--verify", "HEAD"],
+        [
+            "/usr/bin/git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"safe.directory={root}",
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ],
         cwd=root,
         env=_sanitized_environment(),
         stdin=subprocess.DEVNULL,
