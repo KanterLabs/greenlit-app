@@ -100,6 +100,7 @@ commit.
 | GL-STAB-089 | high | 12 | Both release-binary dogfood runs pass, but their enclosing job fails cleanup because the no-new-privileges runner cannot sudo away root-owned derived cache entries. | Two complete dogfood passes followed by exact-root cleanup through an already-materialized pinned networkless helper | open | — |
 | GL-STAB-090 | high | 12 | The canonical parity seed requires a 0644 workspace probe without authoring the 0022 umask that creates it, so certification depends on the nested runtime's ambient umask and can fail before comparison. | Exact same-SHA homelab seed with an authored 0022 umask, requiring oracle, GitHub, and release-Greenlit observations to retain mode 0644 | open | — |
 | GL-STAB-091 | high | 12 | The warm-start budget owner benchmarks Cargo's unoptimized custom-cfg test binary instead of the release product, so either a pass or failure can misstate shipped performance. | Manifest-bound production-config release-profile target, public profile-transfer rejection, and exact homelab warm-start budget gate | open | — |
+| GL-STAB-092 | high | 12 | The corrected release-profile warm-start gate has repeated multi-second pre-step outliers while measured runtime bootstrap remains flat, violating the fixed two-second budget and making certification nondeterministic. | Fresh isolated homelab-heavy 20-sample release gate with complete pre-step attribution, no retries, and invocation-to-first-user-step p95 below two seconds | open | — |
 
 ## Field contract
 
