@@ -158,7 +158,16 @@ def _canary_repository(path: Path, expected_sha256: str) -> None:
             digest.update(chunk)
     environment = credential_free_environment()
     commit = run_command(
-        ["/usr/bin/git", "rev-parse", "--verify", "HEAD"],
+        [
+            "/usr/bin/git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"safe.directory={repository}",
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ],
         cwd=repository,
         timeout=10,
         environment=environment,
