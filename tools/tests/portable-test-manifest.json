@@ -84,7 +84,7 @@
         "run_preflight::shell_execution_is_blocked_by_default_and_explicitly_degraded_before_engine_work",
         "run_preflight::write_back_is_a_distinct_nonforceable_capability_before_host_or_engine_mutation",
         "secrets::computed_dynamic_wildcard_and_bare_sensitive_contexts_fail_closed_before_preparation",
-        "secrets::github_token_is_blocked_before_cli_credentials_are_used",
+        "secrets::github_token_is_blocked_before_credentials_or_engine_work",
         "secrets::malformed_secret_arguments_are_redacted_in_every_supported_spelling",
         "secrets::ordinary_secret_is_blocked_before_input_migration_or_engine_work",
         "secrets::unused_token_permissions_cross_only_the_explicit_degraded_shell_boundary",
