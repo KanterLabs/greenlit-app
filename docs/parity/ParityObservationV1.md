@@ -169,9 +169,9 @@ The derived path is not a schema field and cannot be redirected by an
 observation. Its securely read exact bytes must hash to
 `producer.capture_sha256`. A symlink, hard link, wrong mode/owner, directory,
 missing file, mutation, or digest mismatch cannot supply that evidence.
-Committed captures under `fixtures/stabilization/parity/` remain historical
-replay/self-test material for `collect-parity-observation verify`; they are not
-the live certification input and cannot introduce an evidence-commit lag.
+There is no committed-capture replay route: certification accepts only
+captures produced live from the exact source `HEAD`, so historical evidence
+cannot introduce an evidence-commit lag.
 
 The capture itself is an exact `ParityCaptureV1` object:
 
@@ -181,8 +181,9 @@ The capture itself is an exact `ParityCaptureV1` object:
 
 Unknown fields or versions are rejected. Its embedded `observation` is the
 published observation with only the self-referential
-`producer.capture_sha256` omitted. Replay injects the exact capture-byte digest
-and must reproduce the supplied observation exactly. `authority` has exactly
+`producer.capture_sha256` omitted. Live publication injects the exact
+capture-byte digest and must reproduce the supplied observation exactly.
+`authority` has exactly
 `{common, markers, semantic_sha256, <role>}`. `common` binds
 `{repository, commit, workflow_sha256, run_id}`; `markers` binds
 `{contexts, seed_value, temporary_directory, filesystem_probes}`; and

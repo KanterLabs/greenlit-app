@@ -1,4 +1,4 @@
-"""Command-line routing for canonical parity production and replay."""
+"""Command-line routing for canonical live parity production."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from parity_producer.capture import publish, verify
+from parity_producer.capture import publish
 from parity_producer.common import AUTHORITATIVE_REPOSITORY, COMMIT, ProducerError
 from parity_producer.github import produce_github
 from parity_producer.live_root import validate_live_roots
@@ -18,15 +18,6 @@ def main(arguments: list[str] | None = None) -> int:
     """Run the producer CLI and return a stable process status."""
     args = _parser().parse_args(arguments)
     try:
-        if args.command == "verify":
-            verify(
-                checkout=args.checkout,
-                role_value=args.role,
-                trusted_repository=args.repository_id,
-                trusted_source_commit=args.source_commit,
-            )
-            print(f"verified {args.role} parity observation and capture")
-            return 0
         args.checkout, args.output_root = validate_live_roots(
             args.checkout, args.output_root, args.source_commit
         )
@@ -75,8 +66,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tools/collect-parity-observation",
         description=(
-            "Produce or replay the canonical Phase 12 oracle, GitHub Actions, "
-            "and release-built Greenlit parity evidence."
+            "Produce canonical Phase 12 oracle, GitHub Actions, and "
+            "release-built Greenlit live parity evidence."
         ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -136,16 +127,6 @@ def _parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
 
-    replay = commands.add_parser(
-        "verify",
-        help="replay one tracked fixed capture and reject observation drift",
-    )
-    _trusted_arguments(replay)
-    replay.add_argument(
-        "--role",
-        choices=("oracle", "github-actions", "greenlit-release"),
-        required=True,
-    )
     return parser
 
 
