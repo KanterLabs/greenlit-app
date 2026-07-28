@@ -41,7 +41,9 @@ fn run_with_umask(sandbox: &Sandbox, umask: &str) -> Output {
 }
 
 fn assert_mode(path: &Path, expected: u32) {
-    let metadata = std::fs::symlink_metadata(path).expect("inspect retained evidence path");
+    let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+        panic!("inspect retained evidence path {}: {error}", path.display())
+    });
     assert!(
         !metadata.file_type().is_symlink(),
         "{} must not be a symlink",
@@ -142,14 +144,19 @@ fn run_evidence_is_born_private_and_unsafe_parents_are_not_repaired() {
         !first.status.success(),
         "the deliberately unreachable container endpoint unexpectedly succeeded"
     );
+    let first_stderr = support::stderr_text(&first);
 
     let litci = sandbox.home().join(".litci");
     let runs = litci.join("runs");
+    assert!(
+        runs.is_dir(),
+        "the failed invocation did not retain a run directory: {first_stderr}"
+    );
     let directories = run_directories(&runs);
     assert_eq!(
         directories.len(),
         1,
-        "one failed invocation records one run"
+        "one failed invocation records one run: {first_stderr}"
     );
     let run = &directories[0];
 

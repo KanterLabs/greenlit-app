@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use super::{MAX_PATH_BYTES, SourceSnapshotError, remote};
+use super::{MAX_PATH_BYTES, SourceSnapshotError, private_fs, remote};
 
 const MAX_PATHS: usize = 1_000_000;
 
@@ -9,6 +9,11 @@ pub(super) fn clone_git_metadata(
     repo_root: &Path,
     destination: &Path,
 ) -> Result<(), SourceSnapshotError> {
+    // Create and normalize the empty clone root before Git runs. If the
+    // caller's private parent carries SGID, allowing Git to create this root
+    // would propagate SGID to every metadata directory despite its 0077
+    // child-local umask.
+    private_fs::create_root(destination)?;
     let original_origin = git_optional_text(repo_root, &["config", "--get", "remote.origin.url"])?
         .map(|origin| remote::credential_free_identity(&origin))
         .transpose()

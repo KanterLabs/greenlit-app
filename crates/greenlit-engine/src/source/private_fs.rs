@@ -6,7 +6,9 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags, chmod, fchmod, mkdirat, open, openat, symlinkat};
+use rustix::fs::{
+    CWD, Mode, OFlags, ResolveFlags, chmod, fchmod, mkdirat, open, openat, openat2, symlinkat,
+};
 use rustix::io::Errno;
 
 use super::{SourceSnapshotError, io_error};
@@ -25,8 +27,43 @@ pub(super) struct PrivateTarget {
     path: PathBuf,
 }
 
+pub(super) fn create_root(path: &Path) -> Result<(), SourceSnapshotError> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| io_error(path, "frozen-source root has no parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io_error(path, "frozen-source root has no file name"))?;
+    let parent = openat2(
+        CWD,
+        parent_path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS.union(ResolveFlags::NO_SYMLINKS),
+    )
+    .map(File::from)
+    .map_err(|error| io_error(parent_path, error))?;
+    let metadata = parent
+        .metadata()
+        .map_err(|error| io_error(parent_path, error))?;
+    validate_owner(parent_path, &metadata)?;
+    let mode = metadata.mode() & 0o7777;
+    if !metadata.is_dir() || mode & !0o2700 != 0 {
+        return Err(io_error(
+            parent_path,
+            format!("frozen-source parent has unsafe type or mode 0{mode:03o}"),
+        ));
+    }
+    mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+        .map_err(|error| io_error(path, error))?;
+    drop(open_new_directory(&parent, path, name)?);
+    parent
+        .sync_all()
+        .map_err(|error| io_error(parent_path, error))
+}
+
 impl PrivateTree {
-    pub(super) fn open(path: &Path) -> Result<Self, SourceSnapshotError> {
+    pub(super) fn open_new(path: &Path) -> Result<Self, SourceSnapshotError> {
         let root = open(
             path,
             OFlags::RDONLY
@@ -38,6 +75,21 @@ impl PrivateTree {
         )
         .map(File::from)
         .map_err(|error| io_error(path, error))?;
+        let metadata = root.metadata().map_err(|error| io_error(path, error))?;
+        validate_owner(path, &metadata)?;
+        let mode = metadata.mode() & 0o7777;
+        if !metadata.is_dir() || mode & !0o2700 != 0 {
+            return Err(io_error(
+                path,
+                format!("new frozen-source root has unsafe type or mode 0{mode:03o}"),
+            ));
+        }
+        // A kernel may inherit SGID from the caller's private parent even
+        // though Git creates the destination under a child-local 0077 umask.
+        // This descriptor names the just-created clone root, so normalize
+        // that permitted inheritance before any source byte is copied.
+        fchmod(&root, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .map_err(|error| io_error(path, error))?;
         validate_directory(path, &root)?;
         Ok(Self {
             root,
