@@ -33,6 +33,16 @@ COMMIT_CHECK_TIMEOUT_SECONDS = 5
 GIT_EXECUTABLE = "/usr/bin/git"
 
 
+def _repository_root(path: Path) -> Path:
+    """Return the nearest worktree root containing the checked ledger."""
+
+    resolved = path.resolve()
+    for candidate in resolved.parents:
+        if (candidate / ".git").exists():
+            return candidate
+    return resolved.parent
+
+
 def require_text(
     value: str,
     path: Path,
@@ -90,6 +100,7 @@ def parse_phase_statuses(path: Path, problems: list[str]) -> dict[int, str]:
 
 
 def _commit_exists_locally(path: Path, commit: str) -> bool:
+    repository = _repository_root(path)
     environment = {
         name: value
         for name, value in os.environ.items()
@@ -108,8 +119,10 @@ def _commit_exists_locally(path: Path, commit: str) -> bool:
         [
             GIT_EXECUTABLE,
             "--no-replace-objects",
+            "-c",
+            f"safe.directory={repository}",
             "-C",
-            str(path.parent),
+            str(repository),
             "cat-file",
             "-t",
             commit,
