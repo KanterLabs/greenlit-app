@@ -83,6 +83,38 @@ while True:
     path.chmod(0o755)
 
 
+def write_recorded_gh_executable(
+    path: Path,
+    *,
+    record: Path,
+    endpoints: dict[str, str],
+    github_inputs: dict[str, Path],
+) -> None:
+    """Write a recorded GitHub API boundary with successful fixture responses."""
+    mapping = {
+        endpoints["run"]: str(github_inputs["run"]),
+        endpoints["jobs"]: str(github_inputs["jobs"]),
+        endpoints["content"]: str(github_inputs["content"]),
+        endpoints["log"]: str(github_inputs["log"]),
+    }
+    source = f"""#!/usr/bin/python3
+import json
+import sys
+from pathlib import Path
+with Path({str(record)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(sys.argv) + "\\n")
+endpoint = next(value for value in sys.argv if value.startswith("repos/"))
+mapping = {mapping!r}
+if endpoint not in mapping:
+    raise SystemExit(3)
+sys.stdout.buffer.write(Path(mapping[endpoint]).read_bytes())
+"""
+    path.write_text(source, encoding="utf-8")
+    path.chmod(0o755)
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise RuntimeError("recorded gh boundary is not a regular file")
+
+
 def write_gh_executable(
     path: Path,
     *,

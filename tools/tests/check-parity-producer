@@ -22,6 +22,7 @@ from parity_producer_fixture import (
     github_inputs,
     write_job_log,
 )
+from parity_producer_nonpublication import run_nonpublication_canaries
 
 
 def main() -> int:
@@ -101,10 +102,19 @@ def main() -> int:
             str(inputs["log"]),
             "--self-test-raw-evidence",
         )
-        _run(github)
-        failed = _run(github[:-1], success=False)
-        if "raw GitHub evidence is restricted" not in failed.stderr:
-            raise RuntimeError("canonical GitHub producer accepted raw evidence")
+        run_nonpublication_canaries(
+            tool=tool,
+            test_root=test_root,
+            checkout=checkout,
+            output_root=output_root,
+            source_commit=source_commit,
+            production=production,
+            raw_command=github,
+            inputs=inputs,
+            run=_run,
+            tool_command=_tool_command,
+        )
+
         original_run = inputs["run"].read_bytes()
         inputs["run"].write_text(
             '{"id":' + "9" * 5000 + "}",
@@ -250,6 +260,7 @@ def _run(
     *,
     success: bool = True,
     environment_overrides: dict[str, str] | None = None,
+    pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     environment = {
         key: value
@@ -264,6 +275,7 @@ def _run(
     result = subprocess.run(
         command,
         env=environment,
+        pass_fds=pass_fds,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

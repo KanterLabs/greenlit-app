@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -34,12 +35,41 @@ METHODS = {
 }
 
 
+class AcquisitionDisposition(Enum):
+    """Whether an observation acquisition may certify canonical evidence."""
+
+    CERTIFYING = "certifying"
+    NON_CERTIFYING = "non-certifying"
+
+
 @dataclass(frozen=True)
-class Production:
-    """One unsealed observation and the sanitized authority fields it consumed."""
+class EvidenceProjection:
+    """One neutral observation and the sanitized authority fields it consumed."""
 
     observation: dict[str, Any]
     authority: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class Production(EvidenceProjection):
+    """One acquisition result carrying no seal or its role-owned opaque witness."""
+
+    _certifying_witness: object | None = field(repr=False)
+
+    @property
+    def acquisition_disposition(self) -> AcquisitionDisposition:
+        """Return the publication disposition implied by the acquisition witness."""
+        if self._certifying_witness is None:
+            return AcquisitionDisposition.NON_CERTIFYING
+        return AcquisitionDisposition.CERTIFYING
+
+
+@dataclass(frozen=True)
+class _PreparedPublication:
+    capture_path: Path
+    capture_bytes: bytes
+    observation_path: Path
+    observation_bytes: bytes
 
 
 def publish(
@@ -50,6 +80,62 @@ def publish(
     trusted_source_commit: str,
 ) -> tuple[Path, Path]:
     """Write the role's live capture and observation, binding them by digest."""
+    _require_role_owned_certifying_witness(production)
+    prepared = _prepare_publication(
+        production,
+        checkout,
+        output_root,
+        trusted_repository,
+        trusted_source_commit,
+    )
+    write_bytes_beneath(
+        output_root,
+        prepared.capture_path.relative_to(output_root),
+        prepared.capture_bytes,
+        create_parent_leaf=True,
+        created_directory_mode=0o700,
+    )
+    write_bytes_beneath(
+        output_root,
+        prepared.observation_path.relative_to(output_root),
+        prepared.observation_bytes,
+        create_parent_leaf=False,
+    )
+    return prepared.capture_path, prepared.observation_path
+
+
+def validate_without_publication(
+    production: Production,
+    checkout: Path,
+    output_root: Path,
+    trusted_repository: str,
+    trusted_source_commit: str,
+) -> None:
+    """Validate one non-certifying acquisition without publishing its bytes."""
+    if not isinstance(production, Production):
+        raise ProducerError(
+            "unsealed parity projection cannot publish canonical files"
+        )
+    if production._certifying_witness is not None:
+        raise ProducerError(
+            "publication-free validation requires a non-certifying acquisition"
+        )
+    _prepare_publication(
+        production,
+        checkout,
+        output_root,
+        trusted_repository,
+        trusted_source_commit,
+    )
+
+
+def _prepare_publication(
+    production: EvidenceProjection,
+    checkout: Path,
+    output_root: Path,
+    trusted_repository: str,
+    trusted_source_commit: str,
+) -> _PreparedPublication:
     _validate_trusted_inputs(trusted_repository, trusted_source_commit)
     checkout, output_root = validate_live_roots(
         checkout, output_root, trusted_source_commit
@@ -87,24 +173,44 @@ def publish(
         )
     except ContractError as error:
         raise ProducerError(f"produced capture violates its authority contract: {error}") from error
-    write_bytes_beneath(
-        output_root,
-        capture_path.relative_to(output_root),
-        capture_bytes,
-        create_parent_leaf=True,
-        created_directory_mode=0o700,
-    )
     observation_path = output_root / f"seed-{role}.json"
     observation_bytes = (
         json.dumps(observation, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     ).encode("utf-8")
-    write_bytes_beneath(
-        output_root,
-        observation_path.relative_to(output_root),
-        observation_bytes,
-        create_parent_leaf=False,
+    return _PreparedPublication(
+        capture_path=capture_path,
+        capture_bytes=capture_bytes,
+        observation_path=observation_path,
+        observation_bytes=observation_bytes,
     )
-    return capture_path, observation_path
+
+
+def _require_role_owned_certifying_witness(production: Production) -> None:
+    if not isinstance(production, Production):
+        raise ProducerError(
+            "unsealed parity projection cannot publish canonical files"
+        )
+    producer = require_object(production.observation.get("producer"), "producer")
+    role = _role(producer.get("role"))
+    if production._certifying_witness is not _role_owned_witness(role):
+        raise ProducerError(
+            "parity acquisition without its role-owned certifying witness "
+            "cannot publish canonical files"
+        )
+
+
+def _role_owned_witness(role: str) -> object:
+    if role == "oracle":
+        from parity_producer.oracle import _ORACLE_CERTIFYING_WITNESS
+
+        return _ORACLE_CERTIFYING_WITNESS
+    if role == "github-actions":
+        from parity_producer.github import _LIVE_SYSTEM_GH_CERTIFYING_WITNESS
+
+        return _LIVE_SYSTEM_GH_CERTIFYING_WITNESS
+    from parity_producer.retained import _RETAINED_CERTIFYING_WITNESS
+
+    return _RETAINED_CERTIFYING_WITNESS
 
 
 def _capture_document(

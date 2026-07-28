@@ -36,6 +36,9 @@ from parity_producer.retained_journal import (
 )
 
 
+_RETAINED_CERTIFYING_WITNESS = object()
+
+
 def project_local_evidence(
     *,
     run_directory: Path,
@@ -191,7 +194,11 @@ def project_local_evidence(
             "reported_durations": projection["reported_durations"],
         },
     )
-    return Production(observation=observation, authority=authority)
+    return Production(
+        observation=observation,
+        authority=authority,
+        _certifying_witness=_RETAINED_CERTIFYING_WITNESS,
+    )
 
 
 def _require_private_source_directories(run_directory: Path) -> None:

@@ -19,7 +19,7 @@ from parity_producer.common import (
     require_string,
     sha256_bytes,
 )
-from parity_producer.capture import Production, authority_envelope
+from parity_producer.capture import EvidenceProjection, authority_envelope
 from parity_producer.contract import (
     EXPECTED_JOB_NAME,
     EXPECTED_STEPS,
@@ -47,7 +47,7 @@ def project_github_evidence(
     content_response: dict[str, Any],
     job_log: bytes,
     trusted_source_commit: str,
-) -> Production:
+) -> EvidenceProjection:
     """Project exact API documents and the corresponding workflow-job log."""
     require_fields(
         run,
@@ -148,7 +148,10 @@ def project_github_evidence(
             ],
         },
     )
-    return Production(observation=observation, authority=authority)
+    return EvidenceProjection(
+        observation=observation,
+        authority=authority,
+    )
 
 
 def _project_jobs(

@@ -6,7 +6,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from parity_producer.capture import publish
+from parity_producer.capture import (
+    AcquisitionDisposition,
+    publish,
+    validate_without_publication,
+)
 from parity_producer.common import AUTHORITATIVE_REPOSITORY, COMMIT, ProducerError
 from parity_producer.github import produce_github
 from parity_producer.live_root import validate_live_roots
@@ -47,13 +51,23 @@ def main(arguments: list[str] | None = None) -> int:
                 self_test_raw_evidence=args.self_test_raw_evidence,
                 self_test_gh_executable=args.self_test_gh_executable,
             )
-        capture, observation = publish(
-            production,
-            checkout=args.checkout,
-            output_root=args.output_root,
-            trusted_repository=args.repository_id,
-            trusted_source_commit=args.source_commit,
-        )
+        publication_arguments = {
+            "checkout": args.checkout,
+            "output_root": args.output_root,
+            "trusted_repository": args.repository_id,
+            "trusted_source_commit": args.source_commit,
+        }
+        if (
+            production.acquisition_disposition
+            is AcquisitionDisposition.NON_CERTIFYING
+        ):
+            validate_without_publication(production, **publication_arguments)
+            print(
+                "non-certifying producer self-test passed: "
+                "no canonical files published"
+            )
+            return 0
+        capture, observation = publish(production, **publication_arguments)
     except ProducerError as error:
         print(f"parity observation not produced: {error}", file=sys.stderr)
         return 2
