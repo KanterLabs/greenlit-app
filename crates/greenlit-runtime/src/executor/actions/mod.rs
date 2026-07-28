@@ -92,8 +92,9 @@ pub async fn preflight_plan_actions(
     let mut needs_node20 = false;
     let mut needs_node24 = false;
     let mut container_images = std::collections::BTreeSet::new();
+    let reachability = crate::executor::plan_reachability(plan);
     for job in &plan.jobs {
-        if !job.steps.is_empty() {
+        if reachability.template_reachable(&job.id.0) && !job.steps.is_empty() {
             let resolved =
                 resolve::resolve_job_actions(&job.steps, config, repo_host_path, workspace).await?;
             identities.extend(resolved.identities);
@@ -101,7 +102,10 @@ pub async fn preflight_plan_actions(
             needs_node24 |= resolved.needs_node24;
             container_images.extend(resolved.container_images);
         }
-        for leg in &job.legs {
+        for (index, leg) in job.legs.iter().enumerate() {
+            if !reachability.leg_reachable(&job.id.0, index) {
+                continue;
+            }
             let resolved =
                 resolve::resolve_job_actions(&leg.steps, config, repo_host_path, workspace).await?;
             identities.extend(resolved.identities);
@@ -163,11 +167,9 @@ fn locked_node_toolchains(
 /// Every trait-object field is a true external boundary (`TESTING.md`: "Mock
 /// only true externals... the GitHub API"): production code
 /// (`greenlit-app`'s `run_cmd`) wires the real GitHub API/tokenless resolver,
-/// tarball/git-clone fetcher, and network Node-runtime downloader; tests
-/// inject fakes so the executor's own orchestration is exercised without
-/// touching the network, matching the "zero network fetches for pinned SHAs"
-/// and "no live downloads in the default test path" invariants
-/// (`PHASE-3-actions.md` exit criteria 4 and 6).
+/// tarball/git-clone fetcher, and network Node-runtime downloader. Their
+/// behavior is certified at loopback HTTP, local-Git, or live capability
+/// boundaries rather than through own-crate substitutes.
 pub struct ActionRuntimeConfig {
     /// Resolves a `uses:` ref (tag/branch/SHA) to a commit SHA —
     /// [`greenlit_actions::resolve::GitHubApiResolver`] when a token is
@@ -186,8 +188,7 @@ pub struct ActionRuntimeConfig {
     pub node_runtime_fetcher: Arc<dyn RuntimeBundleFetcher>,
     /// Picks which bundle (URL, checksum) to ensure for a given Node
     /// version/libc variant — [`node_runtime::PinnedNodeBundleSpecs`] in
-    /// production; a test injects a fake naming a tiny synthetic bundle's
-    /// own checksum instead (`node_runtime::NodeBundleSpecs` module docs).
+    /// production.
     pub node_runtime_specs: Arc<dyn NodeBundleSpecs>,
     /// Content-addressed cache of extracted Node runtime bundles
     /// (`~/.litci/node-runtimes/`), and its hit/miss tally.

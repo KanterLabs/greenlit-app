@@ -2,27 +2,69 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::ffi::OsStr;
+use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use greenlit_engine::{
     ExecutionConclusion, ExecutionPlan, ExecutionResultV1, FeatureFinding, FindingDisposition,
-    JobLockV1, LockedSource, MatrixKey, MatrixValue, ResultEvidence, RunLockV1, SourceSnapshot,
-    SupportReport, TraceEventV1, opaque_revision,
+    JobLockV1, LockedSource, MatrixKey, MatrixValue, ResultEvidence, RunLockV1,
+    SUPPORT_CERTIFICATION_WITNESS, SourceSnapshot, SourceSnapshotError, SupportReport,
+    TraceEventV1, opaque_revision,
 };
 use indexmap::IndexMap;
+use rustix::fs::{Mode, OFlags, mkdirat, open, openat, renameat};
+use rustix::io::Errno;
+
+const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
+const PRIVATE_FILE_MODE: u32 = 0o600;
 
 pub(crate) struct RunEvidence {
     pub(crate) run_id: String,
     pub(crate) directory: PathBuf,
     pub(crate) source: SourceSnapshot,
+    runs_handle: File,
+    directory_handle: File,
     next_trace_sequence: Cell<u64>,
     terminal_result_written: Cell<bool>,
+    result_publication_abandoned: Arc<AtomicBool>,
+    sensitive_values: RefCell<Vec<Vec<u8>>>,
     support: RefCell<SupportReport>,
     content_store: greenlit_store::cas::CasStore,
     lease: RefCell<Option<greenlit_store::cas::LeaseGuard>>,
+}
+
+pub(crate) struct PreparedResult {
+    result_bytes: Vec<u8>,
+    terminal_conclusion: String,
+    terminal_compatibility: String,
+    terminal_assurance: String,
+}
+
+struct PreparedTrace {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+impl PreparedResult {
+    pub(crate) fn terminal_conclusion(&self) -> &str {
+        &self.terminal_conclusion
+    }
+
+    pub(crate) fn terminal_compatibility(&self) -> &str {
+        &self.terminal_compatibility
+    }
+
+    pub(crate) fn terminal_assurance(&self) -> &str {
+        &self.terminal_assurance
+    }
 }
 
 pub(crate) struct LockInputs<'a> {
@@ -44,7 +86,11 @@ pub(crate) struct LockInputs<'a> {
 }
 
 impl RunEvidence {
-    pub(crate) fn capture(repo_root: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn capture(repo_root: &Path, sensitive_values: &[String]) -> anyhow::Result<Self> {
+        let sensitive_values = sensitive_values
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect::<Vec<_>>();
         let home = std::env::var_os("HOME").ok_or_else(|| {
             anyhow::anyhow!(
                 "could not persist run evidence because HOME is not set\n  fix: set HOME to an absolute writable directory, then retry"
@@ -56,13 +102,7 @@ impl RunEvidence {
                 "could not persist run evidence because HOME is not absolute\n  fix: set HOME to an absolute writable directory, then retry"
             );
         }
-        let runs = home.join(".litci").join("runs");
-        fs::create_dir_all(&runs).map_err(|error| {
-            anyhow::anyhow!(
-                "could not create run evidence directory {}: {error}\n  fix: make HOME writable, then retry",
-                runs.display()
-            )
-        })?;
+        let (runs, runs_handle) = prepare_runs_directory(&home)?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| {
@@ -75,12 +115,20 @@ impl RunEvidence {
         for suffix in 0_u16..=u16::MAX {
             let run_id = format!("{timestamp:032x}-{:08x}-{suffix:04x}", std::process::id());
             let directory = runs.join(&run_id);
-            match fs::create_dir(&directory) {
+            match mkdirat(
+                &runs_handle,
+                run_id.as_str(),
+                Mode::RUSR | Mode::WUSR | Mode::XUSR,
+            ) {
                 Ok(()) => {
-                    selected = Some((run_id, directory));
+                    let handle = open_private_directory_at(&runs_handle, &runs, run_id.as_str())?;
+                    selected = Some((run_id, directory, handle));
                     break;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(Errno::EXIST) => {
+                    let existing = open_private_directory_at(&runs_handle, &runs, run_id.as_str())?;
+                    drop(existing);
+                }
                 Err(error) => {
                     return Err(anyhow::anyhow!(
                         "could not create run evidence directory {}: {error}\n  fix: make HOME writable, then retry",
@@ -89,65 +137,96 @@ impl RunEvidence {
                 }
             }
         }
-        let (run_id, directory) = selected.ok_or_else(|| {
+        let (run_id, directory, directory_handle) = selected.ok_or_else(|| {
             anyhow::anyhow!(
                 "could not allocate a unique run identity\n  fix: retry after the current invocation finishes"
             )
         })?;
-        let source_root = directory.join("source");
-        let prepared_source = crate::daemon::take_source_template(repo_root, &source_root);
-        let used_prepared_source = prepared_source.is_some();
-        let source = prepared_source
-            .unwrap_or_else(|| SourceSnapshot::capture(repo_root, &source_root))
-            .map_err(|error| {
-                anyhow::anyhow!("{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry")
-            })?;
-        write_json_atomic(&directory.join("source-manifest.json"), &source.entries)?;
-        let content_store = greenlit_store::cas::CasStore::open(
-            greenlit_store::cas::CasStore::default_path_under(&home),
-        )
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
-            )
-        })?;
-        ingest_source(&content_store, &source)?;
-        let evidence = Self {
-            run_id,
-            directory,
-            source,
-            next_trace_sequence: Cell::new(1),
-            terminal_result_written: Cell::new(false),
-            support: RefCell::new(local_support_report()),
-            content_store,
-            lease: RefCell::new(None),
-        };
-        evidence.append_trace(
-            "source_locked",
-            BTreeMap::from([
-                (
-                    "snapshot_digest".to_string(),
-                    evidence.source.digest.clone(),
-                ),
-                ("dirty".to_string(), evidence.source.dirty.to_string()),
-            ]),
-        )?;
-        if used_prepared_source {
-            evidence.append_trace(
-                "source_template_adopted",
-                BTreeMap::from([(
-                    "snapshot_digest".to_string(),
-                    evidence.source.digest.clone(),
-                )]),
+        let captured = (|| {
+            let source_root = directory.join("source");
+            let source =
+                SourceSnapshot::capture(repo_root, &source_root).map_err(|error| match error {
+                    SourceSnapshotError::UnsafeRemote => anyhow::anyhow!(
+                        "{error}\n  fix: remove the credential, or replace or remove remote.origin.url, then retry"
+                    ),
+                    error => anyhow::anyhow!(
+                        "{error}\n  fix: stop concurrent source edits and ensure the repository is readable, then retry"
+                    ),
+                })?;
+            write_json_atomic(
+                &directory_handle,
+                &directory,
+                "source-manifest.json",
+                &source.entries,
             )?;
+            let content_store = greenlit_store::cas::CasStore::open(
+                greenlit_store::cas::CasStore::default_path_under(&home),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "could not open the verified content store: {error}\n  fix: ensure HOME has free space and is writable, then retry"
+                )
+            })?;
+            ingest_source(&content_store, &source)?;
+            let evidence = Self {
+                run_id: run_id.clone(),
+                directory: directory.clone(),
+                source,
+                runs_handle: runs_handle
+                    .try_clone()
+                    .map_err(|error| evidence_write_error(&runs, error))?,
+                directory_handle: directory_handle
+                    .try_clone()
+                    .map_err(|error| evidence_write_error(&directory, error))?,
+                next_trace_sequence: Cell::new(1),
+                terminal_result_written: Cell::new(false),
+                result_publication_abandoned: Arc::new(AtomicBool::new(false)),
+                sensitive_values: RefCell::new(sensitive_values.clone()),
+                support: RefCell::new(local_support_report()),
+                content_store,
+                lease: RefCell::new(None),
+            };
+            evidence.append_trace(
+                "source_locked",
+                BTreeMap::from([
+                    (
+                        "snapshot_digest".to_string(),
+                        evidence.source.digest.clone(),
+                    ),
+                    ("dirty".to_string(), evidence.source.dirty.to_string()),
+                ]),
+            )?;
+            Ok(evidence)
+        })();
+        match captured {
+            Ok(evidence) => Ok(evidence),
+            Err(error) => {
+                remove_sensitive_failed_capture(
+                    &runs_handle,
+                    &directory_handle,
+                    &directory,
+                    &sensitive_values,
+                )
+                .map_err(|cleanup| {
+                    sensitive_cleanup_error("failed source capture", &error, cleanup)
+                })?;
+                Err(error)
+            }
         }
-        Ok(evidence)
     }
 
     pub(crate) fn merge_support(&self, report: &SupportReport) -> anyhow::Result<()> {
         {
             let mut support = self.support.borrow_mut();
             support.findings.extend(report.findings.iter().cloned());
+            support.findings.push(FeatureFinding {
+                code: SUPPORT_CERTIFICATION_WITNESS.to_string(),
+                disposition: FindingDisposition::Supported,
+                scope: "run".to_string(),
+                reason:
+                    "the frozen selected plan was evaluated by the active stabilization registry"
+                        .to_string(),
+            });
             support.canonicalize();
         }
         self.append_trace(
@@ -157,6 +236,20 @@ impl RunEvidence {
                 format!("{:?}", self.support.borrow().compatibility()),
             )]),
         )
+    }
+
+    pub(crate) fn support_report(&self) -> SupportReport {
+        self.support.borrow().clone()
+    }
+
+    pub(crate) fn abandon_result_publication(&self) {
+        self.result_publication_abandoned
+            .store(true, Ordering::Release);
+        self.terminal_result_written.set(true);
+    }
+
+    pub(crate) fn result_publication_gate(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.result_publication_abandoned)
     }
 
     pub(crate) fn apply_execution_policy(&self, clean: bool, hermetic: bool) -> anyhow::Result<()> {
@@ -192,6 +285,16 @@ impl RunEvidence {
                 ("hermetic".to_string(), hermetic.to_string()),
             ]),
         )
+    }
+
+    pub(crate) fn register_sensitive_values<I, V>(&self, values: I)
+    where
+        I: IntoIterator<Item = V>,
+        V: AsRef<[u8]>,
+    {
+        self.sensitive_values
+            .borrow_mut()
+            .extend(values.into_iter().map(|value| value.as_ref().to_vec()));
     }
 
     pub(crate) fn lock(&self, inputs: LockInputs<'_>) -> anyhow::Result<RunLockV1> {
@@ -261,8 +364,18 @@ impl RunEvidence {
                 "could not identify the finalized run lock: {error}\n  fix: preserve the run directory and retry"
             )
         })?;
-        write_json_atomic(&self.directory.join("run-lock.json"), &lock)?;
-        write_json_atomic(&self.directory.join("execution-plan.json"), plan)?;
+        write_json_atomic(
+            &self.directory_handle,
+            &self.directory,
+            "run-lock.json",
+            &lock,
+        )?;
+        write_json_atomic(
+            &self.directory_handle,
+            &self.directory,
+            "execution-plan.json",
+            plan,
+        )?;
         self.write_job_locks(plan, &lock)?;
         let leased = self.source_digests()?;
         self.content_store
@@ -302,13 +415,18 @@ impl RunEvidence {
         Ok(lock)
     }
 
-    pub(crate) fn write_result(
+    pub(crate) fn prepare_result(
         &self,
         conclusion: ExecutionConclusion,
         support: SupportReport,
         clean: bool,
         hermetic: bool,
-    ) -> anyhow::Result<ExecutionResultV1> {
+    ) -> anyhow::Result<PreparedResult> {
+        if self.result_publication_abandoned.load(Ordering::Acquire) {
+            anyhow::bail!(
+                "could not publish a run result after retained event or output failure\n  fix: preserve the run directory and retry with writable output"
+            );
+        }
         let result = ExecutionResultV1::classify(&ResultEvidence {
             conclusion,
             support,
@@ -316,24 +434,80 @@ impl RunEvidence {
             hermetic,
             github_confirmed: false,
         });
-        write_json_atomic(&self.directory.join("result.json"), &result)?;
-        self.append_trace(
+        let terminal_conclusion = format!("{:?}", result.conclusion);
+        let terminal_compatibility = format!("{:?}", result.compatibility);
+        let terminal_assurance = format!("{:?}", result.assurance);
+        let result_bytes = serialize_json_line(&self.directory.join("result.json"), &result)?;
+        let terminal_semantics = crate::run_events::RunEvent::RunFinished {
+            conclusion: terminal_conclusion.clone(),
+            compatibility: terminal_compatibility.clone(),
+            assurance: terminal_assurance.clone(),
+            evidence: self.run_id.clone(),
+        };
+        let terminal_bytes =
+            serialize_json_line(&self.directory.join("events.ndjson"), &terminal_semantics)?;
+        let completed_trace = self.prepare_trace(
             "run_completed",
             BTreeMap::from([
-                ("conclusion".to_string(), format!("{:?}", result.conclusion)),
-                (
-                    "compatibility".to_string(),
-                    format!("{:?}", result.compatibility),
-                ),
-                ("assurance".to_string(), format!("{:?}", result.assurance)),
+                ("conclusion".to_string(), terminal_conclusion.clone()),
+                ("compatibility".to_string(), terminal_compatibility.clone()),
+                ("assurance".to_string(), terminal_assurance.clone()),
             ]),
         )?;
+        let scan_result = crate::retained_secret_scan::scan_retained_run_and_prepared_bytes(
+            &self.directory,
+            self.sensitive_values.borrow().iter(),
+            &[
+                result_bytes.as_slice(),
+                terminal_bytes.as_slice(),
+                completed_trace.bytes.as_slice(),
+            ],
+        );
+        if let Err(error) = scan_result {
+            let retained_tree_is_clean =
+                crate::retained_secret_scan::scan_retained_run_and_prepared_bytes(
+                    &self.directory,
+                    self.sensitive_values.borrow().iter(),
+                    &[],
+                )
+                .is_ok();
+            if !retained_tree_is_clean {
+                self.remove_sensitive_retained_tree().map_err(|cleanup| {
+                    sensitive_cleanup_error("rejected terminal publication", &error, cleanup)
+                })?;
+            }
+            return Err(error);
+        }
+        self.append_prepared_trace(completed_trace)?;
         self.content_store
             .record_run_state(&self.run_id, None, "completed")
             .map_err(lifecycle_error)?;
+        Ok(PreparedResult {
+            result_bytes,
+            terminal_conclusion,
+            terminal_compatibility,
+            terminal_assurance,
+        })
+    }
+
+    pub(crate) fn publish_prepared_result(&self, prepared: PreparedResult) -> anyhow::Result<()> {
+        if self.result_publication_abandoned.load(Ordering::Acquire) {
+            anyhow::bail!(
+                "could not publish a run result after retained event or output failure\n  fix: preserve the run directory and retry with writable output"
+            );
+        }
+        // `result.json` is the retained publication marker. The journal is
+        // already durable in the caller, and this exact byte sequence passed
+        // the retained-secret invariant before the terminal was emitted.
+        write_bytes_atomic(
+            &self.directory_handle,
+            &self.directory,
+            "result.json",
+            &prepared.result_bytes,
+        )?;
         self.terminal_result_written.set(true);
         self.lease.replace(None);
-        Ok(result)
+        Ok(())
     }
 
     fn source_digests(&self) -> anyhow::Result<Vec<greenlit_store::cas::ObjectDigest>> {
@@ -349,22 +523,60 @@ impl RunEvidence {
             .collect()
     }
 
+    fn remove_sensitive_retained_tree(&self) -> anyhow::Result<()> {
+        remove_private_run_tree(&self.runs_handle, &self.directory_handle, &self.directory)?;
+        self.abandon_result_publication();
+        self.lease.replace(None);
+        self.content_store
+            .record_run_state(&self.run_id, None, "aborted")
+            .map_err(lifecycle_error)
+    }
+
     fn append_trace(
         &self,
         event: &str,
         attributes: BTreeMap<String, String>,
     ) -> anyhow::Result<()> {
+        let prepared = self.prepare_trace(event, attributes)?;
+        self.append_prepared_trace(prepared)
+    }
+
+    fn prepare_trace(
+        &self,
+        event: &str,
+        attributes: BTreeMap<String, String>,
+    ) -> anyhow::Result<PreparedTrace> {
         let sequence = self.next_trace_sequence.get();
         let trace = TraceEventV1::new(sequence, event, attributes);
         let path = self.directory.join("trace.ndjson");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|error| evidence_write_error(&path, error))?;
-        serde_json::to_writer(&mut file, &trace)
-            .map_err(|error| evidence_write_error(&path, error))?;
-        file.write_all(b"\n")
+        let bytes = serialize_json_line(&path, &trace)?;
+        Ok(PreparedTrace { sequence, bytes })
+    }
+
+    fn append_prepared_trace(&self, prepared: PreparedTrace) -> anyhow::Result<()> {
+        let sequence = self.next_trace_sequence.get();
+        if sequence != prepared.sequence {
+            anyhow::bail!(
+                "could not append the prepared run trace because its sequence changed\n  fix: preserve the run directory and file a Greenlit defect"
+            );
+        }
+        let path = self.directory.join("trace.ndjson");
+        let mut file = if sequence == 1 {
+            create_private_file_at(
+                &self.directory_handle,
+                &path,
+                OsStr::new("trace.ndjson"),
+                true,
+            )?
+        } else {
+            open_private_file_at(
+                &self.directory_handle,
+                &path,
+                OsStr::new("trace.ndjson"),
+                true,
+            )?
+        };
+        file.write_all(&prepared.bytes)
             .map_err(|error| evidence_write_error(&path, error))?;
         file.sync_all()
             .map_err(|error| evidence_write_error(&path, error))?;
@@ -379,7 +591,8 @@ impl RunEvidence {
             )
         })?;
         let directory = self.directory.join("job-locks");
-        fs::create_dir(&directory).map_err(|error| evidence_write_error(&directory, error))?;
+        let directory_handle =
+            create_new_private_directory(&self.directory_handle, &self.directory, "job-locks")?;
         for job in &plan.jobs {
             let matrix_legs = job.strategy.legs();
             if matrix_legs.is_empty() {
@@ -392,7 +605,7 @@ impl RunEvidence {
                     needs_evidence: BTreeMap::new(),
                     environment_fingerprint: runner_fingerprint(run_lock, &key),
                 };
-                write_json_atomic(&directory.join(format!("{key}.json")), &lock)?;
+                write_json_atomic(&directory_handle, &directory, &format!("{key}.json"), &lock)?;
                 continue;
             }
             for leg in matrix_legs {
@@ -422,7 +635,9 @@ impl RunEvidence {
                     environment_fingerprint: runner_fingerprint(run_lock, &key),
                 };
                 write_json_atomic(
-                    &directory.join(format!("{}-{}.json", job.id.0, leg.index)),
+                    &directory_handle,
+                    &directory,
+                    &format!("{}-{}.json", job.id.0, leg.index),
                     &lock,
                 )?;
             }
@@ -433,15 +648,21 @@ impl RunEvidence {
 
 impl Drop for RunEvidence {
     fn drop(&mut self) {
-        if self.terminal_result_written.get() {
+        if self.terminal_result_written.get()
+            || self.result_publication_abandoned.load(Ordering::Acquire)
+        {
             return;
         }
-        let _ = self.write_result(
+        let support = self.support.borrow().clone();
+        let Ok(prepared) = self.prepare_result(
             ExecutionConclusion::PreparationFailed,
-            self.support.borrow().clone(),
+            support,
             false,
             false,
-        );
+        ) else {
+            return;
+        };
+        let _ = self.publish_prepared_result(prepared);
     }
 }
 
@@ -572,33 +793,301 @@ fn local_support_report() -> SupportReport {
     report
 }
 
-fn write_json_atomic(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+fn write_json_atomic(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+    value: &impl serde::Serialize,
+) -> anyhow::Result<()> {
+    let path = parent_path.join(name);
+    let bytes = serialize_json_line(&path, value)?;
+    write_bytes_atomic(parent, parent_path, name, &bytes)
+}
+
+fn serialize_json_line(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(value).map_err(|error| evidence_write_error(path, error))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn write_bytes_atomic(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let path = parent_path.join(name);
     let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|error| evidence_write_error(&temp, error))?;
-    serde_json::to_writer(&mut file, value).map_err(|error| evidence_write_error(&temp, error))?;
-    file.write_all(b"\n")
+    let temp_name = temp.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not persist run evidence at {}: temporary path has no file name\n  fix: preserve the run directory and file a Greenlit defect",
+            temp.display()
+        )
+    })?;
+    let mut file = create_private_file_at(parent, &temp, temp_name, false)?;
+    file.write_all(bytes)
         .map_err(|error| evidence_write_error(&temp, error))?;
     file.sync_all()
         .map_err(|error| evidence_write_error(&temp, error))?;
-    fs::rename(&temp, path).map_err(|error| evidence_write_error(path, error))?;
-    sync_parent(path)?;
+    let target_name = OsStr::new(name);
+    reject_unsafe_existing_file(parent, &path, target_name)?;
+    renameat(parent, temp_name, parent, target_name)
+        .map_err(|error| evidence_write_error(&path, error))?;
+    parent
+        .sync_all()
+        .map_err(|error| evidence_write_error(parent_path, error))?;
     Ok(())
 }
 
-fn sync_parent(path: &Path) -> anyhow::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
+fn remove_sensitive_failed_capture(
+    runs_handle: &File,
+    directory_handle: &File,
+    directory: &Path,
+    sensitive_values: &[Vec<u8>],
+) -> anyhow::Result<()> {
+    if sensitive_values.is_empty()
+        || crate::retained_secret_scan::scan_retained_run_and_prepared_bytes(
+            directory,
+            sensitive_values.iter(),
+            &[],
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    remove_private_run_tree(runs_handle, directory_handle, directory)
+}
+
+fn remove_private_run_tree(
+    runs_handle: &File,
+    directory_handle: &File,
+    directory: &Path,
+) -> anyhow::Result<()> {
+    let expected = directory_handle
+        .metadata()
+        .map_err(|error| evidence_write_error(directory, error))?;
+    let current = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(evidence_write_error(directory, error)),
+    };
+    if !current.is_dir()
+        || current.uid() != rustix::process::getuid().as_raw()
+        || (current.dev(), current.ino()) != (expected.dev(), expected.ino())
+    {
+        return Err(unsafe_path_error(
+            directory,
+            "the exact private run directory changed before sensitive cleanup",
+        ));
+    }
+    fs::remove_dir_all(directory).map_err(|error| {
         anyhow::anyhow!(
-            "could not persist run evidence at {}: path has no parent\n  fix: set HOME to an absolute writable directory",
-            path.display()
+            "could not remove sensitive run evidence at {}: {error}\n  fix: stop processes accessing the private run directory, remove it, then retry",
+            directory.display()
         )
     })?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| evidence_write_error(parent, error))
+    runs_handle
+        .sync_all()
+        .map_err(|error| evidence_write_error(directory, error))
+}
+
+fn sensitive_cleanup_error(
+    context: &str,
+    primary: &anyhow::Error,
+    cleanup: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{primary}\nadditionally, {context} could not remove potentially sensitive retained evidence: {cleanup}"
+    )
+}
+
+fn prepare_runs_directory(home: &Path) -> anyhow::Result<(PathBuf, File)> {
+    let home_handle = open(
+        home,
+        OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "could not open HOME for run evidence at {}: {error}\n  fix: set HOME to an absolute writable directory owned by the current user, then retry",
+            home.display()
+        )
+    })?;
+    validate_current_owner(home, &home_handle.metadata().map_err(|error| {
+        anyhow::anyhow!(
+            "could not inspect HOME for run evidence at {}: {error}\n  fix: set HOME to an absolute writable directory owned by the current user, then retry",
+            home.display()
+        )
+    })?)?;
+    let litci = create_or_open_private_directory(&home_handle, home, ".litci")?;
+    let litci_path = home.join(".litci");
+    let runs = create_or_open_private_directory(&litci, &litci_path, "runs")?;
+    Ok((litci_path.join("runs"), runs))
+}
+
+fn create_or_open_private_directory(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+) -> anyhow::Result<File> {
+    match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+        Ok(()) | Err(Errno::EXIST) => open_private_directory_at(parent, parent_path, name),
+        Err(error) => Err(evidence_write_error(&parent_path.join(name), error)),
+    }
+}
+
+fn create_new_private_directory(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+) -> anyhow::Result<File> {
+    let path = parent_path.join(name);
+    match mkdirat(parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+        Ok(()) => open_private_directory_at(parent, parent_path, name),
+        Err(Errno::EXIST) => {
+            let existing = open_private_directory_at(parent, parent_path, name)?;
+            drop(existing);
+            Err(evidence_write_error(
+                &path,
+                "a directory already exists at this write-once evidence path",
+            ))
+        }
+        Err(error) => Err(evidence_write_error(&path, error)),
+    }
+}
+
+fn open_private_directory_at(
+    parent: &File,
+    parent_path: &Path,
+    name: &str,
+) -> anyhow::Result<File> {
+    let path = parent_path.join(name);
+    let file = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| unsafe_path_error(&path, error))?;
+    validate_private_directory(&path, &file)?;
+    Ok(file)
+}
+
+fn create_private_file_at(
+    parent: &File,
+    path: &Path,
+    name: &OsStr,
+    append: bool,
+) -> anyhow::Result<File> {
+    let mut flags =
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if append {
+        flags |= OFlags::APPEND;
+    }
+    let file = match openat(parent, name, flags, Mode::RUSR | Mode::WUSR) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::EXIST) => {
+            reject_unsafe_existing_file(parent, path, name)?;
+            return Err(evidence_write_error(
+                path,
+                "a file already exists at this write-once evidence path",
+            ));
+        }
+        Err(error) => return Err(evidence_write_error(path, error)),
+    };
+    validate_private_file(path, &file)?;
+    Ok(file)
+}
+
+fn open_private_file_at(
+    parent: &File,
+    path: &Path,
+    name: &OsStr,
+    append: bool,
+) -> anyhow::Result<File> {
+    let mut flags = OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    if append {
+        flags |= OFlags::APPEND;
+    }
+    let file = openat(parent, name, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|error| unsafe_path_error(path, error))?;
+    validate_private_file(path, &file)?;
+    Ok(file)
+}
+
+fn reject_unsafe_existing_file(parent: &File, path: &Path, name: &OsStr) -> anyhow::Result<()> {
+    match openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => validate_private_file(path, &File::from(fd)),
+        Err(Errno::NOENT) => Ok(()),
+        Err(error) => Err(unsafe_path_error(path, error)),
+    }
+}
+
+fn validate_private_directory(path: &Path, directory: &File) -> anyhow::Result<()> {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| evidence_write_error(path, error))?;
+    if !metadata.is_dir() {
+        return Err(unsafe_path_error(path, "path is not a directory"));
+    }
+    validate_private_metadata(path, &metadata, PRIVATE_DIRECTORY_MODE)
+}
+
+fn validate_private_file(path: &Path, file: &File) -> anyhow::Result<()> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| evidence_write_error(path, error))?;
+    if !metadata.is_file() {
+        return Err(unsafe_path_error(path, "path is not a regular file"));
+    }
+    validate_private_metadata(path, &metadata, PRIVATE_FILE_MODE)
+}
+
+fn validate_private_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    required_mode: u32,
+) -> anyhow::Result<()> {
+    validate_current_owner(path, metadata)?;
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "refused unsafe run evidence path {} because its mode is 0{mode:03o}\n  fix: change its mode to 0{required_mode:03o} and ensure it is owned by the current user, then retry",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_current_owner(path: &Path, metadata: &fs::Metadata) -> anyhow::Result<()> {
+    let current_uid = rustix::process::getuid().as_raw();
+    if metadata.uid() == current_uid {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refused unsafe run evidence path {} because it is owned by uid {}, not the current uid {current_uid}\n  fix: move the path aside or make it private and owned by the current user, then retry",
+        path.display(),
+        metadata.uid()
+    )
+}
+
+fn unsafe_path_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refused unsafe run evidence path {}: {error}\n  fix: move the path aside or make it private and owned by the current user, then retry",
+        path.display()
+    )
 }
 
 fn evidence_write_error(path: &Path, error: impl std::fmt::Display) -> anyhow::Error {

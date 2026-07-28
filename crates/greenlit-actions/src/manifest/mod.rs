@@ -32,8 +32,6 @@
 //!   is exactly how GitHub itself would behave.
 
 mod parse;
-#[cfg(test)]
-mod tests;
 mod yaml;
 
 use std::path::{Path, PathBuf};

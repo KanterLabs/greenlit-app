@@ -56,11 +56,13 @@ pub use events::{
     StepEventKind,
 };
 pub use executor::{
-    ActionPreflight, ExecError, JobReport, ReadinessConfig, RunConfig, RunReport, StepReport,
-    StoreConfig, actions::ActionRuntimeConfig, actions::node_runtime::HttpRuntimeBundleFetcher,
-    actions::preflight_plan_actions, container::ContainerRejection, preflight_plan_images,
-    preflight_plan_runners, reject_hermetic_late_inputs, reject_uses_steps, run_plan,
-    run_plan_cancellable, run_plan_with_events_cancellable,
+    ActionPreflight, ExecError, JobReport, PlanReachability, ReadinessConfig, RunConfig, RunReport,
+    RuntimeAuthorization, RuntimeCapabilityAssessment, RuntimeCapabilityInputs, RuntimeControl,
+    StepReport, StoreConfig, actions::ActionRuntimeConfig,
+    actions::node_runtime::HttpRuntimeBundleFetcher, actions::preflight_plan_actions,
+    assess_runtime_capabilities, container::ContainerRejection, plan_reachability,
+    preflight_plan_images, preflight_plan_runners, reject_hermetic_late_inputs, reject_uses_steps,
+    run_plan, run_plan_cancellable, run_plan_with_events_cancellable,
 };
 pub use image::{BaseImagePlan, ImageError, ensure_base_image, init_binary, plan_base_image};
 pub use isolation::{IsolationStrategy, isolation_container_spec};

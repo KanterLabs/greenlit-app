@@ -9,27 +9,23 @@
 //! two, records the run's metrics (`AGENTS.md` Metrics: "every `plan` or `run`
 //! invocation appends one NDJSON record"), and renders the human summary.
 
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::process::ExitCode;
 
 use greenlit_engine::execution::env::RunnerEnv;
-use greenlit_engine::git::{collect_git_context, find_repository_root};
-use greenlit_engine::{
-    DEFAULT_MAX_MATRIX_LEGS, ExecutionConclusion, ExecutionPlan, JobId, MatrixPlan, MatrixValue,
-    PlanOptions, analyze_support, build_synthetic_event, plan, validate_v0_support,
-};
+use greenlit_engine::git::find_repository_root;
+use greenlit_engine::{Conclusion, ExecutionConclusion, analyze_support};
 use greenlit_expr::Value;
 use greenlit_metrics::{Invocation, MetricsStore};
 use greenlit_runtime::{
     Cancellation, ContainerEngine, DockerEngine, EngineState, InteractiveConfirm,
-    IsolationStrategy, RunConfig, RunReport, SystemProber, WriteBackOutcome, detect,
-    reject_hermetic_late_inputs, reject_uses_steps, run_plan_with_events_cancellable,
-    run_write_back, validate_host, validate_request,
+    IsolationStrategy, RunConfig, RunReport, RuntimeAuthorization, RuntimeControl, SystemProber,
+    WriteBackOutcome, detect, reject_hermetic_late_inputs, reject_uses_steps,
+    run_plan_with_events_cancellable, run_write_back, validate_host, validate_request,
 };
 
 use crate::cli::{IsolationArg, RunArgs};
-use crate::{auth, errors, render, secrets, vars, workflow_discovery, workflow_picker};
+use crate::{errors, render, workflow_discovery, workflow_picker};
 
 /// Run the command, returning the process exit code (a failed workflow run
 /// exits non-zero without an error, since its table is the real output).
@@ -39,13 +35,21 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
     let record = invocation.finish();
     let _ = render::diagnostics::render_timings(&record, &mut io::stderr());
-    let metrics_result = MetricsStore::open_default()
+    let metrics = MetricsStore::open_default()
         .and_then(|store| store.append(&record))
         .map_err(|error| errors::metrics_error(&error));
-
-    let code = outcome?;
-    metrics_result?;
-    Ok(code)
+    match (outcome, metrics) {
+        (Ok(code), Ok(())) => Ok(code),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(metrics_error)) => {
+            let warning = format!(
+                "warning: could not append the sanitized local run metric: {metrics_error}\n"
+            );
+            let _ = crate::render::terminal::write_sanitized(&mut io::stderr(), &warning);
+            Err(primary)
+        }
+    }
 }
 
 /// The isolation strategy the run actually uses. `--write-back` upgrades the
@@ -64,6 +68,7 @@ fn resolved_strategy(isolation: IsolationArg, write_back: bool) -> IsolationStra
 
 fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> {
     let clean = args.clean || args.hermetic;
+    let cli_sensitive_values = crate::run_quarantine::explicit_sensitive_values(args);
     validate_host().map_err(|host| anyhow::anyhow!("{host}\n  fix: {}", host.fix()))?;
     validate_request(args.write_back, args.no_input).map_err(|error| anyhow::anyhow!("{error}"))?;
     if !args.matrix.is_empty() && args.job.is_none() {
@@ -85,7 +90,6 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     })?;
     let repo_root = find_repository_root(&cwd)
         .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
-    crate::daemon::prepare(&repo_root, args.no_daemon);
     let workflow_path =
         workflow_discovery::resolve_workflow_path(args.workflow.as_deref(), &cwd, &repo_root)
             .and_then(|resolution| {
@@ -93,7 +97,19 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
             })
             .map_err(|message| anyhow::anyhow!(message))?;
     let evidence = invocation.time_stage("source-freeze", || {
-        crate::run_evidence::RunEvidence::capture(&repo_root)
+        crate::run_evidence::RunEvidence::capture(&repo_root, &cli_sensitive_values)
+    })?;
+    let frozen_repo_root = evidence.source.root.clone();
+    let workflow = invocation.time_stage("parse", || {
+        greenlit_workflow::parse_workflow_file_with_name(
+            frozen_repo_root.join(&workflow_path.source_name),
+            workflow_path.source_name.clone(),
+        )
+        .map_err(|error| errors::parse_error(&error))
+    })?;
+    let local_variables = crate::run_quarantine::LocalVariables::read(&repo_root)?;
+    let prepared = invocation.time_stage("plan", || {
+        crate::run_quarantine::prepare(workflow, &frozen_repo_root, args, &local_variables)
     })?;
     let recorder = crate::run_events::RunEventRecorder::create(
         &evidence.directory,
@@ -101,151 +117,53 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         args.format,
         args.log_mode,
         args.color,
+        evidence.result_publication_gate(),
     )?;
     recorder.preparation_finished("source snapshot", Some(evidence.source.digest.clone()))?;
     evidence.apply_execution_policy(clean, args.hermetic)?;
-    let frozen_repo_root = evidence.source.root.clone();
-    let frozen_workflow_path = frozen_repo_root.join(&workflow_path.source_name);
-
-    let workflow = invocation
-        .time_stage("parse", || {
-            greenlit_workflow::parse_workflow_file_with_name(
-                &frozen_workflow_path,
-                workflow_path.source_name.as_str(),
-            )
-        })
-        .map_err(|error| errors::parse_error(&error))?;
+    let crate::run_quarantine::PreparedQuarantine {
+        workflow,
+        git,
+        event,
+        plan: execution_plan,
+        vars: vars_value,
+        assessment,
+    } = prepared;
     recorder.preparation_finished("workflow", Some(workflow_path.source_name.clone()))?;
-    evidence.merge_support(&analyze_support(&workflow))?;
-    validate_v0_support(&workflow).map_err(|error| errors::plan_error(&error))?;
+    let mut support = analyze_support(&workflow);
+    support
+        .findings
+        .extend(crate::run_quarantine::evidence_findings(&assessment));
+    support.canonicalize();
+    evidence.merge_support(&support)?;
+    recorder.compatibility_findings(&evidence.support_report())?;
+    recorder.preparation_finished("execution plan", None)?;
     recorder.preparation_finished("compatibility", None)?;
+    if let Err(error) = crate::run_quarantine::reject_blocked(&assessment) {
+        let support = evidence.support_report();
+        publish_terminal_result(
+            &recorder,
+            &evidence,
+            ExecutionConclusion::Blocked,
+            support,
+            clean,
+            args.hermetic,
+        )?;
+        return Err(error);
+    }
+    crate::run_quarantine::render_degraded(&assessment);
 
-    let extraction = greenlit_workflow::extract_static(&workflow)
-        .map_err(|error| errors::parse_error(&error))?;
-
-    // Local git metadata is collected once, up front: the remote `vars`
-    // lookup needs the repository owner/name before planning even starts,
-    // and every later use (`build_runner_env`) reuses this same value
-    // instead of re-collecting it.
-    let git = collect_git_context(&frozen_repo_root)
-        .map_err(|error| errors::event_error(&greenlit_engine::EventError::Git(error)))?;
     let repo_leaf = git
         .repository
         .rsplit('/')
         .next()
         .unwrap_or(&git.repository)
         .to_string();
-
-    let dotenv_vars =
-        vars::read_dotenv_vars(&repo_root).map_err(|message| anyhow::anyhow!(message))?;
-    let vars_outcome = if args.offline {
-        vars::resolve_vars(
-            &extraction,
-            &args.vars,
-            dotenv_vars.as_deref().unwrap_or_default(),
-            dotenv_vars.is_some(),
-        )
-        .map_or_else(vars::VarsOutcome::LocalError, vars::VarsOutcome::Resolved)
-    } else {
-        vars::resolve_vars_with_remote(
-            &extraction,
-            &args.vars,
-            dotenv_vars.as_deref().unwrap_or_default(),
-            dotenv_vars.is_some(),
-            &git.repository_owner,
-            &repo_leaf,
-        )
-    };
-    let vars_value = errors::vars_outcome(vars_outcome)?;
-
-    // Secrets are collected next, before engine detection and well before
-    // any container starts (`PHASE-3-actions.md` Secrets: "before any
-    // container starts, prompt for every referenced-but-unresolved
-    // secret"). `GITHUB_TOKEN` is deliberately excluded from the ordinary
-    // chain and resolved separately just below.
-    let dotenv_secrets =
-        secrets::read_dotenv_secrets(&repo_root).map_err(|message| anyhow::anyhow!(message))?;
-    let secrets_outcome = secrets::resolve_secrets(
-        &extraction,
-        &args.secrets,
-        dotenv_secrets.as_deref().unwrap_or_default(),
-        &repo_root,
-        args.no_input,
-    )
-    .map_err(|failure| errors::secrets_error(&failure))?;
-
-    let references_token = extraction.references_github_token
-        || extraction.secrets.contains_key(secrets::GITHUB_TOKEN_NAME);
-    let token_local_override = secrets::local_override_for(
-        secrets::GITHUB_TOKEN_NAME,
-        &args.secrets,
-        dotenv_secrets.as_deref().unwrap_or_default(),
-    );
-    let (github_token, token_notice) = if references_token {
-        auth::resolve_github_token(token_local_override)
-    } else {
-        (String::new(), None)
-    };
-    if let Some(notice) = &token_notice {
-        eprintln!("{notice}");
-    }
-
-    let mut all_secrets = secrets_outcome.resolved.clone();
-    if references_token && !github_token.is_empty() {
-        all_secrets.push((secrets::GITHUB_TOKEN_NAME.to_string(), github_token.clone()));
-    }
-    let secrets_value = Value::object(
-        all_secrets
-            .iter()
-            .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-            .collect(),
-    );
-
     let event_kind: greenlit_engine::EventKind = args.event.into();
-    let dispatch_inputs: HashMap<String, String> = args.inputs.iter().cloned().collect();
-    let mut event =
-        build_synthetic_event(event_kind, &frozen_repo_root, &workflow, &dispatch_inputs)
-            .map_err(|error| errors::event_error(&error))?;
-    if references_token {
-        // Baked in *before* planning: plan-time partial evaluation folds
-        // `github.*` field access against this concrete object, so a later
-        // `RunConfig.github` patch would be too late for any statically
-        // foldable `${{ github.token }}` use.
-        event.github = auth::inject_github_token(event.github, &github_token);
-    }
-    let plan_options = PlanOptions {
-        vars: vars_value.clone(),
-        max_matrix_legs: DEFAULT_MAX_MATRIX_LEGS,
-    };
-    let execution_plan = invocation
-        .time_stage("plan", || plan(&workflow, &event, &plan_options))
-        .map_err(|error| errors::plan_error(&error))?;
-    recorder.preparation_finished("execution plan", None)?;
-    let execution_plan = match &args.job {
-        Some(job) => prune_to_job(&execution_plan, job, &args.matrix, args.write_back)?,
-        None => execution_plan,
-    };
-    // Fail before any engine work: a `uses:` step that is certain to execute
-    // would otherwise surface only after image ensure, container boot, and a
-    // potentially long workspace copy.
     reject_uses_steps(&execution_plan).map_err(|error| anyhow::anyhow!("{error}"))?;
     if args.hermetic {
         reject_hermetic_late_inputs(&execution_plan, &git.repository)
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
-    if references_token && !github_token.is_empty() {
-        let effective_permissions: Vec<Option<&greenlit_engine::PermissionsPlan>> = execution_plan
-            .jobs
-            .iter()
-            .map(|job| {
-                job.permissions
-                    .as_ref()
-                    .or(execution_plan.permissions.as_ref())
-            })
-            .collect();
-        if let Some(notice) = auth::token_permission_notice(&effective_permissions) {
-            eprintln!("{notice}");
-        }
     }
 
     let workflow_name = workflow
@@ -254,15 +172,9 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         .map(|name| name.value.clone())
         .unwrap_or_else(|| workflow_path.source_name.clone());
     let workspace = format!("/home/runner/work/{repo_leaf}/{repo_leaf}");
-
-    // Action resolution reuses whatever token `litci auth` already stored
-    // (`PHASE-3-actions.md` "Action execution": "pick `GitHubApiResolver`
-    // (token) when Some, else `GitLsRemoteResolver`") — independent of
-    // whether *this workflow* references `secrets.GITHUB_TOKEN`/
-    // `github.token` (host-side action fetching is not workflow-token
-    // injection).
-    let action_token = auth::current_token().ok().flatten();
-    let (actions_config, pinned_resolver) = build_action_runtime_config(action_token, args.offline)
+    let all_secrets: Vec<(String, String)> = Vec::new();
+    let secrets_value = Value::object(Vec::<(String, Value)>::new());
+    let (actions_config, pinned_resolver) = build_action_runtime_config(None, args.offline)
         .map_err(|message| anyhow::anyhow!(message))?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -371,6 +283,15 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     // does on a runner with no cache service, which is an honest miss rather
     // than a broken run.
     let store_config = build_store_config(clean, args.hermetic);
+    let mut initial_masks = cli_sensitive_values;
+    if let Some(store) = &store_config {
+        // These shim capabilities authenticate workflow-visible services and
+        // can be reflected just like repository secrets. Register them before
+        // the first step can emit a log or structured event.
+        let store_sensitive_values = [store.runtime_token.clone(), store.url_signature.clone()];
+        evidence.register_sensitive_values(&store_sensitive_values);
+        initial_masks.extend(store_sensitive_values);
+    }
 
     let mut execution_image_locks = run_lock
         .containers
@@ -400,14 +321,13 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         vars: vars_value,
         inputs: event.inputs.clone(),
         secrets: secrets_value,
-        // Every secret this run actually resolved — from any source in the
-        // chain, not only `-s` — is masked before any step runs
-        // (`PHASE-3-actions.md` Secrets: "Every resolved secret value
-        // registers with the Phase 2 masker before any step runs").
-        initial_masks: all_secrets.iter().map(|(_, value)| value.clone()).collect(),
+        // Every credential this run minted or resolved is masked before any
+        // step runs, including the cache/artifact service capabilities.
+        initial_masks,
         volume_namespace: evidence.run_id.clone(),
         locked_images: Some(execution_image_locks),
         write_back: args.write_back,
+        dind: false,
         readiness: greenlit_runtime::ReadinessConfig::default(),
         actions: actions_config,
         store: store_config.clone(),
@@ -422,37 +342,67 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     let mut logs = recorder.clone();
     let mut events = recorder.clone();
     let cancellation = Cancellation::new();
-    let report = runtime
-        .block_on(async {
-            let execution = run_plan_with_events_cancellable(
-                &engine,
-                &execution_plan,
-                &config,
-                &mut logs,
-                &mut events,
-                &mut progress,
-                &cancellation,
-            );
-            tokio::pin!(execution);
-            tokio::select! {
-                result = &mut execution => result,
-                signal = tokio::signal::ctrl_c() => {
-                    cancellation.cancel();
-                    let result = execution.await;
-                    match signal {
-                        Ok(()) => result,
-                        Err(error) => {
-                            result?;
-                            Err(greenlit_runtime::ExecError::Infrastructure {
-                                message: format!("could not listen for cancellation: {error}"),
-                                fix: "retry the run".to_string(),
-                            })
-                        }
+    let authorization = if args.allow_degraded {
+        RuntimeAuthorization::AllowDegradedShell
+    } else {
+        RuntimeAuthorization::Enforce
+    };
+    let execution_result = runtime.block_on(async {
+        let execution = run_plan_with_events_cancellable(
+            &engine,
+            &execution_plan,
+            &config,
+            RuntimeControl::with_assessment(authorization, &cancellation, &assessment),
+            &mut logs,
+            &mut events,
+            &mut progress,
+        );
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => result,
+            signal = tokio::signal::ctrl_c() => {
+                cancellation.cancel();
+                let result = execution.await;
+                match signal {
+                    Ok(()) => result,
+                    Err(error) => {
+                        result?;
+                        Err(greenlit_runtime::ExecError::Infrastructure {
+                            message: format!("could not listen for cancellation: {error}"),
+                            fix: "retry the run".to_string(),
+                        })
                     }
                 }
             }
-        })
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        }
+    });
+    let report = match execution_result {
+        Ok(report) => report,
+        Err(error @ greenlit_runtime::ExecError::CapabilityQuarantined { .. }) => {
+            let support = evidence.support_report();
+            publish_terminal_result(
+                &recorder,
+                &evidence,
+                ExecutionConclusion::Blocked,
+                support,
+                clean,
+                args.hermetic,
+            )?;
+            return Err(anyhow::anyhow!("{error}"));
+        }
+        Err(error) => {
+            let support = evidence.support_report();
+            publish_terminal_result(
+                &recorder,
+                &evidence,
+                ExecutionConclusion::PreparationFailed,
+                support,
+                clean,
+                args.hermetic,
+            )?;
+            return Err(anyhow::anyhow!("{error}"));
+        }
+    };
 
     for job in &report.jobs {
         for step in &job.steps {
@@ -509,22 +459,18 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
         node_runtime_counts.misses,
     )?;
 
-    let conclusion = if report.failed() {
-        ExecutionConclusion::Failed
-    } else {
-        ExecutionConclusion::Passed
+    let conclusion = match report.overall {
+        Conclusion::Success | Conclusion::Skipped => ExecutionConclusion::Passed,
+        Conclusion::Failure => ExecutionConclusion::Failed,
+        Conclusion::Cancelled => ExecutionConclusion::Canceled,
     };
-    recorder.verify_durable()?;
-    let result = evidence.write_result(
+    publish_terminal_result(
+        &recorder,
+        &evidence,
         conclusion,
         run_lock.compatibility.clone(),
         clean,
         args.hermetic,
-    )?;
-    recorder.finish(
-        format!("{:?}", result.conclusion),
-        format!("{:?}", result.compatibility),
-        format!("{:?}", result.assurance),
     )?;
 
     if args.write_back {
@@ -558,6 +504,44 @@ fn execute(args: &RunArgs, invocation: &Invocation) -> anyhow::Result<ExitCode> 
     } else {
         ExitCode::SUCCESS
     })
+}
+
+fn publish_terminal_result(
+    recorder: &crate::run_events::RunEventRecorder,
+    evidence: &crate::run_evidence::RunEvidence,
+    conclusion: ExecutionConclusion,
+    support: greenlit_engine::SupportReport,
+    clean: bool,
+    hermetic: bool,
+) -> anyhow::Result<()> {
+    if let Err(error) = recorder.flush_pending_logs() {
+        evidence.abandon_result_publication();
+        return Err(error);
+    }
+    let prepared = match evidence.prepare_result(conclusion, support, clean, hermetic) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            evidence.abandon_result_publication();
+            return Err(error);
+        }
+    };
+    if let Err(error) = recorder.finish(
+        prepared.terminal_conclusion(),
+        prepared.terminal_compatibility(),
+        prepared.terminal_assurance(),
+    ) {
+        evidence.abandon_result_publication();
+        return Err(error);
+    }
+    if let Err(error) = recorder.verify_durable() {
+        evidence.abandon_result_publication();
+        return Err(error);
+    }
+    if let Err(error) = evidence.publish_prepared_result(prepared) {
+        evidence.abandon_result_publication();
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn open_content_store() -> anyhow::Result<greenlit_store::cas::CasStore> {
@@ -782,163 +766,5 @@ fn build_runner_env(
         runner_temp: "/tmp".to_string(),
         runner_tool_cache: "/opt/hostedtoolcache".to_string(),
         actions_service: None,
-    }
-}
-
-/// Prune `plan` to the requested job and its transitive `needs:` closure.
-fn prune_to_job(
-    plan: &ExecutionPlan,
-    job: &str,
-    selected_matrix: &[(String, String)],
-    write_back: bool,
-) -> anyhow::Result<ExecutionPlan> {
-    let target = JobId(job.to_string());
-    if !plan.jobs.iter().any(|candidate| candidate.id == target) {
-        anyhow::bail!(
-            "no job '{job}' in this workflow\n  fix: pass -j with a job id defined under `jobs:`"
-        );
-    }
-    let mut keep: HashSet<String> = HashSet::new();
-    let mut queue: VecDeque<JobId> = VecDeque::from([target]);
-    while let Some(id) = queue.pop_front() {
-        if !keep.insert(id.0.clone()) {
-            continue;
-        }
-        if let Some(job_plan) = plan.jobs.iter().find(|candidate| candidate.id == id) {
-            for need in &job_plan.needs {
-                queue.push_back(need.clone());
-            }
-        }
-    }
-    let mut pruned = plan.clone();
-    pruned
-        .jobs
-        .retain(|candidate| keep.contains(&candidate.id.0));
-    pruned.topo_order.retain(|id| keep.contains(&id.0));
-    let selected = parse_matrix_filter(selected_matrix)?;
-    let target = pruned
-        .jobs
-        .iter_mut()
-        .find(|candidate| candidate.id.0 == job)
-        .ok_or_else(|| anyhow::anyhow!("selected job disappeared while pruning"))?;
-    if selected.is_some() && target.strategy.matrix.is_none() {
-        anyhow::bail!(
-            "job '{job}' is not a matrix job\n  fix: omit `--matrix`, or select a job with `strategy.matrix`"
-        );
-    }
-    if write_back && target.strategy.matrix.is_some() && selected.is_none() {
-        anyhow::bail!(
-            "`--write-back` needs one exact matrix case for job '{job}'\n  fix: repeat `--matrix KEY=JSON_VALUE` for every property in the desired case"
-        );
-    }
-    if let (Some(filter), Some(MatrixPlan::Static { legs, .. })) =
-        (&selected, &target.strategy.matrix)
-    {
-        let matches = legs
-            .iter()
-            .filter(|leg| matrix_leg_matches(leg, filter))
-            .count();
-        if matches != 1 {
-            anyhow::bail!(
-                "matrix selection for job '{job}' matched {matches} cases\n  fix: specify every matrix property so exactly one case matches"
-            );
-        }
-    }
-    target.matrix_filter = selected;
-    Ok(pruned)
-}
-
-fn parse_matrix_filter(
-    selected: &[(String, String)],
-) -> anyhow::Result<Option<indexmap::IndexMap<String, MatrixValue>>> {
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    let mut filter = indexmap::IndexMap::new();
-    for (key, raw) in selected {
-        if filter.contains_key(key) {
-            anyhow::bail!(
-                "matrix property '{key}' was selected more than once\n  fix: pass each `--matrix KEY=JSON_VALUE` once"
-            );
-        }
-        let value = serde_json::from_str::<serde_json::Value>(raw)
-            .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
-        filter.insert(key.clone(), json_matrix_value(&value)?);
-    }
-    Ok(Some(filter))
-}
-
-fn json_matrix_value(value: &serde_json::Value) -> anyhow::Result<MatrixValue> {
-    Ok(match value {
-        serde_json::Value::Null => MatrixValue::Null,
-        serde_json::Value::Bool(value) => MatrixValue::Bool(*value),
-        serde_json::Value::Number(value) => MatrixValue::Number(value.as_f64().ok_or_else(|| {
-            anyhow::anyhow!(
-                "matrix numeric selector is outside the supported range\n  fix: use a finite JSON number"
-            )
-        })?),
-        serde_json::Value::String(value) => MatrixValue::String(value.as_str().into()),
-        serde_json::Value::Array(values) => MatrixValue::Sequence(
-            values
-                .iter()
-                .map(json_matrix_value)
-                .collect::<anyhow::Result<Vec<_>>>()?
-                .into(),
-        ),
-        serde_json::Value::Object(values) => MatrixValue::Mapping(
-            values
-                .iter()
-                .map(|(key, value)| Ok((key.clone(), json_matrix_value(value)?)))
-                .collect::<anyhow::Result<indexmap::IndexMap<_, _>>>()?
-                .into(),
-        ),
-    })
-}
-
-fn matrix_leg_matches(
-    leg: &greenlit_engine::MatrixLeg,
-    filter: &indexmap::IndexMap<String, MatrixValue>,
-) -> bool {
-    leg.values.len() == filter.len()
-        && filter.iter().all(|(key, value)| {
-            leg.values
-                .get(key.as_str())
-                .is_some_and(|actual| actual == value)
-        })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_back_requires_overlay_never_auto() {
-        // `auto` may fall back to copy-in at container start, which would turn
-        // `--write-back` into a silent no-op; requesting write-back must
-        // therefore pin the strategy to a required overlay.
-        assert_eq!(
-            resolved_strategy(IsolationArg::Auto, true),
-            IsolationStrategy::Overlay
-        );
-        assert_eq!(
-            resolved_strategy(IsolationArg::Overlay, true),
-            IsolationStrategy::Overlay
-        );
-    }
-
-    #[test]
-    fn without_write_back_the_requested_isolation_passes_through() {
-        assert_eq!(
-            resolved_strategy(IsolationArg::Auto, false),
-            IsolationStrategy::Auto
-        );
-        assert_eq!(
-            resolved_strategy(IsolationArg::Overlay, false),
-            IsolationStrategy::Overlay
-        );
-        assert_eq!(
-            resolved_strategy(IsolationArg::CopyIn, false),
-            IsolationStrategy::CopyIn
-        );
     }
 }

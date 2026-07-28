@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Check or execute exact feature-gated capability test owner groups."""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+from cargo_test_manifest import (
+    CargoTarget,
+    GateError,
+    cargo_metadata,
+    listed_tests,
+    run_target,
+    unique_object,
+)
+from capability_manifest_selftest import self_test_negative
+from capability_workflows import validate_route_schema, validate_workflow_routes
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MANIFEST = Path(__file__).with_name("capability-test-manifest.json")
+TOP_LEVEL_KEYS = {"schema_version", "targets", "workflow_routes"}
+ENTRY_KEYS = {
+    "features",
+    "owner",
+    "package",
+    "target",
+    "test_cfgs",
+    "tests",
+}
+OWNERS = {
+    "credential-keyring",
+    "docker-policy",
+    "docker-runtime",
+    "host-deep-path",
+    "stargz-provider",
+}
+TEST_CFGS = {"litci_test_boundaries"}
+
+
+def text_list(value: Any, location: str, *, nonempty: bool) -> list[str]:
+    """Validate one sorted unique string array."""
+
+    if not isinstance(value, list) or (nonempty and not value):
+        qualifier = "nonempty " if nonempty else ""
+        raise GateError(f"{location} must be a {qualifier}array")
+    result: list[str] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, str) or not item or item.strip() != item:
+            raise GateError(f"{location}[{index}] must be nonempty trimmed text")
+        result.append(item)
+    if len(result) != len(set(result)):
+        raise GateError(f"{location} contains a duplicate")
+    if result != sorted(result):
+        raise GateError(f"{location} must be sorted")
+    return result
+
+
+def load_manifest(
+    path: Path = MANIFEST,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load the strict owner-partitioned capability manifest."""
+
+    if path.is_symlink() or not path.is_file():
+        raise GateError(f"{path}: manifest must be a regular non-symlink file")
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+        )
+    except OSError as error:
+        raise GateError(f"could not read {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise GateError(f"{path}: invalid JSON: {error}") from error
+
+    if not isinstance(value, dict) or set(value) != TOP_LEVEL_KEYS:
+        raise GateError(
+            f"{path}: top level must contain exactly {sorted(TOP_LEVEL_KEYS)!r}"
+        )
+    if value["schema_version"] != 2:
+        raise GateError(f"{path}: schema_version must be 2")
+    entries = value["targets"]
+    if not isinstance(entries, list) or not entries:
+        raise GateError(f"{path}: targets must be a nonempty array")
+
+    identities: set[tuple[str, str]] = set()
+    previous: tuple[str, str] | None = None
+    owners_seen: set[str] = set()
+    for index, entry in enumerate(entries):
+        location = f"{path}: targets[{index}]"
+        if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
+            raise GateError(f"{location} must contain exactly {sorted(ENTRY_KEYS)!r}")
+        for field in ("package", "target", "owner"):
+            text = entry[field]
+            if not isinstance(text, str) or not text or text.strip() != text:
+                raise GateError(f"{location}.{field} must be nonempty trimmed text")
+        if entry["owner"] not in OWNERS:
+            raise GateError(
+                f"{location}.owner must be one of {sorted(OWNERS)!r}"
+            )
+        owners_seen.add(entry["owner"])
+        entry["features"] = text_list(
+            entry["features"], f"{location}.features", nonempty=True
+        )
+        entry["test_cfgs"] = text_list(
+            entry["test_cfgs"], f"{location}.test_cfgs", nonempty=False
+        )
+        unknown_cfgs = set(entry["test_cfgs"]) - TEST_CFGS
+        if unknown_cfgs:
+            raise GateError(
+                f"{location}.test_cfgs contains unknown cfgs {sorted(unknown_cfgs)!r}"
+            )
+        expected_cfgs = (
+            ["litci_test_boundaries"]
+            if entry["package"] == "greenlit-app"
+            else []
+        )
+        if entry["test_cfgs"] != expected_cfgs:
+            raise GateError(
+                f"{location}.test_cfgs must be {expected_cfgs!r} for "
+                f"{entry['package']}"
+            )
+        entry["tests"] = text_list(
+            entry["tests"], f"{location}.tests", nonempty=True
+        )
+        identity = (entry["package"], entry["target"])
+        if identity in identities:
+            raise GateError(f"{location} duplicates target identity {identity!r}")
+        if previous is not None and identity < previous:
+            raise GateError(f"{path}: targets must be sorted by package and target")
+        identities.add(identity)
+        previous = identity
+    if owners_seen != OWNERS:
+        raise GateError(
+            f"{path}: every fixed capability owner must be nonempty; "
+            f"missing={sorted(OWNERS - owners_seen)!r}"
+        )
+    routes = validate_route_schema(value["workflow_routes"], path)
+    return entries, routes
+
+
+def declared_capability_targets(
+    targets: list[CargoTarget],
+) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Extract every required-feature integration target from Cargo."""
+
+    declared: dict[tuple[str, str], tuple[str, ...]] = {}
+    for target in targets:
+        if "test" not in target.kinds or not target.required_features:
+            continue
+        identity = (target.package, target.name)
+        if identity in declared:
+            raise GateError(f"Cargo metadata repeats target {identity!r}")
+        declared[identity] = target.required_features
+    if not declared:
+        raise GateError("Cargo metadata declares no feature-gated capability targets")
+    return declared
+
+
+def validate_declarations(
+    entries: list[dict[str, Any]],
+    targets: list[CargoTarget],
+) -> None:
+    """Require a one-to-one manifest/Cargo target mapping."""
+
+    declared = declared_capability_targets(targets)
+    manifest = {
+        (entry["package"], entry["target"]): tuple(entry["features"])
+        for entry in entries
+    }
+    if manifest == declared:
+        return
+    manifest_targets = set(manifest)
+    declared_targets = set(declared)
+    raise GateError(
+        "feature-gated test targets differ from the manifest; "
+        f"missing={sorted(declared_targets - manifest_targets)!r}, "
+        f"unexpected={sorted(manifest_targets - declared_targets)!r}, "
+        "feature mismatches="
+        f"{sorted(identity for identity in manifest_targets & declared_targets if manifest[identity] != declared[identity])!r}"
+    )
+
+
+def validate_cases(entries: list[dict[str, Any]], root: Path) -> int:
+    """List and compare every selected target's exact nonzero cases."""
+
+    selected = 0
+    for entry in entries:
+        actual = listed_tests(
+            root,
+            package=entry["package"],
+            target=entry["target"],
+            selector="test",
+            features=tuple(entry["features"]),
+            test_cfgs=tuple(entry["test_cfgs"]),
+        )
+        expected = entry["tests"]
+        if not actual:
+            raise GateError(
+                f"{entry['package']}/{entry['target']} selected zero tests"
+            )
+        if actual != expected:
+            expected_set = set(expected)
+            actual_set = set(actual)
+            identity = f"{entry['package']}/{entry['target']}"
+            raise GateError(
+                f"{identity}: selected tests differ from the manifest; "
+                f"missing={sorted(expected_set - actual_set)!r}, "
+                f"unexpected={sorted(actual_set - expected_set)!r}"
+            )
+        selected += len(actual)
+    return selected
+
+
+def run_owner(entries: list[dict[str, Any]], root: Path, owner: str) -> int:
+    """Execute every whole target assigned to one fixed capability owner."""
+
+    selected = [entry for entry in entries if entry["owner"] == owner]
+    if not selected:
+        raise GateError(f"capability owner {owner!r} selects zero targets")
+    case_count = validate_cases(selected, root)
+    for entry in selected:
+        run_target(
+            root,
+            package=entry["package"],
+            target=entry["target"],
+            selector="test",
+            features=tuple(entry["features"]),
+            test_cfgs=tuple(entry["test_cfgs"]),
+        )
+    print(
+        f"capability owner {owner} passed: {len(selected)} targets, "
+        f"{case_count} tests"
+    )
+    return 0
+
+
+def main() -> int:
+    """Dispatch the check-only or fixed-owner execution boundary."""
+
+    root = ROOT
+    manifest = MANIFEST
+    run_group: str | None = None
+    if sys.argv[1:] == ["--self-test-negative"]:
+        try:
+            return self_test_negative()
+        except GateError as error:
+            print(f"capability test manifest gate failed: {error}", file=sys.stderr)
+            return 1
+    arguments = sys.argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in {"--run-owner", "--repository-root", "--manifest"}:
+            if index + 1 >= len(arguments):
+                print(f"{argument} requires a value", file=sys.stderr)
+                return 2
+            value = arguments[index + 1]
+            if argument == "--run-owner":
+                run_group = value
+            elif argument == "--repository-root":
+                root = Path(value).resolve()
+            else:
+                manifest = Path(value).resolve()
+            index += 2
+            continue
+        print(
+            f"usage: {Path(sys.argv[0]).name} "
+            "[--run-owner OWNER] [--repository-root PATH] [--manifest PATH] "
+            "[--self-test-negative]",
+            file=sys.stderr,
+        )
+        return 2
+    if run_group is not None and run_group not in OWNERS:
+        print(
+            f"unknown capability owner {run_group!r}; "
+            f"choose one of {sorted(OWNERS)!r}",
+            file=sys.stderr,
+        )
+        return 2
+    if not root.is_dir():
+        print(f"repository root is not a directory: {root}", file=sys.stderr)
+        return 2
+
+    try:
+        entries, routes = load_manifest(manifest)
+        route_count = validate_workflow_routes(routes, root)
+        targets = cargo_metadata(root)
+        validate_declarations(entries, targets)
+        if run_group is not None:
+            return run_owner(entries, root, run_group)
+        selected = validate_cases(entries, root)
+    except GateError as error:
+        print(f"capability test manifest gate failed: {error}", file=sys.stderr)
+        return 1
+
+    print(
+        f"capability test manifest gate passed: {len(entries)} targets, "
+        f"{selected} selected tests, {len(OWNERS)} fixed owners, "
+        f"{route_count} workflow routes"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

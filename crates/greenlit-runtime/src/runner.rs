@@ -265,8 +265,12 @@ impl Snapshotter for EagerDockerSnapshotter {
             identity: manifest.digest.clone(),
             cache_hit: manifest.metadata_cache_hit,
         });
+        // The provider has already fixed this pull reference to the immutable
+        // digest verified below. Reuse an exact daemon hit so an unchanged
+        // warm run does not publish a false setup-download event.
+        let materialized = engine.image_exists(&manifest.pull_reference).await?;
         if self.offline {
-            if !engine.image_exists(&manifest.pull_reference).await? {
+            if !materialized {
                 return Err(ExecError::Infrastructure {
                     message: format!(
                         "offline content is missing: runner profile {}",
@@ -276,7 +280,7 @@ impl Snapshotter for EagerDockerSnapshotter {
                         .to_string(),
                 });
             }
-        } else {
+        } else if !materialized {
             engine
                 .pull_image(&manifest.pull_reference, None, progress)
                 .await?;

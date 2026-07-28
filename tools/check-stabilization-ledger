@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Validate Greenlit's permanent stabilization governance ledgers."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from stabilization_check.selftest import run_self_test
+from stabilization_check.validate import report_result, validate_paths
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_AGENTS = REPO_ROOT / "AGENTS.md"
+DEFAULT_STABILIZATION_LEDGER = REPO_ROOT / "docs" / "STABILIZATION-LEDGER.md"
+DEFAULT_PARITY_EXCEPTIONS = REPO_ROOT / "docs" / "PARITY-EXCEPTIONS.md"
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse the checker command line."""
+
+    parser = argparse.ArgumentParser(
+        description="validate Greenlit stabilization governance ledgers"
+    )
+    parser.add_argument("--agents", type=Path, default=DEFAULT_AGENTS)
+    parser.add_argument(
+        "--stabilization-ledger",
+        type=Path,
+        default=DEFAULT_STABILIZATION_LEDGER,
+    )
+    parser.add_argument(
+        "--parity-exceptions",
+        type=Path,
+        default=DEFAULT_PARITY_EXCEPTIONS,
+    )
+    self_test = parser.add_mutually_exclusive_group()
+    self_test.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run valid and negative command-boundary behavior canaries",
+    )
+    self_test.add_argument(
+        "--self-test-negative",
+        action="store_true",
+        help="compatibility alias for --self-test",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    """Run repository validation or the command-boundary behavior gate."""
+
+    args = parse_args()
+    if args.self_test or args.self_test_negative:
+        return run_self_test(Path(__file__).resolve())
+    return report_result(
+        validate_paths(
+            args.agents,
+            args.stabilization_ledger,
+            args.parity_exceptions,
+        )
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

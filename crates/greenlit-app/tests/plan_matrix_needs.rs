@@ -7,7 +7,7 @@
 
 pub mod support;
 
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::process::Output;
 
 use support::Sandbox;
@@ -355,7 +355,12 @@ fn plan_appends_exactly_one_metrics_record() {
 #[test]
 fn plan_fails_actionably_when_its_required_metrics_record_cannot_be_written() {
     let sandbox = sandbox_with_fixture();
-    std::fs::create_dir_all(sandbox.metrics_file()).expect("create blocking metrics directory");
+    let metrics_file = sandbox.metrics_file();
+    std::fs::create_dir_all(&metrics_file).expect("create blocking metrics directory");
+    for parent in metrics_file.ancestors().skip(1).take(2) {
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make metrics parent private");
+    }
 
     let output = sandbox.run(&["plan", "-W", "fixtures/matrix-needs.yml"]);
     assert!(!output.status.success());

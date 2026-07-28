@@ -1,0 +1,40 @@
+{
+  "schema_version": 2,
+  "benchmarks": [
+    {
+      "package": "greenlit-expr",
+      "target": "expr_eval",
+      "name": "parse",
+      "samples": 10,
+      "max_time_ns": 10000
+    },
+    {
+      "package": "greenlit-expr",
+      "target": "expr_eval",
+      "name": "parse_and_evaluate",
+      "samples": 10,
+      "max_time_ns": 15000
+    },
+    {
+      "package": "greenlit-expr",
+      "target": "expr_eval",
+      "name": "evaluate_only",
+      "samples": 10,
+      "max_time_ns": 4000
+    },
+    {
+      "package": "greenlit-workflow",
+      "target": "parse",
+      "name": "parse_workflow(multi_job.yml)",
+      "samples": 10,
+      "max_time_ns": 300000
+    },
+    {
+      "package": "greenlit-workflow",
+      "target": "parse",
+      "name": "extract_static(multi_job.yml)",
+      "samples": 10,
+      "max_time_ns": 45000
+    }
+  ]
+}

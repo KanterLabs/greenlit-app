@@ -75,19 +75,6 @@ pub(crate) enum ExtractError {
 /// ([`crate::store::ActionStore`]) is responsible for the atomic
 /// fetch-then-rename this is one half of.
 pub(crate) fn extract_tarball(reader: impl Read, dest: &Path) -> Result<(), ExtractError> {
-    extract_tarball_bounded(reader, dest, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRIES)
-}
-
-/// [`extract_tarball`] with the size/entry ceilings taken as parameters
-/// instead of the fixed constants, so tests can exercise the `TooLarge`/
-/// `TooManyEntries` rejection paths with a tiny fixture instead of a
-/// multi-hundred-megabyte or hundred-thousand-entry one.
-fn extract_tarball_bounded(
-    reader: impl Read,
-    dest: &Path,
-    max_bytes: u64,
-    max_entries: usize,
-) -> Result<(), ExtractError> {
     let mut archive = tar::Archive::new(reader);
     let entries = archive
         .entries()
@@ -101,12 +88,12 @@ fn extract_tarball_bounded(
         let mut entry = entry.map_err(|error| ExtractError::Read(error.to_string()))?;
 
         count += 1;
-        if count > max_entries {
-            return Err(ExtractError::TooManyEntries(max_entries));
+        if count > MAX_EXTRACTED_ENTRIES {
+            return Err(ExtractError::TooManyEntries(MAX_EXTRACTED_ENTRIES));
         }
         total_bytes = total_bytes.saturating_add(entry.header().size().unwrap_or(0));
-        if total_bytes > max_bytes {
-            return Err(ExtractError::TooLarge(max_bytes));
+        if total_bytes > MAX_EXTRACTED_BYTES {
+            return Err(ExtractError::TooLarge(MAX_EXTRACTED_BYTES));
         }
 
         let raw_path = entry
@@ -262,203 +249,4 @@ fn reject_escaping_link(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Writes `path` directly into the header's raw name field, bypassing
-    /// `Header::set_path`'s own traversal-safety validation — several tests
-    /// below must construct exactly the hostile archives that validation
-    /// would otherwise refuse to let this test helper build.
-    fn set_raw_path(header: &mut tar::Header, path: &str) {
-        let field = &mut header.as_mut_bytes()[0..100];
-        field.fill(0);
-        field[..path.len()].copy_from_slice(path.as_bytes());
-    }
-
-    fn build_tarball(entries: &[(&str, tar::EntryType, &[u8], Option<&str>)]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (path, kind, content, link_target) in entries {
-            let mut header = tar::Header::new_gnu();
-            set_raw_path(&mut header, path);
-            header.set_entry_type(*kind);
-            header.set_mode(0o644);
-            header.set_size(content.len() as u64);
-            if let Some(target) = link_target {
-                header.set_link_name(target).unwrap();
-            }
-            header.set_cksum();
-            builder.append(&header, *content).expect("append tar entry");
-        }
-        builder.into_inner().expect("finish tar")
-    }
-
-    #[test]
-    fn extracts_files_and_strips_top_level_directory() {
-        let tarball = build_tarball(&[
-            ("repo-abc123/", tar::EntryType::Directory, b"", None),
-            (
-                "repo-abc123/action.yml",
-                tar::EntryType::Regular,
-                b"name: test",
-                None,
-            ),
-            (
-                "repo-abc123/src/main.js",
-                tar::EntryType::Regular,
-                b"console.log(1)",
-                None,
-            ),
-        ]);
-        let dest = tempfile::tempdir().unwrap();
-        extract_tarball(tarball.as_slice(), dest.path()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join("action.yml")).unwrap(),
-            "name: test"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.path().join("src/main.js")).unwrap(),
-            "console.log(1)"
-        );
-    }
-
-    #[test]
-    fn rejects_absolute_path_entry() {
-        let tarball = build_tarball(&[("/etc/passwd", tar::EntryType::Regular, b"evil", None)]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::UnsafePath(_)));
-    }
-
-    #[test]
-    fn rejects_parent_traversal_entry() {
-        let tarball = build_tarball(&[(
-            "repo-abc123/../../evil",
-            tar::EntryType::Regular,
-            b"evil",
-            None,
-        )]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::UnsafePath(_)));
-    }
-
-    #[test]
-    fn rejects_symlink_escaping_destination() {
-        let tarball = build_tarball(&[(
-            "repo-abc123/evil-link",
-            tar::EntryType::Symlink,
-            b"",
-            Some("../../../etc/passwd"),
-        )]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::UnsafeLinkTarget(_)));
-        assert!(!dest.path().join("evil-link").exists());
-    }
-
-    #[test]
-    fn rejects_absolute_symlink_target() {
-        let tarball = build_tarball(&[(
-            "repo-abc123/evil-link",
-            tar::EntryType::Symlink,
-            b"",
-            Some("/etc/passwd"),
-        )]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::UnsafeLinkTarget(_)));
-    }
-
-    #[test]
-    fn accepts_symlink_within_destination() {
-        let tarball = build_tarball(&[
-            (
-                "repo-abc123/dir/real.txt",
-                tar::EntryType::Regular,
-                b"hi",
-                None,
-            ),
-            (
-                "repo-abc123/link.txt",
-                tar::EntryType::Symlink,
-                b"",
-                Some("dir/real.txt"),
-            ),
-        ]);
-        let dest = tempfile::tempdir().unwrap();
-        extract_tarball(tarball.as_slice(), dest.path()).unwrap();
-        let resolved = std::fs::read_to_string(dest.path().join("link.txt")).unwrap();
-        assert_eq!(resolved, "hi");
-    }
-
-    #[test]
-    fn rejects_inconsistent_top_level_directory() {
-        let tarball = build_tarball(&[
-            (
-                "repo-abc123/action.yml",
-                tar::EntryType::Regular,
-                b"x",
-                None,
-            ),
-            ("other-dir/evil", tar::EntryType::Regular, b"x", None),
-        ]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::InconsistentTopLevel(_)));
-    }
-
-    #[test]
-    fn rejects_unsupported_entry_type() {
-        let tarball = build_tarball(&[("repo-abc123/fifo", tar::EntryType::Fifo, b"", None)]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball(tarball.as_slice(), dest.path()).unwrap_err();
-        assert!(matches!(error, ExtractError::UnsupportedEntryType(_, _)));
-    }
-
-    #[test]
-    fn preserves_executable_bit() {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_path("repo-abc123/run.sh").unwrap();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_mode(0o755);
-        header.set_size(2);
-        header.set_cksum();
-        builder.append(&header, &b"ok"[..]).unwrap();
-        let tarball = builder.into_inner().unwrap();
-
-        let dest = tempfile::tempdir().unwrap();
-        extract_tarball(tarball.as_slice(), dest.path()).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dest.path().join("run.sh"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755);
-    }
-
-    #[test]
-    fn rejects_archive_exceeding_the_byte_ceiling() {
-        let big = vec![0_u8; 1024];
-        let tarball =
-            build_tarball(&[("repo-abc123/big.bin", tar::EntryType::Regular, &big, None)]);
-        let dest = tempfile::tempdir().unwrap();
-        let error = extract_tarball_bounded(tarball.as_slice(), dest.path(), 100, 100).unwrap_err();
-        assert!(matches!(error, ExtractError::TooLarge(100)));
-    }
-
-    #[test]
-    fn rejects_archive_exceeding_the_entry_ceiling() {
-        let tarball = build_tarball(&[
-            ("repo-abc123/a", tar::EntryType::Regular, b"1", None),
-            ("repo-abc123/b", tar::EntryType::Regular, b"2", None),
-        ]);
-        let dest = tempfile::tempdir().unwrap();
-        let error =
-            extract_tarball_bounded(tarball.as_slice(), dest.path(), u64::MAX, 1).unwrap_err();
-        assert!(matches!(error, ExtractError::TooManyEntries(1)));
-    }
 }

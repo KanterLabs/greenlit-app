@@ -5,6 +5,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Support-report marker proving the active capability registry was evaluated
+/// completely for the selected work.
+pub const SUPPORT_CERTIFICATION_WITNESS: &str = "stabilization.capability-registry.complete";
+
 /// Whether Greenlit knows how faithfully one workflow feature is supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -425,17 +429,22 @@ impl ExecutionResultV1 {
     /// acquire a green assurance.
     #[must_use]
     pub fn classify(evidence: &ResultEvidence) -> Self {
-        let compatibility = evidence.support.compatibility();
+        let certification_complete = evidence.support.findings.iter().any(|finding| {
+            finding.code == SUPPORT_CERTIFICATION_WITNESS
+                && finding.disposition == FindingDisposition::Supported
+        });
+        let compatibility = if certification_complete {
+            evidence.support.compatibility()
+        } else {
+            Compatibility::Unsupported
+        };
         let passing = evidence.conclusion == ExecutionConclusion::Passed
-            && compatibility != Compatibility::Unsupported;
+            && compatibility == Compatibility::Supported;
         let assurance = if !passing {
             Assurance::None
-        } else if evidence.github_confirmed
-            && evidence.hermetic
-            && compatibility == Compatibility::Supported
-        {
+        } else if evidence.github_confirmed && evidence.hermetic {
             Assurance::GithubConfirmed
-        } else if evidence.hermetic && compatibility == Compatibility::Supported {
+        } else if evidence.hermetic {
             Assurance::Hermetic
         } else if evidence.clean {
             Assurance::Clean
@@ -449,6 +458,12 @@ impl ExecutionResultV1 {
             .filter(|finding| finding.disposition != FindingDisposition::Supported)
             .map(|finding| format!("{}: {}", finding.code, finding.reason))
             .collect::<Vec<_>>();
+        if !certification_complete {
+            reasons.push(
+                "stabilization.capability-registry.incomplete: no complete capability certification witness was retained"
+                    .to_string(),
+            );
+        }
         if evidence.github_confirmed && assurance != Assurance::GithubConfirmed {
             reasons.push(
                 "github_confirmation_disqualified: local identity or compatibility did not qualify"

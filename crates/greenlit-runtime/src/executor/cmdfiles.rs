@@ -327,34 +327,3 @@ fn heredoc_delimiter(script: &str) -> String {
     }
     delimiter
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn paths_are_distinct_per_step() {
-        let a = CommandFilePaths::new("/greenlit/cmd", 0);
-        let b = CommandFilePaths::new("/greenlit/cmd", 1);
-        assert_ne!(a.dir, b.dir);
-        assert!(a.env.starts_with(&a.dir));
-        assert!(a.script.ends_with("/script"));
-    }
-
-    #[test]
-    fn delimiter_avoids_collision_with_script_lines() {
-        // A pathological script that contains a plausible delimiter still gets a
-        // non-colliding one.
-        let script = "line\nGREENLIT_SCRIPT_EOF_0\nmore";
-        let delimiter = heredoc_delimiter(script);
-        assert!(!script.lines().any(|line| line == delimiter));
-    }
-
-    #[test]
-    fn event_file_path_is_rooted_under_the_given_base() {
-        assert_eq!(
-            event_file_path("/greenlit/cmdfiles"),
-            "/greenlit/cmdfiles/event.json"
-        );
-    }
-}

@@ -1,8 +1,9 @@
-//! Stored-credential persistence for `litci auth`: the Linux kernel keyring
-//! first, falling back to a `0600` file under `~/.litci/` with a printed
-//! warning (`PHASE-3-actions.md` Auth: "store token + refresh token in the
-//! system keyring, fall back to a 0600 file under `~/.litci/` with a printed
-//! warning").
+//! Stored-credential persistence for `litci auth`.
+//!
+//! Phase 12 containment forbids serializing bearer or refresh tokens to disk.
+//! The Linux kernel persistent keyring is therefore the only credential
+//! backend. If it is unavailable, authentication fails with an actionable
+//! diagnostic rather than falling back to `~/.litci/auth.json`.
 //!
 //! # Keyring choice
 //!
@@ -26,37 +27,32 @@
 //! # `allow_keyring`
 //!
 //! Every entry point here takes an explicit `allow_keyring: bool` rather
-//! than reading an environment variable itself. Production call sites
-//! (`crate::auth`) always pass `true`; the compiled-binary integration tests
-//! (`crates/greenlit-app/tests/`) run through the real `litci` binary and so
-//! cannot inject a Rust-level `bool` — they instead set the internal
-//! `LITCI_TEST_NO_KEYRING` process-environment variable, which `main.rs`
-//! reads once at startup and threads down as this same `bool`. This module
-//! itself never touches that variable, so its own unit tests can force the
-//! file-only path with a plain function argument — no process-global
-//! `std::env::set_var` (which `#![forbid(unsafe_code)]` disallows in this
-//! crate as of Rust edition 2024) is needed anywhere. The reason to force
-//! file-only at all: the kernel keyring is scoped to the calling process's
-//! UID, not to `$HOME`, so it is not sandboxable the way the file fallback
-//! is — an integration test that let it run for real would read/write the
-//! *real* test-runner account's persistent keyring. The keyring code path
-//! itself is instead covered by a unit test below scoped to the `Thread`
-//! keyring identifier, which never touches persistent kernel state.
+//! than reading an environment variable itself. `crate::auth` owns the
+//! custom-cfg-only `LITCI_TEST_NO_KEYRING` switch used by portable
+//! compiled-CLI cases, while ordinary and release builds always enable
+//! keyring access. The dedicated credential capability target instead runs
+//! in an isolated Linux user and anonymous session-keyring boundary, selects
+//! a unique `litci-test:` description through the same custom cfg, exercises
+//! the persistent-ring path across separate processes, and unlinks that
+//! exact key before teardown.
 
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use linux_keyutils::{KeyRing, KeyRingIdentifier};
 use rustix::fs::{Mode, OFlags, openat};
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use linux_keyutils::{KeyRing, KeyRingIdentifier};
-
-const KEYRING_DESCRIPTION: &str = "litci-github-token";
+/// Production key description inside the current user's persistent keyring.
+#[cfg(not(litci_test_boundaries))]
+pub(crate) const DEFAULT_KEYRING_DESCRIPTION: &str = "litci-github-token";
 const AUTH_FILE_NAME: &str = "auth.json";
 /// A stored-token payload is a small JSON object; this bounds a corrupted or
-/// hostile file/keyring entry rather than reflecting an expected size.
-const MAX_STORED_BYTES: usize = 64 * 1024;
+/// hostile keyring entry rather than reflecting an expected size. Linux
+/// `user` keys accept at most 32,767 payload bytes.
+const MAX_STORED_BYTES: usize = 32_767;
 
 /// How a stored access token was obtained — governs whether a refresh
 /// attempt applies (device-flow only; PAT/`gh` tokens carry no refresh
@@ -89,16 +85,6 @@ pub(crate) struct StoredToken {
     pub(crate) source: TokenSource,
 }
 
-/// Which backend a save actually used, so the caller can print the
-/// fallback warning `PHASE-3-actions.md` requires.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoreBackend {
-    /// The kernel persistent keyring.
-    Keyring,
-    /// The `0600` file fallback.
-    File,
-}
-
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -119,47 +105,46 @@ pub(crate) fn is_expired(expires_at: u64) -> bool {
     now_unix().saturating_add(SAFETY_MARGIN_SECS) >= expires_at
 }
 
-/// Persists `token`, trying the kernel keyring first (when `allow_keyring`)
-/// and falling back to the `0600` file under `home/.litci/auth.json` on any
-/// keyring failure (disabled, missing kernel support, quota, etc.).
+/// Persists `token` in the kernel persistent keyring.
+///
+/// Plaintext disk fallback is forbidden. A legacy `~/.litci/auth.json`, an
+/// unavailable keyring, or an invalid credential payload fails closed with
+/// the action needed to recover.
 pub(crate) fn save(
     home: &Path,
     token: &StoredToken,
     allow_keyring: bool,
-) -> Result<StoreBackend, String> {
-    let payload = serde_json::to_vec(token)
-        .map_err(|error| format!("could not serialize the credential payload: {error}"))?;
-    if allow_keyring && save_to_keyring(&payload).is_ok() {
-        return Ok(StoreBackend::Keyring);
+    description: &str,
+) -> Result<(), String> {
+    validate_home(home)?;
+    validate_token(token)?;
+    ensure_legacy_file_absent(home)?;
+    let payload = serde_json::to_vec(token).map_err(|_| {
+        "could not encode the credential for the kernel keyring\n  fix: retry `litci auth`; if this persists, file a Greenlit defect"
+            .to_string()
+    })?;
+    if payload.len() > MAX_STORED_BYTES {
+        return Err(format!(
+            "the GitHub credential exceeds Greenlit's {MAX_STORED_BYTES}-byte keyring limit\n  fix: authenticate with a valid GitHub token, then retry"
+        ));
     }
-    save_to_file(home, &payload)?;
-    Ok(StoreBackend::File)
+    if !allow_keyring {
+        return Err(keyring_required_error());
+    }
+    save_to_keyring(description, &payload).map_err(|_| keyring_required_error())?;
+    Ok(())
 }
 
-/// Loads the currently stored token, trying the keyring (when
-/// `allow_keyring`) then the file. Returns `None` when neither backend
-/// holds a (valid) entry — the caller treats this identically to "never
-/// authenticated".
-pub(crate) fn load(home: &Path, allow_keyring: bool) -> Option<StoredToken> {
-    if allow_keyring && let Some(token) = load_from_keyring() {
-        return Some(token);
+/// Loads the currently stored token from the kernel persistent keyring.
+///
+/// Returns `None` when keyring use is disabled or unavailable, the keyring
+/// payload is invalid, `home` is unsafe, or a legacy plaintext credential
+/// file exists. Callers already map this state to re-running `litci auth`.
+pub(crate) fn load(home: &Path, allow_keyring: bool, description: &str) -> Option<StoredToken> {
+    if !allow_keyring || !home.is_absolute() || ensure_legacy_file_absent(home).is_err() {
+        return None;
     }
-    load_from_file(home)
-}
-
-/// Removes any stored token from every backend this module writes to,
-/// leaving the caller effectively unauthenticated. Used by `litci auth` to
-/// replace a stale credential outright rather than potentially leaving both
-/// an old keyring entry and a new file (or vice versa) simultaneously
-/// resolvable.
-pub(crate) fn clear(home: &Path, allow_keyring: bool) {
-    if allow_keyring
-        && let Ok(ring) = persistent_ring()
-        && let Ok(key) = ring.search(KEYRING_DESCRIPTION)
-    {
-        let _ = key.invalidate();
-    }
-    let _ = std::fs::remove_file(auth_file_path(home));
+    load_from_keyring(description)
 }
 
 fn persistent_ring() -> Result<KeyRing, linux_keyutils::KeyError> {
@@ -170,170 +155,84 @@ fn persistent_ring() -> Result<KeyRing, linux_keyutils::KeyError> {
     KeyRing::get_persistent(KeyRingIdentifier::Session)
 }
 
-fn save_to_keyring(payload: &[u8]) -> Result<(), linux_keyutils::KeyError> {
+fn save_to_keyring(description: &str, payload: &[u8]) -> Result<(), linux_keyutils::KeyError> {
     let ring = persistent_ring()?;
-    ring.add_key(KEYRING_DESCRIPTION, payload)?;
+    ring.add_key(description, payload)?;
     Ok(())
 }
 
-fn load_from_keyring() -> Option<StoredToken> {
+fn load_from_keyring(description: &str) -> Option<StoredToken> {
     let ring = persistent_ring().ok()?;
-    let key = ring.search(KEYRING_DESCRIPTION).ok()?;
+    let key = ring.search(description).ok()?;
     let bytes = key.read_to_vec().ok()?;
     if bytes.len() > MAX_STORED_BYTES {
         return None;
     }
-    serde_json::from_slice(&bytes).ok()
+    let token: StoredToken = serde_json::from_slice(&bytes).ok()?;
+    validate_token(&token).ok()?;
+    Some(token)
 }
 
-fn auth_file_path(home: &Path) -> PathBuf {
-    home.join(".litci").join(AUTH_FILE_NAME)
+fn validate_home(home: &Path) -> Result<(), String> {
+    if home.is_absolute() {
+        Ok(())
+    } else {
+        Err(
+            "could not use the credential keyring because HOME is not absolute\n  fix: set HOME to an absolute directory, then retry `litci auth`"
+                .to_string(),
+        )
+    }
 }
 
-fn save_to_file(home: &Path, payload: &[u8]) -> Result<(), String> {
-    let home_dir = std::fs::File::open(home)
-        .map_err(|error| format!("could not open home directory {}: {error}", home.display()))?;
-    let litci_dir = match openat(
-        &home_dir,
-        ".litci",
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
-        Mode::empty(),
-    ) {
-        Ok(fd) => std::fs::File::from(fd),
-        Err(Errno::NOENT) => {
-            rustix::fs::mkdirat(&home_dir, ".litci", Mode::RUSR | Mode::WUSR | Mode::XUSR)
-                .map_err(|error| format!("could not create ~/.litci: {error}"))?;
-            let fd = openat(
-                &home_dir,
-                ".litci",
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
-            .map_err(|error| format!("could not open ~/.litci after creating it: {error}"))?;
-            std::fs::File::from(fd)
-        }
-        Err(error) => return Err(format!("could not open ~/.litci: {error}")),
+fn validate_token(token: &StoredToken) -> Result<(), String> {
+    if token.access_token.is_empty() || token.refresh_token.as_ref().is_some_and(String::is_empty) {
+        return Err(
+            "could not store an empty GitHub credential\n  fix: authenticate with a valid GitHub token, then retry"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_legacy_file_absent(home: &Path) -> Result<(), String> {
+    let Some(state_dir) = open_state_dir(home)? else {
+        return Ok(());
     };
-    let mode = Mode::RUSR | Mode::WUSR;
-    let fd = openat(
-        &litci_dir,
-        AUTH_FILE_NAME,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        mode,
-    )
-    .map_err(|error| format!("could not open ~/.litci/{AUTH_FILE_NAME}: {error}"))?;
-    let mut file = std::fs::File::from(fd);
-    // `O_CREAT` alone does not tighten an already-existing file's mode, so
-    // fix it explicitly every save (belt-and-suspenders: `$HOME` is a
-    // trusted, single-user directory, but the credential file itself must
-    // never be group/other-readable regardless of prior contents).
-    rustix::fs::fchmod(&file, mode).ok();
-    use std::io::Write;
-    file.write_all(payload)
-        .map_err(|error| format!("could not write ~/.litci/{AUTH_FILE_NAME}: {error}"))
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    match openat(&state_dir, AUTH_FILE_NAME, flags, Mode::empty()) {
+        Err(Errno::NOENT) => Ok(()),
+        Ok(_) | Err(Errno::LOOP | Errno::NOTDIR) => Err(
+            "Greenlit refused the legacy plaintext credential at ~/.litci/auth.json\n  fix: remove ~/.litci/auth.json, then run `litci auth` to store the credential in the kernel keyring"
+                .to_string(),
+        ),
+        Err(_) => Err(
+            "Greenlit could not safely inspect the legacy credential path ~/.litci/auth.json\n  fix: repair permissions on ~/.litci, remove auth.json, then run `litci auth`"
+                .to_string(),
+        ),
+    }
 }
 
-fn load_from_file(home: &Path) -> Option<StoredToken> {
-    let home_dir = std::fs::File::open(home).ok()?;
-    let litci_dir = openat(
-        &home_dir,
-        ".litci",
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
-    let litci_dir = std::fs::File::from(litci_dir);
-    let fd = openat(
-        &litci_dir,
-        AUTH_FILE_NAME,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
-    let mut file = std::fs::File::from(fd);
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_STORED_BYTES as u64 {
-        return None;
+fn open_state_dir(home: &Path) -> Result<Option<File>, String> {
+    let home_dir = File::open(home).map_err(|_| {
+        "Greenlit could not safely inspect HOME for legacy credentials\n  fix: repair HOME permissions, then retry `litci auth`"
+            .to_string()
+    })?;
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+    match openat(&home_dir, ".litci", flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP | Errno::NOTDIR) => Err(
+            "Greenlit refused an unsafe ~/.litci path while checking legacy credentials\n  fix: replace ~/.litci with a user-owned directory, then retry `litci auth`"
+                .to_string(),
+        ),
+        Err(_) => Err(
+            "Greenlit could not safely inspect ~/.litci for legacy credentials\n  fix: repair ~/.litci permissions, then retry `litci auth`"
+                .to_string(),
+        ),
     }
-    use std::io::Read;
-    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
-    file.read_to_end(&mut bytes).ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample(source: TokenSource) -> StoredToken {
-        StoredToken {
-            access_token: "ghu_example".to_string(),
-            refresh_token: Some("ghr_example".to_string()),
-            access_token_expires_at: Some(expires_in(28_800)),
-            refresh_token_expires_at: Some(expires_in(15_897_600)),
-            source,
-        }
-    }
-
-    #[test]
-    fn file_backend_round_trips_and_is_mode_0600() {
-        let home = tempfile::tempdir().expect("tempdir");
-        let token = sample(TokenSource::Pat);
-        let backend = save(home.path(), &token, false).expect("save");
-        assert_eq!(backend, StoreBackend::File);
-
-        let loaded = load(home.path(), false).expect("load");
-        assert_eq!(loaded, token);
-
-        let metadata = std::fs::metadata(home.path().join(".litci").join(AUTH_FILE_NAME))
-            .expect("stat auth file");
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn missing_store_loads_as_none() {
-        let home = tempfile::tempdir().expect("tempdir");
-        assert!(load(home.path(), false).is_none());
-    }
-
-    #[test]
-    fn clear_removes_the_file_backend() {
-        let home = tempfile::tempdir().expect("tempdir");
-        save(home.path(), &sample(TokenSource::Gh), false).expect("save");
-        clear(home.path(), false);
-        assert!(load(home.path(), false).is_none());
-    }
-
-    #[test]
-    fn expiry_math_has_a_safety_margin() {
-        assert!(is_expired(now_unix()));
-        assert!(is_expired(now_unix() + 30));
-        assert!(!is_expired(now_unix() + 3600));
-    }
-
-    /// Exercises the real kernel-keyring syscalls this module drives
-    /// (`TESTING.md`: "Mock only true externals"; the kernel keyring is one),
-    /// scoped to the calling *thread's* private keyring rather than the
-    /// per-UID persistent one `save`/`load` use in production — `Thread` is
-    /// never linked into any session and is destroyed with the thread, so
-    /// this can never leak into or collide with a real `litci auth` session
-    /// on the machine running the test.
-    #[test]
-    fn kernel_keyring_add_and_search_round_trip_on_a_thread_scoped_ring() {
-        let ring = match KeyRing::from_special_id(KeyRingIdentifier::Thread, true) {
-            Ok(ring) => ring,
-            // A kernel without keyring support (or a sandboxed CI runner
-            // that denies the syscall) cannot exercise this boundary; the
-            // production fallback for exactly this case is the file store,
-            // covered above.
-            Err(_) => return,
-        };
-        let payload = b"thread-scoped-roundtrip-probe";
-        ring.add_key("litci-test-probe", payload)
-            .expect("add_key on thread ring");
-        let key = ring.search("litci-test-probe").expect("search thread ring");
-        let read_back = key.read_to_vec().expect("read_to_vec");
-        assert_eq!(read_back, payload);
-    }
+fn keyring_required_error() -> String {
+    "Greenlit could not store the GitHub credential because the Linux kernel persistent keyring is unavailable\n  fix: enable kernel keyring support for this user, then retry `litci auth`; plaintext credential files are disabled"
+        .to_string()
 }

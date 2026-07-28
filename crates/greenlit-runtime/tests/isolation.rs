@@ -14,16 +14,21 @@
 //! tmpfs-upper container the mount needs), and the strategy decision itself is
 //! covered by `greenlit-init`'s decision unit tests.
 
-mod dockerkit;
+#[path = "dockerkit/engine.rs"]
+mod engine_support;
+#[path = "dockerkit/repo.rs"]
+mod repo_support;
+#[path = "dockerkit/sink.rs"]
+mod sink_support;
 
 use greenlit_runtime::engine::{BindMount, ContainerEngine, ContainerSpec, ExecSpec};
 use greenlit_runtime::isolation::CONTAINER_LOWER;
 use greenlit_runtime::progress::ProgressNull;
 use greenlit_runtime::{UbuntuRelease, ensure_base_image};
 
-use dockerkit::{
-    CollectSink, engine_if_reachable, notice_no_daemon, seed_repo, tree_fingerprint, unique_suffix,
-};
+use engine_support::{required_engine, unique_suffix};
+use repo_support::{seed_repo, tree_fingerprint};
+use sink_support::CollectSink;
 
 /// The marker `greenlit-init` prints to stderr on the copy-in fallback
 /// (`greenlit_init::FALLBACK_MARKER`; that crate is not a dependency here, so
@@ -35,10 +40,7 @@ const WORKSPACE: &str = "/workspace";
 
 #[tokio::test]
 async fn overlay_isolation_protects_the_host_across_strategies() {
-    let Some(engine) = engine_if_reachable().await else {
-        notice_no_daemon("overlay_isolation_protects_the_host_across_strategies");
-        return;
-    };
+    let engine = required_engine("overlay_isolation_protects_the_host_across_strategies").await;
 
     let tag = ensure_base_image(&engine, UbuntuRelease::Noble2404, &mut ProgressNull)
         .await
@@ -233,5 +235,9 @@ async fn init_exec(
         ..ExecSpec::default()
     };
     let out = engine.exec(id, &spec, &mut sink).await?;
-    Ok((sink.out(), sink.err(), out.exit_code))
+    Ok((
+        sink.out(),
+        String::from_utf8_lossy(&sink.stderr).into_owned(),
+        out.exit_code,
+    ))
 }

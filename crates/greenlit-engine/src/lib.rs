@@ -46,6 +46,7 @@ pub mod plan;
 pub mod planned;
 pub mod runner;
 pub mod source;
+pub mod stabilization;
 
 mod convert;
 mod json_shape;
@@ -57,8 +58,8 @@ pub use event::{EventError, EventKind, SyntheticEvent, build_synthetic_event};
 pub use evidence::{
     Assurance, Compatibility, ExecutionConclusion, ExecutionResultV1, FeatureFinding,
     FindingDisposition, GithubEvidenceV1, GithubJobEvidenceV1, GithubStepEvidenceV1, JobLockV1,
-    LockedSource, ResultEvidence, RunLockV1, RunnerLockV1, SupportReport, TraceEventV1,
-    opaque_revision,
+    LockedSource, ResultEvidence, RunLockV1, RunnerLockV1, SUPPORT_CERTIFICATION_WITNESS,
+    SupportReport, TraceEventV1, opaque_revision,
 };
 pub use execution::{Conclusion, StepExit, StepInvocation, StepResult};
 pub use git::GitError;
@@ -82,3 +83,12 @@ pub use runner::{
     resolve_runner_label,
 };
 pub use source::{SourceEntry, SourceEntryKind, SourceSnapshot, SourceSnapshotError};
+pub use stabilization::{
+    CAPABILITY_ACTION_USES, CAPABILITY_CREDENTIAL_GITHUB, CAPABILITY_EVIDENCE_INTEGRITY,
+    CAPABILITY_EXECUTION_SHELL, CAPABILITY_INFRASTRUCTURE_DIND, CAPABILITY_REACHABILITY_AMBIGUOUS,
+    CAPABILITY_SECRET_CONTEXT, CAPABILITY_SECURITY_BOUNDARY, CAPABILITY_SERVICE_CONTAINER,
+    CAPABILITY_SOURCE_CONTAINMENT, CAPABILITY_SOURCE_WRITE_BACK, CAPABILITY_VARIABLE_REMOTE,
+    CapabilityCertification, CapabilityClass, CapabilityFinding, CertificationState, Forceability,
+    QuarantineDecision, QuarantineOutcome, ResolvedCapabilityFinding, capability_certification,
+    capability_certifications, decide_capability_quarantine,
+};

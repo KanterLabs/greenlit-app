@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use greenlit_engine::FindingDisposition;
+
 pub(super) const VERSION: u32 = 1;
 
 /// One stable journal record.
@@ -88,6 +90,12 @@ pub(crate) enum RunEvent {
         store: String,
         hits: u64,
         misses: u64,
+    },
+    CompatibilityFinding {
+        code: String,
+        disposition: FindingDisposition,
+        scope: String,
+        reason: String,
     },
     RunFinished {
         conclusion: String,

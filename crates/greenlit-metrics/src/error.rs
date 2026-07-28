@@ -60,6 +60,19 @@ pub enum MetricsError {
         path: PathBuf,
     },
 
+    /// A writable metrics directory or file grants access to group or other
+    /// users. Greenlit refuses to append rather than silently trusting or
+    /// repairing a path it did not create.
+    #[error(
+        "metrics path component {path} has unsafe mode {mode:#05o} — restrict the directory to 0700 or the file to 0600, then retry"
+    )]
+    UnsafePermissions {
+        /// The path whose permission bits are too broad.
+        path: PathBuf,
+        /// The observed Unix permission bits.
+        mode: u32,
+    },
+
     /// Acquiring the cross-process lock that serializes append/repair and
     /// excludes readers during mutation failed.
     #[error("failed to lock metrics file {path}: {source}")]

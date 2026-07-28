@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Check or execute the exact nonzero portable Cargo test inventory."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from cargo_test_manifest import GateError
+from portable_manifest.gate import check
+from portable_manifest.selftest import self_test_negative
+
+
+DEFAULT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MANIFEST = Path(__file__).with_name("portable-test-manifest.json")
+
+
+def parse_arguments() -> tuple[Path, Path, bool] | None:
+    """Parse the deliberately filter-free public command surface."""
+
+    if sys.argv[1:] == ["--self-test-negative"]:
+        return None
+    root = DEFAULT_ROOT
+    manifest = DEFAULT_MANIFEST
+    execute = False
+    arguments = sys.argv[1:]
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--run":
+            execute = True
+            index += 1
+        elif argument in {"--repository-root", "--manifest"}:
+            if index + 1 >= len(arguments):
+                raise GateError(f"{argument} requires a path")
+            value = Path(arguments[index + 1]).resolve()
+            if argument == "--repository-root":
+                root = value
+            else:
+                manifest = value
+            index += 2
+        else:
+            raise GateError(f"unknown argument {argument!r}")
+    if not root.is_dir():
+        raise GateError(f"repository root is not a directory: {root}")
+    return root, manifest, execute
+
+
+def main() -> int:
+    """Dispatch check-only, whole-inventory run, or negative self-test."""
+
+    try:
+        parsed = parse_arguments()
+        if parsed is None:
+            return self_test_negative()
+        root, manifest, execute = parsed
+        targets, selected = check(root, manifest, execute=execute)
+    except GateError as error:
+        print(f"portable test manifest gate failed: {error}", file=sys.stderr)
+        return 1
+    action = "run" if execute else "gate"
+    print(
+        f"portable test manifest {action} passed: {targets} targets, "
+        f"{selected} selected tests"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

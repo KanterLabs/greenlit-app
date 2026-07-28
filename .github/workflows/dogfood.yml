@@ -1,11 +1,10 @@
 name: dogfood
-# The repo's own gates run under litci itself (TESTING.md dogfood clause;
-# PHASE-2-execution.md exit criterion 7). Shell-only because Phase 2 cannot
-# execute ci.yml's `uses:` steps; from Phase 3, litci runs ci.yml directly.
-# GitHub never auto-runs this (workflow_dispatch; no checkout step here).
-#   invoke: litci run -W .github/workflows/dogfood.yml -e workflow_dispatch
-# Omitted TESTING.md gates: cargo deny (needs a prebuilt binary), cargo doc
-# and benches (cold-container cost without guard value) — ci.yml runs all.
+# The repo's complete portable TESTING.md pipeline runs under the release-built
+# litci binary. Docker/provider/whole-run performance gates remain in their
+# explicit capability-owning jobs in ci.yml. GitHub never auto-runs this
+# shell-only workflow.
+#   invoke: litci run -W .github/workflows/dogfood.yml \
+#             -e workflow_dispatch --allow-degraded
 on: workflow_dispatch
 
 env:
@@ -19,7 +18,8 @@ jobs:
   gates:
     runs-on: homelab-heavy
     container:
-      image: rust:1.96.0 # matches rust-toolchain.toml channel
+      # Matches rust-toolchain.toml and is immutable across both executors.
+      image: rust@sha256:58fe97504a0e4cbba5d85599619a589923d3e779472a6fb0840d58d1c4ba99d7
     defaults:
       run:
         shell: bash # job containers default to sh -e {0}
@@ -33,12 +33,42 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         timeout-minutes: 45
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Install pinned cargo-deny
+        timeout-minutes: 20
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Dependency policy
+        run: cargo deny check
       - name: Stub registry consistency
         run: |
           command -v python3 >/dev/null || { apt-get update && apt-get install -y --no-install-recommends python3; }
           python3 tools/check-stubs
+      - name: Stabilization ledger consistency
+        run: |
+          python3 tools/check-stabilization-ledger
+          python3 tools/check-stabilization-ledger --self-test-negative
+      - name: Test authority
+        run: |
+          python3 tools/check-test-authority
+          python3 tools/check-test-authority --self-test-negative
+      - name: Capability target command manifest
+        run: |
+          python3 tools/tests/check-portable-test-manifest
+          python3 tools/tests/check-portable-test-manifest --self-test-negative
+          python3 tools/tests/check-capability-test-manifest
+          python3 tools/tests/check-capability-test-manifest --self-test-negative
+      - name: Parity comparator contract
+        run: |
+          python3 tools/compare-parity --self-test
+          python3 tools/tests/check-parity-producer
       - name: Test
         timeout-minutes: 45
-        # Daemon-gated tests self-skip: no docker socket in the container, by invariant.
-        run: cargo test --workspace
+        run: python3 tools/tests/check-portable-test-manifest --run
+      - name: Docs (warnings denied)
+        timeout-minutes: 45
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps
+      - name: Criterion benchmark manifest
+        timeout-minutes: 45
+        run: python3 tools/tests/check-criterion-manifest

@@ -86,26 +86,3 @@ impl PostChain {
         entries
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(label: &str) -> PostEntry {
-        PostEntry {
-            label: label.to_string(),
-            action: PostAction::Checkout(CheckoutPost::Noop),
-        }
-    }
-
-    #[test]
-    fn drains_in_reverse_push_order() {
-        let mut chain = PostChain::default();
-        chain.push(entry("first"));
-        chain.push(entry("second"));
-        chain.push(entry("third"));
-        let drained: Vec<String> = chain.drain_reverse().into_iter().map(|e| e.label).collect();
-        assert_eq!(drained, vec!["third", "second", "first"]);
-        assert!(chain.drain_reverse().is_empty(), "chain is consumed");
-    }
-}

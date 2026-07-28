@@ -1,6 +1,7 @@
 //! Component-safe opening of the local metrics directory and NDJSON file.
 
 use std::fs::File;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::Path;
 
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
@@ -34,15 +35,34 @@ impl MetricsStore {
             openat(&directory, "runs.ndjson", flags, Mode::RUSR | Mode::WUSR)
         } else {
             if let Some(parent) = self.file_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| MetricsError::CreateDir {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                builder
+                    .create(parent)
+                    .map_err(|source| MetricsError::CreateDir {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?;
+                reject_broad_mode(
+                    parent,
+                    &std::fs::metadata(parent).map_err(|source| MetricsError::ReadFile {
+                        path: parent.to_path_buf(),
+                        source,
+                    })?,
+                )?;
             }
             open(&self.file_path, flags, Mode::RUSR | Mode::WUSR)
         }
         .map_err(|source| self.open_write_error(source))?;
-        self.regular_file(File::from(fd))
+        let file = self.regular_file(File::from(fd))?;
+        reject_broad_mode(
+            &self.file_path,
+            &file.metadata().map_err(|source| MetricsError::ReadFile {
+                path: self.file_path.clone(),
+                source,
+            })?,
+        )?;
+        Ok(file)
     }
 
     pub(super) fn open_for_read(&self) -> Result<Option<File>, MetricsError> {
@@ -81,6 +101,13 @@ impl MetricsStore {
         let Some(litci) = open_directory_component(home, home_path, ".litci", create)? else {
             return Ok(None);
         };
+        reject_broad_mode(
+            &home_path.join(".litci"),
+            &litci.metadata().map_err(|source| MetricsError::ReadFile {
+                path: home_path.join(".litci"),
+                source,
+            })?,
+        )?;
         open_directory_component(&litci, &home_path.join(".litci"), "metrics", create)
     }
 
@@ -122,7 +149,17 @@ fn open_directory_component(
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
     loop {
         match openat(parent, name, flags, Mode::empty()) {
-            Ok(fd) => return Ok(Some(File::from(fd))),
+            Ok(fd) => {
+                let file = File::from(fd);
+                reject_broad_mode(
+                    &parent_path.join(name),
+                    &file.metadata().map_err(|source| MetricsError::ReadFile {
+                        path: parent_path.join(name),
+                        source,
+                    })?,
+                )?;
+                return Ok(Some(file));
+            }
             Err(Errno::NOENT) if !create => return Ok(None),
             Err(Errno::NOENT) => {
                 let path = parent_path.join(name);
@@ -148,5 +185,17 @@ fn open_directory_component(
                 });
             }
         }
+    }
+}
+
+fn reject_broad_mode(path: &Path, metadata: &std::fs::Metadata) -> Result<(), MetricsError> {
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o077 == 0 {
+        Ok(())
+    } else {
+        Err(MetricsError::UnsafePermissions {
+            path: path.to_path_buf(),
+            mode,
+        })
     }
 }

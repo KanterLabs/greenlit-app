@@ -1,13 +1,254 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${GH_TOKEN+x}" || -n "${GITHUB_TOKEN+x}" \
+  || -n "${GH_ENTERPRISE_TOKEN+x}" || -n "${GITHUB_ENTERPRISE_TOKEN+x}" \
+  || -n "${GREENLIT_RELEASE_CREDENTIAL_FD+x}" ]]; then
+  echo "release-check is tokenless; live parity uses the isolated credential launcher" >&2
+  exit 1
+fi
+if [[ "$#" -ne 1 || ( "$1" != prepare && "$1" != finalize ) ]]; then
+  echo "usage: tools/release-check {prepare|finalize}" >&2
+  exit 1
+fi
+stage="$1"
+
+repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+cd "$repository_root"
+export PYTHONDONTWRITEBYTECODE=1
+
+source_commit="${GREENLIT_BUILD_COMMIT:-}"
+if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "GREENLIT_BUILD_COMMIT must be the exact 40-character release source commit" >&2
+  exit 1
+fi
+if [[ "$(/usr/bin/git rev-parse --verify HEAD^{commit})" != "$source_commit" ]]; then
+  echo "GREENLIT_BUILD_COMMIT does not match the checked-out release source" >&2
+  exit 1
+fi
+if [[ -n "$(/usr/bin/git status --porcelain=v1 --untracked-files=all --ignored=matching)" ]]; then
+  echo "release verification requires a pristine tracked-only source checkout" >&2
+  exit 1
+fi
+if /usr/bin/git config --local --get-regexp \
+  '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
+  >/dev/null 2>&1; then
+  echo "release checkout retains a Git credential helper or authorization header" >&2
+  exit 1
+fi
+
+finalize_unpack_root=""
+finalize_candidate_parent=""
+finalize_retain_outputs=0
+cleanup_finalize() {
+  local failed=0
+  if [[ "$finalize_retain_outputs" -eq 0 \
+    && -n "$finalize_candidate_parent" \
+    && -d "$finalize_candidate_parent" ]]; then
+    find "$finalize_candidate_parent" -xdev -depth -delete || failed=1
+  fi
+  if [[ -n "$finalize_unpack_root" && -d "$finalize_unpack_root" ]]; then
+    find "$finalize_unpack_root" -xdev -depth -delete || failed=1
+  fi
+  return "$failed"
+}
+
+finalize_release() {
+  local prepared_bundle="${GREENLIT_PREPARED_BUNDLE:-}"
+  local prepared_sha="${GREENLIT_PREPARED_SHA256:-}"
+  local local_bundle="${GREENLIT_LOCAL_BUNDLE:-}"
+  local local_sha="${GREENLIT_LOCAL_SHA256:-}"
+  local github_bundle="${GREENLIT_GITHUB_BUNDLE:-}"
+  local github_sha="${GREENLIT_GITHUB_SHA256:-}"
+  local temporary_parent="${RUNNER_TEMP:-/tmp}"
+  local candidate_parent="$repository_root/target"
+  local candidate_root="$candidate_parent/release-candidate"
+  local parity_root="$candidate_parent/parity-evidence"
+  local unpack_root candidate_staging parity_staging
+  if [[ ! "$prepared_bundle" = /* || ! -f "$prepared_bundle" || -L "$prepared_bundle" \
+    || ! "$local_bundle" = /* || ! -f "$local_bundle" || -L "$local_bundle" \
+    || ! "$github_bundle" = /* || ! -f "$github_bundle" || -L "$github_bundle" \
+    || ! "$prepared_sha" =~ ^[0-9a-f]{64}$ \
+    || ! "$local_sha" =~ ^[0-9a-f]{64}$ \
+    || ! "$github_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "finalization requires exact prepared, local, and GitHub bundle identities" >&2
+    exit 1
+  fi
+  if [[ ! -d "$temporary_parent" || -L "$temporary_parent" \
+    || -e "$candidate_parent" || -L "$candidate_parent" ]]; then
+    echo "finalization requires a real temporary directory and no prior target output" >&2
+    exit 1
+  fi
+  unpack_root="$(mktemp -d "$temporary_parent/greenlit-release-finalize.XXXXXX")"
+  chmod 0700 "$unpack_root"
+  finalize_unpack_root="$unpack_root"
+  finalize_candidate_parent="$candidate_parent"
+  finalize_retain_outputs=0
+  candidate_staging="$unpack_root/prepared/candidate"
+  parity_staging="$unpack_root/local/parity"
+  trap 'status=$?; trap - EXIT; cleanup_finalize || exit 1; exit "$status"' EXIT
+  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+    unpack-prepared \
+    --bundle "$prepared_bundle" \
+    --output-root "$unpack_root/prepared" \
+    --expected-sha256 "$prepared_sha" \
+    --expected-source "$source_commit"
+  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+    unpack-local \
+    --bundle "$local_bundle" \
+    --output-root "$unpack_root/local" \
+    --expected-sha256 "$local_sha" \
+    --expected-source "$source_commit"
+  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+    unpack-github \
+    --bundle "$github_bundle" \
+    --output-root "$unpack_root/github" \
+    --expected-sha256 "$github_sha" \
+    --expected-source "$source_commit"
+  /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+    verify-binary-match \
+    --prepared-binary "$candidate_staging/target/release/litci" \
+    --local-binary "$unpack_root/local/binary/litci"
+  mv -- "$unpack_root/github/parity/seed-github-actions.json" "$parity_staging/"
+  mv -- \
+    "$unpack_root/github/parity/captures/shell-only-seed-github-actions.json" \
+    "$parity_staging/captures/"
+  tools/check-live-parity compare \
+    --repository-root "$repository_root" \
+    --greenlit-binary "$candidate_staging/target/release/litci" \
+    --output-root "$parity_staging"
+  tools/release-provenance create \
+    --repository-root "$repository_root" \
+    --candidate-root "$candidate_staging" \
+    --parity-root "$parity_staging" \
+    --expected-source "$source_commit"
+  tools/release-provenance verify \
+    --repository-root "$repository_root" \
+    --candidate-root "$candidate_staging" \
+    --parity-root "$parity_staging" \
+    --expected-source "$source_commit"
+  install -d -m 0755 "$candidate_parent"
+  mv -- "$candidate_staging" "$candidate_root"
+  mv -- "$parity_staging" "$parity_root"
+  finalize_retain_outputs=1
+  cleanup_finalize
+  trap - EXIT
+  echo "verified release candidate: $candidate_root"
+  echo "retained live parity evidence: $parity_root"
+}
+
+if [[ "$stage" == finalize ]]; then
+  finalize_release
+  exit 0
+fi
+
+candidate_parent="$repository_root/target"
+if [[ -L "$candidate_parent" || ( -e "$candidate_parent" && ! -d "$candidate_parent" ) ]]; then
+  echo "$candidate_parent must be one real directory" >&2
+  exit 1
+fi
+mkdir -p "$candidate_parent"
+
+if [[ ! -f Cargo.lock || -L Cargo.lock ]]; then
+  echo "Cargo.lock must be a regular checked-in file" >&2
+  exit 1
+fi
+cargo_lock_checksum="$(sha256sum -- Cargo.lock)"
+assert_cargo_lock_unchanged() {
+  local current_checksum
+  current_checksum="$(sha256sum -- Cargo.lock)"
+  if [[ "$current_checksum" != "$cargo_lock_checksum" ]]; then
+    echo "release preparation mutated Cargo.lock" >&2
+    exit 1
+  fi
+}
+
+temporary_parent="${RUNNER_TEMP:-/tmp}"
+if [[ ! -d "$temporary_parent" || -L "$temporary_parent" ]]; then
+  echo "release temporary parent is not a real directory: $temporary_parent" >&2
+  exit 1
+fi
+release_work_root="$(mktemp -d "$temporary_parent/greenlit-release.XXXXXX")"
+prepared_staging=""
+cleanup_prepare() {
+  local failed=0
+  if [[ -n "$prepared_staging" && -d "$prepared_staging" ]]; then
+    find "$prepared_staging" -xdev -depth -delete || failed=1
+  fi
+  find "$release_work_root" -xdev -depth -delete || failed=1
+  return "$failed"
+}
+trap 'status=$?; trap - EXIT; cleanup_prepare || exit 1; exit "$status"' EXIT
+
+export CARGO_TARGET_DIR="$release_work_root/build-target"
+unset RUSTC RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER RUSTFLAGS
+unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET
+
+tools/tests/check-release-transfer-bundles
+tools/tests/check-release-provenance-temp
+cargo fetch --locked
+cargo deny fetch
+export CARGO_NET_OFFLINE=true
+
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-cargo build --release -p greenlit-app
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo deny --frozen check
+python3 tools/check-stubs
+python3 tools/check-stabilization-ledger
+python3 tools/check-stabilization-ledger --self-test-negative
+tools/check-test-authority
+tools/check-test-authority --self-test-negative
+tools/tests/check-portable-test-manifest
+tools/tests/check-portable-test-manifest --self-test-negative
+tools/tests/check-capability-test-manifest
+tools/tests/check-capability-test-manifest --self-test-negative
+tools/tests/check-parity-producer
+tools/compare-parity --self-test
+tools/tests/check-portable-test-manifest --run
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
+tools/tests/check-criterion-manifest
 
-find target/package -maxdepth 1 -type f -name 'greenlit-*.crate' -delete 2>/dev/null || true
-cargo package --workspace --exclude greenlit-init --no-verify
+cargo build --locked --release -p greenlit-app --bin litci
+release_binary="$CARGO_TARGET_DIR/release/litci"
+if [[ ! -x "$release_binary" || -L "$release_binary" ]]; then
+  echo "release build did not produce one regular executable litci" >&2
+  exit 1
+fi
 
-sha256sum target/release/litci target/package/*.crate > SHA256SUMS
+package_target="$release_work_root/package-target"
+mkdir -m 0700 "$package_target"
+CARGO_TARGET_DIR="$package_target" \
+  cargo package --locked --offline --workspace --exclude greenlit-init
+shopt -s nullglob
+package_artifacts=("$package_target/package"/greenlit-*.crate)
+shopt -u nullglob
+if [[ "${#package_artifacts[@]}" -ne 8 ]]; then
+  echo "verified packaging produced ${#package_artifacts[@]} artifacts instead of 8" >&2
+  exit 1
+fi
+
+prepared_bundle="$candidate_parent/release-prepared.tar"
+if [[ -e "$prepared_bundle" || -L "$prepared_bundle" ]]; then
+  echo "$prepared_bundle already exists; remove it before retrying" >&2
+  exit 1
+fi
+prepared_staging="$(mktemp -d "$candidate_parent/.release-prepared.XXXXXX")"
+install -d -m 0755 \
+  "$prepared_staging/candidate/target/release" \
+  "$prepared_staging/candidate/target/package"
+install -m 0755 -- "$release_binary" \
+  "$prepared_staging/candidate/target/release/litci"
+for artifact in "${package_artifacts[@]}"; do
+  install -m 0644 -- "$artifact" \
+    "$prepared_staging/candidate/target/package/"
+done
+/usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+  pack-prepared \
+  --input-root "$prepared_staging" \
+  --output "$prepared_bundle" \
+  --expected-source "$source_commit"
+assert_cargo_lock_unchanged
+prepared_staging=""
+cleanup_prepare
+trap - EXIT
+echo "sealed tokenless release preparation: $prepared_bundle"

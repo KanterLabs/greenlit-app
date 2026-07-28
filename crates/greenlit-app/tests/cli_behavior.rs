@@ -22,8 +22,6 @@ mod github_confirmation;
 mod inspect;
 #[path = "cli_behavior/logs.rs"]
 mod logs;
-#[path = "cli_behavior/policy_modes.rs"]
-mod policy_modes;
 #[path = "cli_behavior/repository.rs"]
 mod repository;
 #[path = "cli_behavior/run_preflight.rs"]
@@ -32,3 +30,21 @@ mod run_preflight;
 mod secrets;
 #[path = "cli_behavior/variables_remote.rs"]
 mod variables_remote;
+
+#[test]
+fn version_binds_the_compiled_source_identity_on_one_exact_line() {
+    let sandbox = support::Sandbox::new();
+    let output = sandbox.run(&["--version"]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        support::stdout_text(&output),
+        concat!(
+            "litci ",
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("GREENLIT_BUILD_COMMIT"),
+            ")\n"
+        )
+    );
+    assert!(output.stderr.is_empty());
+}

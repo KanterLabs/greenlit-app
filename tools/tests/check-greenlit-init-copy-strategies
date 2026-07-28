@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Force and verify Greenlit's real reflink and bounded-stream copy paths."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+IMAGE_BYTES = 256 * 1024 * 1024
+PAYLOAD = (b"greenlit-copy-strategy-gate\n" * 4096) + b"terminal\n"
+MARKER = "GREENLIT_INIT_COPY "
+
+
+class GateError(RuntimeError):
+    """An authoritative capability or behavior failure."""
+
+
+def require_command(name: str) -> None:
+    if shutil.which(name) is None:
+        raise GateError(f"required command is unavailable: {name}")
+
+
+def command(
+    args: list[str],
+    *,
+    capture: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE if capture else subprocess.PIPE,
+    )
+
+
+def bounded_output(value: str) -> str:
+    value = value.strip()
+    return value if len(value) <= 4096 else f"{value[:4096]}…"
+
+
+def parse_report(stderr: str) -> dict[str, int]:
+    lines = [line for line in stderr.splitlines() if line.startswith(MARKER)]
+    if len(lines) != 1:
+        raise GateError(
+            "greenlit-init did not emit exactly one measured copy report: "
+            f"{bounded_output(stderr)}"
+        )
+    fields: dict[str, int] = {}
+    for token in lines[0][len(MARKER) :].split():
+        key, separator, value = token.partition("=")
+        if not separator:
+            raise GateError(f"malformed copy report token: {token}")
+        if key in fields:
+            raise GateError(f"duplicate copy report field: {key}")
+        try:
+            fields[key] = int(value)
+        except ValueError as error:
+            raise GateError(f"non-integer copy report field {key}={value}") from error
+    return fields
+
+
+def verify_copy(
+    binary: Path,
+    mountpoint: Path,
+    policy: str,
+    expected_reflink: int,
+    expected_stream: int,
+) -> None:
+    workspace = mountpoint / f"workspace-{policy}"
+    upper = mountpoint / f"upper-{policy}"
+    result = subprocess.run(
+        [
+            str(binary),
+            "--lower",
+            str(mountpoint / "lower"),
+            "--upper",
+            str(upper),
+            "--workspace",
+            str(workspace),
+            "--strategy",
+            "copy-in",
+            "--file-copy",
+            policy,
+            "--",
+            "/bin/true",
+        ],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise GateError(
+            f"forced {policy} copy exited {result.returncode}: "
+            f"{bounded_output(result.stderr)}"
+        )
+    fields = parse_report(result.stderr)
+    expected = {
+        "v": 1,
+        "files": 1,
+        "bytes": len(PAYLOAD),
+        "reflink_files": expected_reflink,
+        "bounded_stream_files": expected_stream,
+    }
+    if fields != expected:
+        raise GateError(
+            f"forced {policy} copy reported {fields}, expected {expected}"
+        )
+    copied = workspace / "payload"
+    if copied.read_bytes() != PAYLOAD:
+        raise GateError(f"forced {policy} copy changed the payload bytes")
+    copied_mode = stat.S_IMODE(copied.stat().st_mode)
+    if copied_mode != 0o751:
+        raise GateError(
+            f"forced {policy} copy changed mode 0751 to {copied_mode:#06o}"
+        )
+
+
+def cleanup(
+    root: Path,
+    mountpoint: Path,
+    mounted: bool,
+    loop_device: str | None,
+) -> list[str]:
+    errors: list[str] = []
+    if mounted:
+        result = subprocess.run(
+            ["umount", str(mountpoint)],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            mounted = False
+        else:
+            errors.append(f"umount failed: {bounded_output(result.stderr)}")
+    if loop_device is not None and not mounted:
+        result = subprocess.run(
+            ["losetup", "--detach", loop_device],
+            check=False,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0:
+            loop_device = None
+        else:
+            errors.append(f"loop detach failed: {bounded_output(result.stderr)}")
+    if not mounted and loop_device is None:
+        try:
+            shutil.rmtree(root)
+        except OSError as error:
+            errors.append(f"temporary-tree removal failed: {error}")
+    return errors
+
+
+def run_gate(binary: Path) -> None:
+    if os.geteuid() != 0:
+        raise GateError(
+            "this gate requires root with CAP_SYS_ADMIN and loop-device access"
+        )
+    for name in ("losetup", "mkfs.btrfs", "mount", "umount"):
+        require_command(name)
+    binary = binary.resolve()
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise GateError(f"greenlit-init binary is not executable: {binary}")
+
+    root = Path(tempfile.mkdtemp(prefix="greenlit-copy-strategies-", dir="/var/tmp"))
+    image = root / "filesystem.btrfs"
+    mountpoint = root / "mount"
+    mountpoint.mkdir(mode=0o700)
+    loop_device: str | None = None
+    mounted = False
+    failure: BaseException | None = None
+    try:
+        with image.open("wb") as output:
+            output.truncate(IMAGE_BYTES)
+        loop_device = command(
+            ["losetup", "--find", "--show", str(image)], capture=True
+        ).stdout.strip()
+        if not loop_device:
+            raise GateError("losetup returned no loop device")
+        command(["mkfs.btrfs", "--quiet", "--force", loop_device])
+        command(["mount", "--types", "btrfs", loop_device, str(mountpoint)])
+        mounted = True
+
+        lower = mountpoint / "lower"
+        lower.mkdir(mode=0o700)
+        payload = lower / "payload"
+        payload.write_bytes(PAYLOAD)
+        payload.chmod(0o751)
+
+        verify_copy(binary, mountpoint, "reflink", 1, 0)
+        verify_copy(binary, mountpoint, "bounded-stream", 0, 1)
+    except BaseException as error:
+        failure = error
+
+    cleanup_errors = cleanup(root, mountpoint, mounted, loop_device)
+    if cleanup_errors:
+        detail = "; ".join(cleanup_errors)
+        if failure is not None:
+            detail = f"{detail}; original gate failure: {failure}"
+        raise GateError(f"copy-strategy gate cleanup failed: {detail}")
+    if failure is not None:
+        raise failure
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print(
+            f"usage: {Path(sys.argv[0]).name} <compiled-greenlit-init>",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        run_gate(Path(sys.argv[1]))
+    except (GateError, OSError, subprocess.SubprocessError) as error:
+        print(f"copy-strategy gate failed: {error}", file=sys.stderr)
+        return 1
+    print("copy-strategy gate passed: reflink=1 bounded-stream=1")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

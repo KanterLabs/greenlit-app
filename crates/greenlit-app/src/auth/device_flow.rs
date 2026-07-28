@@ -90,8 +90,9 @@ pub(crate) enum PollOutcome {
 /// Talks to the device-flow endpoints. `crate::auth` always constructs one
 /// via [`DeviceFlowClient::with_base_url`] — production passes real
 /// `https://github.com` (`DEFAULT_OAUTH_BASE_URL`, via
-/// `crate::auth::oauth_base_url`, which is also the one seam its internal
-/// test-only override replaces); tests inject a loopback base URL directly.
+/// `crate::auth::oauth_base_url`); only an explicit
+/// `litci_test_boundaries` custom-cfg build can replace that URL with a
+/// loopback boundary.
 /// The same injection pattern `greenlit_actions::resolve::GitHubApiResolver`
 /// uses, and required here for the same reason (`PHASE-3-actions.md` exit
 /// criterion 5: "device flow … use a mocked external GitHub endpoint").
@@ -123,12 +124,19 @@ impl DeviceFlowClient {
             .header("Accept", "application/json")
             .header("User-Agent", USER_AGENT)
             .send_form([("client_id", client_id)])
-            .map_err(|error| format!("could not reach {url}: {error}"))?;
+            .map_err(|_| "could not reach GitHub's device-code endpoint".to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!(
+                "GitHub's device-code endpoint returned HTTP {}",
+                status.as_u16()
+            ));
+        }
         let body = read_body(&mut response)?;
-        let parsed: DeviceCodeResponse = serde_json::from_slice(&body).map_err(|error| {
+        let parsed: DeviceCodeResponse = serde_json::from_slice(&body).map_err(|_| {
             format!(
-                "unexpected response requesting a device code: {error} (body: {})",
-                String::from_utf8_lossy(&body)
+                "GitHub's device-code endpoint returned HTTP {} with an invalid response",
+                status.as_u16()
             )
         })?;
         Ok(DeviceCode {
@@ -154,18 +162,29 @@ impl DeviceFlowClient {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
             ]) {
             Ok(response) => response,
-            Err(error) => return PollOutcome::Error(format!("could not reach {url}: {error}")),
+            Err(_) => {
+                return PollOutcome::Error(
+                    "could not reach GitHub's access-token endpoint".to_string(),
+                );
+            }
         };
+        let status = response.status();
+        if !status.is_success() {
+            return PollOutcome::Error(format!(
+                "GitHub's access-token endpoint returned HTTP {}",
+                status.as_u16()
+            ));
+        }
         let body = match read_body(&mut response) {
             Ok(body) => body,
             Err(error) => return PollOutcome::Error(error),
         };
         let parsed: TokenResponse = match serde_json::from_slice(&body) {
             Ok(parsed) => parsed,
-            Err(error) => {
+            Err(_) => {
                 return PollOutcome::Error(format!(
-                    "unexpected response polling for the access token: {error} (body: {})",
-                    String::from_utf8_lossy(&body)
+                    "GitHub's access-token endpoint returned HTTP {} with an invalid response",
+                    status.as_u16()
                 ));
             }
         };
@@ -178,7 +197,7 @@ fn classify(parsed: TokenResponse) -> PollOutcome {
         None => {
             let Some(access_token) = parsed.access_token else {
                 return PollOutcome::Error(
-                    "GitHub returned neither an access token nor an error".to_string(),
+                    "GitHub's access-token endpoint returned an incomplete response".to_string(),
                 );
             };
             PollOutcome::Success(DeviceToken {
@@ -192,11 +211,21 @@ fn classify(parsed: TokenResponse) -> PollOutcome {
         Some("slow_down") => PollOutcome::SlowDown,
         Some("access_denied") => PollOutcome::Denied,
         Some("expired_token") => PollOutcome::Expired,
-        Some(other) => PollOutcome::Error(
-            parsed
-                .error_description
-                .unwrap_or_else(|| other.to_string()),
-        ),
+        Some("incorrect_client_credentials") => {
+            PollOutcome::Error("GitHub rejected the OAuth client credentials".to_string())
+        }
+        Some("incorrect_device_code") => {
+            PollOutcome::Error("GitHub rejected the device code".to_string())
+        }
+        Some("unsupported_grant_type") => {
+            PollOutcome::Error("GitHub rejected the device-flow grant type".to_string())
+        }
+        Some("device_flow_disabled") => {
+            PollOutcome::Error("GitHub App device flow is disabled".to_string())
+        }
+        Some(_) => {
+            PollOutcome::Error("GitHub returned an unrecognized device-flow error".to_string())
+        }
     }
 }
 
@@ -249,7 +278,7 @@ fn read_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<Vec<u8>,
         .with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
-        .map_err(|error| format!("could not read GitHub's response: {error}"))
+        .map_err(|_| "could not read GitHub's OAuth response".to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,179 +297,4 @@ struct TokenResponse {
     expires_in: Option<u64>,
     refresh_token_expires_in: Option<u64>,
     error: Option<String>,
-    error_description: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-
-    fn drain_request(stream: &mut TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set read timeout");
-        let mut buf = [0_u8; 8192];
-        let mut total = Vec::new();
-        loop {
-            let read = stream.read(&mut buf).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            total.extend_from_slice(&buf[..read]);
-            if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                // For a POST with a body, keep draining until the
-                // Content-Length worth of bytes has definitely arrived; the
-                // fixed-size bodies here always fit the first read.
-                break;
-            }
-        }
-    }
-
-    fn respond(listener: &TcpListener, body: &str) {
-        let (mut stream, _) = listener.accept().expect("accept");
-        drain_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    }
-
-    #[test]
-    fn requests_a_device_code() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(
-                &listener,
-                r#"{"device_code":"d","user_code":"ABCD-EFGH","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}"#,
-            );
-        });
-
-        let client = DeviceFlowClient::with_base_url(base_url);
-        let code = client
-            .request_device_code("client-id")
-            .expect("device code");
-        assert_eq!(code.user_code, "ABCD-EFGH");
-        assert_eq!(code.expires_in, 900);
-        assert_eq!(code.interval, 5);
-        handle.join().unwrap();
-    }
-
-    /// A predicate over one poll outcome — pulled out to its own alias so
-    /// the data-driven table below stays a plain array type for clippy's
-    /// type-complexity lint.
-    type OutcomePredicate = fn(PollOutcome) -> bool;
-
-    #[test]
-    fn poll_once_classifies_every_documented_outcome() {
-        let cases: [(&str, OutcomePredicate); 4] = [
-            (
-                r#"{"error":"authorization_pending"}"#,
-                (|outcome| matches!(outcome, PollOutcome::Pending)) as OutcomePredicate,
-            ),
-            (
-                r#"{"error":"slow_down"}"#,
-                (|outcome| matches!(outcome, PollOutcome::SlowDown)) as OutcomePredicate,
-            ),
-            (
-                r#"{"error":"access_denied"}"#,
-                (|outcome| matches!(outcome, PollOutcome::Denied)) as OutcomePredicate,
-            ),
-            (
-                r#"{"error":"expired_token"}"#,
-                (|outcome| matches!(outcome, PollOutcome::Expired)) as OutcomePredicate,
-            ),
-        ];
-        for (body, predicate) in cases {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-            let base_url = format!("http://{}", listener.local_addr().unwrap());
-            let body = body.to_string();
-            let handle = std::thread::spawn(move || respond(&listener, &body));
-            let client = DeviceFlowClient::with_base_url(base_url);
-            let outcome = client.poll_once("client-id", "device-code");
-            assert!(
-                predicate(outcome.clone()),
-                "unexpected outcome: {outcome:?}"
-            );
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn poll_once_reports_a_successful_token_exchange() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(
-                &listener,
-                r#"{"access_token":"ghu_abc","token_type":"bearer","scope":"","expires_in":28800,"refresh_token":"ghr_xyz","refresh_token_expires_in":15897600}"#,
-            );
-        });
-        let client = DeviceFlowClient::with_base_url(base_url);
-        let outcome = client.poll_once("client-id", "device-code");
-        assert_eq!(
-            outcome,
-            PollOutcome::Success(DeviceToken {
-                access_token: "ghu_abc".to_string(),
-                refresh_token: Some("ghr_xyz".to_string()),
-                expires_in: Some(28800),
-                refresh_token_expires_in: Some(15_897_600),
-            })
-        );
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn poll_until_authorized_retries_pending_then_succeeds_without_real_sleeping() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(&listener, r#"{"error":"authorization_pending"}"#);
-            respond(
-                &listener,
-                r#"{"access_token":"ghu_final","token_type":"bearer","scope":"","expires_in":28800}"#,
-            );
-        });
-        let client = DeviceFlowClient::with_base_url(base_url);
-        let code = DeviceCode {
-            device_code: "device-code".to_string(),
-            user_code: "ABCD-EFGH".to_string(),
-            verification_uri: "https://github.com/login/device".to_string(),
-            expires_in: 900,
-            interval: 0,
-        };
-        let token = poll_until_authorized(&client, "client-id", &code, |_duration| {
-            // No real sleeping in tests: interval 0 plus a no-op sleep
-            // function keeps this test bounded in milliseconds.
-        })
-        .expect("eventual success");
-        assert_eq!(token.access_token, "ghu_final");
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn poll_until_authorized_reports_denial() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(&listener, r#"{"error":"access_denied"}"#);
-        });
-        let client = DeviceFlowClient::with_base_url(base_url);
-        let code = DeviceCode {
-            device_code: "device-code".to_string(),
-            user_code: "ABCD-EFGH".to_string(),
-            verification_uri: "https://github.com/login/device".to_string(),
-            expires_in: 900,
-            interval: 0,
-        };
-        let error = poll_until_authorized(&client, "client-id", &code, |_| {}).unwrap_err();
-        assert!(error.contains("denied"), "{error}");
-        assert!(error.contains("litci auth"), "{error}");
-        handle.join().unwrap();
-    }
 }

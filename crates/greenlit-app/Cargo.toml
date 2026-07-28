@@ -10,6 +10,42 @@ description = "litci: run your GitHub Actions workflows locally, fast, with resu
 name = "litci"
 path = "src/main.rs"
 
+[features]
+default = []
+# Capability-owning jobs opt into Docker-dependent integration and whole-run
+# performance tests. Portable `cargo test --workspace` deliberately leaves
+# this disabled and therefore makes no live-runtime claim.
+live-runtime-tests = []
+# The credential-capability job opts into compiled-CLI persistence acceptance
+# against the production persistent Linux keyring. The target isolates its
+# fake credentials under a unique key description and removes them afterward.
+credential-capability-tests = []
+
+[[test]]
+name = "performance_budgets"
+path = "tests/performance_budgets.rs"
+required-features = ["live-runtime-tests"]
+
+[[test]]
+name = "retained_secret_invariant"
+path = "tests/retained_secret_invariant.rs"
+required-features = ["live-runtime-tests"]
+
+[[test]]
+name = "policy_modes_live"
+path = "tests/policy_modes_live.rs"
+required-features = ["live-runtime-tests"]
+
+[[test]]
+name = "selected_matrix_runtime"
+path = "tests/selected_matrix_runtime.rs"
+required-features = ["live-runtime-tests"]
+
+[[test]]
+name = "credential_capability"
+path = "tests/credential_capability.rs"
+required-features = ["credential-capability-tests"]
+
 [dependencies]
 # The typed workflow model, expression value type, planner, and local
 # metrics layer this thin CLI wires together. `version` is pinned alongside
@@ -69,9 +105,8 @@ ureq = { version = "3.3.0", default-features = false, features = [
     "rustls",
     "json",
 ] }
-# (De)serializes the stored-token payload (`auth::token_store`) for both the
-# keyring and 0600-file backends. Version pinned alongside the workspace's
-# existing `serde` use.
+# (De)serializes the stored-token payload (`auth::token_store`) inside the
+# kernel keyring. Version pinned alongside the workspace's existing use.
 serde = { version = "1.0.229", features = ["derive"] }
 # The kernel keyring backend for `litci auth`'s token storage
 # (`auth::token_store`): a safe wrapper around the Linux `keyctl(2)` family
@@ -87,20 +122,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 # `libc`/`bitflags` (both already elsewhere in the tree at the same
 # versions) with no daemon requirement. See `ARCHITECTURE.md` "Known issues
 # log" for the persistence caveat (kernel keyrings are in-memory; a reboot
-# clears them, same as any session credential cache) and the documented
-# 0600-file fallback this crate's absence/failure falls back to.
+# clears them, same as any session credential cache). Phase 12 deliberately
+# fails closed instead of serializing a credential to disk.
 linux-keyutils = "0.2.5"
-# Authenticated encryption for repository-local persisted secrets. The random
-# 256-bit key lives only under the user's 0700 `~/.litci`; repositories contain
-# AES-GCM ciphertext and a nonce, never the key or plaintext.
-ring = "0.17.14"
-# Confirmation downloads GitHub's evidence artifact archive, verifies its
-# API-reported SHA-256 digest, and reads exactly one bounded JSON member.
-zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
-# Exported workflow and external artifact identities use the same SHA-256
-# representation as RunLock/CAS evidence.
-sha2 = "0.11.0"
-
 [dev-dependencies]
 # Integration tests (`crates/greenlit-app/tests/`) spawn the compiled
 # `litci` binary against an isolated temp `$HOME`/cwd rather than touching

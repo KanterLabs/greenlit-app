@@ -37,8 +37,9 @@ struct RefreshResponse {
     expires_in: Option<u64>,
     refresh_token_expires_in: Option<u64>,
     error: Option<String>,
-    error_description: Option<String>,
 }
+
+const REAUTH_FIX: &str = "\n  fix: run `litci auth` again";
 
 /// Exchanges `refresh_token` for a new access/refresh token pair against
 /// `base_url` (real GitHub, or a loopback fake in tests).
@@ -62,28 +63,35 @@ pub(crate) fn refresh_access_token(
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
         ])
-        .map_err(|error| format!("could not reach {url}: {error}"))?;
+        .map_err(|_| refresh_error("could not reach GitHub's token-refresh endpoint"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(refresh_error(&format!(
+            "GitHub's token-refresh endpoint returned HTTP {}",
+            status.as_u16()
+        )));
+    }
     let body = response
         .body_mut()
         .with_config()
         .limit(MAX_RESPONSE_BYTES)
         .read_to_vec()
-        .map_err(|error| format!("could not read GitHub's refresh response: {error}"))?;
-    let parsed: RefreshResponse = serde_json::from_slice(&body).map_err(|error| {
-        format!(
-            "unexpected response refreshing the token: {error} (body: {})",
-            String::from_utf8_lossy(&body)
-        )
+        .map_err(|_| refresh_error("could not read GitHub's token-refresh response"))?;
+    let parsed: RefreshResponse = serde_json::from_slice(&body).map_err(|_| {
+        refresh_error(&format!(
+            "GitHub's token-refresh endpoint returned HTTP {} with an invalid response",
+            status.as_u16()
+        ))
     })?;
-    if let Some(error) = parsed.error {
-        return Err(parsed.error_description.unwrap_or(error));
+    if parsed.error.is_some() {
+        return Err(refresh_error("GitHub rejected the refresh credential"));
     }
-    let access_token = parsed
-        .access_token
-        .ok_or_else(|| "GitHub's refresh response had no access_token".to_string())?;
-    let refresh_token = parsed
-        .refresh_token
-        .ok_or_else(|| "GitHub's refresh response had no refresh_token".to_string())?;
+    let access_token = parsed.access_token.ok_or_else(|| {
+        refresh_error("GitHub's token-refresh endpoint returned an incomplete response")
+    })?;
+    let refresh_token = parsed.refresh_token.ok_or_else(|| {
+        refresh_error("GitHub's token-refresh endpoint returned an incomplete response")
+    })?;
     Ok(RefreshedToken {
         access_token,
         refresh_token,
@@ -92,73 +100,6 @@ pub(crate) fn refresh_access_token(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-
-    fn drain_request(stream: &mut TcpStream) {
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("set read timeout");
-        let mut buf = [0_u8; 8192];
-        let mut total = Vec::new();
-        loop {
-            let read = stream.read(&mut buf).unwrap_or(0);
-            if read == 0 {
-                break;
-            }
-            total.extend_from_slice(&buf[..read]);
-            if total.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-    }
-
-    fn respond(listener: TcpListener, body: &'static str) {
-        let (mut stream, _) = listener.accept().expect("accept");
-        drain_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write response");
-    }
-
-    #[test]
-    fn refreshes_and_rotates_both_tokens() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(
-                listener,
-                r#"{"access_token":"ghu_new","token_type":"bearer","scope":"","expires_in":28800,"refresh_token":"ghr_new","refresh_token_expires_in":15897600}"#,
-            );
-        });
-
-        let refreshed = refresh_access_token(&base_url, "client-id", "ghr_old").expect("refresh");
-        assert_eq!(refreshed.access_token, "ghu_new");
-        assert_eq!(refreshed.refresh_token, "ghr_new");
-        assert_eq!(refreshed.expires_in, 28_800);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn an_error_response_surfaces_its_description() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = std::thread::spawn(move || {
-            respond(
-                listener,
-                r#"{"error":"bad_refresh_token","error_description":"The refresh token is invalid or expired."}"#,
-            );
-        });
-
-        let error = refresh_access_token(&base_url, "client-id", "ghr_old").unwrap_err();
-        assert!(error.contains("invalid or expired"), "{error}");
-        handle.join().unwrap();
-    }
+fn refresh_error(category: &str) -> String {
+    format!("{category}{REAUTH_FIX}")
 }

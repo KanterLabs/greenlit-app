@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use greenlit_engine::planned::Evaluation;
-use greenlit_engine::{ContainerPlan, ExecutionPlan, StepKind};
+use greenlit_engine::{ContainerPlan, ExecutionPlan, PlannedCond, StepKind};
 use greenlit_store::cas::CasStore;
 use greenlit_store::oci::RegistryResolver;
 
@@ -27,14 +27,22 @@ pub async fn preflight_plan_images(
     progress: &mut (dyn ProgressSink + Send),
 ) -> Result<BTreeMap<String, String>, ExecError> {
     let mut references = BTreeSet::new();
-    references.insert(crate::executor::netguard::NETGUARD_IMAGE.to_string());
+    let reachability = crate::executor::plan_reachability(plan);
+    if reachability.any_job_reachable() {
+        references.insert(crate::executor::netguard::NETGUARD_IMAGE.to_string());
+    }
     for job in &plan.jobs {
-        collect_container(job.container.as_ref(), &mut references)?;
-        for service in job.services.values() {
-            collect_container(Some(service), &mut references)?;
+        if reachability.template_reachable(&job.id.0) {
+            collect_container(job.container.as_ref(), &mut references)?;
+            for service in job.services.values() {
+                collect_container(Some(service), &mut references)?;
+            }
+            collect_docker_steps(&job.steps, &mut references);
         }
-        collect_docker_steps(&job.steps, &mut references);
-        for leg in &job.legs {
+        for (index, leg) in job.legs.iter().enumerate() {
+            if !reachability.leg_reachable(&job.id.0, index) {
+                continue;
+            }
             collect_container(leg.container.as_ref(), &mut references)?;
             for service in leg.services.values() {
                 collect_container(Some(service), &mut references)?;
@@ -76,8 +84,12 @@ pub async fn preflight_plan_images(
             identity: resolved.digest.to_string(),
             cache_hit: resolved.cache_hit,
         });
+        // The resolver has already fixed this pull reference to the immutable
+        // digest verified below. Reuse an exact daemon hit so an unchanged
+        // warm run does not publish a false setup-download event.
+        let materialized = engine.image_exists(&resolved.pull_reference).await?;
         if offline {
-            if !engine.image_exists(&resolved.pull_reference).await? {
+            if !materialized {
                 return Err(ExecError::Infrastructure {
                     message: format!(
                         "offline content is missing: container image {}",
@@ -87,7 +99,7 @@ pub async fn preflight_plan_images(
                         .to_string(),
                 });
             }
-        } else {
+        } else if !materialized {
             engine
                 .pull_image(&resolved.pull_reference, None, progress)
                 .await?;
@@ -151,6 +163,13 @@ fn collect_container(
 
 fn collect_docker_steps(steps: &[greenlit_engine::StepPlan], references: &mut BTreeSet<String>) {
     for step in steps {
+        if step
+            .condition
+            .as_ref()
+            .is_some_and(|condition| matches!(condition.eval, PlannedCond::Static(false)))
+        {
+            continue;
+        }
         if let StepKind::Uses { reference, .. } = &step.kind
             && let Some(image) = reference.strip_prefix("docker://")
         {

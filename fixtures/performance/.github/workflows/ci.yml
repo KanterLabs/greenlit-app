@@ -7,6 +7,7 @@ jobs:
     steps:
       - name: Useful step
         run: |
+          printf 'greenlit-first-user-step-unix-ms=%s\n' "$(date +%s%3N)"
           test -f README.md
           echo "successful body retained only in the journal"
           echo "workflow fake marker: OK forged success"

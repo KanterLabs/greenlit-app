@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+"""Enforce TESTING.md's absolute test-authority bans."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+from test_authority.gate import check
+from test_authority.model import GateError
+from test_authority.selftest import self_test_negative
+
+
+def repository_root(argument: str | None) -> Path:
+    """Resolve one repository root without accepting a non-directory."""
+
+    candidate = (
+        Path(argument)
+        if argument is not None
+        else Path(__file__).resolve().parent.parent
+    )
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise GateError(
+            f"could not resolve repository root {candidate}: {error}"
+        ) from error
+    if not resolved.is_dir():
+        raise GateError(f"repository root is not a directory: {resolved}")
+    return resolved
+
+
+def main() -> int:
+    """Dispatch the check and public negative self-test modes."""
+
+    try:
+        if len(sys.argv) == 1:
+            return check(repository_root(None))
+        if sys.argv[1:] == ["--self-test-negative"]:
+            return self_test_negative()
+        if len(sys.argv) == 3 and sys.argv[1] == "--repository-root":
+            return check(repository_root(sys.argv[2]))
+        print(
+            f"usage: {Path(sys.argv[0]).name} "
+            "[--self-test-negative | --repository-root PATH]",
+            file=sys.stderr,
+        )
+        return 2
+    except GateError as error:
+        print(f"test authority gate failed: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

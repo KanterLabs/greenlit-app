@@ -12,13 +12,12 @@ const DIGEST: &str = "sha256:8ae89e93cf60d297da92e0e1649261401b5d173746d285e3c91
 
 #[tokio::test]
 async fn direct_provider_prepares_a_verified_remote_snapshot() {
-    let Some(address) = std::env::var_os(LIVE_ENV_VAR) else {
-        eprintln!(
-            "direct_provider_prepares_a_verified_remote_snapshot: skipped \
-             (set {LIVE_ENV_VAR} to a configured containerd socket)"
-        );
-        return;
-    };
+    let address = std::env::var_os(LIVE_ENV_VAR).unwrap_or_else(|| {
+        panic!(
+            "direct_provider_prepares_a_verified_remote_snapshot: \
+             live-runtime-tests requires {LIVE_ENV_VAR} to name the configured containerd socket"
+        )
+    });
     let temp = tempfile::tempdir().expect("temporary provider store");
     let provider = OciRunnerProvider::new(
         CasStore::open(temp.path().join("cas")).expect("provider CAS"),

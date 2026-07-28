@@ -58,18 +58,3 @@ pub(crate) fn print_permission_guidance(out: &mut impl Write) {
     )
     .ok();
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guidance_names_the_required_permissions() {
-        let mut buffer = Vec::new();
-        print_permission_guidance(&mut buffer);
-        let text = String::from_utf8(buffer).unwrap();
-        assert!(text.contains("Variables"));
-        assert!(text.contains("Contents"));
-        assert!(text.contains("read"));
-    }
-}

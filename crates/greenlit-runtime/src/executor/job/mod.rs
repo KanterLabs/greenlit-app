@@ -465,10 +465,12 @@ pub(crate) async fn run_instance(
         return Err(error);
     }
 
-    // Docker-in-Docker, only when the job's own scripts call `docker`.
-    // Starting a privileged daemon for every job would cost seconds and a
-    // privileged container for a capability most workflows never use.
-    let dind = if dind::job_uses_docker(instance.steps.iter().filter_map(step_script)) {
+    // Docker-in-Docker is an explicit privileged-infrastructure request.
+    // Phase 12 never infers it from shell text: comments, `echo docker`, and
+    // ordinary Docker clients are not authority to create a privileged
+    // daemon. Runtime quarantine rejects this request until Phase 20
+    // certifies a provisioning path.
+    let dind = if shared.config.dind {
         let dind_start = tokio::select! {
             result = dind::start(
                 shared.engine,
@@ -975,24 +977,4 @@ fn resolve_services(
         ));
     }
     Ok(resolved)
-}
-
-/// A `run:` step's script text, as far as planning resolved it.
-///
-/// A script whose body is still deferred contributes its authored source, so
-/// a `docker` call behind an expression is still detected — over-detecting
-/// costs one container, under-detecting costs a confusing failure.
-fn step_script(step: &greenlit_engine::StepPlan) -> Option<String> {
-    match &step.kind {
-        greenlit_engine::StepKind::Run { script, .. } => {
-            let planned = script.as_ref();
-            Some(match &planned.evaluation {
-                greenlit_engine::Evaluation::Static(value) => value.clone(),
-                // Still deferred: scan the authored source instead, so a
-                // `docker` call behind an expression is not missed.
-                greenlit_engine::Evaluation::Deferred(_) => planned.source.clone(),
-            })
-        }
-        greenlit_engine::StepKind::Uses { .. } => None,
-    }
 }

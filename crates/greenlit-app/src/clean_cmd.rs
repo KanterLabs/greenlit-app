@@ -27,7 +27,8 @@ use greenlit_runtime::{ContainerEngine, DockerEngine, EngineState, SystemProber,
 
 use crate::cli::CleanArgs;
 
-/// The label every Greenlit-built image carries (`images/base/Dockerfile`),
+/// The label every Greenlit-built image carries
+/// (`greenlit-runtime/images/base/Dockerfile`),
 /// inherited by per-repo convergent images through `docker commit`.
 const IMAGE_LABEL: &str = "greenlit.managed=1";
 
@@ -386,19 +387,4 @@ fn human_bytes(bytes: u64) -> String {
         }
     }
     "0 B".to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::human_bytes;
-
-    #[test]
-    fn byte_counts_render_in_the_largest_small_unit() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GiB");
-    }
 }

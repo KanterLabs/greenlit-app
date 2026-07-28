@@ -1,0 +1,29 @@
+#!/usr/bin/python3 -EsB
+"""Run the public split-job release-transfer authority gate."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import sys
+
+sys.dont_write_bytecode = True
+
+
+def main() -> int:
+    """Execute the canonical command-boundary canary with isolated Python."""
+
+    repository = Path(__file__).resolve().parents[2]
+    canary = repository / "tools/release_check_credential_bundle_canary.py"
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.execve(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-E", "-s", "-B", str(canary)],
+        environment,
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

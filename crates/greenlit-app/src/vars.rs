@@ -276,14 +276,20 @@ pub(crate) fn resolve_vars(
     }
 }
 
-/// Internal test-only override for the GitHub REST API base URL (real
-/// `https://api.github.com` in production) — see `crate::auth`'s identical
-/// convention for its own base-URL override.
+/// Internal custom-cfg test boundary for the GitHub REST API base URL.
+/// Ordinary and release builds do not contain this environment seam.
+#[cfg(litci_test_boundaries)]
 const TEST_API_BASE_URL_ENV: &str = "LITCI_TEST_GITHUB_API_BASE_URL";
 
+#[cfg(litci_test_boundaries)]
 fn api_base_url() -> String {
     std::env::var(TEST_API_BASE_URL_ENV)
         .unwrap_or_else(|_| remote::DEFAULT_API_BASE_URL.to_string())
+}
+
+#[cfg(not(litci_test_boundaries))]
+fn api_base_url() -> String {
+    remote::DEFAULT_API_BASE_URL.to_string()
 }
 
 /// The outcome of resolving `vars` with the authenticated remote leg

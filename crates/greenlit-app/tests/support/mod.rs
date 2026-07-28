@@ -67,9 +67,9 @@ impl Sandbox {
         self.home.path()
     }
 
-    /// Writes `contents` to `relative` under the sandbox's isolated `$HOME`
-    /// (e.g. pre-seeding `~/.litci/auth.json` so a test can exercise
-    /// authenticated behavior without driving a real device-flow prompt).
+    /// Writes `contents` to `relative` under the sandbox's isolated `$HOME`.
+    /// Credential success tests use the production keyring capability target;
+    /// this helper never represents a credential-storage backend.
     pub fn write_home(&self, relative: &str, contents: &str) -> PathBuf {
         let path = self.home.path().join(relative);
         if let Some(parent) = path.parent() {
@@ -77,20 +77,6 @@ impl Sandbox {
         }
         std::fs::write(&path, contents).expect("write sandbox HOME file");
         path
-    }
-
-    /// Pre-seeds `~/.litci/auth.json` (the `crate::auth::token_store` file
-    /// fallback every sandboxed invocation uses — see `LITCI_TEST_NO_KEYRING`
-    /// above) with a non-expiring token, so a test can exercise "already
-    /// authenticated" behavior without driving a real device-flow prompt.
-    /// Matches `crate::auth::token_store::StoredToken`'s JSON shape exactly;
-    /// there is no public constructor to reuse from a binary-only crate, so
-    /// this is hand-written and kept in this one shared place.
-    pub fn seed_auth_token(&self, access_token: &str) {
-        let json = format!(
-            r#"{{"access_token":"{access_token}","refresh_token":null,"access_token_expires_at":null,"refresh_token_expires_at":null,"source":"pat"}}"#
-        );
-        self.write_home(".litci/auth.json", &json);
     }
 
     /// The sandbox repository working-directory path, for integration
@@ -140,16 +126,19 @@ impl Sandbox {
         self.run_from_with_env(".", args, extra_env)
     }
 
-    /// Runs with the production daemon default enabled. Ordinary integration
-    /// calls suppress background daemons so isolated temp homes can disappear
-    /// immediately; daemon lifecycle coverage opts back in explicitly here.
-    pub fn run_with_daemon(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
+    /// Runs the custom-cfg compiled CLI against the real persistent Linux
+    /// keyring under one unique test description. Missing keyring support is
+    /// an ordinary command failure; this helper never substitutes storage.
+    pub fn run_with_credential_keyring(
+        &self,
+        args: &[&str],
+        description: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Output {
         let mut cmd = self.command_from(Path::new("."), args);
-        cmd.env_remove("LITCI_TEST_DISABLE_DAEMON");
-        for (key, value) in extra_env {
-            cmd.env(key, value);
-        }
-        cmd.output().expect("spawn litci with daemon enabled")
+        configure_credential_keyring(&mut cmd, description, extra_env);
+        cmd.output()
+            .expect("spawn litci with persistent-keyring capability")
     }
 
     /// Runs `litci` with raw operating-system environment strings. Linux
@@ -195,6 +184,34 @@ impl Sandbox {
         child.wait_with_output().expect("wait for litci")
     }
 
+    /// The piped-stdin variant of [`Self::run_with_credential_keyring`].
+    pub fn run_with_credential_keyring_stdin(
+        &self,
+        args: &[&str],
+        description: &str,
+        extra_env: &[(&str, &str)],
+        stdin_input: &str,
+    ) -> Output {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut cmd = self.command_from(Path::new("."), args);
+        configure_credential_keyring(&mut cmd, description, extra_env);
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn litci with persistent-keyring capability");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin_input.as_bytes())
+            .expect("write credential input");
+        child.wait_with_output().expect("wait for litci")
+    }
+
     /// Runs `litci` from a directory below the sandbox repository root.
     pub fn run_from(&self, relative_cwd: &str, args: &[&str]) -> Output {
         self.run_from_with_env(relative_cwd, args, &[])
@@ -229,19 +246,28 @@ impl Sandbox {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             // The kernel keyring `crate::auth::token_store` uses is scoped to
             // the real test-runner process's UID, not to the sandboxed
-            // `$HOME` above — it is therefore *not* isolated by anything
-            // else in this harness. Forcing the documented internal
-            // file-only fallback here keeps every sandboxed invocation from
-            // ever touching (or being affected by) whatever the actual
-            // developer/CI account's real persistent keyring holds; a test
-            // that wants to simulate an authenticated state pre-seeds
-            // `~/.litci/auth.json` directly (`Sandbox::write_home`) instead.
+            // `$HOME` above. Ordinary portable cases therefore disable
+            // credential storage entirely; only the required-feature
+            // credential target opts into a unique description on the real
+            // persistent ring and performs exact-key cleanup.
             .env("LITCI_TEST_NO_KEYRING", "1")
-            .env("LITCI_TEST_DISABLE_DAEMON", "1")
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0");
         cmd
+    }
+}
+
+fn configure_credential_keyring(
+    command: &mut Command,
+    description: &str,
+    extra_env: &[(&str, &str)],
+) {
+    command
+        .env_remove("LITCI_TEST_NO_KEYRING")
+        .env("LITCI_TEST_KEYRING_DESCRIPTION", description);
+    for (key, value) in extra_env {
+        command.env(key, value);
     }
 }
 
@@ -255,4 +281,48 @@ pub fn stdout_text(output: &Output) -> String {
 
 pub fn stderr_text(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("litci stderr must be valid UTF-8")
+}
+
+/// Proves a completed live run left no managed Docker container, network, or
+/// volume behind. Listing failures are test failures too: a capability gate
+/// cannot claim cleanup when its external observer is unavailable.
+pub fn assert_run_resources_removed(run: &Path) {
+    let run_id = run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("run directory has a UTF-8 identity");
+    let label_filter = format!("label=greenlit.run={run_id}");
+    assert_docker_listing_empty(
+        &["ps", "--all", "--quiet", "--filter", &label_filter],
+        "container",
+        run_id,
+    );
+    let name_filter = format!("name=greenlit-run-{run_id}");
+    assert_docker_listing_empty(
+        &["network", "ls", "--quiet", "--filter", &name_filter],
+        "network",
+        run_id,
+    );
+    assert_docker_listing_empty(
+        &["volume", "ls", "--quiet", "--filter", &name_filter],
+        "volume",
+        run_id,
+    );
+}
+
+fn assert_docker_listing_empty(args: &[&str], resource: &str, run_id: &str) {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .expect("spawn Docker cleanup observer");
+    assert!(
+        output.status.success(),
+        "could not verify {resource} cleanup for run {run_id}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stdout.iter().all(u8::is_ascii_whitespace),
+        "run {run_id} retained a managed Docker {resource}: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }

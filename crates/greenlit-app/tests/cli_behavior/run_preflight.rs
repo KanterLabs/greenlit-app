@@ -1,369 +1,453 @@
-//! `litci run` rejects a malformed `uses:` reference before any engine
-//! work; a syntactically valid one now proceeds to resolution/execution
-//! (`PHASE-3-actions.md` "Action execution" narrowed the Phase 2 blanket
-//! rejection — see `greenlit_runtime::executor::preflight`'s module docs).
+//! Compiled-CLI coverage for the Phase 12 stabilization quarantine.
 //!
-//! The oracle for "preflight passed" is deliberate: every test sets
-//! `DOCKER_HOST=ssh://example`, which engine detection rejects with a known
-//! message in any environment, daemon or not. A run that fails with the
-//! DOCKER_HOST error therefore got past preflight; a run that fails with
-//! the malformed-`uses:` error never touched the engine.
+//! `DOCKER_HOST=ssh://example` is the recording boundary for engine access:
+//! the runtime rejects that non-local endpoint before contacting it. Seeing
+//! the endpoint diagnostic proves a forceable shell-only run crossed the
+//! quarantine; every hard-block case must fail without reaching it.
 
-use super::support;
-use super::support::Sandbox;
+use super::support::{self, Sandbox};
+use std::os::unix::fs::PermissionsExt;
 
 const SSH_DOCKER_HOST: (&str, &str) = ("DOCKER_HOST", "ssh://example");
 
-const MALFORMED_USES_WORKFLOW: &str = "\
+const SHELL_WORKFLOW: &str = "\
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: not-a-valid-reference
+      - run: echo selected
 ";
 
-const WELL_FORMED_USES_WORKFLOW: &str = "\
+fn run_workflow(workflow: &str, args: &[&str]) -> (Sandbox, std::process::Output) {
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", workflow);
+    sandbox.init_git();
+    let mut full_args = vec!["run", "--no-input"];
+    full_args.extend_from_slice(args);
+    let output = sandbox.run_with_env(&full_args, &[SSH_DOCKER_HOST]);
+    (sandbox, output)
+}
+
+fn assert_retained_result(
+    sandbox: &Sandbox,
+    workflow: &str,
+    expected_conclusion: &str,
+    expected_compatibility: &str,
+) {
+    let mut runs = std::fs::read_dir(sandbox.home().join(".litci/runs"))
+        .expect("one invocation retained run evidence")
+        .map(|entry| entry.expect("read retained run entry").path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert_eq!(runs.len(), 1, "one invocation retained exactly one run");
+    let run = runs.pop().expect("one retained run");
+    assert_eq!(
+        std::fs::read_to_string(run.join("source/.github/workflows/ci.yml"))
+            .expect("read captured workflow source"),
+        workflow,
+        "retained run did not contain the captured workflow source"
+    );
+    let result: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(run.join("result.json")).expect("read retained terminal result"),
+    )
+    .expect("parse retained terminal result");
+    assert_eq!(result["conclusion"], expected_conclusion);
+    assert_eq!(result["compatibility"], expected_compatibility);
+    assert_eq!(result["assurance"], "none");
+    assert!(
+        !sandbox.home().join(".litci/daemon").exists(),
+        "preflight started or prepared daemon state"
+    );
+}
+
+#[test]
+fn shell_execution_is_blocked_by_default_and_explicitly_degraded_before_engine_work() {
+    let blocked_sandbox = Sandbox::new();
+    blocked_sandbox.write(".github/workflows/ci.yml", SHELL_WORKFLOW);
+    blocked_sandbox.init_git();
+    let blocked = blocked_sandbox.run_with_env(&["run", "--no-input"], &[SSH_DOCKER_HOST]);
+    assert_eq!(blocked.status.code(), Some(1));
+    let blocked_stderr = support::stderr_text(&blocked);
+    assert!(
+        blocked_stderr.contains("uncertified capability `execution.shell`"),
+        "{blocked_stderr}"
+    );
+    assert!(
+        blocked_stderr.contains("rerun with `--allow-degraded`"),
+        "{blocked_stderr}"
+    );
+    assert!(!blocked_stderr.contains("DOCKER_HOST"), "{blocked_stderr}");
+    assert_retained_result(&blocked_sandbox, SHELL_WORKFLOW, "blocked", "unsupported");
+
+    let (_forced_sandbox, forced) = run_workflow(SHELL_WORKFLOW, &["--allow-degraded"]);
+    assert_eq!(forced.status.code(), Some(1));
+    let forced_stderr = support::stderr_text(&forced);
+    assert!(
+        forced_stderr.contains("`--allow-degraded` forced 1 uncertified capability"),
+        "{forced_stderr}"
+    );
+    assert!(
+        forced_stderr.contains("assurance is none"),
+        "{forced_stderr}"
+    );
+    assert!(
+        forced_stderr.contains("DOCKER_HOST"),
+        "the explicit force did not reach the engine boundary: {forced_stderr}"
+    );
+}
+
+#[test]
+fn security_sensitive_capabilities_cannot_be_forced() {
+    let cases = [
+        (
+            "secret",
+            "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ secrets.DEPLOY_TOKEN }}
+",
+            "secret.context",
+        ),
+        (
+            "github credential",
+            "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ github.token }}
+",
+            "credential.github",
+        ),
+        (
+            "remote variable",
+            "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ vars.REMOTE_ONLY }}
+",
+            "variable.remote",
+        ),
+        (
+            "action",
+            "\
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-";
+",
+            "action.uses",
+        ),
+        (
+            "service",
+            "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    services:
+      database:
+        image: postgres:17
+    steps:
+      - run: echo ready
+",
+            "service.container",
+        ),
+    ];
 
-const LATE_CHECKOUT_WORKFLOW: &str = "\
+    for (name, workflow, capability) in cases {
+        let (sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
+        assert_eq!(output.status.code(), Some(1), "{name}");
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains(&format!("uncertified capability `{capability}`")),
+            "{name}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("DOCKER_HOST"),
+            "{name} reached engine detection: {stderr}"
+        );
+        assert_retained_result(&sandbox, workflow, "blocked", "unsupported");
+        assert!(
+            sandbox.home().join(".litci/metrics/runs.ndjson").is_file(),
+            "{name} did not append the explicitly permitted sanitized metric"
+        );
+    }
+}
+
+#[test]
+fn docker_text_and_commands_are_shell_degradation_not_inferred_dind() {
+    for script in ["echo docker", "docker version"] {
+        let workflow = format!(
+            "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {script}\n"
+        );
+        let (_sandbox, output) = run_workflow(&workflow, &["--allow-degraded"]);
+        assert_eq!(output.status.code(), Some(1), "{script}");
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains("forced: execution.shell"),
+            "{script}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("infrastructure.dind"),
+            "{script} was misclassified as DinD: {stderr}"
+        );
+        assert!(
+            stderr.contains("DOCKER_HOST"),
+            "{script} did not cross the engine boundary: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn selected_and_statically_unreachable_protected_capabilities_do_not_block() {
+    let workflow = "\
+on: push
+jobs:
+  selected:
+    runs-on: ubuntu-latest
+    steps:
+      - if: false
+        uses: actions/checkout@v4
+      - if: false
+        run: echo ${{ secrets.UNREACHABLE }}
+      - run: echo selected
+  unselected:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo ${{ github.token }}
+";
+    let (_sandbox, output) = run_workflow(workflow, &["--job", "selected", "--allow-degraded"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("forced: execution.shell"), "{stderr}");
+    for protected in ["action.uses", "secret.context", "credential.github"] {
+        assert!(
+            !stderr.contains(protected),
+            "unreachable {protected} blocked selection: {stderr}"
+        );
+    }
+    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
+}
+
+#[test]
+fn exact_matrix_selection_uses_only_the_selected_legs_reachability() {
+    let workflow = "\
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mode: [safe, protected]
+    steps:
+      - if: matrix.mode == 'protected'
+        uses: actions/checkout@v4
+      - run: echo ${{ matrix.mode }}
+";
+    let (_sandbox, output) = run_workflow(
+        workflow,
+        &[
+            "--job",
+            "build",
+            "--matrix",
+            "mode=safe",
+            "--allow-degraded",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(!stderr.contains("action.uses"), "{stderr}");
+    assert!(stderr.contains("forced: execution.shell"), "{stderr}");
+    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
+}
+
+#[test]
+fn ambiguous_reachability_fails_closed_before_the_engine() {
+    let workflow = "\
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: another/project
+      - if: success()
+        run: echo maybe
 ";
+    let (sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("reachability.ambiguous"),
+        "ambiguous condition was not quarantined: {stderr}"
+    );
+    assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert_retained_result(&sandbox, workflow, "blocked", "unsupported");
+}
 
-const MIXED_WORKFLOW: &str = "\
-on: push
-jobs:
-  shell:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo hi
-  action:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: not-a-valid-reference
-";
-
-const SKIPPED_MALFORMED_USES_WORKFLOW: &str = "\
+#[test]
+fn every_unresolved_variable_condition_remains_conservatively_reachable() {
+    let workflow = "\
 on: push
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - if: false
-        uses: not-a-valid-reference
-      - run: echo hi
+        run: echo ${{ vars.REMOTE_FLAG }}
+      - if: vars.REMOTE_FLAG == 'enabled'
+        uses: actions/checkout@v4
 ";
-
-const MATRIX_MALFORMED_USES_WORKFLOW: &str = "\
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        leg: [a, b]
-    steps:
-      - uses: not-a-valid-reference
-";
-
-const SELECTABLE_MATRIX_WORKFLOW: &str = "\
-on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        os: [ubuntu-24.04, ubuntu-22.04]
-        node: [20, 22]
-    steps:
-      - run: echo selected
-";
-
-fn run_workflow(workflow: &str, args: &[&str]) -> std::process::Output {
-    let sandbox = Sandbox::new();
-    sandbox.write(".github/workflows/ci.yml", workflow);
-    sandbox.init_git();
-    let mut full_args = vec!["run"];
-    full_args.extend_from_slice(args);
-    sandbox.run_with_env(&full_args, &[SSH_DOCKER_HOST])
-}
-
-#[test]
-fn a_malformed_uses_reference_is_rejected_before_any_engine_work() {
-    let output = run_workflow(MALFORMED_USES_WORKFLOW, &[]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("`uses: not-a-valid-reference`"), "{stderr}");
-    assert!(
-        stderr.contains(".github/workflows/ci.yml:"),
-        "span must locate the authored uses: value: {stderr}"
-    );
-    assert!(
-        !stderr.contains("DOCKER_HOST"),
-        "rejection must precede engine detection: {stderr}"
-    );
-}
-
-#[test]
-fn a_well_formed_uses_reference_passes_preflight_and_reaches_engine_detection() {
-    // `actions/checkout@v4` parses into one of GitHub's four documented
-    // `uses:` forms, so preflight (which only rejects a malformed
-    // reference) lets it through; the run then fails at engine detection,
-    // proving preflight never rejected it.
-    let output = run_workflow(WELL_FORMED_USES_WORKFLOW, &[]);
-    assert!(!output.status.success());
+    let (sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
+    assert_eq!(output.status.code(), Some(1));
     let stderr = support::stderr_text(&output);
     assert!(
-        stderr.contains("DOCKER_HOST"),
-        "a syntactically valid uses: reference must reach engine detection: {stderr}"
+        stderr.contains("variable.remote"),
+        "a later unresolved-variable condition was incorrectly pruned: {stderr}"
     );
-}
-
-#[test]
-fn an_exact_matrix_case_is_selected_before_engine_work() {
-    let exact = run_workflow(
-        SELECTABLE_MATRIX_WORKFLOW,
-        &[
-            "--job",
-            "build",
-            "--matrix",
-            "os=ubuntu-24.04",
-            "--matrix",
-            "node=20",
-        ],
-    );
-    let exact_stderr = support::stderr_text(&exact);
-    assert!(!exact.status.success());
-    assert!(
-        exact_stderr.contains("DOCKER_HOST"),
-        "one exact case proceeds to engine detection: {exact_stderr}"
-    );
-
-    let partial = run_workflow(
-        SELECTABLE_MATRIX_WORKFLOW,
-        &["--job", "build", "--matrix", "node=20"],
-    );
-    let partial_stderr = support::stderr_text(&partial);
-    assert!(
-        partial_stderr.contains("matched 0 cases"),
-        "a selector missing an authored property is not guessed: {partial_stderr}"
-    );
-    assert!(!partial_stderr.contains("DOCKER_HOST"), "{partial_stderr}");
-
-    let unscoped = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--matrix", "node=20"]);
-    let unscoped_stderr = support::stderr_text(&unscoped);
-    assert!(
-        unscoped_stderr.contains("`--matrix` needs one selected job"),
-        "{unscoped_stderr}"
-    );
-
-    let write_back = run_workflow(SELECTABLE_MATRIX_WORKFLOW, &["--write-back"]);
-    let write_back_stderr = support::stderr_text(&write_back);
-    assert!(
-        write_back_stderr.contains("`--write-back` applies one selected job only"),
-        "{write_back_stderr}"
-    );
-}
-
-#[test]
-fn daemon_and_no_daemon_paths_persist_identical_terminal_results() {
-    let sandbox = Sandbox::new();
-    sandbox.write(".github/workflows/ci.yml", SELECTABLE_MATRIX_WORKFLOW);
-    sandbox.init_git();
-
-    let direct = sandbox.run_with_daemon(&["run", "--no-daemon"], &[SSH_DOCKER_HOST]);
-    assert!(!direct.status.success());
-    assert!(!sandbox.home().join(".litci/daemon/v1.sock").exists());
-
-    let managed = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
-    assert!(!managed.status.success());
-    let status = sandbox.run(&["daemon", "--status"]);
-    assert!(
-        status.status.success(),
-        "auto-managed daemon did not become ready: {}",
-        support::stderr_text(&status)
-    );
-    let template_root = sandbox.home().join(".litci/daemon/templates/repos");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline && !contains_ready_template(&template_root) {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
-    assert!(
-        contains_ready_template(&template_root),
-        "daemon did not publish a one-use source template"
-    );
-
-    let prepared = sandbox.run_with_daemon(&["run"], &[SSH_DOCKER_HOST]);
-    assert!(!prepared.status.success());
-
-    let run_directories = std::fs::read_dir(sandbox.home().join(".litci/runs"))
-        .expect("run evidence exists")
-        .map(|entry| entry.expect("run evidence entry").path())
-        .collect::<Vec<_>>();
-    let mut results = run_directories
-        .iter()
-        .map(|directory| {
-            std::fs::read(directory.join("result.json")).expect("terminal result exists")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(results.len(), 3);
-    let expected = results.pop().expect("one result");
-    assert!(results.iter().all(|result| result == &expected));
-    assert!(
-        run_directories.iter().any(|directory| {
-            std::fs::read_to_string(directory.join("trace.ndjson"))
-                .is_ok_and(|trace| trace.contains("\"event\":\"source_template_adopted\""))
-        }),
-        "a prepared source template was published but never adopted"
-    );
-
-    let shutdown = sandbox.run(&["daemon", "--shutdown"]);
-    assert!(
-        shutdown.status.success(),
-        "daemon shutdown failed: {}",
-        support::stderr_text(&shutdown)
-    );
-}
-
-fn contains_ready_template(path: &std::path::Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return false;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir()
-            && path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("ready-"))
-        {
-            return true;
-        }
-        if path.is_dir() && contains_ready_template(&path) {
-            return true;
-        }
-    }
-    false
-}
-
-#[test]
-fn offline_resolution_names_the_exact_missing_action_ref_before_engine_work() {
-    let output = run_workflow(WELL_FORMED_USES_WORKFLOW, &["--offline", "--no-input"]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(
-        stderr.contains("offline content is missing: action ref actions/checkout@v4"),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("DOCKER_HOST"),
-        "offline preparation must fail at the exact absent identity without trying another source: {stderr}"
-    );
-}
-
-#[test]
-fn hermetic_mode_rejects_a_late_mutable_checkout_before_engine_work() {
-    let output = run_workflow(LATE_CHECKOUT_WORKFLOW, &["--hermetic", "--no-input"]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(
-        stderr.contains(
-            "hermetic execution cannot resolve checkout input 'repository=another/project'"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        !stderr.contains("DOCKER_HOST"),
-        "hermetic preflight must reject the late identity before engine detection: {stderr}"
-    );
-}
-
-#[test]
-fn a_matrix_leg_malformed_uses_step_is_rejected_before_any_engine_work() {
-    let output = run_workflow(MATRIX_MALFORMED_USES_WORKFLOW, &[]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(stderr.contains("`uses: not-a-valid-reference`"), "{stderr}");
     assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert_retained_result(&sandbox, workflow, "blocked", "unsupported");
 }
 
 #[test]
-fn pruning_to_a_shell_job_lets_a_mixed_workflow_past_preflight() {
-    let output = run_workflow(MIXED_WORKFLOW, &["-j", "shell"]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(
-        stderr.contains("DOCKER_HOST"),
-        "the pruned plan has no uses: step, so the run must reach engine detection: {stderr}"
-    );
-    assert!(!stderr.contains("not-a-valid-reference"), "{stderr}");
+fn hidden_daemon_lifecycle_commands_are_quarantined_before_socket_or_network_work() {
+    let sandbox = support::Sandbox::new();
+    for arguments in [
+        &["daemon"][..],
+        &["daemon", "--status"][..],
+        &["daemon", "--shutdown"][..],
+    ] {
+        let output = sandbox.run_with_env(arguments, &[]);
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        let stderr = support::stderr_text(&output);
+        assert!(
+            stderr.contains("disabled until Phase 25"),
+            "{arguments:?}: {stderr}"
+        );
+        assert!(
+            !sandbox.home().join(".litci/daemon").exists(),
+            "{arguments:?} created daemon state"
+        );
+    }
 }
 
 #[test]
-fn a_statically_skipped_malformed_uses_step_stays_accepted() {
-    let output = run_workflow(SKIPPED_MALFORMED_USES_WORKFLOW, &[]);
-    assert!(!output.status.success());
-    let stderr = support::stderr_text(&output);
-    assert!(
-        stderr.contains("DOCKER_HOST"),
-        "an `if: false` uses: step never runs, so preflight must not reject it: {stderr}"
-    );
-    assert!(!stderr.contains("not-a-valid-reference"), "{stderr}");
-}
-
-#[test]
-fn unsupported_preflight_persists_terminal_result_and_trace() {
-    let sandbox = Sandbox::new();
-    sandbox.write(
-        ".github/workflows/ci.yml",
-        "\
+fn a_literal_local_variable_does_not_trigger_remote_credential_work() {
+    let workflow = "\
 on: push
 jobs:
   build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo ${{ vars.LOCAL_ONLY }}
+";
+    let (_sandbox, output) =
+        run_workflow(workflow, &["--var", "LOCAL_ONLY=value", "--allow-degraded"]);
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert!(!stderr.contains("variable.remote"), "{stderr}");
+}
+
+#[test]
+fn authored_out_of_scope_behavior_is_rejected_after_source_capture_before_external_work() {
+    let workflow = "\
+on: push
+jobs:
+  deploy:
     runs-on: ubuntu-latest
     environment: production
     steps:
       - run: echo blocked
-",
-    );
+";
+    let (sandbox, output) = run_workflow(workflow, &["--allow-degraded"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(stderr.contains("environment"), "{stderr}");
+    assert!(stderr.contains("out of scope"), "{stderr}");
+    assert!(!stderr.contains("DOCKER_HOST"), "{stderr}");
+    assert_retained_result(&sandbox, workflow, "preparation_failed", "unsupported");
+}
+
+#[test]
+fn write_back_is_a_distinct_nonforceable_capability_before_host_or_engine_mutation() {
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", SHELL_WORKFLOW);
+    sandbox.write("host-sentinel.txt", "host bytes must stay unchanged\n");
     sandbox.init_git();
+    let before = std::fs::read(sandbox.root().join("host-sentinel.txt"))
+        .expect("read host sentinel before quarantine");
 
-    let output = sandbox.run(&["run", "--no-input"]);
-    assert!(!output.status.success());
-    let runs = sandbox.home().join(".litci/runs");
-    let run = std::fs::read_dir(&runs)
-        .expect("run directory exists")
-        .next()
-        .expect("one run is persisted")
-        .expect("run entry is readable")
-        .path();
-    let result: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(run.join("result.json")).expect("terminal result is persisted"),
-    )
-    .expect("terminal result is JSON");
-    assert_eq!(result["conclusion"], "preparation_failed");
-    assert_eq!(result["compatibility"], "unsupported");
-    assert_eq!(result["assurance"], "none");
-
-    let trace =
-        std::fs::read_to_string(run.join("trace.ndjson")).expect("append-only trace is persisted");
-    assert!(trace.contains("\"event\":\"source_locked\""), "{trace}");
-    assert!(
-        trace.contains("\"event\":\"compatibility_analyzed\""),
-        "{trace}"
+    let output = sandbox.run_with_env(
+        &["run", "--write-back", "--job", "build", "--allow-degraded"],
+        &[SSH_DOCKER_HOST],
     );
-    assert!(trace.contains("\"event\":\"run_completed\""), "{trace}");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("uncertified capability `source.write-back`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("source.containment"),
+        "write-back was collapsed into snapshot containment: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "write-back quarantine reached engine detection: {stderr}"
+    );
+    assert_retained_result(&sandbox, SHELL_WORKFLOW, "blocked", "unsupported");
+    assert!(
+        !sandbox.root().join(".litci").exists(),
+        "write-back quarantine mutated repository-local state"
+    );
+    assert_eq!(
+        std::fs::read(sandbox.root().join("host-sentinel.txt"))
+            .expect("read host sentinel after quarantine"),
+        before,
+        "write-back quarantine mutated the host worktree"
+    );
+}
+
+#[test]
+fn metric_failure_cannot_replace_the_primary_quarantine_diagnostic() {
+    let sandbox = Sandbox::new();
+    sandbox.write(".github/workflows/ci.yml", SHELL_WORKFLOW);
+    sandbox.init_git();
+    let litci = sandbox.home().join(".litci");
+    let metrics = litci.join("metrics");
+    let metric_file_collision = metrics.join("runs.ndjson");
+    std::fs::create_dir_all(&metric_file_collision).expect("create metric-file collision");
+    for path in [&litci, &metrics, &metric_file_collision] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("secure metric collision path");
+    }
+
+    let output = sandbox.run_with_env(&["run"], &[SSH_DOCKER_HOST]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = support::stderr_text(&output);
+    assert!(
+        stderr.contains("uncertified capability `execution.shell`"),
+        "metric failure replaced quarantine: {stderr}"
+    );
+    assert!(
+        stderr.contains("could not append the sanitized local run metric"),
+        "metric failure was not reported as a secondary warning: {stderr}"
+    );
+    assert!(
+        !stderr.contains("DOCKER_HOST"),
+        "quarantine reached engine detection: {stderr}"
+    );
+    assert_retained_result(&sandbox, SHELL_WORKFLOW, "blocked", "unsupported");
 }

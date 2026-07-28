@@ -61,5 +61,3 @@ ureq = { version = "3.3.0", default-features = false, features = ["rustls", "jso
 # Every store test runs against an isolated temp root rather than the real
 # `~/.litci/`, matching `greenlit-actions`' store tests.
 tempfile = "3.27.0"
-# The shim is async, so its tests need a runtime to start it on.
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "net"] }

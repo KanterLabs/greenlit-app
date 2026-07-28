@@ -9,10 +9,17 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+pub(crate) const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GREENLIT_BUILD_COMMIT"),
+    ")"
+);
+
 /// `litci` -- run your GitHub Actions workflows locally, fast, with results
 /// you can trust (`greenlit-v0-spec.md`).
 #[derive(Debug, Parser)]
-#[command(name = "litci", version, about, long_about = None)]
+#[command(name = "litci", version = VERSION, about, long_about = None)]
 pub(crate) struct Cli {
     #[command(subcommand)]
     pub(crate) command: Command,
@@ -27,8 +34,8 @@ pub(crate) enum Command {
     Run(RunArgs),
     /// Detect, start, or install the container engine (three-state UX).
     Setup(SetupArgs),
-    /// Authenticate for GitHub configuration-variable lookup and action
-    /// resolution: GitHub App device flow by default, or `--pat`/`--gh`.
+    /// Store a GitHub credential in the kernel keyring. Runtime lookup and
+    /// action use remain quarantined until their owning stabilization phases.
     Auth(AuthArgs),
     /// Show local invocation history and per-stage timing trends. Read-only:
     /// never appends a metrics record for its own invocation.
@@ -37,9 +44,9 @@ pub(crate) enum Command {
     Inspect(InspectArgs),
     /// Replay redacted logs from a local run's structured event journal.
     Logs(LogsArgs),
-    /// Export a separate, fully pinned workflow and GitHub evidence artifact.
+    /// Report that export is quarantined until Phase 27 certification.
     Export(ExportArgs),
-    /// Import read-only GitHub evidence for a completed local run.
+    /// Report that GitHub confirmation is quarantined until Phase 27.
     Confirm(ConfirmArgs),
     /// Diagnose local daemon, run, and storage state without deleting data.
     Doctor(DoctorArgs),
@@ -149,12 +156,8 @@ pub(crate) struct RunArgs {
     #[arg(long = "input", value_name = "KEY=VALUE", value_parser = parse_key_val)]
     pub(crate) inputs: Vec<(String, String)>,
 
-    /// A secret value override, `KEY=VALUE`. Repeatable; the highest
-    /// priority source in the `secrets.*` resolution chain (CLI override,
-    /// then same-named process environment variable, then
-    /// `.litci/secrets`, then an interactive prompt for anything still
-    /// unresolved). Every resolved value is registered for log masking
-    /// before any step runs.
+    /// A secret override, `KEY=VALUE`. Phase 12 accepts and redacts the
+    /// command-line shape but blocks any run that would use it until Phase 16.
     #[arg(short = 's', long = "secret", value_name = "KEY=VALUE", value_parser = parse_secret)]
     pub(crate) secrets: Vec<(String, String)>,
 
@@ -162,18 +165,21 @@ pub(crate) struct RunArgs {
     #[arg(long = "isolation", value_enum, default_value = "auto")]
     pub(crate) isolation: IsolationArg,
 
-    /// After the run, export each ran job's overlay changes, list them, and
-    /// (after confirmation) apply them to the working tree. Requires overlay
-    /// isolation — refused together with `--isolation copy-in`, and with
-    /// `--no-input` (the confirmation cannot be skipped in v0). Implies
-    /// `--isolation overlay`: the run fails if overlay cannot be mounted
-    /// rather than falling back to copy-in and discarding the changes.
+    /// Request source write-back. This is non-forceably quarantined until
+    /// Phase 26 certifies the real-overlay diff and apply boundary.
     #[arg(long = "write-back")]
     pub(crate) write_back: bool,
 
     /// Disable every interactive prompt. Conflicts with `--write-back`.
     #[arg(long = "no-input")]
     pub(crate) no_input: bool,
+
+    /// Explicitly continue through forceable uncertified capabilities.
+    ///
+    /// Security-sensitive findings are never forceable. A forced run is
+    /// recorded as degraded and can never receive passing assurance.
+    #[arg(long = "allow-degraded")]
+    pub(crate) allow_degraded: bool,
 
     /// Forbid Greenlit-controlled network access and use only previously
     /// verified locked content already present on this machine.
@@ -190,8 +196,8 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) hermetic: bool,
 
-    /// Run through the identical in-process path without contacting or
-    /// auto-starting the optional preparation daemon.
+    /// Explicitly select the in-process path. The daemon is hard-disabled for
+    /// every run until Phase 25.
     #[arg(long)]
     pub(crate) no_daemon: bool,
 
@@ -426,20 +432,23 @@ fn parse_var(raw: &str) -> Result<(String, String), String> {
 /// Parses and validates one secret override. `GITHUB_TOKEN` is deliberately
 /// accepted here even though it starts with the reserved `GITHUB_` prefix
 /// (which every other name is rejected for) — it is the one name
-/// `crate::secrets`' ordinary chain excludes entirely in favor of
-/// `crate::auth::resolve_github_token`, and a local `-s GITHUB_TOKEN=...`
-/// override is that resolution's own highest-priority source
-/// (`crate::run_cmd`), not a name a repository could ever store as a real
-/// secret.
+/// `crate::secrets`' ordinary chain excludes entirely. Phase 12 accepts the
+/// CLI syntax so the selected-plan quarantine can return its canonical
+/// credential diagnostic before any value is resolved or retained.
 fn parse_secret(raw: &str) -> Result<(String, String), String> {
-    let (key, value) = parse_key_val(raw)?;
+    let (key, value) = raw
+        .split_once('=')
+        .filter(|(key, _)| !key.is_empty())
+        .ok_or_else(|| {
+            "invalid -s/--secret value: expected KEY=VALUE with a non-empty KEY".to_string()
+        })?;
     if key.eq_ignore_ascii_case(crate::secrets::GITHUB_TOKEN_NAME) {
-        return Ok((key, value));
+        return Ok((key.to_string(), value.to_string()));
     }
-    crate::secrets::validate_name(&key).map_err(|reason| {
+    crate::secrets::validate_name(key).map_err(|reason| {
         format!(
-            "invalid -s/--secret name '{key}': {reason}\n  fix: rename it to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_"
+            "invalid -s/--secret name: {reason}\n  fix: rename it to use only letters, digits, and underscores, starting with a letter or underscore and not GITHUB_"
         )
     })?;
-    Ok((key, value))
+    Ok((key.to_string(), value.to_string()))
 }

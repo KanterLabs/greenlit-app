@@ -4,10 +4,8 @@
 //! via the GitHub API when a token exists, or via `git ls-remote`
 //! tokenless." The network/API surface is the [`RefResolver`] trait so
 //! `greenlit-engine`/`greenlit-runtime` can drive real resolution
-//! ([`github_api::GitHubApiResolver`], [`git_ls_remote::GitLsRemoteResolver`])
-//! while tests inject a fake — `TESTING.md`: "Mock only true externals: …
-//! the GitHub API …" applies to *this* trait boundary specifically, not to
-//! `greenlit-actions`' own internal logic.
+//! ([`github_api::GitHubApiResolver`], [`git_ls_remote::GitLsRemoteResolver`]).
+//! Tests exercise those true boundaries through loopback HTTP and local Git.
 //!
 //! Callers do not need to pick a resolver themselves for the one case that
 //! never touches the network at all: [`resolve_ref`] checks
@@ -36,9 +34,7 @@ use crate::sha::CommitSha;
 /// The injected boundary that turns a ref into a commit SHA against a real
 /// GitHub-hosted repository.
 ///
-/// Implementations perform real I/O (an HTTP request, or spawning `git`);
-/// tests supply a fake so the calling code's own logic (which resolver to
-/// pick, how a resolution failure surfaces) is exercised without either.
+/// Implementations perform real I/O through an HTTP request or spawned `git`.
 #[async_trait]
 pub trait RefResolver: Send + Sync {
     /// Resolves `git_ref` (a tag or branch name — never called for a ref
@@ -160,87 +156,4 @@ pub async fn resolve_ref(
         }
     }
     resolver.resolve(owner, repo, git_ref).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct CountingFake {
-        calls: Arc<AtomicUsize>,
-        result: Result<CommitSha, ResolveError>,
-    }
-
-    #[async_trait]
-    impl RefResolver for CountingFake {
-        async fn resolve(
-            &self,
-            _owner: &str,
-            _repo: &str,
-            _git_ref: &str,
-        ) -> Result<CommitSha, ResolveError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.result.clone()
-        }
-    }
-
-    // Interaction assertion permitted under `TESTING.md`'s exception ("zero-
-    // refetch and no-script-replay invariants... asserted at the recording-
-    // boundary layer"): a full-SHA ref is the store's own "zero network
-    // fetches for pinned SHAs" invariant one layer up, at resolution.
-    #[tokio::test]
-    async fn full_sha_ref_never_calls_the_resolver() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let fake = CountingFake {
-            calls: Arc::clone(&calls),
-            result: Err(ResolveError::NotFound {
-                owner: "o".into(),
-                repo: "r".into(),
-                git_ref: "never".into(),
-            }),
-        };
-        let sha = "b".repeat(40);
-        let resolved = resolve_ref(&fake, "owner", "repo", &sha).await.unwrap();
-        assert_eq!(resolved.as_str(), sha);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn non_sha_ref_delegates_to_resolver() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let expected = CommitSha::parse(&"c".repeat(40)).unwrap();
-        let fake = CountingFake {
-            calls: Arc::clone(&calls),
-            result: Ok(expected.clone()),
-        };
-        let resolved = resolve_ref(&fake, "owner", "repo", "v4").await.unwrap();
-        assert_eq!(resolved, expected);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn resolver_failure_propagates() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let fake = CountingFake {
-            calls,
-            result: Err(ResolveError::NotFound {
-                owner: "owner".into(),
-                repo: "repo".into(),
-                git_ref: "missing".into(),
-            }),
-        };
-        let error = resolve_ref(&fake, "owner", "repo", "missing")
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error,
-            ResolveError::NotFound {
-                owner: "owner".into(),
-                repo: "repo".into(),
-                git_ref: "missing".into(),
-            }
-        );
-    }
 }

@@ -17,12 +17,43 @@ readonly state_parent="${RUNNER_TEMP:-/tmp}"
 state_dir="$(mktemp -d "${state_parent%/}/greenlit-stargz-provider.XXXXXX")"
 
 cleanup() {
-  docker rm --force "${container_name}" >/dev/null 2>&1 || true
+  local original_status=$?
+  local cleanup_failed=0
+  local remaining=''
+  trap - EXIT
+
+  if docker container inspect "${container_name}" >/dev/null 2>&1; then
+    if ! docker rm --force "${container_name}" >/dev/null; then
+      printf 'failed to remove privileged provider-test container: %s\n' \
+        "${container_name}" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if ! remaining="$(
+    docker container ls --all --quiet --filter "name=^/${container_name}$"
+  )"; then
+    printf 'could not verify privileged provider-test container cleanup\n' >&2
+    cleanup_failed=1
+  elif [[ -n "${remaining}" ]]; then
+    printf 'privileged provider-test container remains after cleanup: %s\n' \
+      "${container_name}" >&2
+    cleanup_failed=1
+  fi
+
   if [[ "${state_dir}" == "${state_parent%/}/greenlit-stargz-provider."* ]]; then
-    rm -rf -- "${state_dir}"
+    if ! rm -rf -- "${state_dir}"; then
+      printf 'failed to remove provider-test state directory: %s\n' "${state_dir}" >&2
+      cleanup_failed=1
+    fi
   else
     printf 'refusing to remove unexpected provider-test path: %s\n' "${state_dir}" >&2
+    cleanup_failed=1
   fi
+
+  if (( cleanup_failed != 0 )); then
+    exit 1
+  fi
+  exit "${original_status}"
 }
 trap cleanup EXIT
 
@@ -92,7 +123,7 @@ done
 test -f "${state_dir}/ready"
 
 LITCI_TEST_LIVE_STARGZ="${state_dir}/containerd/containerd.sock" \
-  cargo test -p greenlit-runtime --test stargz_provider_live -- --nocapture
+  tools/tests/check-capability-test-manifest --run-owner stargz-provider
 
 lazy_output="$(
   docker exec "${container_name}" bash -lc "

@@ -10,7 +10,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One canned response: HTTP status, reason phrase, and body.
 pub struct Canned {
@@ -57,11 +57,47 @@ impl FakeGitHub {
     /// seen for each — lets a test assert both the response-driven outcome
     /// and, when it matters, which endpoints were actually called.
     pub fn serve(self, responses: Vec<Canned>) -> JoinHandle<Vec<String>> {
+        self.serve_requests(responses, false)
+    }
+
+    /// Serves canned responses while retaining each bounded request head.
+    /// Credential capability tests use this true external boundary to prove
+    /// which bearer value a later compiled `litci` process actually loaded.
+    pub fn serve_recorded(self, responses: Vec<Canned>) -> JoinHandle<Vec<String>> {
+        self.serve_requests(responses, true)
+    }
+
+    fn serve_requests(
+        self,
+        responses: Vec<Canned>,
+        record_full_head: bool,
+    ) -> JoinHandle<Vec<String>> {
+        self.listener
+            .set_nonblocking(true)
+            .expect("make fake GitHub listener nonblocking");
         std::thread::spawn(move || {
-            let mut paths = Vec::with_capacity(responses.len());
+            let mut requests = Vec::with_capacity(responses.len());
             for canned in responses {
-                let (mut stream, _) = self.listener.accept().expect("accept");
-                paths.push(read_request_line(&mut stream));
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match self.listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "fake GitHub did not receive its expected request"
+                            );
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("accept fake GitHub request: {error}"),
+                    }
+                };
+                let head = read_request_head(&mut stream);
+                requests.push(if record_full_head {
+                    head
+                } else {
+                    head.lines().next().unwrap_or("").to_string()
+                });
                 let response = format!(
                     "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     canned.status,
@@ -75,28 +111,49 @@ impl FakeGitHub {
                     .write_all(&canned.body)
                     .expect("write fake GitHub body");
             }
-            paths
+            requests
         })
     }
 }
 
-fn read_request_line(stream: &mut TcpStream) -> String {
+fn read_request_head(stream: &mut TcpStream) -> String {
     stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
     let mut buf = [0_u8; 8192];
     let mut total = Vec::new();
+    let mut expected_len = None;
     loop {
         let read = stream.read(&mut buf).unwrap_or(0);
         if read == 0 {
             break;
         }
         total.extend_from_slice(&buf[..read]);
-        if total.windows(4).any(|w| w == b"\r\n\r\n") {
+        assert!(
+            total.len() <= 64 * 1024,
+            "fake GitHub request exceeded its 64 KiB test bound"
+        );
+        if expected_len.is_none()
+            && let Some(header_end) = total.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            let head_len = header_end + 4;
+            let head = String::from_utf8_lossy(&total[..head_len]);
+            let content_len = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length").then(|| {
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("numeric Content-Length")
+                })
+            });
+            expected_len = Some(head_len + content_len.unwrap_or(0));
+        }
+        if expected_len.is_some_and(|expected| total.len() >= expected) {
             break;
         }
     }
-    String::from_utf8_lossy(&total)
-        .lines()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    assert!(
+        expected_len.is_some_and(|expected| total.len() >= expected),
+        "fake GitHub received an incomplete request"
+    );
+    String::from_utf8_lossy(&total).into_owned()
 }
