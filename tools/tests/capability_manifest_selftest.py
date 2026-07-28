@@ -30,6 +30,9 @@ def _run(
         environment.update(environment_overrides)
     return subprocess.run(
         [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
             str(CHECKER),
             "--repository-root",
             str(repository_root),
