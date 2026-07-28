@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import io
-import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +16,7 @@ from parity_producer.common import (
 )
 
 
-MAX_LOG_ARCHIVE_BYTES = 32 * 1024 * 1024
-MAX_LOG_BYTES = 64 * 1024 * 1024
-MAX_LOG_ENTRIES = 32
+MAX_JOB_LOG_BYTES = 8 * 1024 * 1024
 
 
 def content_bytes(response: dict[str, Any]) -> bytes:
@@ -48,38 +44,18 @@ def content_bytes(response: dict[str, Any]) -> bytes:
     return raw
 
 
-def log_lines(archive: bytes) -> list[str]:
-    """Extract bounded UTF-8 lines from one Actions log ZIP."""
-    if len(archive) > MAX_LOG_ARCHIVE_BYTES:
-        raise ProducerError("GitHub log archive exceeds the compressed safety limit")
+def job_log_lines(raw: bytes) -> list[str]:
+    """Decode one bounded plain-text workflow-job log."""
+    if not raw:
+        raise ProducerError("GitHub job log is empty")
+    if len(raw) > MAX_JOB_LOG_BYTES:
+        raise ProducerError("GitHub job log exceeds the expanded safety limit")
     try:
-        zipped = zipfile.ZipFile(io.BytesIO(archive))
-    except (zipfile.BadZipFile, OSError) as error:
-        raise ProducerError("GitHub log response is not a valid ZIP archive") from error
-    infos = zipped.infolist()
-    if not infos or len(infos) > MAX_LOG_ENTRIES:
-        raise ProducerError("GitHub log archive has an invalid entry count")
-    total = 0
-    lines: list[str] = []
-    for info in sorted(infos, key=lambda item: item.filename):
-        if info.is_dir():
-            continue
-        if info.flag_bits & 0x1:
-            raise ProducerError("GitHub log archive contains an encrypted entry")
-        total += info.file_size
-        if total > MAX_LOG_BYTES:
-            raise ProducerError("GitHub log archive exceeds the expanded safety limit")
-        try:
-            raw = zipped.read(info)
-            text = raw.decode("utf-8")
-        except (OSError, RuntimeError, UnicodeDecodeError, zipfile.BadZipFile) as error:
-            raise ProducerError(
-                f"cannot read GitHub log archive entry {info.filename!r}"
-            ) from error
-        lines.extend(text.splitlines())
-    return lines
+        return raw.decode("utf-8-sig").splitlines()
+    except UnicodeDecodeError as error:
+        raise ProducerError("GitHub job log is not valid UTF-8") from error
 
 
-def read_archive(path: Path) -> bytes:
-    """Read an explicitly exported bounded Actions log archive."""
-    return read_regular_file(path, "GitHub logs export", MAX_LOG_ARCHIVE_BYTES)
+def read_job_log(path: Path) -> bytes:
+    """Read an explicitly exported bounded workflow-job log."""
+    return read_regular_file(path, "GitHub job-log export", MAX_JOB_LOG_BYTES)

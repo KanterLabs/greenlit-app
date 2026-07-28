@@ -25,7 +25,8 @@ from parity_producer.contract import (
     EXPECTED_STEPS,
     assemble_observation,
 )
-from parity_producer.github_inputs import content_bytes, log_lines
+from parity_producer.github_inputs import content_bytes, job_log_lines
+from parity_producer.github_job import exact_job_id
 from parity_producer.markers import parse_markers
 
 
@@ -44,10 +45,10 @@ def project_github_evidence(
     run: dict[str, Any],
     jobs_response: dict[str, Any],
     content_response: dict[str, Any],
-    log_archive: bytes,
+    job_log: bytes,
     trusted_source_commit: str,
 ) -> Production:
-    """Project exact API documents and the corresponding Actions log archive."""
+    """Project exact API documents and the corresponding workflow-job log."""
     require_fields(
         run,
         "GitHub run",
@@ -99,17 +100,19 @@ def project_github_evidence(
     run_started = parse_timestamp(run["run_started_at"], "GitHub run start")
     run_completed = parse_timestamp(run["updated_at"], "GitHub run completion")
 
-    workflow_sha256 = sha256_bytes(content_bytes(content_response))
-    markers = parse_markers(log_lines(log_archive), "GitHub Actions log archive")
-    if markers.probe_sha256 != sha256_bytes(b"greenlit\n"):
-        raise ProducerError("GitHub parity probe digest does not match deterministic bytes")
     projection = _project_jobs(
+        repository=repository,
+        run_id=api_run_id,
         jobs_response=jobs_response,
         commit=commit,
         attempt=attempt,
         run_started=run_started,
         run_completed=run_completed,
     )
+    workflow_sha256 = sha256_bytes(content_bytes(content_response))
+    markers = parse_markers(job_log_lines(job_log), "GitHub Actions job log")
+    if markers.probe_sha256 != sha256_bytes(b"greenlit\n"):
+        raise ProducerError("GitHub parity probe digest does not match deterministic bytes")
     producer = {
         "role": "github-actions",
         "repository": repository,
@@ -150,32 +153,31 @@ def project_github_evidence(
 
 def _project_jobs(
     *,
+    repository: str,
+    run_id: int,
     jobs_response: dict[str, Any],
     commit: str,
     attempt: int,
     run_started: dt.datetime,
     run_completed: dt.datetime,
 ) -> dict[str, Any]:
-    require_fields(
-        jobs_response,
-        "GitHub jobs response",
-        {"total_count", "jobs"},
-        allow_extra=True,
-    )
-    total_count = require_integer(
-        jobs_response["total_count"], "GitHub jobs total count", 0
+    exact_job_id(
+        repository=repository,
+        run_id=run_id,
+        attempt=attempt,
+        trusted_source_commit=commit,
+        jobs_response=jobs_response,
     )
     jobs = jobs_response["jobs"]
-    if not isinstance(jobs, list):
-        raise ProducerError("GitHub jobs response jobs must be an array")
-    if total_count != 1 or len(jobs) != 1:
-        raise ProducerError("canonical GitHub seed must have exactly one job")
     job = require_object(jobs[0], "GitHub shell job")
     require_fields(
         job,
         "GitHub shell job",
         {
             "name",
+            "id",
+            "run_id",
+            "url",
             "status",
             "conclusion",
             "head_sha",

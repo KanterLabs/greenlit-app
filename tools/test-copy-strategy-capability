@@ -2,7 +2,7 @@
 # Run the real privileged copy-strategy gate in an isolated pinned child.
 set -euo pipefail
 
-readonly runner_image='ghcr.io/kanterlabs/homelab-runner:2.336.0-3@sha256:f8d30c1e995667f5e5146c638b411288163efaf79fe44f06df91385b924f18dd'
+readonly runner_image='rust:1.96.0@sha256:58fe97504a0e4cbba5d85599619a589923d3e779472a6fb0840d58d1c4ba99d7'
 readonly btrfs_url='https://archive.ubuntu.com/ubuntu/pool/main/b/btrfs-progs/btrfs-progs_6.6.3-1.1build2_amd64.deb'
 readonly btrfs_sha256='b4aeb482adcce07b276827d8f4b0c502427a2a43574fa8349081f23dcd8c96aa'
 readonly lzo_url='https://archive.ubuntu.com/ubuntu/pool/main/l/lzo2/liblzo2-2_2.10-2build4_amd64.deb'

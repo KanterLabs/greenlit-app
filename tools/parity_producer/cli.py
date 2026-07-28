@@ -52,7 +52,7 @@ def main(arguments: list[str] | None = None) -> int:
                 run_json=args.run_json,
                 jobs_json=args.jobs_json,
                 content_json=args.content_json,
-                logs_zip=args.logs_zip,
+                job_log_path=args.job_log,
                 self_test_raw_evidence=args.self_test_raw_evidence,
                 self_test_gh_executable=args.self_test_gh_executable,
             )
@@ -124,7 +124,7 @@ def _parser() -> argparse.ArgumentParser:
     raw.add_argument("--run-json", type=Path)
     raw.add_argument("--jobs-json", type=Path)
     raw.add_argument("--content-json", type=Path)
-    raw.add_argument("--logs-zip", type=Path)
+    raw.add_argument("--job-log", type=Path)
     raw.add_argument(
         "--self-test-raw-evidence",
         action="store_true",
