@@ -113,6 +113,25 @@ impl RunningLitci {
         drop(stdout);
     }
 
+    fn exited_output(&mut self) -> Option<Output> {
+        let child = self.child.as_mut().expect("running litci");
+        child.try_wait().expect("poll litci").map(|_| {
+            self.child
+                .take()
+                .expect("exited litci")
+                .wait_with_output()
+                .expect("collect exited litci output")
+        })
+    }
+
+    fn terminate_and_collect(&mut self) -> Output {
+        let mut child = self.child.take().expect("running litci");
+        let _ = child.kill();
+        child
+            .wait_with_output()
+            .expect("collect terminated litci output")
+    }
+
     pub(super) fn finish(mut self) -> Output {
         let mut child = self.child.take().expect("running litci");
         let deadline = Instant::now() + RUN_TIMEOUT;
@@ -216,7 +235,10 @@ pub(super) fn assert_real_docker() {
     );
 }
 
-pub(super) fn observe_running_container(sandbox: &Sandbox) -> (String, String) {
+pub(super) fn observe_running_container(
+    sandbox: &Sandbox,
+    running: &mut RunningLitci,
+) -> (String, String) {
     let deadline = Instant::now() + RUN_TIMEOUT;
     loop {
         if let Some(run_id) = current_run_id(sandbox)
@@ -224,10 +246,25 @@ pub(super) fn observe_running_container(sandbox: &Sandbox) -> (String, String) {
         {
             return (run_id, container);
         }
-        assert!(
-            Instant::now() < deadline,
-            "litci did not expose a live workflow container before the deadline"
-        );
+        if let Some(output) = running.exited_output() {
+            panic!(
+                "litci exited before exposing a live workflow container: {}; \
+                 stdout={} bytes, stderr={} bytes",
+                output.status,
+                output.stdout.len(),
+                output.stderr.len()
+            );
+        }
+        if Instant::now() >= deadline {
+            let output = running.terminate_and_collect();
+            panic!(
+                "litci did not expose a live workflow container before the deadline: \
+                 terminated {}; stdout={} bytes, stderr={} bytes",
+                output.status,
+                output.stdout.len(),
+                output.stderr.len()
+            );
+        }
         thread::sleep(Duration::from_millis(50));
     }
 }
