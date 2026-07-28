@@ -199,7 +199,10 @@ def _governance_case(valid_parity: str, resolving_commit: str) -> Case:
     )
 
 
-def _create_baseline_commit(root: Path) -> str:
+def _create_baseline_commit(
+    root: Path,
+    message: str = "checker baseline",
+) -> str:
     subprocess.run(
         [GIT_EXECUTABLE, "-C", str(root), "init", "--quiet", "--template="],
         stdin=subprocess.DEVNULL,
@@ -224,7 +227,7 @@ def _create_baseline_commit(root: Path) -> str:
             "--quiet",
             "--allow-empty",
             "-m",
-            "checker baseline",
+            message,
         ],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -451,6 +454,39 @@ def run_self_test(executable: Path) -> int:
                     f"stderr={completed.stderr!r}"
                 )
 
+        with tempfile.TemporaryDirectory(
+            prefix="greenlit-ledger-foreign-"
+        ) as foreign_directory:
+            foreign_root = Path(foreign_directory)
+            try:
+                foreign_commit = _create_baseline_commit(
+                    foreign_root,
+                    "foreign checker baseline",
+                )
+            except (OSError, subprocess.SubprocessError):
+                failures.append(
+                    "mixed-repository ledger: could not create the foreign Git "
+                    "commit baseline"
+                )
+            else:
+                agents.write_text(valid_agents, encoding="utf-8")
+                parity.write_text(valid_parity, encoding="utf-8")
+                foreign_ledger = foreign_root / "STABILIZATION-LEDGER.md"
+                foreign_ledger.write_text(
+                    _stabilization(foreign_commit),
+                    encoding="utf-8",
+                )
+                completed = _run(executable, agents, foreign_ledger, parity)
+                output = f"{completed.stdout}\n{completed.stderr}"
+                expected = "must be contained within the AGENTS repository root"
+                if completed.returncode != 1 or expected not in output:
+                    failures.append(
+                        "mixed-repository ledger: "
+                        f"exit {completed.returncode}, missing={expected!r}; "
+                        f"stdout={completed.stdout!r}; "
+                        f"stderr={completed.stderr!r}"
+                    )
+
     if failures:
         print("check-stabilization-ledger self-test: FAILED", file=sys.stderr)
         for failure in failures:
@@ -459,6 +495,6 @@ def run_self_test(executable: Path) -> int:
     print(
         "check-stabilization-ledger self-test: OK — "
         f"{len(baselines)} valid baselines and "
-        f"{len(cases)} rejection canaries passed"
+        f"{len(cases) + 1} rejection canaries passed"
     )
     return 0
