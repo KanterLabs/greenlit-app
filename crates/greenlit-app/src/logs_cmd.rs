@@ -1,13 +1,15 @@
 //! Read-only replay of redacted log events from a persisted run journal.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::thread;
 use std::time::Duration;
 
+use greenlit_store::cas::RunCatalogState;
+
 use crate::cli::{LogFormatArg, LogsArgs};
+use crate::inspect_cmd::{RetainedRun, RunsDirectory};
 use crate::run_events::{RunEvent, RunEventRecord};
 
 #[derive(Debug, Clone)]
@@ -17,10 +19,13 @@ struct StepIdentity {
 }
 
 pub(crate) fn run(args: LogsArgs) -> anyhow::Result<()> {
-    let runs = crate::inspect_cmd::runs_root()?;
-    let (run_id, journal) = select_journal(&runs, args.run_id.as_deref())?;
+    let runs = crate::inspect_cmd::open_runs_directory()?;
+    let (retained, mut journal) = select_journal(&runs, args.run_id.as_deref())?;
+    let run_id = retained.run_id().to_string();
+    let store = crate::inspect_cmd::open_catalog_store()?;
     let mut offset = 0;
-    let mut terminal = false;
+    let mut expected_sequence = 1_u64;
+    let mut saw_terminal = false;
     let mut steps = HashMap::new();
     let mut tail = VecDeque::new();
     let mut first_pass = true;
@@ -29,17 +34,8 @@ pub(crate) fn run(args: LogsArgs) -> anyhow::Result<()> {
         .map(|value| usize::try_from(value).unwrap_or(usize::MAX));
 
     loop {
-        let bytes = fs::read(&journal).map_err(|error| {
-            anyhow::anyhow!(
-                "could not read logs for run '{run_id}': {error}\n  fix: use `litci doctor` to check the run journal"
-            )
-        })?;
-        if offset > bytes.len() {
-            anyhow::bail!(
-                "run journal for '{run_id}' shrank while it was being read\n  fix: preserve the run directory and use `litci doctor`"
-            );
-        }
-        let appended = &bytes[offset..];
+        let bytes = read_appended(&mut journal, offset, &run_id)?;
+        let appended = bytes.as_slice();
         let complete_len = appended
             .iter()
             .rposition(|byte| *byte == b'\n')
@@ -58,8 +54,17 @@ pub(crate) fn run(args: LogsArgs) -> anyhow::Result<()> {
                     "run journal for '{run_id}' contains an invalid event: {error}\n  fix: preserve the run directory and use `litci doctor`"
                 )
             })?;
+            if record.schema_version != 1
+                || record.sequence != expected_sequence
+                || record.run_id != run_id
+            {
+                anyhow::bail!(
+                    "run journal for '{run_id}' has inconsistent schema, ordering, or run identity at sequence {expected_sequence}\n  fix: preserve the run directory and use `litci doctor`"
+                );
+            }
+            expected_sequence = expected_sequence.saturating_add(1);
             index_step(&record, &mut steps);
-            terminal |= matches!(record.event, RunEvent::RunFinished { .. });
+            saw_terminal |= matches!(&record.event, RunEvent::RunFinished { .. });
             if matches_filter(&record, &args, &steps) {
                 let rendered = render_record(line, &record, args.format)?;
                 if let Some(limit) = tail_limit
@@ -81,45 +86,112 @@ pub(crate) fn run(args: LogsArgs) -> anyhow::Result<()> {
             }
             first_pass = false;
         }
-        if !args.follow || terminal {
+        if !args.follow {
             break;
         }
-        thread::sleep(Duration::from_millis(150));
+
+        let recovery = store.recover_incomplete_run_publications(runs.path());
+        let state = store.run_state(&run_id).map_err(|error| {
+            anyhow::anyhow!(
+                "could not read durable state while following run '{run_id}': {error}\n  fix: preserve ~/.litci and use `litci doctor`"
+            )
+        })?;
+        match state {
+            Some(RunCatalogState::Completed) => {
+                crate::inspect_cmd::terminal_authority(&retained, &store)?;
+                break;
+            }
+            Some(RunCatalogState::Aborted) => {
+                let cleanup = recovery
+                    .err()
+                    .map(|error| format!("; recovery cleanup also reported: {error}"))
+                    .unwrap_or_default();
+                anyhow::bail!(
+                    "run '{run_id}' was aborted before a composite terminal commit{cleanup}\n  fix: choose another run or use `litci doctor` to inspect recovery state"
+                );
+            }
+            Some(RunCatalogState::Resolved) => {
+                let recovery = recovery.map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not reconcile run '{run_id}' while following its logs: {error}\n  fix: preserve ~/.litci and use `litci doctor`"
+                    )
+                })?;
+                if recovery.unprotected.iter().any(|id| id == &run_id) {
+                    anyhow::bail!(
+                        "run '{run_id}' lacks the private publication lock required to distinguish an active writer from an orphan\n  fix: preserve the run directory and use `litci doctor`"
+                    );
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+            None if saw_terminal => {
+                anyhow::bail!(
+                    "run '{run_id}' published RunFinished without any durable catalog state; the event is not authoritative\n  fix: preserve the run directory and use `litci doctor`"
+                );
+            }
+            None => thread::sleep(Duration::from_millis(150)),
+        }
     }
     Ok(())
 }
 
-fn select_journal(runs: &Path, requested: Option<&str>) -> anyhow::Result<(String, PathBuf)> {
+fn read_appended(journal: &mut File, offset: usize, run_id: &str) -> anyhow::Result<Vec<u8>> {
+    let length = journal
+        .metadata()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "could not inspect logs for run '{run_id}': {error}\n  fix: use `litci doctor` to check the run journal"
+            )
+        })?
+        .len();
+    let offset_u64 = u64::try_from(offset).map_err(|_| {
+        anyhow::anyhow!(
+            "run journal for '{run_id}' exceeds the supported host size\n  fix: preserve the run directory and use `litci doctor`"
+        )
+    })?;
+    if offset_u64 > length {
+        anyhow::bail!(
+            "run journal for '{run_id}' shrank while it was being read\n  fix: preserve the run directory and use `litci doctor`"
+        );
+    }
+    journal.seek(SeekFrom::Start(offset_u64)).map_err(|error| {
+        anyhow::anyhow!(
+            "could not seek logs for run '{run_id}': {error}\n  fix: use `litci doctor` to check the run journal"
+        )
+    })?;
+    let mut bytes = Vec::new();
+    journal.read_to_end(&mut bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read logs for run '{run_id}': {error}\n  fix: use `litci doctor` to check the run journal"
+        )
+    })?;
+    Ok(bytes)
+}
+
+fn select_journal(
+    runs: &RunsDirectory,
+    requested: Option<&str>,
+) -> anyhow::Result<(RetainedRun, File)> {
     if let Some(requested) = requested {
         let run_id = crate::inspect_cmd::validate_run_id(requested)?;
-        let journal = runs.join(&run_id).join("events.ndjson");
-        if !journal.is_file() {
+        let retained = runs.open_run(&run_id)?;
+        if !retained.has_artifact("events.ndjson")? {
             anyhow::bail!(
                 "run '{run_id}' has no structured log journal\n  fix: choose a run created by this version of Greenlit"
             );
         }
-        return Ok((run_id, journal));
+        let journal = retained.open_artifact("events.ndjson")?;
+        return Ok((retained, journal));
     }
-    let entries = fs::read_dir(runs).map_err(|error| {
-        anyhow::anyhow!(
-            "could not list run logs at {}: {error}\n  fix: run a workflow first, or make HOME readable",
-            runs.display()
-        )
-    })?;
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| crate::inspect_cmd::validate_run_id(name).is_ok())
-        .filter_map(|run_id| {
-            let path = runs.join(&run_id).join("events.ndjson");
-            path.is_file().then_some((run_id, path))
-        })
-        .max_by(|left, right| left.0.cmp(&right.0))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no structured run logs exist\n  fix: run `litci run` once with this version, then retry"
-            )
-        })
+    for run_id in runs.run_ids()?.into_iter().rev() {
+        let retained = runs.open_run(&run_id)?;
+        if retained.has_artifact("events.ndjson")? {
+            let journal = retained.open_artifact("events.ndjson")?;
+            return Ok((retained, journal));
+        }
+    }
+    Err(anyhow::anyhow!(
+        "no structured run logs exist\n  fix: run `litci run` once with this version, then retry"
+    ))
 }
 
 fn index_step(record: &RunEventRecord, steps: &mut HashMap<(String, String), StepIdentity>) {

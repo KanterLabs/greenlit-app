@@ -3,18 +3,24 @@
 mod catalog;
 mod digest;
 mod http;
+mod private_fs;
+mod recovery;
 mod tree;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use rustix::fs::OFlags;
 use sha2::{Digest, Sha256};
 
 use catalog::Catalog;
 pub use digest::{InvalidDigest, ObjectDigest};
 pub use http::HttpFetch;
+use private_fs::PrivateStore;
+pub use recovery::{RecoveredRun, RunPublicationGuard, RunPublicationLockState, RunRecoveryReport};
 pub use tree::{TreeEntry, TreeEntryKind, TreeManifest};
 
 const LOCK_WAIT: Duration = Duration::from_secs(120);
@@ -119,6 +125,30 @@ pub enum CasError {
         /// Catalog path.
         path: String,
     },
+    /// A catalog row contains a run lifecycle state this version does not
+    /// understand.
+    #[error("content catalog contains unknown run state {state:?}")]
+    UnknownRunState {
+        /// Unrecognized persisted state.
+        state: String,
+    },
+    /// A terminal run state cannot transition back to an authoritative state.
+    #[error("run {run_id} cannot transition from {from} to {to}")]
+    InvalidRunStateTransition {
+        /// Stable run identity.
+        run_id: String,
+        /// Durable state already in the catalog.
+        from: RunCatalogState,
+        /// Rejected target state.
+        to: RunCatalogState,
+    },
+    /// A catalog identity cannot safely be used as one path component during
+    /// recovery.
+    #[error("run identity {run_id:?} is not a safe catalog identity")]
+    InvalidRunIdentity {
+        /// Rejected run identity.
+        run_id: String,
+    },
     /// The supplied bytes did not match the requested identity.
     #[error("downloaded content does not match {expected}; computed {actual}")]
     DigestMismatch {
@@ -200,10 +230,60 @@ pub enum CasError {
     },
 }
 
+/// Durable lifecycle state used as the authority boundary for retained runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunCatalogState {
+    /// The run lock is durable and execution may still be active.
+    Resolved,
+    /// Every terminal evidence component was durably published.
+    Completed,
+    /// Recovery or failed publication revoked terminal authority.
+    Aborted,
+}
+
+impl RunCatalogState {
+    /// Stable SQLite representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Completed => "completed",
+            Self::Aborted => "aborted",
+        }
+    }
+
+    fn parse(state: &str) -> Result<Self, CasError> {
+        match state {
+            "resolved" => Ok(Self::Resolved),
+            "completed" => Ok(Self::Completed),
+            "aborted" => Ok(Self::Aborted),
+            _ => Err(CasError::UnknownRunState {
+                state: state.to_string(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for RunCatalogState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One durable run catalog row plus its current lease status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunCatalogEntry {
+    /// Stable run identity.
+    pub run_id: String,
+    /// Durable lifecycle state.
+    pub state: RunCatalogState,
+}
+
 /// A machine-wide SHA-256 object store with SQLite-WAL metadata.
 #[derive(Debug, Clone)]
 pub struct CasStore {
     root: PathBuf,
+    private: Arc<PrivateStore>,
     catalog: Catalog,
 }
 
@@ -211,12 +291,17 @@ impl CasStore {
     /// Opens or initializes a store at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, CasError> {
         let root = root.into();
+        let private = Arc::new(PrivateStore::open(&root)?);
         for child in ["objects/sha256", "tmp", "inflight", "quarantine"] {
-            let path = root.join(child);
-            fs::create_dir_all(&path).map_err(|source| io_error(&path, source))?;
+            private.ensure_directory(Path::new(child))?;
         }
+        drop(private.ensure_file(Path::new("catalog.sqlite3"))?);
         let catalog = Catalog::open(&root.join("catalog.sqlite3"))?;
-        Ok(Self { root, catalog })
+        Ok(Self {
+            root,
+            private,
+            catalog,
+        })
     }
 
     /// Returns the default machine-user store path.
@@ -229,11 +314,19 @@ impl CasStore {
     /// as a digest mismatch, never as usable bytes.
     pub fn read_verified(&self, digest: &ObjectDigest) -> Result<Option<Vec<u8>>, CasError> {
         let path = self.object_path(digest);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(io_error(&path, source)),
+        let mut file = match self
+            .private
+            .open_file(&self.object_relative(digest), OFlags::RDONLY)
+        {
+            Ok(file) => file,
+            Err(CasError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
         };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| io_error(&path, source))?;
         let actual = digest_bytes(&bytes);
         if &actual != digest {
             self.quarantine(&path, digest)?;
@@ -273,10 +366,14 @@ impl CasStore {
         if self.usable_or_quarantined(digest)? {
             return Ok(EnsureOutcome::Hit);
         }
-        self.ensure_with(digest, |partial, _offset| {
-            fs::copy(source, partial)
-                .map(|_| ())
-                .map_err(|error| io_error(source, error))
+        let partial_relative = self.partial_relative(digest);
+        self.ensure_with(digest, |_partial, _offset| {
+            let mut input = File::open(source).map_err(|error| io_error(source, error))?;
+            let mut output = self
+                .private
+                .open_file(&partial_relative, OFlags::WRONLY | OFlags::TRUNC)?;
+            std::io::copy(&mut input, &mut output).map_err(|error| io_error(source, error))?;
+            output.sync_all().map_err(|error| io_error(source, error))
         })
     }
 
@@ -291,15 +388,12 @@ impl CasStore {
         if self.usable_or_quarantined(digest)? {
             return Ok(EnsureOutcome::Hit);
         }
-        let lock_path = self.root.join("inflight").join(digest.hex());
+        let lock_relative = PathBuf::from("inflight").join(digest.hex());
+        let lock_path = self.root.join(&lock_relative);
         let start = Instant::now();
         loop {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-            {
-                Ok(mut lock) => {
+            match self.private.create_exclusive_file(&lock_relative)? {
+                Some(mut lock) => {
                     writeln!(lock, "{}", current_process_identity())
                         .map_err(|source| io_error(&lock_path, source))?;
                     lock.sync_all()
@@ -308,11 +402,14 @@ impl CasStore {
                     if self.usable_or_quarantined(digest)? {
                         return Ok(EnsureOutcome::Shared);
                     }
-                    let partial = self
-                        .root
-                        .join("tmp")
-                        .join(format!("{}.partial", digest.hex()));
-                    let offset = fs::metadata(&partial).map_or(0, |metadata| metadata.len());
+                    let partial_relative = self.partial_relative(digest);
+                    let partial = self.root.join(&partial_relative);
+                    let partial_file = self.private.ensure_file(&partial_relative)?;
+                    let offset = partial_file
+                        .metadata()
+                        .map_err(|error| io_error(&partial, error))?
+                        .len();
+                    drop(partial_file);
                     self.catalog.record_download(digest, offset)?;
                     if let Err(error) = materialize(&partial, offset) {
                         let retained =
@@ -320,9 +417,14 @@ impl CasStore {
                         self.catalog.record_download(digest, retained)?;
                         return Err(error);
                     }
-                    let retained = fs::metadata(&partial).map_or(offset, |metadata| metadata.len());
+                    let verified_partial =
+                        self.private.open_file(&partial_relative, OFlags::RDONLY)?;
+                    let retained = verified_partial
+                        .metadata()
+                        .map_err(|error| io_error(&partial, error))?
+                        .len();
                     self.catalog.record_download(digest, retained)?;
-                    let (actual, size) = digest_file(&partial)?;
+                    let (actual, size) = digest_file_handle(verified_partial, &partial)?;
                     if &actual != digest {
                         self.quarantine(&partial, digest)?;
                         return Err(CasError::DigestMismatch {
@@ -335,7 +437,7 @@ impl CasStore {
                     drop(guard);
                     return Ok(outcome);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                None => {
                     if stale_lock(&lock_path)? {
                         match fs::remove_file(&lock_path) {
                             Ok(()) => continue,
@@ -353,7 +455,6 @@ impl CasStore {
                     }
                     std::thread::sleep(LOCK_POLL);
                 }
-                Err(source) => return Err(io_error(&lock_path, source)),
             }
         }
     }
@@ -522,7 +623,68 @@ impl CasStore {
         lock_digest: Option<&str>,
         state: &str,
     ) -> Result<(), CasError> {
+        validate_run_identity(run_id)?;
+        let state = RunCatalogState::parse(state)?;
         self.catalog.record_run_state(run_id, lock_digest, state)
+    }
+
+    /// Reads the durable lifecycle state for one run.
+    pub fn run_state(&self, run_id: &str) -> Result<Option<RunCatalogState>, CasError> {
+        validate_run_identity(run_id)?;
+        self.catalog
+            .run_state(run_id)?
+            .map(|state| RunCatalogState::parse(&state))
+            .transpose()
+    }
+
+    /// Lists every durable run catalog row and whether its lease is live.
+    pub fn run_catalog_entries(&self) -> Result<Vec<RunCatalogEntry>, CasError> {
+        self.catalog
+            .all_run_states()?
+            .into_iter()
+            .map(|(run_id, state)| {
+                validate_run_identity(&run_id)?;
+                Ok(RunCatalogEntry {
+                    run_id,
+                    state: RunCatalogState::parse(&state)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Creates and exclusively holds the private liveness lock for one active
+    /// run publication.
+    pub fn acquire_run_publication_guard(
+        &self,
+        runs_root: &Path,
+        run_id: &str,
+    ) -> Result<RunPublicationGuard, CasError> {
+        validate_run_identity(run_id)?;
+        recovery::acquire_publication_guard(runs_root, run_id)
+    }
+
+    /// Reports whether a retained run's private publication lock is held.
+    pub fn run_publication_lock_state(
+        &self,
+        runs_root: &Path,
+        run_id: &str,
+    ) -> Result<RunPublicationLockState, CasError> {
+        validate_run_identity(run_id)?;
+        recovery::publication_lock_state(runs_root, run_id)
+    }
+
+    /// Revokes and quarantines inactive runs whose terminal publication never
+    /// reached the durable `completed` catalog state.
+    ///
+    /// The catalog is changed to `aborted` before the run tree is moved. A
+    /// failed move can therefore leave diagnostic bytes behind, but those
+    /// bytes cannot regain terminal authority. Active leases and completed
+    /// rows are never touched.
+    pub fn recover_incomplete_run_publications(
+        &self,
+        runs_root: &Path,
+    ) -> Result<RunRecoveryReport, CasError> {
+        recovery::recover(self, runs_root)
     }
 
     /// Terminal run identities whose engine resources may be reconciled once
@@ -645,16 +807,18 @@ impl CasStore {
                 std::io::Error::other("object path has no parent directory"),
             )
         })?;
-        fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-        let temp =
-            self.root
-                .join("tmp")
-                .join(format!("{}.{}.publish", digest.hex(), std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|source| io_error(&temp, source))?;
+        let object_relative = self.object_relative(digest);
+        let parent_relative = object_relative.parent().ok_or_else(|| {
+            io_error(
+                &target,
+                std::io::Error::other("object path has no relative parent directory"),
+            )
+        })?;
+        drop(self.private.ensure_directory(parent_relative)?);
+        let temp_relative =
+            PathBuf::from("tmp").join(format!("{}.{}.publish", digest.hex(), std::process::id()));
+        let temp = self.root.join(&temp_relative);
+        let mut file = self.private.create_new_file(&temp_relative)?;
         file.write_all(bytes)
             .map_err(|source| io_error(&temp, source))?;
         file.sync_all().map_err(|source| io_error(&temp, source))?;
@@ -675,13 +839,17 @@ impl CasStore {
 
     fn has_verified(&self, digest: &ObjectDigest) -> Result<bool, CasError> {
         let path = self.object_path(digest);
-        let (actual, _size) = match digest_file(&path) {
-            Ok(value) => value,
+        let file = match self
+            .private
+            .open_file(&self.object_relative(digest), OFlags::RDONLY)
+        {
+            Ok(file) => file,
             Err(CasError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(false);
             }
             Err(error) => return Err(error),
         };
+        let (actual, _size) = digest_file_handle(file, &path)?;
         if &actual != digest {
             self.quarantine(&path, digest)?;
             return Err(CasError::DigestMismatch {
@@ -713,9 +881,18 @@ impl CasStore {
                 std::io::Error::other("object path has no parent directory"),
             )
         })?;
-        fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
-        File::open(source)
-            .and_then(|file| file.sync_all())
+        let object_relative = self.object_relative(digest);
+        let parent_relative = object_relative.parent().ok_or_else(|| {
+            io_error(
+                &target,
+                std::io::Error::other("object path has no relative parent directory"),
+            )
+        })?;
+        drop(self.private.ensure_directory(parent_relative)?);
+        let partial_relative = self.partial_relative(digest);
+        self.private
+            .open_file(&partial_relative, OFlags::RDONLY)?
+            .sync_all()
             .map_err(|error| io_error(source, error))?;
         fs::rename(source, &target).map_err(|error| io_error(&target, error))?;
         sync_directory(parent)?;
@@ -724,12 +901,19 @@ impl CasStore {
     }
 
     fn object_path(&self, digest: &ObjectDigest) -> PathBuf {
+        self.root.join(self.object_relative(digest))
+    }
+
+    fn object_relative(&self, digest: &ObjectDigest) -> PathBuf {
         let hex = digest.hex();
-        self.root
-            .join("objects")
+        PathBuf::from("objects")
             .join("sha256")
             .join(&hex[..2])
             .join(&hex[2..])
+    }
+
+    fn partial_relative(&self, digest: &ObjectDigest) -> PathBuf {
+        PathBuf::from("tmp").join(format!("{}.partial", digest.hex()))
     }
 
     fn quarantine(&self, path: &Path, digest: &ObjectDigest) -> Result<(), CasError> {
@@ -765,6 +949,20 @@ fn expiry_after(ttl: Duration) -> Result<i64, CasError> {
     now.checked_add(seconds).ok_or(CasError::ClockRange)
 }
 
+fn validate_run_identity(run_id: &str) -> Result<(), CasError> {
+    if !run_id.is_empty()
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(CasError::InvalidRunIdentity {
+            run_id: run_id.to_string(),
+        })
+    }
+}
+
 fn unix_seconds() -> Result<i64, CasError> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -789,8 +987,7 @@ fn directory_files(path: &Path) -> Result<(usize, u64), CasError> {
     Ok((count, bytes))
 }
 
-fn digest_file(path: &Path) -> Result<(ObjectDigest, u64), CasError> {
-    let mut file = File::open(path).map_err(|error| io_error(path, error))?;
+fn digest_file_handle(mut file: File, path: &Path) -> Result<(ObjectDigest, u64), CasError> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];

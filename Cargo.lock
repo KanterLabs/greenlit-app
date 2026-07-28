@@ -762,6 +762,7 @@ dependencies = [
  "greenlit-workflow",
  "indexmap",
  "regex",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -840,6 +841,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

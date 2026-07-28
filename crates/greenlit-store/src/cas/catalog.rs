@@ -3,9 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
-use super::{CasError, ObjectDigest};
+use super::{CasError, ObjectDigest, RunCatalogState};
 
 #[derive(Debug, Clone)]
 pub(super) struct Catalog {
@@ -406,19 +406,71 @@ impl Catalog {
         &self,
         run_id: &str,
         lock_digest: Option<&str>,
-        state: &str,
+        state: RunCatalogState,
     ) -> Result<(), CasError> {
         let now = unix_seconds()?;
-        self.connection()?
+        let changed = self
+            .connection()?
             .execute(
                 "INSERT INTO runs(run_id,lock_digest,state,updated_at) VALUES(?1,?2,?3,?4)
                  ON CONFLICT(run_id) DO UPDATE SET
                    lock_digest=COALESCE(excluded.lock_digest,runs.lock_digest),
-                   state=excluded.state,updated_at=excluded.updated_at",
-                params![run_id, lock_digest, state, now],
+                   state=excluded.state,updated_at=excluded.updated_at
+                 WHERE runs.state='resolved'
+                    OR runs.state=excluded.state
+                    OR (runs.state='completed' AND excluded.state='aborted')",
+                params![run_id, lock_digest, state.as_str(), now],
             )
             .map_err(CasError::Catalog)?;
-        Ok(())
+        if changed > 0 {
+            return Ok(());
+        }
+        let from = self
+            .run_state(run_id)?
+            .ok_or_else(|| CasError::CatalogState {
+                path: self.path.display().to_string(),
+            })
+            .and_then(|persisted| RunCatalogState::parse(&persisted))?;
+        Err(CasError::InvalidRunStateTransition {
+            run_id: run_id.to_string(),
+            from,
+            to: state,
+        })
+    }
+
+    pub(super) fn run_state(&self, run_id: &str) -> Result<Option<String>, CasError> {
+        self.connection()?
+            .query_row(
+                "SELECT state FROM runs WHERE run_id=?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(CasError::Catalog)
+    }
+
+    pub(super) fn all_run_states(&self) -> Result<Vec<(String, String)>, CasError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT run_id,state FROM runs ORDER BY updated_at ASC,run_id ASC")
+            .map_err(CasError::Catalog)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(CasError::Catalog)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(CasError::Catalog)
+    }
+
+    pub(super) fn abort_if_incomplete(&self, run_id: &str) -> Result<bool, CasError> {
+        let now = unix_seconds()?;
+        self.connection()?
+            .execute(
+                "UPDATE runs SET state='aborted',updated_at=?2
+                 WHERE run_id=?1 AND state NOT IN ('completed','aborted')",
+                params![run_id, now],
+            )
+            .map(|changed| changed > 0)
+            .map_err(CasError::Catalog)
     }
 
     pub(super) fn terminal_run_ids(&self) -> Result<Vec<String>, CasError> {
@@ -446,6 +498,11 @@ impl Catalog {
 
 fn open_connection(path: &Path) -> Result<Connection, CasError> {
     let connection = Connection::open(path).map_err(CasError::Catalog)?;
+    configure_connection(&connection)?;
+    Ok(connection)
+}
+
+fn configure_connection(connection: &Connection) -> Result<(), CasError> {
     connection
         .pragma_update(None, "journal_mode", "WAL")
         .map_err(CasError::Catalog)?;
@@ -455,7 +512,7 @@ fn open_connection(path: &Path) -> Result<Connection, CasError> {
     connection
         .busy_timeout(std::time::Duration::from_secs(10))
         .map_err(CasError::Catalog)?;
-    Ok(connection)
+    Ok(())
 }
 
 fn unix_seconds() -> Result<i64, CasError> {
