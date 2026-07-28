@@ -35,6 +35,7 @@ use private_fs::{
 pub(crate) struct RunEvidence {
     pub(crate) run_id: String,
     pub(crate) directory: PathBuf,
+    pub(crate) state_root: PathBuf,
     pub(crate) source: SourceSnapshot,
     runs_handle: File,
     directory_handle: File,
@@ -202,6 +203,7 @@ impl RunEvidence {
             let evidence = Self {
                 run_id: run_id.clone(),
                 directory: directory.clone(),
+                state_root: home.join(".litci"),
                 source,
                 runs_handle: runs_handle
                     .try_clone()

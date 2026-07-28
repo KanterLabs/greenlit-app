@@ -19,6 +19,10 @@ use crate::isolation::IsolationStrategy;
 pub struct RunConfig {
     /// Absolute host path of the repository checkout (the read-only lower).
     pub repo_host_path: PathBuf,
+    /// Absolute private Greenlit state root used for daemon-visible runtime
+    /// infrastructure that remains available when workflow stores are
+    /// disabled.
+    pub runtime_state_root: PathBuf,
     /// `GITHUB_WORKSPACE` inside every job container.
     pub workspace: String,
     /// Which isolation mechanism `greenlit-init` should use.

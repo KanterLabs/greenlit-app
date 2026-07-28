@@ -411,6 +411,7 @@ async fn public_run_plan_blocks_protected_findings_before_production_engine_requ
         let repo = tempfile::tempdir().expect("temporary repository");
         let config = RunConfig {
             repo_host_path: repo.path().to_path_buf(),
+            runtime_state_root: repo.path().join(".litci"),
             workspace: "/workspace".to_string(),
             strategy: IsolationStrategy::default(),
             runner_env: Default::default(),
@@ -479,6 +480,7 @@ async fn bound_assessment_drift_is_nonforceable_before_production_engine_request
     let repo = tempfile::tempdir().expect("temporary repository");
     let config = RunConfig {
         repo_host_path: repo.path().to_path_buf(),
+        runtime_state_root: repo.path().join(".litci"),
         workspace: "/workspace".to_string(),
         strategy: IsolationStrategy::default(),
         runner_env: Default::default(),
@@ -593,6 +595,7 @@ async fn public_bound_assessment_cannot_force_source_containment_or_unknown_find
         let repo = tempfile::tempdir().expect("temporary repository");
         let config = RunConfig {
             repo_host_path: repo.path().to_path_buf(),
+            runtime_state_root: repo.path().join(".litci"),
             workspace: "/workspace".to_string(),
             strategy: IsolationStrategy::default(),
             runner_env: Default::default(),
@@ -676,6 +679,7 @@ async fn public_cancellable_entrypoint_independently_blocks_sensitive_plan_conte
         let repo = tempfile::tempdir().expect("temporary repository");
         let config = RunConfig {
             repo_host_path: repo.path().to_path_buf(),
+            runtime_state_root: repo.path().join(".litci"),
             workspace: "/workspace".to_string(),
             strategy: IsolationStrategy::default(),
             runner_env: Default::default(),

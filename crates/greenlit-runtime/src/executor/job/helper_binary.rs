@@ -4,12 +4,13 @@
 //! container starts. A helper written into a runner-managed scratch directory
 //! can disappear between create and start if that directory is swept between
 //! CI steps. Normal Greenlit runs therefore publish the embedded helper under
-//! the user-local Greenlit state root, keyed by its digest. The temporary-file
-//! fallback exists only for callers that deliberately configure no store.
+//! the user-local Greenlit state root, keyed by its digest. This path is
+//! independent of workflow-facing stores so containment can disable those
+//! stores without returning helper publication to ephemeral host scratch.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,11 +25,8 @@ use crate::image::init_binary;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// Publish the embedded helper and return its absolute bind source.
-pub(super) fn stage(state_root: Option<&Path>) -> Result<String, ExecError> {
-    let path = match state_root {
-        Some(root) => stage_durable(root)?,
-        None => stage_ephemeral()?,
-    };
+pub(super) fn stage(state_root: &Path) -> Result<String, ExecError> {
+    let path = stage_durable(state_root)?;
     path.into_os_string()
         .into_string()
         .map_err(|_| staging_error("the helper path is not valid UTF-8"))
@@ -96,17 +94,6 @@ fn remove_temporary(directory: &File, name: &str) -> Result<(), ExecError> {
     }
 }
 
-/// Stage a unique helper for runtime-library callers that configured no store.
-fn stage_ephemeral() -> Result<PathBuf, ExecError> {
-    let path = std::env::temp_dir().join(format!(
-        "greenlit-init-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    write_ephemeral_file(&path)?;
-    Ok(path)
-}
-
 /// Atomically move a fully written helper into its immutable public name.
 fn publish(
     directory: &File,
@@ -129,19 +116,6 @@ fn publish(
         Err(Errno::EXIST) => Ok(false),
         Err(error) => Err(io_error(error.into())),
     }
-}
-
-/// Write and synchronize the embedded helper with executable permissions.
-fn write_ephemeral_file(path: &Path) -> Result<(), ExecError> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o700)
-        .open(path)
-        .map_err(io_error)?;
-    normalize_new_helper(path, &file)?;
-    file.write_all(init_binary()).map_err(io_error)?;
-    file.sync_all().map_err(io_error)
 }
 
 fn open_private_runtime_directory(state_root: &Path) -> Result<File, ExecError> {
