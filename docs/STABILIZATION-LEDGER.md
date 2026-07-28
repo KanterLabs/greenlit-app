@@ -1,0 +1,78 @@
+# Greenlit stabilization ledger
+
+This permanent ledger records every defect discovered by the stabilization
+workflow. Rows are appended or closed; they are never deleted. `open` means
+the owning phase has not repaired the defect, `contained` means Phase 12 has
+made the affected path impossible without claiming the underlying behavior is
+correct, and `resolved` requires a verification case plus the resolving
+commit.
+
+| Defect ID | Severity | Owning phase | User-visible impact | Authoritative test or oracle | Status | Resolving commit |
+|---|---|---:|---|---|---|---|
+| GL-STAB-001 | critical | 12 | An empty or incomplete support report is treated as certified, so unknown behavior can run and appear trustworthy. | Compiled-CLI default quarantine, unknown finding, and forceability cases | open | — |
+| GL-STAB-002 | critical | 12 | Certification rejection occurs after daemon, credential, network, action, engine, or image side effects. | Compiled-CLI zero-side-effect preflight cases with recording external boundaries | open | — |
+| GL-STAB-003 | critical | 12 | A direct runtime caller can bypass CLI quarantine and start uncertified work. | Public runtime-boundary zero-operation quarantine case | open | — |
+| GL-STAB-004 | critical | 12 | A forced degraded pass can receive local or clean assurance instead of none. | Forceable seed result, lock, journal, and human-output integration case | open | — |
+| GL-STAB-005 | critical | 12 | Export and confirmation remain operational against uncertified evidence. | Compiled export/confirm refusal cases proving zero files, requests, and mutations | open | — |
+| GL-STAB-006 | high | 12 | A support-policy block is persisted as preparation-failed and can conflict with the journal terminal. | Unsupported-preflight single-terminal blocked-result case | open | — |
+| GL-STAB-007 | critical | 12 | A passing result is published before journal, trace, catalog, output, and metrics completion. | Closed-writer and terminal-publication integration fault case | open | — |
+| GL-STAB-008 | high | 12 | Run directories, evidence files, and atomic temporaries inherit ambient umask. | Compiled run-tree mode gate under umask 000 across terminal paths | open | — |
+| GL-STAB-009 | high | 12 | Retained frozen-source files and daemon templates use broad physical modes. | Direct and daemon source-capture run-tree mode integration case | open | — |
+| GL-STAB-010 | critical | 12 | No complete retained-run secret scan exists and the runtime bearer token is not masked. | Recursive direct, encoded, chunk-split, runtime-token run-tree invariant | open | — |
+| GL-STAB-011 | critical | 12 | The keyring fallback persists access and refresh tokens in plaintext on disk. | Compiled auth case proving keyring failure creates no credential file | open | — |
+| GL-STAB-012 | high | 12 | OAuth and GitHub CLI failures can reflect credential-bearing response bodies into diagnostics. | Malformed OAuth, refresh, and gh diagnostic sentinel cases | open | — |
+| GL-STAB-013 | medium | 12 | Metrics appends to pre-existing directories or files with unsafe modes. | Existing-mode stats integration cases with actionable refusal | open | — |
+| GL-STAB-014 | critical | 12 | Capability-owning Docker, overlay, provider, policy, and benchmark tests return success when prerequisites are absent. | CI capability manifest plus prerequisite-failure gates | open | — |
+| GL-STAB-015 | high | 12 | Shell scripts pretending to be Node and over-broad fake engines support real-runtime claims. | CI authority inventory and genuine-runtime ownership gate | open | — |
+| GL-STAB-016 | high | 12 | Documented live-test commands use `--ignored` on non-ignored tests and execute zero cases. | Command-manifest gate that observes a nonzero selected test count | open | — |
+| GL-STAB-017 | high | 12 | Overlay, reflink, bounded-copy, and beyond-PATH_MAX tests can pass without exercising the named path. | Forced-path heavy-runner capability gates with recorded strategy | open | — |
+| GL-STAB-018 | high | 12 | Dogfood and release verification omit required gates, permit capability no-ops, and run only once. | Release-built two-run dogfood and release-check command manifest | open | — |
+| GL-STAB-019 | high | 12 | No canonical parity schema, comparator, seed oracle, or intentional-mismatch gate exists. | Four-stage `ParityObservationV1` seed comparison workflow | open | — |
+| GL-STAB-020 | medium | 12 | Criterion silently drops parser or evaluator benchmarks after fixture setup failure. | Criterion benchmark-name manifest and nonzero-sample gate | open | — |
+| GL-STAB-021 | critical | 13 | Workflow discovery and source capture can follow unsafe or changing filesystem content. | Frozen-source race, alias, containment, and sealed-tree fixture | open | — |
+| GL-STAB-022 | critical | 14 | Lossy or partial YAML validation can accept unsupported workflow behavior. | Full-document schema oracle with mixed valid and invalid constructs | open | — |
+| GL-STAB-023 | high | 15 | Expression parsing, evaluation, budgets, or `hashFiles` semantics can diverge from the pinned runner. | Expression oracle and pinned-runner comparison table | open | — |
+| GL-STAB-024 | medium | 16 | `litci plan` promises no network but can retrieve stored credentials and query remote variables. | Zero-network plan case against request-counting GitHub boundary | open | — |
+| GL-STAB-025 | critical | 16 | Remote variables and GitHub-token acquisition lack one trust-scoped transactional preflight. | Hostile-fork, missing-token, rotation, and zero-request quarantine cases | open | — |
+| GL-STAB-026 | critical | 16 | Dynamic or whole `secrets` access can expose every persisted entry. | Whole-map and dynamic-key secret inventory integration cases | open | — |
+| GL-STAB-027 | high | 16 | Credential-bearing dispatch inputs are retained in locks and can be exported verbatim. | Credential-shaped input preflight and evidence-absence case | open | — |
+| GL-STAB-028 | critical | 17 | Job selection, static skips, and ambiguous reachability do not consistently bound support, prompt, action, or network work. | Selected-closure and dynamic-ambiguity planner comparison fixture | open | — |
+| GL-STAB-029 | critical | 18 | JobLocks are fabricated before needs finish, including skipped, canceled, zero-leg, and never-started jobs. | Needs/dynamic/skipped lifecycle lock fixture with dependency digests | open | — |
+| GL-STAB-030 | critical | 18 | Run evidence is not a digest-linked atomic bundle and can expose premature or mixed terminal state. | Bundle tamper, missing-link, duplicate-terminal, and final-marker gate | open | — |
+| GL-STAB-031 | medium | 18 | Unsalted secret revision hashes permit dictionary recovery and cross-run correlation. | Keyed revision identity and tamper gate | open | — |
+| GL-STAB-032 | critical | 19 | Mutable, hostile, corrupt, or partially published action, OCI, CAS, or source content can execute as verified. | Transitive content-graph, corruption, kill, race, and offline gate | open | — |
+| GL-STAB-033 | high | 19 | DinD uses an unlocked mutable image and can pull it after lock finalization. | Exact DinD graph identity and offline-miss case | open | — |
+| GL-STAB-034 | critical | 20 | Network containment and resource limits can be applied after untrusted code starts. | Reachable LAN/metadata canary and pre-start limit inspection gate | open | — |
+| GL-STAB-035 | critical | 20 | DinD is privileged, unguarded on the job network, effectively unlimited, and can bypass policy. | Isolated authenticated DinD network, limit, and traffic invariant | open | — |
+| GL-STAB-036 | high | 20 | Provisioning failures and skipped jobs can leak containers, volumes, networks, or sidecars. | Fault injection after every resource transition with zero survivors | open | — |
+| GL-STAB-037 | high | 21 | Queued, fail-fast, and preparation cancellation paths omit lifecycle terminals. | Scheduler cancellation matrix with exactly one terminal per instance | open | — |
+| GL-STAB-038 | critical | 21 | Cleanup errors are discarded, allowing success while untrusted resources survive. | Removal-failure lifecycle gate that prevents successful completion | open | — |
+| GL-STAB-039 | high | 22 | Shell, environment, command-file, timeout, and step-result semantics can differ from GitHub. | `shell-ci` and `matrix-needs` compiled/GitHub comparison | open | — |
+| GL-STAB-040 | critical | 23 | Cross-repository checkout implicitly writes the host GitHub credential into workflow-readable Git config. | Real checkout credential/config and exfiltration boundary probe | open | — |
+| GL-STAB-041 | critical | 23 | Docker action builds and siblings can reach host networks, omit limits, or survive cancellation. | Dockerfile-build canary, actual-limit, and cancellation teardown cases | open | — |
+| GL-STAB-042 | high | 23 | Action pre/main/post, real Node 20/24, state, checkout, and nested lifecycle behavior is uncertified. | Genuine-runtime `actions-ci` compiled/GitHub comparison | open | — |
+| GL-STAB-043 | critical | 24 | Service PID 1 can start before network policy and service failures can leak state or secrets. | Pre-entrypoint canary, health-failure logs, and teardown invariant | open | — |
+| GL-STAB-044 | high | 24 | Cache and artifact roots, staging files, blobs, and metadata inherit unsafe modes and incomplete protocol semantics. | `full-ci`, cache, artifact, and mode/concurrency integration gates | open | — |
+| GL-STAB-045 | high | 25 | Daemon prefetch scans unrelated workflows and retrieves credentials before selected-workflow quarantine. | Daemon-enabled selected-workflow zero-request case | open | — |
+| GL-STAB-046 | high | 25 | Recovery, daemon templates, credential stores, clean, and GC trust unsafe paths or modes. | Crash-boundary, unsafe-path, lease, and mode fault matrix | open | — |
+| GL-STAB-047 | high | 26 | Recorder Drop fabricates an aborted terminal that conflicts with result evidence. | Preparation-failure exactly-one-terminal case | open | — |
+| GL-STAB-048 | critical | 26 | Event and log sink failures are remembered but do not stop execution or pass publication. | Journal/output failure boundary with retained-log completeness | open | — |
+| GL-STAB-049 | high | 26 | Cancellation is mapped to failed and post-step infrastructure failures are mislabeled as preparation failures. | SIGINT and post-step fault terminal-result cases | open | — |
+| GL-STAB-050 | high | 26 | Metrics failure can make the CLI fail after retaining an assuring pass. | Invalid metrics path result/exit agreement case | open | — |
+| GL-STAB-051 | high | 26 | Runtime tokens, lowercase percent encoding, JSON escaping, and error-routed secrets can evade masking. | Complete transformed-secret and structured-error invariant | open | — |
+| GL-STAB-052 | high | 27 | Inspect and logs accept partial, unknown-version, wrong-run, duplicate, or contradictory evidence. | Verified-consumer version, identity, ordering, and terminal cases | open | — |
+| GL-STAB-053 | critical | 27 | Confirmation can update result and confirmation evidence independently, and export lacks a verified immutable closure. | Partial-write, tamper, pagination, and two-pass export/confirm gate | open | — |
+| GL-STAB-054 | high | 28 | Component greens may not compose into release-ready whole-product behavior or performance. | Release-built cumulative certification matrix and two dogfood runs | open | — |
+
+## Field contract
+
+- **Defect ID:** `GL-STAB-NNN`, unique and never reused.
+- **Severity:** `critical`, `high`, `medium`, or `low`.
+- **Owning phase:** one stabilization phase from 12 through 28.
+- **Authoritative test or oracle:** one behavior-level oracle, integration,
+  invariant, external comparison, or fault-injection gate permitted by
+  `TESTING.md`.
+- **Status:** `open`, `contained`, or `resolved`. A completed phase may own no
+  `open` or `contained` row.
+- **Resolving commit:** `—` until resolved, then the 7–40 character Git commit
+  that contains the repair and authoritative verification.
