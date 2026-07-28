@@ -269,6 +269,10 @@
       "capabilities": ["live-parity-local"],
       "prerequisites": [
         {
+          "name": "Prepare branch-backed source identity",
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ntest \"$GITHUB_REF_TYPE\" = branch\ntest \"$GITHUB_REF\" = \"refs/heads/$GITHUB_REF_NAME\"\ncase \"$GITHUB_REF_NAME\" in\n  main|stabilization/*) ;;\n  *) exit 1 ;;\nesac\ngit switch -C \"$GITHUB_REF_NAME\" \"$GITHUB_SHA\"\ntest \"$(git branch --show-current)\" = \"$GITHUB_REF_NAME\"\n"
+        },
+        {
           "name": "Require live parity capabilities",
           "run": "test \"$(uname -s)\" = Linux\ntest \"$(uname -m)\" = x86_64\ncommand -v python3 >/dev/null\ndocker info >/dev/null\ndocker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16\n"
         },
@@ -433,7 +437,7 @@
       "prerequisites": [
         {
           "name": "Prepare exact source and runtime",
-          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-release-local \"$GITHUB_SHA\"\ntest \"$(uname -s)\" = Linux\ntest \"$(uname -m)\" = x86_64\ncommand -v python3 >/dev/null\ndocker info >/dev/null\ndocker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16\n"
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ntest \"$GITHUB_REF_TYPE\" = branch\ntest \"$GITHUB_REF\" = \"refs/heads/$GITHUB_REF_NAME\"\ncase \"$GITHUB_REF_NAME\" in\n  main|stabilization/*) ;;\n  *) exit 1 ;;\nesac\ngit switch -C \"$GITHUB_REF_NAME\" \"$GITHUB_SHA\"\ntest \"$(git branch --show-current)\" = \"$GITHUB_REF_NAME\"\ntest \"$(uname -s)\" = Linux\ntest \"$(uname -m)\" = x86_64\ncommand -v python3 >/dev/null\ndocker info >/dev/null\ndocker pull ghcr.io/actions/actions-runner@sha256:a1919047b038c38871d667c58cfdc7a878452711ab1212fb6036188f27a7ab16\n"
         },
         {
           "name": "Verify and unpack prepared binary",

@@ -78,7 +78,14 @@ jobs:
           ! /usr/bin/git config --local --get-regexp \
             '^(http\..*\.extraheader|credential(\..*)?\.helper)$' \
             >/dev/null 2>&1
-          git switch -C greenlit-release-local "$GITHUB_SHA"
+          test "$GITHUB_REF_TYPE" = branch
+          test "$GITHUB_REF" = "refs/heads/$GITHUB_REF_NAME"
+          case "$GITHUB_REF_NAME" in
+            main|stabilization/*) ;;
+            *) exit 1 ;;
+          esac
+          git switch -C "$GITHUB_REF_NAME" "$GITHUB_SHA"
+          test "$(git branch --show-current)" = "$GITHUB_REF_NAME"
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
           command -v python3 >/dev/null
