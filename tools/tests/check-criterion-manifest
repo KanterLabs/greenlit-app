@@ -3,8 +3,9 @@
 
 The schema-v2 ceilings are rounded to roughly 2.3--2.7 times the conservative
 Criterion slope upper bounds measured on the pinned Linux x86_64 benchmark
-host. That margin absorbs ordinary host noise while still rejecting a material
-micro-benchmark regression.
+host. Each benchmark receives a one-second measurement window after a
+100-millisecond warm-up so ordinary shared-runner scheduling cannot dominate
+the slope estimate; the fixed ceilings still reject a material regression.
 """
 
 from __future__ import annotations
@@ -178,9 +179,9 @@ def check_target(
             "--sample-size",
             str(sample_count),
             "--warm-up-time",
-            "0.01",
+            "0.10",
             "--measurement-time",
-            "0.05",
+            "1.0",
             "--noplot",
             "--quiet",
         ],
