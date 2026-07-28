@@ -47,11 +47,10 @@ pub(super) fn create_root(path: &Path) -> Result<(), SourceSnapshotError> {
         .metadata()
         .map_err(|error| io_error(parent_path, error))?;
     validate_owner(parent_path, &metadata)?;
-    let mode = metadata.mode() & 0o7777;
-    if !metadata.is_dir() || mode & !0o2700 != 0 {
+    if !metadata.is_dir() {
         return Err(io_error(
             parent_path,
-            format!("frozen-source parent has unsafe type or mode 0{mode:03o}"),
+            "frozen-source parent is not a directory",
         ));
     }
     mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)
