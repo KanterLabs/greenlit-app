@@ -32,6 +32,7 @@ CI_JOBS = {
     "credential-capability",
     "host-deep-path",
     "provider-and-policy",
+    "performance-policy",
     "live_parity_local",
     "live_parity_github",
     "live_parity_compare",
