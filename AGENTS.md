@@ -120,7 +120,7 @@ Stubs rot when they are invisible. Every cross-phase placeholder must be loud, t
 | 9 — Lazy & hermetic | `docs/PHASE-9-lazy-hermetic.md` | completed |
 | 10 — Confirmation | `docs/PHASE-10-confirmation.md` | completed |
 | 11 — Terminal events | `docs/PHASE-11-terminal-events.md` | completed |
-| 12 — Containment and test authority | `docs/PHASE-12-containment-test-authority.md` | in progress |
+| 12 — Containment and test authority | `docs/PHASE-12-containment-test-authority.md` | completed |
 | 13 — Workflow intake and frozen source | `docs/PHASE-13-workflow-intake-frozen-source.md` | not started |
 | 14 — YAML schema and typed workflow model | `docs/PHASE-14-yaml-schema-workflow-model.md` | not started |
 | 15 — Expression language | `docs/PHASE-15-expression-language.md` | not started |
