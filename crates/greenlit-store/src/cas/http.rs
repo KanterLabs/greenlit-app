@@ -68,7 +68,7 @@ pub(super) fn download(
         return Err(too_large(digest, fetch));
     }
     let mut output = OpenOptions::new()
-        .create(true)
+        .create(false)
         .write(true)
         .truncate(!append)
         .open(partial)

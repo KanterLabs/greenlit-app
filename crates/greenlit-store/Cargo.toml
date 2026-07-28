@@ -56,6 +56,10 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"
 # already used by greenlit-actions and greenlit-runtime; CAS wraps it with
 # Range resumption and runs callers on a blocking worker.
 ureq = { version = "3.3.0", default-features = false, features = ["rustls", "json"] }
+# Persistent CAS inodes are created and inspected descriptor-relatively so
+# restrictive umasks cannot strand them at mode 000 and unsafe existing paths
+# are never repaired.
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 
 [dev-dependencies]
 # Every store test runs against an isolated temp root rather than the real
