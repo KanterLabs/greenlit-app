@@ -9,6 +9,10 @@ __pycache__/
 # Local Greenlit state
 .litci/
 
+# Local live stabilization dashboard
+.live-roadmap.pid
+.live-roadmap.log
+
 # Ignore markdown scratch/notes files except README and the project's
 # required governance docs (AGENTS.md/spec/TESTING.md/PHASE-*.md/ARCHITECTURE.md
 # and stabilization ledgers/workflow are mandated to stay tracked).
