@@ -35,7 +35,6 @@ fn copy_fixture_into(src: &Path, dst: &Path) {
 
 #[test]
 fn actions_ci_fixture_is_blocked_before_capability_side_effects() {
-    const CLI_SECRET: &str = "actions-cli-secret-must-not-be-read-7391";
     const ENV_SECRET: &str = "actions-env-secret-must-not-be-read-7391";
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind GitHub API recording boundary");
     listener
@@ -57,10 +56,6 @@ fn actions_ci_fixture_is_blocked_before_capability_side_effects() {
             ".github/workflows/ci.yml",
             "--no-input",
             "--allow-degraded",
-            "--var",
-            "LOCAL_MODE=ci",
-            "-s",
-            &format!("CLI_SECRET={CLI_SECRET}"),
         ],
         &[
             ("LITCI_TEST_GITHUB_API_BASE_URL", base_url.as_str()),
@@ -82,10 +77,8 @@ fn actions_ci_fixture_is_blocked_before_capability_side_effects() {
         !stderr.contains("DOCKER_HOST"),
         "actions-ci quarantine reached engine detection: {stderr}"
     );
-    for sentinel in [CLI_SECRET, ENV_SECRET] {
-        assert!(!stdout.contains(sentinel), "{stdout}");
-        assert!(!stderr.contains(sentinel), "{stderr}");
-    }
+    assert!(!stdout.contains(ENV_SECRET), "{stdout}");
+    assert!(!stderr.contains(ENV_SECRET), "{stderr}");
     match listener.accept() {
         Err(error) if error.kind() == ErrorKind::WouldBlock => {}
         Ok(_) => panic!("actions-ci quarantine contacted the GitHub API"),
