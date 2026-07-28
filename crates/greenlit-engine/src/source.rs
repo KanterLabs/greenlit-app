@@ -276,7 +276,7 @@ fn copy_and_hash(
     paths: &[String],
     guard: Option<&SensitiveGuard>,
 ) -> Result<Vec<SourceEntry>, SourceSnapshotError> {
-    let frozen_tree = private_fs::PrivateTree::open(destination)?;
+    let frozen_tree = private_fs::PrivateTree::open_new(destination)?;
     let mut entries = Vec::with_capacity(paths.len());
     for relative in paths {
         let source = repo_root.join(relative);
