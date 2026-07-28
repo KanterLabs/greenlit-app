@@ -313,7 +313,7 @@
       "executions": [
         {
           "name": "Clean, hermetic, and native performance policy",
-          "run": "GREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" tools/tests/check-capability-test-manifest --run-owner docker-policy"
+          "run": "unset RUSTC_WRAPPER\nGREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" \\\n  tools/tests/check-capability-test-manifest --run-owner docker-policy\n"
         }
       ]
     },
@@ -422,7 +422,7 @@
         },
         {
           "name": "Clean, hermetic, and native performance policy",
-          "run": "GREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" tools/tests/check-capability-test-manifest --run-owner docker-policy"
+          "run": "unset RUSTC_WRAPPER\nGREENLIT_BUILD_COMMIT=\"$GITHUB_SHA\" \\\n  tools/tests/check-capability-test-manifest --run-owner docker-policy\n"
         },
         {
           "name": "Run and verify repository gates under release litci twice",

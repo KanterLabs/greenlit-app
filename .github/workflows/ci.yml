@@ -288,7 +288,10 @@ jobs:
           docker info >/dev/null
 
       - name: Clean, hermetic, and native performance policy
-        run: GREENLIT_BUILD_COMMIT="$GITHUB_SHA" tools/tests/check-capability-test-manifest --run-owner docker-policy
+        run: |
+          unset RUSTC_WRAPPER
+          GREENLIT_BUILD_COMMIT="$GITHUB_SHA" \
+            tools/tests/check-capability-test-manifest --run-owner docker-policy
 
   live_parity_local:
     name: tokenless same-SHA oracle and Greenlit evidence
