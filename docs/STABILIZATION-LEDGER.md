@@ -94,6 +94,7 @@ commit.
 | GL-STAB-083 | high | 12 | GitHub's job-log archive repeats each seed marker in aggregate and per-step entries, so concatenating every entry rejects valid same-SHA evidence as ambiguous. | Attempt-bound plain-text workflow-job log canaries plus exact live GitHub parity collection | open | — |
 | GL-STAB-084 | high | 12 | The isolated copy gate pins a private runner image that the job's credential-free DinD daemon cannot pull, so filesystem capability assertions never execute. | Public digest-pinned child image plus exact native CI execution of the real reflink and bounded-stream gate | open | — |
 | GL-STAB-085 | high | 12 | Same-SHA local parity passes Cargo's final hard-linked binary directly to a single-link identity boundary, so valid release builds are rejected before execution. | Separately installed single-link release binary plus exact live local parity production | open | — |
+| GL-STAB-086 | high | 12 | A standalone parity binary installed directly beneath its private root makes the sibling isolated HOME appear nested within the binary target boundary, so local evidence fails before execution. | Canonical private target/release binary layout plus exact live local parity production | open | — |
 
 ## Field contract
 
