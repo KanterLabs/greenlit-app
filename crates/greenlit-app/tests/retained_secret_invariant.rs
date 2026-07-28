@@ -546,7 +546,8 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     let container_cleanup = ContainerGuard::new(container.clone());
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
     let representations = observed_dynamic_representations(&container);
-    let source_identities = source_identities(&one_run_directory(&sandbox));
+    let run = one_run_directory(&sandbox);
+    let source_identities = source_identities(&run);
     let network_collision = matches!(terminal, TerminalPath::PreparationFailed)
         .then(|| NetworkGuard::create(format!("greenlit-run-{run_id}-prepare-000")));
 
@@ -562,6 +563,7 @@ fn exercise_terminal_path(terminal: TerminalPath) {
         running.signal_interrupt();
     } else if matches!(terminal, TerminalPath::ClosedOutput) {
         wait_for_container_path(&container, EMITTED_MARKER);
+        wait_for_durable_closed_output_boundary(&run);
         running.close_stdout();
         assert!(
             docker(["exec", &container, "touch", FINISH_MARKER])
@@ -571,7 +573,6 @@ fn exercise_terminal_path(terminal: TerminalPath) {
         );
     }
     let output = running.finish();
-    let run = one_run_directory(&sandbox);
 
     match terminal {
         TerminalPath::Success => assert!(output.status.success(), "success path failed"),
@@ -614,6 +615,28 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     }
     container_cleanup.cleanup();
     support::assert_run_resources_removed(&run);
+}
+
+fn wait_for_durable_closed_output_boundary(run: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if fs::read_to_string(run.join("events.ndjson")).is_ok_and(|events| {
+            events.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                    record["type"] == "log"
+                        && record["text"] == "split=***"
+                        && record["partial"].as_bool() == Some(false)
+                })
+            })
+        }) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "closed-output path did not durably record its final masked log line"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn assert_result_and_journal_truth(run: &Path, terminal: TerminalPath) {
