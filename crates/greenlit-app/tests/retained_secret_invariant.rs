@@ -26,6 +26,8 @@ const STORAGE_ENV_CHECKED_MARKER: &str = "/tmp/greenlit-phase12-storage-env-abse
 const DYNAMIC_VALUE_MARKER: &str = "/tmp/greenlit-dynamic-mask-value";
 const CLI_SECRET_NAME: &str = "RETAINED_TREE_SECRET";
 const ORIGIN_SECRET_VALUE: &str = "ghp_REMOTE_ORIGIN+SENTINEL";
+const PRIVATE_HELPER_WORKFLOW: &str =
+    "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n";
 const HELPER_READ_LIMIT_KIB: u64 = 768 * 1024;
 const OVERSIZED_HELPER_BYTES: u64 = 1536 * 1024 * 1024;
 const SPARSE_HELPER_MAX_ALLOCATED_BYTES: u64 = 1024 * 1024;
@@ -466,8 +468,8 @@ fn catalog_has_terminal_state(sandbox: &Sandbox, run_id: &str) -> bool {
 
 fn assert_restrictive_umask_full_execution_is_private() {
     let sandbox = Sandbox::new();
-    let workflow = "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n";
-    let output = RunningLitci::spawn_under_restrictive_umask(&sandbox, workflow).finish();
+    let output =
+        RunningLitci::spawn_under_restrictive_umask(&sandbox, PRIVATE_HELPER_WORKFLOW).finish();
     assert!(
         output.status.success(),
         "full execution failed under umask 0777: {}",
@@ -519,7 +521,8 @@ fn assert_restrictive_umask_full_execution_is_private() {
         1,
         "full execution did not retain exactly one digest-addressed runtime helper"
     );
-    let second = RunningLitci::spawn_under_restrictive_umask(&sandbox, workflow).finish();
+    let second =
+        RunningLitci::spawn_under_restrictive_umask(&sandbox, PRIVATE_HELPER_WORKFLOW).finish();
     assert!(
         second.status.success(),
         "second full execution failed under umask 0777: {}",
@@ -544,7 +547,7 @@ fn assert_restrictive_umask_full_execution_is_private() {
         .into_iter()
         .next()
         .expect("one reusable runtime helper");
-    let existing_runs = run_directories(&sandbox);
+    let mut existing_runs = run_directories(&sandbox);
     fs::remove_file(&helper).expect("remove valid runtime helper");
     let oversized = fs::OpenOptions::new()
         .write(true)
@@ -562,28 +565,29 @@ fn assert_restrictive_umask_full_execution_is_private() {
         "oversized helper collision consumed physical storage instead of remaining sparse"
     );
 
-    let bounded =
-        RunningLitci::spawn_with_address_space_limit(&sandbox, workflow, HELPER_READ_LIMIT_KIB)
-            .finish();
+    let bounded = RunningLitci::spawn_with_address_space_limit(
+        &sandbox,
+        PRIVATE_HELPER_WORKFLOW,
+        HELPER_READ_LIMIT_KIB,
+    )
+    .finish();
     let collision_metadata =
         fs::metadata(&helper).expect("inspect rejected sparse runtime helper collision");
     let retained_helpers = runtime_helpers(&state);
-    fs::remove_file(&helper).expect("remove sparse runtime helper collision");
-    assert_eq!(
-        bounded.status.code(),
-        Some(1),
-        "oversized helper collision did not fail through the bounded CLI error path"
-    );
     let stderr = String::from_utf8_lossy(&bounded.stderr);
-    let expected_error = format!(
-        "could not stage the greenlit-init helper: {} is private but its bytes do not match the embedded helper digest\n  fix: remove {}, then retry",
-        helper.display(),
-        helper.display()
-    );
     assert!(
-        stderr.contains(&expected_error)
-            && !stderr.contains("ensure the Greenlit state directory is writable"),
-        "oversized helper collision lacked its single exact actionable diagnostic: {stderr}"
+        stderr.contains(&format!(
+            "could not stage the greenlit-init helper: {} is private but its bytes do not match the embedded helper digest",
+            helper.display()
+        )),
+        "oversized helper collision lacked its exact rejection state: {stderr}"
+    );
+    assert_helper_collision_failure(
+        &sandbox,
+        &bounded,
+        &mut existing_runs,
+        &helper,
+        "oversized helper collision",
     );
     assert_eq!(
         collision_metadata.len(),
@@ -596,47 +600,136 @@ fn assert_restrictive_umask_full_execution_is_private() {
         "helper staging changed the rejected collision mode"
     );
     assert_eq!(
-        retained_helpers,
-        [helper],
+        retained_helpers.as_slice(),
+        std::slice::from_ref(&helper),
         "helper staging replaced the rejected collision or left a partial sibling"
     );
-    let mut bounded_runs = run_directories(&sandbox)
-        .into_iter()
-        .filter(|candidate| !existing_runs.contains(candidate))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        bounded_runs.len(),
-        1,
-        "oversized helper collision did not retain exactly one failed run identity"
-    );
-    let bounded_run = bounded_runs.pop().expect("one bounded helper run");
-    assert_result_and_journal_truth(&bounded_run, TerminalPath::PreparationFailed);
-    assert!(
-        journal_records(&bounded_run).iter().all(|record| {
-            record["type"] != "step_started" && record["type"] != "step_finished"
-        }),
-        "oversized helper collision started untrusted workflow execution"
-    );
-    let bounded_run_id = bounded_run
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("bounded helper run has a UTF-8 identity");
-    let catalog = greenlit_store::cas::CasStore::open(
-        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
-    )
-    .expect("open bounded helper run catalog");
-    assert_eq!(
-        catalog
-            .run_state(bounded_run_id)
-            .expect("read bounded helper run state"),
-        Some(greenlit_store::cas::RunCatalogState::Completed),
-        "oversized helper collision did not publish authoritative preparation-failure evidence"
-    );
-    support::assert_run_resources_removed(&bounded_run);
+    fs::remove_file(&helper).expect("remove sparse runtime helper collision");
     assert!(
         runtime_helpers(&state).is_empty(),
         "sparse helper cleanup left a runtime publication behind"
     );
+
+    assert_published_helper_collision(
+        &sandbox,
+        &state,
+        &helper,
+        &mut existing_runs,
+        "symlink helper collision",
+        |path| symlink("missing-helper-target", path).expect("create symlink helper collision"),
+        |path| {
+            assert!(
+                fs::symlink_metadata(path)
+                    .expect("inspect retained symlink helper collision")
+                    .file_type()
+                    .is_symlink(),
+                "helper staging replaced the rejected symlink collision"
+            );
+            fs::remove_file(path).expect("remove symlink helper collision");
+        },
+    );
+    assert_published_helper_collision(
+        &sandbox,
+        &state,
+        &helper,
+        &mut existing_runs,
+        "directory helper collision",
+        |path| {
+            fs::create_dir(path).expect("create directory helper collision");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("set directory helper collision mode");
+        },
+        |path| fs::remove_dir(path).expect("remove directory helper collision"),
+    );
+}
+
+fn assert_published_helper_collision(
+    sandbox: &Sandbox,
+    state: &Path,
+    helper: &Path,
+    existing_runs: &mut Vec<std::path::PathBuf>,
+    context: &str,
+    install: impl FnOnce(&Path),
+    remove: impl FnOnce(&Path),
+) {
+    install(helper);
+    let output = RunningLitci::spawn(sandbox, PRIVATE_HELPER_WORKFLOW).finish();
+    let retained_helpers = runtime_helpers(state);
+    assert_helper_collision_failure(sandbox, &output, existing_runs, helper, context);
+    assert!(
+        retained_helpers.len() == 1 && retained_helpers[0] == helper,
+        "{context} was replaced or left a partial sibling: {retained_helpers:?}"
+    );
+    remove(helper);
+    assert!(
+        runtime_helpers(state).is_empty(),
+        "{context} cleanup left a runtime publication behind"
+    );
+}
+
+fn assert_helper_collision_failure(
+    sandbox: &Sandbox,
+    output: &Output,
+    existing_runs: &mut Vec<std::path::PathBuf>,
+    helper: &Path,
+    context: &str,
+) {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{context} did not fail through the compiled CLI error path"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_fix = format!("fix: remove {}, then retry", helper.display());
+    let fix_lines = stderr
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("fix:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fix_lines,
+        [expected_fix.as_str()],
+        "{context} did not expose exactly one effective action: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ensure the Greenlit state directory is writable"),
+        "{context} exposed the ineffective generic staging action: {stderr}"
+    );
+
+    let mut new_runs = run_directories(sandbox)
+        .into_iter()
+        .filter(|candidate| !existing_runs.contains(candidate))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_runs.len(),
+        1,
+        "{context} did not retain exactly one failed run identity"
+    );
+    let run = new_runs.pop().expect("one helper-collision run");
+    assert_result_and_journal_truth(&run, TerminalPath::PreparationFailed);
+    assert!(
+        journal_records(&run).iter().all(|record| {
+            record["type"] != "step_started" && record["type"] != "step_finished"
+        }),
+        "{context} started untrusted workflow execution"
+    );
+    let run_id = run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("helper-collision run has a UTF-8 identity");
+    let catalog = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
+    )
+    .expect("open helper-collision run catalog");
+    assert_eq!(
+        catalog
+            .run_state(run_id)
+            .expect("read helper-collision run state"),
+        Some(greenlit_store::cas::RunCatalogState::Completed),
+        "{context} did not publish authoritative preparation-failure evidence"
+    );
+    support::assert_run_resources_removed(&run);
+    existing_runs.push(run);
 }
 
 fn is_runtime_helper(path: &Path) -> bool {
