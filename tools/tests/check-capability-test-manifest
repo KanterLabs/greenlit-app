@@ -312,6 +312,7 @@ def run_owner(entries: list[dict[str, Any]], root: Path, owner: str) -> int:
             features=tuple(entry["features"]),
             test_cfgs=tuple(entry["test_cfgs"]),
             cargo_profile=entry["cargo_profile"],
+            test_threads=1,
         )
     print(
         f"capability owner {owner} passed: {len(selected)} targets, "

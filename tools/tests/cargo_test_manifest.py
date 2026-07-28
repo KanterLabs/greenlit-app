@@ -169,12 +169,17 @@ def target_command(
     *,
     cargo_profile: str = "test",
     list_only: bool,
+    test_threads: int | None = None,
 ) -> list[str]:
     """Build one whole-target Cargo test command with no name filter."""
 
     if cargo_profile not in {"release", "test"}:
         raise GateError(
             f"{package}/{target}: unknown Cargo profile {cargo_profile!r}"
+        )
+    if test_threads is not None and test_threads < 1:
+        raise GateError(
+            f"{package}/{target}: test thread count must be positive"
         )
     command = [
         "cargo",
@@ -201,6 +206,8 @@ def target_command(
         command.extend(["--list", "--format", "terse"])
     else:
         command.append("--nocapture")
+        if test_threads is not None:
+            command.append(f"--test-threads={test_threads}")
     return command
 
 
@@ -359,6 +366,7 @@ def run_target(
     features: tuple[str, ...],
     test_cfgs: tuple[str, ...],
     cargo_profile: str = "test",
+    test_threads: int | None = None,
 ) -> None:
     """Execute one complete target after its exact list was checked."""
 
@@ -369,6 +377,7 @@ def run_target(
         features,
         cargo_profile=cargo_profile,
         list_only=False,
+        test_threads=test_threads,
     )
     run(
         command,
