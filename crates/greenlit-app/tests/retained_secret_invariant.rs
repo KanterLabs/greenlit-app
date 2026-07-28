@@ -224,12 +224,12 @@ fn assert_metrics_failure_after_execution_cannot_turn_green() {
 
 fn assert_result_directory_sync_failure_removes_visible_authority() {
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn_with_env(
+    let mut running = RunningLitci::spawn_with_env(
         &sandbox,
         &workflow(TerminalPath::Success),
         &[("LITCI_TEST_RESULT_DIRECTORY_SYNC_FAILURE", "after-rename")],
     );
-    let (_run_id, container) = observe_running_container(&sandbox);
+    let (_run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
     let representations = observed_dynamic_representations(&container);
@@ -264,12 +264,12 @@ fn assert_result_directory_sync_failure_removes_visible_authority() {
 
 fn assert_terminal_sync_failure_cannot_leave_mixed_authority() {
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn_with_env(
+    let mut running = RunningLitci::spawn_with_env(
         &sandbox,
         &workflow(TerminalPath::Success),
         &[("LITCI_TEST_TERMINAL_SYNC_FAILURE", "after-write")],
     );
-    let (_run_id, container) = observe_running_container(&sandbox);
+    let (_run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
     let representations = observed_dynamic_representations(&container);
@@ -332,12 +332,12 @@ fn assert_composite_publication_interruption_windows() {
 
 fn assert_post_catalog_render_failure_preserves_authority() {
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn_with_env(
+    let mut running = RunningLitci::spawn_with_env(
         &sandbox,
         &workflow(TerminalPath::Success),
         &[("LITCI_TEST_TERMINAL_RENDER_FAILURE", "after-catalog")],
     );
-    let (run_id, container) = observe_running_container(&sandbox);
+    let (run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
     let representations = observed_dynamic_representations(&container);
@@ -392,12 +392,12 @@ fn exercise_publication_interruption(
     reached: impl Fn(&Sandbox, &Path, &str) -> bool,
 ) {
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn_with_env(
+    let mut running = RunningLitci::spawn_with_env(
         &sandbox,
         &workflow(TerminalPath::Success),
         &[(variable, point)],
     );
-    let (run_id, container) = observe_running_container(&sandbox);
+    let (run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     let run = one_run_directory(&sandbox);
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
@@ -542,7 +542,7 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     .expect("create ordinary source symlink");
     let workflow = workflow(terminal);
     let mut running = RunningLitci::spawn(&sandbox, &workflow);
-    let (run_id, container) = observe_running_container(&sandbox);
+    let (run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
     let representations = observed_dynamic_representations(&container);
@@ -826,8 +826,8 @@ fn remote_origin_credentials_are_contained_at_the_compiled_run_boundary() {
 fn credential_bytes_in_a_retained_symlink_target_block_result_publication() {
     assert_real_docker();
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
-    let (run_id, container) = observe_running_container(&sandbox);
+    let mut running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
+    let (run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     let run = one_run_directory(&sandbox);
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
@@ -869,8 +869,8 @@ fn credential_bytes_in_a_retained_symlink_target_block_result_publication() {
 fn unsafe_retained_file_mode_blocks_result_and_terminal_publication() {
     assert_real_docker();
     let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
-    let (run_id, container) = observe_running_container(&sandbox);
+    let mut running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
+    let (run_id, container) = observe_running_container(&sandbox, &mut running);
     let container_cleanup = ContainerGuard::new(container.clone());
     let run = one_run_directory(&sandbox);
     wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
