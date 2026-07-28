@@ -74,6 +74,9 @@ def boundary_run(
     """Invoke the installed public checker against one fixture repository."""
 
     command = [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
         str(launcher),
         "--repository-root",
         str(root),

@@ -108,7 +108,14 @@ def _boundary(
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            [str(CHECKER), "--repository-root", str(root)],
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(CHECKER),
+                "--repository-root",
+                str(root),
+            ],
             check=False,
             capture_output=True,
             env=environment,
