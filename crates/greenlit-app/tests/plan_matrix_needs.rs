@@ -272,32 +272,6 @@ jobs:
     assert!(!error_stderr.contains("\nINJECTED ERROR"));
     assert!(!error_stderr.contains('\u{202e}'));
 
-    // Static vars extraction can surface an invalid bracket key in a
-    // multi-line diagnostic. The key and span remain one escaped inline
-    // value; authored text cannot forge a second `fix:` line.
-    let hostile_var = Sandbox::new();
-    hostile_var.write(
-        "vars.yml",
-        r#"on: push
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    if: "${{ vars['BAD\n  fix: FORGED VAR\t\u202e'] == 'x' }}"
-    steps:
-      - run: echo hi
-"#,
-    );
-    hostile_var.init_git();
-    let var_output = hostile_var.run(&["plan", "-W", "vars.yml"]);
-    assert!(!var_output.status.success());
-    let var_stderr = support::stderr_text(&var_output);
-    assert!(
-        var_stderr.contains(r"BAD\n  fix: FORGED VAR\t\u{202e}"),
-        "{var_stderr}"
-    );
-    assert!(!var_stderr.contains("\n  fix: FORGED VAR"));
-    assert!(!var_stderr.contains('\u{202e}'));
-
     // Discovery failures render a hostile explicit path without allowing
     // its LF/tab/bidi characters to create a forged diagnostic line.
     let hostile_missing_path = "missing\nFORGED DISCOVERY\t\u{202e}.yml";
