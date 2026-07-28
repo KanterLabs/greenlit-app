@@ -575,10 +575,15 @@ fn assert_restrictive_umask_full_execution_is_private() {
         "oversized helper collision did not fail through the bounded CLI error path"
     );
     let stderr = String::from_utf8_lossy(&bounded.stderr);
+    let expected_error = format!(
+        "could not stage the greenlit-init helper: {} is private but its bytes do not match the embedded helper digest\n  fix: remove {}, then retry",
+        helper.display(),
+        helper.display()
+    );
     assert!(
-        stderr.contains("bytes do not match the embedded helper digest")
-            && stderr.contains("remove this file and retry"),
-        "oversized helper collision lacked the bounded actionable diagnostic: {stderr}"
+        stderr.contains(&expected_error)
+            && !stderr.contains("ensure the Greenlit state directory is writable"),
+        "oversized helper collision lacked its single exact actionable diagnostic: {stderr}"
     );
     assert_eq!(
         collision_metadata.len(),

@@ -170,10 +170,13 @@ fn helper_matches(file: &mut File, digest: &str) -> Result<bool, ExecError> {
 }
 
 fn mismatched_helper_error(path: &Path) -> ExecError {
-    staging_error(&format!(
-        "{} is private but its bytes do not match the embedded helper digest; remove this file and retry",
-        path.display()
-    ))
+    ExecError::Infrastructure {
+        message: format!(
+            "could not stage the greenlit-init helper: {} is private but its bytes do not match the embedded helper digest",
+            path.display()
+        ),
+        fix: format!("remove {}, then retry", path.display()),
+    }
 }
 
 fn normalize_new_helper(path: &Path, file: &File) -> Result<(), ExecError> {
