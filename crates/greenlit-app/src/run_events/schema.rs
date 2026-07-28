@@ -104,3 +104,254 @@ pub(crate) enum RunEvent {
         evidence: String,
     },
 }
+
+impl RunEvent {
+    pub(super) fn protected_value_collision(
+        &self,
+        masker: &greenlit_engine::execution::Masker,
+    ) -> bool {
+        let collides = |value: &str| masker.apply(value) != value;
+        match self {
+            Self::RunStarted => false,
+            Self::Preparation { phase, state, .. } => collides(phase) || collides(state),
+            Self::JobStarted {
+                job_id,
+                instance_id,
+                ..
+            }
+            | Self::JobSkipped {
+                job_id,
+                instance_id,
+                ..
+            } => collides(job_id) || collides(instance_id),
+            Self::JobFinished {
+                job_id,
+                instance_id,
+                conclusion,
+                ..
+            } => collides(job_id) || collides(instance_id) || collides(conclusion),
+            Self::StepStarted {
+                job_id,
+                instance_id,
+                event_id,
+                step_id,
+                kind,
+                ..
+            } => {
+                collides(job_id)
+                    || collides(instance_id)
+                    || collides(event_id)
+                    || step_id.as_deref().is_some_and(&collides)
+                    || collides(kind)
+            }
+            Self::StepSkipped {
+                job_id,
+                instance_id,
+                event_id,
+                step_id,
+                ..
+            } => {
+                collides(job_id)
+                    || collides(instance_id)
+                    || collides(event_id)
+                    || step_id.as_deref().is_some_and(&collides)
+            }
+            Self::StepFinished {
+                job_id,
+                instance_id,
+                event_id,
+                step_id,
+                outcome,
+                conclusion,
+                ..
+            } => {
+                collides(job_id)
+                    || collides(instance_id)
+                    || collides(event_id)
+                    || step_id.as_deref().is_some_and(&collides)
+                    || collides(outcome)
+                    || collides(conclusion)
+            }
+            Self::Log {
+                job_id,
+                instance_id,
+                step_event_id,
+                ..
+            } => {
+                collides(job_id)
+                    || collides(instance_id)
+                    || step_event_id.as_deref().is_some_and(&collides)
+            }
+            Self::CacheSummary { store, .. } => collides(store),
+            Self::CompatibilityFinding { code, scope, .. } => collides(code) || collides(scope),
+            Self::RunFinished {
+                conclusion,
+                compatibility,
+                assurance,
+                evidence,
+            } => {
+                collides(conclusion)
+                    || collides(compatibility)
+                    || collides(assurance)
+                    || collides(evidence)
+            }
+        }
+    }
+
+    pub(super) fn masked(self, masker: &greenlit_engine::execution::Masker) -> Self {
+        let mask = |value: String| masker.apply(&value);
+        let mask_option = |value: Option<String>| value.map(&mask);
+        match self {
+            Self::RunStarted => Self::RunStarted,
+            Self::Preparation {
+                phase,
+                state,
+                detail,
+                current_bytes,
+                total_bytes,
+                cache_hit,
+            } => Self::Preparation {
+                phase,
+                state,
+                detail: mask_option(detail),
+                current_bytes,
+                total_bytes,
+                cache_hit,
+            },
+            Self::JobStarted {
+                job_id,
+                instance_id,
+                display,
+            } => Self::JobStarted {
+                job_id,
+                instance_id,
+                display: mask(display),
+            },
+            Self::JobSkipped {
+                job_id,
+                instance_id,
+                display,
+                reason,
+            } => Self::JobSkipped {
+                job_id,
+                instance_id,
+                display: mask(display),
+                reason: mask(reason),
+            },
+            Self::JobFinished {
+                job_id,
+                instance_id,
+                display,
+                conclusion,
+                duration_ms,
+            } => Self::JobFinished {
+                job_id,
+                instance_id,
+                display: mask(display),
+                conclusion,
+                duration_ms,
+            },
+            Self::StepStarted {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label,
+                kind,
+                reference,
+            } => Self::StepStarted {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label: mask(label),
+                kind,
+                reference: mask_option(reference),
+            },
+            Self::StepSkipped {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label,
+                reason,
+            } => Self::StepSkipped {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label: mask(label),
+                reason: mask(reason),
+            },
+            Self::StepFinished {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label,
+                outcome,
+                conclusion,
+                duration_ms,
+            } => Self::StepFinished {
+                job_id,
+                instance_id,
+                event_id,
+                index,
+                step_id,
+                label: mask(label),
+                outcome,
+                conclusion,
+                duration_ms,
+            },
+            Self::Log {
+                job_id,
+                instance_id,
+                step_event_id,
+                text,
+                partial,
+            } => Self::Log {
+                job_id,
+                instance_id,
+                step_event_id,
+                text: mask(text),
+                partial,
+            },
+            Self::CacheSummary {
+                store,
+                hits,
+                misses,
+            } => Self::CacheSummary {
+                store,
+                hits,
+                misses,
+            },
+            Self::CompatibilityFinding {
+                code,
+                disposition,
+                scope,
+                reason,
+            } => Self::CompatibilityFinding {
+                code,
+                disposition,
+                scope,
+                reason: mask(reason),
+            },
+            Self::RunFinished {
+                conclusion,
+                compatibility,
+                assurance,
+                evidence,
+            } => Self::RunFinished {
+                conclusion,
+                compatibility,
+                assurance,
+                evidence,
+            },
+        }
+    }
+}

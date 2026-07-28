@@ -542,8 +542,9 @@ async fn run_nested_step(
         working_dir: Some(working_dir),
     };
     let mut sink = StepLogSink::new(state.out, state.masker);
-    let output = env.engine.exec(env.container, &spec, &mut sink).await?;
-    sink.finish();
+    let output = env.engine.exec(env.container, &spec, &mut sink).await;
+    sink.finish()?;
+    let output = output?;
     let exit = if output.exit_code == 0 {
         StepExit::Success
     } else {

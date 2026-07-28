@@ -10,8 +10,9 @@ use std::thread;
 use std::time::Duration;
 
 use harness::{
-    ContainerGuard, NetworkGuard, RunningLitci, assert_real_docker, docker, observe_runtime_token,
-    one_run_directory, run_directories, wait_for_container_path, write_container_path,
+    ContainerGuard, NetworkGuard, RunningLitci, assert_real_docker, docker,
+    observe_running_container, one_run_directory, read_container_text, run_directories,
+    wait_for_container_path,
 };
 use support::Sandbox;
 
@@ -21,12 +22,9 @@ mod harness;
 const RELEASE_MARKER: &str = "/tmp/greenlit-secret-invariant-release";
 const EMITTED_MARKER: &str = "/tmp/greenlit-secret-invariant-emitted";
 const FINISH_MARKER: &str = "/tmp/greenlit-secret-invariant-finish";
-const CLI_SECRET_INPUT: &str = "/tmp/greenlit-secret-invariant-cli";
+const STORAGE_ENV_CHECKED_MARKER: &str = "/tmp/greenlit-phase12-storage-env-absent";
+const DYNAMIC_VALUE_MARKER: &str = "/tmp/greenlit-dynamic-mask-value";
 const CLI_SECRET_NAME: &str = "RETAINED_TREE_SECRET";
-const CLI_SECRET_VALUE: &str = "gl-stab-069+/retained-cli-value";
-const RETAINED_COLLISION_SECRET_NAME: &str = "RETAINED_COLLISION_SECRET";
-const RETAINED_COLLISION_SECRET_VALUE: &str = greenlit_engine::SUPPORT_CERTIFICATION_WITNESS;
-const ORIGIN_SECRET_NAME: &str = "UNUSED_ORIGIN_SECRET";
 const ORIGIN_SECRET_VALUE: &str = "ghp_REMOTE_ORIGIN+SENTINEL";
 const REJECTED_ENGINE_BOUNDARY: (&str, &str) = (
     "DOCKER_HOST",
@@ -34,11 +32,18 @@ const REJECTED_ENGINE_BOUNDARY: (&str, &str) = (
 );
 
 const LEAK_SCRIPT: &str = r#"
-test -n "$ACTIONS_RUNTIME_TOKEN"
+if env | grep -Eq '^(ACTIONS_CACHE_URL|ACTIONS_RESULTS_URL|ACTIONS_RUNTIME_TOKEN)='; then
+  echo "Phase 12 exposed quarantined ACTIONS_* workflow-storage credentials" >&2
+  exit 91
+fi
+dynamic_prefix=$(printf '\147\150\160\137')
+dynamic_mask="${dynamic_prefix}DYNAMIC_MASK_$$_f91c"
+printf '%s' "$dynamic_mask" > /tmp/greenlit-dynamic-mask-value
+printf '::add-mask::%s\n' "$dynamic_mask"
+touch /tmp/greenlit-phase12-storage-env-absent
 while [ ! -f /tmp/greenlit-secret-invariant-release ]; do sleep 0.05; done
-token=$ACTIONS_RUNTIME_TOKEN
-printf 'direct=%s\n' "$token"
-encoded=$(printf '%s' "$token" | base64 | tr -d '\n')
+printf 'direct=%s\n' "$dynamic_mask"
+encoded=$(printf '%s' "$dynamic_mask" | base64 | tr -d '\n')
 printf 'base64=%s\n' "$encoded"
 percent_encode() {
   value=$1
@@ -53,10 +58,10 @@ percent_encode() {
   done
 }
 printf 'percent='
-percent_encode "$token"
+percent_encode "$dynamic_mask"
 printf '\n'
-first=$(printf '%s' "$token" | cut -c 1-17)
-rest=$(printf '%s' "$token" | cut -c 18-)
+first=$(printf '%s' "$dynamic_mask" | cut -c 1-17)
+rest=$(printf '%s' "$dynamic_mask" | cut -c 18-)
 printf 'split=%s' "$first"
 sleep 0.1
 printf '%s\n' "$rest"
@@ -75,9 +80,14 @@ enum TerminalPath {
 #[test]
 fn internal_runtime_token_never_reaches_any_retained_terminal_tree() {
     assert_real_docker();
-    assert_cli_secret_reference_blocks_after_clean_capture();
-    assert_capture_failure_scrubs_sensitive_partial_tree();
-    assert_capture_failure_preserves_clean_partial_tree();
+    assert_explicit_values_are_rejected_before_retained_state();
+    assert_interrupted_source_stage_never_enters_litci_state();
+    assert_metrics_failure_after_execution_cannot_turn_green();
+    assert_terminal_sync_failure_cannot_leave_mixed_authority();
+    assert_result_directory_sync_failure_removes_visible_authority();
+    assert_composite_publication_interruption_windows();
+    assert_post_catalog_render_failure_preserves_authority();
+    assert_restrictive_umask_full_execution_is_private();
     for terminal in [
         TerminalPath::Success,
         TerminalPath::FailedStep,
@@ -87,7 +97,440 @@ fn internal_runtime_token_never_reaches_any_retained_terminal_tree() {
     ] {
         exercise_terminal_path(terminal);
     }
-    assert_terminal_scan_scrubs_sensitive_run_tree();
+}
+
+fn assert_explicit_values_are_rejected_before_retained_state() {
+    let cases = [
+        ("--secret", format!("{CLI_SECRET_NAME}=abc"), "abc"),
+        ("--input", "name=run".to_string(), "run"),
+        ("--var", "name=shell".to_string(), "shell"),
+    ];
+    for (option, assignment, sensitive) in cases {
+        let sandbox = Sandbox::new();
+        let output = sandbox.run(&["run", "--allow-degraded", option, assignment.as_str()]);
+        assert!(
+            !output.status.success(),
+            "{option} passed explicit credential-bearing preflight"
+        );
+        let mut representations = sensitive_representations(sensitive);
+        if sensitive == "abc" {
+            representations.push(b"YWJj".to_vec());
+        }
+        assert_rendered_bytes_are_clean(&output, &representations);
+        assert!(
+            !sandbox.home().join(".litci").exists(),
+            "{option} created retained state before its fixed rejection"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("blocked before daemon, credential, network, action, or container")
+                && stderr.contains("fix:"),
+            "{option} rejection was not the fixed actionable boundary: {stderr}"
+        );
+    }
+}
+
+fn assert_interrupted_source_stage_never_enters_litci_state() {
+    const SOURCE_SENTINEL: &str = "interrupted-source-sentinel-5f91";
+    let sandbox = Sandbox::new();
+    let mut source = vec![b'x'; 8 * 1024 * 1024];
+    source.extend_from_slice(SOURCE_SENTINEL.as_bytes());
+    let source_identity = greenlit_store::cas::ObjectDigest::of_bytes(&source);
+    let source_len = source.len() as u64;
+    sandbox.write_bytes("large-source.bin", &source);
+    let running = RunningLitci::spawn_with_env(
+        &sandbox,
+        "on: push\njobs:\n  interrupted:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
+        &[("LITCI_TEST_SOURCE_STAGE_HOLD", "after-capture")],
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let stage = loop {
+        if let Some(path) = fs::read_dir(sandbox.home())
+            .expect("read staging home")
+            .map(|entry| entry.expect("read staging entry").path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".greenlit-source-stage-") && !name.contains(".capture-")
+                }) && fs::metadata(path.join("large-source.bin"))
+                    .is_ok_and(|metadata| metadata.len() == source_len)
+            })
+        {
+            break path;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "private source stage did not appear before interruption deadline"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_private_tree_modes(&stage);
+    running.signal_kill();
+    let output = running.finish();
+    assert!(
+        !output.status.success(),
+        "SIGKILL interruption unexpectedly succeeded"
+    );
+    let representations = sensitive_representations(SOURCE_SENTINEL);
+    let litci = sandbox.home().join(".litci");
+    assert!(
+        litci.is_dir(),
+        "interrupted run never allocated private state"
+    );
+    assert_complete_tree_is_clean(&litci, &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &[source_identity]);
+    assert_phase_24_storage_absent(&sandbox);
+    assert!(
+        stage.is_dir(),
+        "named private source stage did not preserve the interrupted capture boundary"
+    );
+    fs::remove_dir_all(&stage).expect("remove interrupted private source stage");
+}
+
+fn assert_metrics_failure_after_execution_cannot_turn_green() {
+    let sandbox = Sandbox::new();
+    sandbox.write_home(".litci/metrics", "force metrics open failure");
+    fs::set_permissions(
+        sandbox.home().join(".litci"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .expect("make metrics-failure state root private");
+    fs::set_permissions(
+        sandbox.home().join(".litci/metrics"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("make metrics-failure tripwire private");
+    let output = RunningLitci::spawn(
+        &sandbox,
+        "on: push\njobs:\n  metrics:\n    runs-on: ubuntu-latest\n    steps:\n      - name: execution reached metrics\n        run: exit 0\n",
+    )
+    .finish();
+    assert!(
+        !output.status.success(),
+        "metrics persistence failure published a successful command"
+    );
+    let run = one_run_directory(&sandbox);
+    assert_execution_succeeded_before_writer_failure(&run);
+    assert_unpublished_run_is_aborted(&sandbox, &run, "metrics persistence failure");
+    assert_source_not_in_shared_cas(&sandbox, &run);
+    assert_phase_24_storage_absent(&sandbox);
+    let trace = fs::read_to_string(run.join("trace.ndjson")).expect("read failed metrics trace");
+    assert!(
+        !trace.contains("\"event\":\"run_completed\""),
+        "metrics failure persisted run_completed: {trace}"
+    );
+    assert_no_rendered_passed(&output, "metrics persistence failure");
+}
+
+fn assert_result_directory_sync_failure_removes_visible_authority() {
+    let sandbox = Sandbox::new();
+    let running = RunningLitci::spawn_with_env(
+        &sandbox,
+        &workflow(TerminalPath::Success),
+        &[("LITCI_TEST_RESULT_DIRECTORY_SYNC_FAILURE", "after-rename")],
+    );
+    let (_run_id, container) = observe_running_container(&sandbox);
+    let container_cleanup = ContainerGuard::new(container.clone());
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let source_identities = source_identities(&one_run_directory(&sandbox));
+    assert!(
+        docker(["exec", &container, "touch", RELEASE_MARKER])
+            .status
+            .success(),
+        "could not release the result directory-sync fault workflow"
+    );
+    let output = running.finish();
+    assert!(
+        !output.status.success(),
+        "post-rename result directory-sync failure passed"
+    );
+    assert!(
+        run_directories(&sandbox).is_empty(),
+        "post-rename sync failure left result.json or its run tree visible"
+    );
+    assert_no_rendered_passed(&output, "post-rename result sync failure");
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected directory sync failure after result rename"),
+        "result transaction did not reach the post-rename fault boundary: {stderr}"
+    );
+    container_cleanup.cleanup();
+}
+
+fn assert_terminal_sync_failure_cannot_leave_mixed_authority() {
+    let sandbox = Sandbox::new();
+    let running = RunningLitci::spawn_with_env(
+        &sandbox,
+        &workflow(TerminalPath::Success),
+        &[("LITCI_TEST_TERMINAL_SYNC_FAILURE", "after-write")],
+    );
+    let (_run_id, container) = observe_running_container(&sandbox);
+    let container_cleanup = ContainerGuard::new(container.clone());
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let source_identities = source_identities(&one_run_directory(&sandbox));
+    assert!(
+        docker(["exec", &container, "touch", RELEASE_MARKER])
+            .status
+            .success(),
+        "could not release the terminal-sync fault workflow"
+    );
+    let output = running.finish();
+    assert!(
+        !output.status.success(),
+        "terminal journal sync fault published success"
+    );
+    assert!(
+        run_directories(&sandbox).is_empty(),
+        "terminal sync fault retained a mixed Passed/Aborted journal"
+    );
+    assert_no_rendered_passed(&output, "terminal journal sync failure");
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
+    container_cleanup.cleanup();
+}
+
+fn assert_composite_publication_interruption_windows() {
+    exercise_publication_interruption(
+        "after-terminal-sync",
+        "LITCI_TEST_TERMINAL_PUBLICATION_HOLD",
+        |sandbox, run, run_id| {
+            run.join("events.ndjson").is_file()
+                && journal_records(run)
+                    .iter()
+                    .any(|record| record["type"] == "run_finished")
+                && !run.join("result.json").exists()
+                && !catalog_has_terminal_state(sandbox, run_id)
+        },
+    );
+    exercise_publication_interruption(
+        "after-directory-sync",
+        "LITCI_TEST_RESULT_PUBLICATION_HOLD",
+        |sandbox, run, run_id| {
+            run.join("result.json").is_file() && !catalog_has_terminal_state(sandbox, run_id)
+        },
+    );
+    exercise_publication_interruption(
+        "after-catalog-complete",
+        "LITCI_TEST_TERMINAL_PUBLICATION_HOLD",
+        |sandbox, run, run_id| {
+            run.join("result.json").is_file()
+                && catalog_has_terminal_state(sandbox, run_id)
+                && journal_records(run)
+                    .iter()
+                    .any(|record| record["type"] == "run_finished")
+        },
+    );
+}
+
+fn assert_post_catalog_render_failure_preserves_authority() {
+    let sandbox = Sandbox::new();
+    let running = RunningLitci::spawn_with_env(
+        &sandbox,
+        &workflow(TerminalPath::Success),
+        &[("LITCI_TEST_TERMINAL_RENDER_FAILURE", "after-catalog")],
+    );
+    let (run_id, container) = observe_running_container(&sandbox);
+    let container_cleanup = ContainerGuard::new(container.clone());
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let run = one_run_directory(&sandbox);
+    let source_identities = source_identities(&run);
+    assert!(
+        docker(["exec", &container, "touch", RELEASE_MARKER])
+            .status
+            .success(),
+        "could not release the post-catalog render-failure workflow"
+    );
+    let output = running.finish();
+    assert!(
+        !output.status.success(),
+        "post-catalog render failure returned command success"
+    );
+    assert!(
+        run.join("result.json").is_file()
+            && catalog_has_terminal_state(&sandbox, &run_id)
+            && journal_records(&run)
+                .iter()
+                .any(|record| record["type"] == "run_finished"),
+        "post-catalog presentation failure revoked authoritative evidence"
+    );
+    assert_result_and_journal_truth(&run, TerminalPath::Success);
+    let trace = fs::read_to_string(run.join("trace.ndjson")).expect("read completed run trace");
+    assert!(
+        trace.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|record| record["event"] == "run_completed")
+        }),
+        "post-catalog presentation failure lost the completed trace"
+    );
+    assert_no_rendered_passed(&output, "post-catalog presentation failure");
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not render the committed terminal run event")
+            && stderr.contains("injected post-catalog render failure"),
+        "post-catalog presentation diagnostic was not distinct from workflow failure: {stderr}"
+    );
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
+    container_cleanup.cleanup();
+    support::assert_run_resources_removed(&run);
+}
+
+fn exercise_publication_interruption(
+    point: &str,
+    variable: &str,
+    reached: impl Fn(&Sandbox, &Path, &str) -> bool,
+) {
+    let sandbox = Sandbox::new();
+    let running = RunningLitci::spawn_with_env(
+        &sandbox,
+        &workflow(TerminalPath::Success),
+        &[(variable, point)],
+    );
+    let (run_id, container) = observe_running_container(&sandbox);
+    let container_cleanup = ContainerGuard::new(container.clone());
+    let run = one_run_directory(&sandbox);
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let source_identities = source_identities(&run);
+    assert!(
+        docker(["exec", &container, "touch", RELEASE_MARKER])
+            .status
+            .success(),
+        "could not release the {point} interruption workflow"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !reached(&sandbox, &run, &run_id) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "publication did not reach {point} before the interruption deadline"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    running.signal_kill();
+    let output = running.finish();
+    assert!(
+        !output.status.success(),
+        "{point} SIGKILL unexpectedly returned success"
+    );
+    assert_no_rendered_passed(&output, point);
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
+    match point {
+        "after-terminal-sync" => {
+            assert!(
+                !run.join("result.json").exists() && !catalog_has_terminal_state(&sandbox, &run_id),
+                "pre-result interruption became composite authority"
+            );
+        }
+        "after-directory-sync" => {
+            assert!(
+                run.join("result.json").is_file() && !catalog_has_terminal_state(&sandbox, &run_id),
+                "pre-catalog interruption became composite authority"
+            );
+        }
+        "after-catalog-complete" => {
+            assert!(
+                run.join("result.json").is_file() && catalog_has_terminal_state(&sandbox, &run_id),
+                "catalog-complete interruption lost composite authority"
+            );
+        }
+        _ => unreachable!("declared publication interruption point"),
+    }
+    container_cleanup.cleanup();
+    support::assert_run_resources_removed(&run);
+}
+
+fn catalog_has_terminal_state(sandbox: &Sandbox, run_id: &str) -> bool {
+    greenlit_store::cas::CasStore::open(greenlit_store::cas::CasStore::default_path_under(
+        sandbox.home(),
+    ))
+    .and_then(|store| store.reclaimable_run_ids())
+    .is_ok_and(|runs| runs.iter().any(|candidate| candidate == run_id))
+}
+
+fn assert_restrictive_umask_full_execution_is_private() {
+    let sandbox = Sandbox::new();
+    let output = RunningLitci::spawn_under_restrictive_umask(
+        &sandbox,
+        "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
+    )
+    .finish();
+    assert!(
+        output.status.success(),
+        "full execution failed under umask 0777: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state = sandbox.home().join(".litci");
+    let mut pending = vec![state.clone()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).expect("inspect Greenlit state entry");
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let mode = metadata.permissions().mode() & 0o7777;
+        if metadata.is_dir() {
+            assert_eq!(
+                mode,
+                0o700,
+                "{} was not born as a private directory under umask 0777",
+                path.display()
+            );
+            pending.extend(
+                fs::read_dir(&path)
+                    .expect("walk Greenlit state directory")
+                    .map(|entry| entry.expect("read Greenlit state entry").path()),
+            );
+            continue;
+        }
+        assert_eq!(
+            mode,
+            0o600,
+            "{} was not born with its exact private mode under umask 0777",
+            path.display()
+        );
+    }
+    let run = one_run_directory(&sandbox);
+    assert!(
+        run.join("result.json").is_file(),
+        "restrictive-umask full execution did not publish a result"
+    );
+    support::assert_run_resources_removed(&run);
+    assert!(
+        !state.join("runtime").exists(),
+        "Phase 12 retained a durable runtime helper despite disabling all run stores"
+    );
+    let second = RunningLitci::spawn_under_restrictive_umask(
+        &sandbox,
+        "on: push\njobs:\n  private:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
+    )
+    .finish();
+    assert!(
+        second.status.success(),
+        "second full execution failed under umask 0777: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_run = run_directories(&sandbox)
+        .into_iter()
+        .find(|candidate| candidate != &run)
+        .expect("second restrictive-umask execution retained its own run identity");
+    assert!(
+        second_run.join("result.json").is_file(),
+        "second restrictive-umask execution did not publish a result"
+    );
+    support::assert_run_resources_removed(&second_run);
 }
 
 fn exercise_terminal_path(terminal: TerminalPath) {
@@ -98,18 +541,14 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     )
     .expect("create ordinary source symlink");
     let workflow = workflow(terminal);
-    let mut running = if matches!(terminal, TerminalPath::PreparationFailed) {
-        RunningLitci::spawn_with_secret(&sandbox, &workflow, CLI_SECRET_NAME, CLI_SECRET_VALUE)
-    } else {
-        RunningLitci::spawn(&sandbox, &workflow)
-    };
-    let (run_id, container, token) = observe_runtime_token(&sandbox);
+    let mut running = RunningLitci::spawn(&sandbox, &workflow);
+    let (run_id, container) = observe_running_container(&sandbox);
     let container_cleanup = ContainerGuard::new(container.clone());
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let source_identities = source_identities(&one_run_directory(&sandbox));
     let network_collision = matches!(terminal, TerminalPath::PreparationFailed)
         .then(|| NetworkGuard::create(format!("greenlit-run-{run_id}-prepare-000")));
-    if matches!(terminal, TerminalPath::PreparationFailed) {
-        write_container_path(&container, CLI_SECRET_INPUT, CLI_SECRET_VALUE.as_bytes());
-    }
 
     assert!(
         docker(["exec", &container, "touch", RELEASE_MARKER])
@@ -133,12 +572,6 @@ fn exercise_terminal_path(terminal: TerminalPath) {
     }
     let output = running.finish();
     let run = one_run_directory(&sandbox);
-    let mut representations = sensitive_representations(&token);
-    if matches!(terminal, TerminalPath::PreparationFailed) {
-        representations.extend(sensitive_representations(CLI_SECRET_VALUE));
-        representations.sort();
-        representations.dedup();
-    }
 
     match terminal {
         TerminalPath::Success => assert!(output.status.success(), "success path failed"),
@@ -163,6 +596,7 @@ fn exercise_terminal_path(terminal: TerminalPath) {
             "closed output published a {published_conclusion:?} result despite terminal writer failure"
         );
         assert_execution_succeeded_before_writer_failure(&run);
+        assert_unpublished_run_is_aborted(&sandbox, &run, "closed-output failure");
     } else {
         assert!(
             run.join("result.json").is_file(),
@@ -172,130 +606,14 @@ fn exercise_terminal_path(terminal: TerminalPath) {
         assert_exact_shell_degradation_is_retained(&run);
     }
     assert_rendered_bytes_are_clean(&output, &representations);
-    assert_complete_tree_is_clean(&run, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
     if let Some(network) = network_collision {
         network.cleanup();
     }
     container_cleanup.cleanup();
     support::assert_run_resources_removed(&run);
-}
-
-fn assert_cli_secret_reference_blocks_after_clean_capture() {
-    let sandbox = Sandbox::new();
-    let workflow = format!(
-        "on: push\njobs:\n  blocked:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ${{{{ secrets.{CLI_SECRET_NAME} }}}}\n"
-    );
-    let output =
-        RunningLitci::spawn_with_secret(&sandbox, &workflow, CLI_SECRET_NAME, CLI_SECRET_VALUE)
-            .finish();
-    assert!(
-        !output.status.success(),
-        "a referenced CLI secret bypassed stabilization quarantine"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("secret.context")
-            && stderr.contains("blocked before daemon, credential, network, action, or container"),
-        "referenced CLI secret did not produce the non-forceable quarantine diagnostic: {stderr}"
-    );
-    let representations = sensitive_representations(CLI_SECRET_VALUE);
-    assert_rendered_bytes_are_clean(&output, &representations);
-    let run = one_run_directory(&sandbox);
-    assert_complete_tree_is_clean(&run, &representations);
-    let result: serde_json::Value = serde_json::from_slice(
-        &fs::read(run.join("result.json")).expect("read blocked secret result"),
-    )
-    .expect("parse blocked secret result");
-    assert_eq!(result["conclusion"], "blocked");
-    assert_eq!(result["compatibility"], "unsupported");
-    assert_eq!(result["assurance"], "none");
-}
-
-fn assert_capture_failure_scrubs_sensitive_partial_tree() {
-    let sandbox = Sandbox::new();
-    sandbox.write("captured-sensitive.txt", RETAINED_COLLISION_SECRET_VALUE);
-    force_content_store_open_failure(&sandbox);
-    let output = RunningLitci::spawn_with_secret(
-        &sandbox,
-        "on: push\njobs:\n  capture:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
-        RETAINED_COLLISION_SECRET_NAME,
-        RETAINED_COLLISION_SECRET_VALUE,
-    )
-    .finish();
-    assert!(
-        !output.status.success(),
-        "content-store collision did not fail source preparation"
-    );
-    assert_rendered_bytes_are_clean(
-        &output,
-        &sensitive_representations(RETAINED_COLLISION_SECRET_VALUE),
-    );
-    assert!(
-        run_directories(&sandbox).is_empty(),
-        "failed capture retained a partial tree containing the declared secret"
-    );
-}
-
-fn assert_capture_failure_preserves_clean_partial_tree() {
-    let sandbox = Sandbox::new();
-    sandbox.write("ordinary-source.txt", "ordinary failure evidence");
-    force_content_store_open_failure(&sandbox);
-    let output = RunningLitci::spawn_with_secret(
-        &sandbox,
-        "on: push\njobs:\n  capture:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 0\n",
-        CLI_SECRET_NAME,
-        CLI_SECRET_VALUE,
-    )
-    .finish();
-    assert!(
-        !output.status.success(),
-        "content-store collision did not fail source preparation"
-    );
-    let run = one_run_directory(&sandbox);
-    assert_complete_tree_is_clean(&run, &sensitive_representations(CLI_SECRET_VALUE));
-}
-
-fn force_content_store_open_failure(sandbox: &Sandbox) {
-    sandbox.write_home(".litci/store", "force content-store open failure");
-    fs::set_permissions(
-        sandbox.home().join(".litci"),
-        fs::Permissions::from_mode(0o700),
-    )
-    .expect("make test state root private");
-}
-
-fn assert_terminal_scan_scrubs_sensitive_run_tree() {
-    let sandbox = Sandbox::new();
-    let running = RunningLitci::spawn_with_secret(
-        &sandbox,
-        &workflow(TerminalPath::Success),
-        RETAINED_COLLISION_SECRET_NAME,
-        RETAINED_COLLISION_SECRET_VALUE,
-    );
-    let (run_id, container, _token) = observe_runtime_token(&sandbox);
-    let container_cleanup = ContainerGuard::new(container.clone());
-    let run = one_run_directory(&sandbox);
-    assert!(
-        docker(["exec", &container, "touch", RELEASE_MARKER])
-            .status
-            .success(),
-        "could not release the retained-collision workflow"
-    );
-    let output = running.finish();
-    assert!(
-        !output.status.success(),
-        "terminal publication retained evidence containing the declared secret"
-    );
-    assert!(
-        !run.exists(),
-        "terminal scan refusal left the sensitive run tree retained"
-    );
-    assert_rendered_bytes_are_clean(
-        &output,
-        &sensitive_representations(RETAINED_COLLISION_SECRET_VALUE),
-    );
-    container_cleanup.cleanup();
-    support::assert_run_resources_removed(Path::new(&run_id));
 }
 
 fn assert_result_and_journal_truth(run: &Path, terminal: TerminalPath) {
@@ -440,15 +758,12 @@ fn remote_origin_credentials_are_contained_at_the_compiled_run_boundary() {
         );
         sandbox.init_git();
         sandbox.git(&["remote", "add", "origin", &case.origin]);
-        let secret_argument = format!("{ORIGIN_SECRET_NAME}={ORIGIN_SECRET_VALUE}");
         let output = sandbox.run_with_env(
             &[
                 "run",
                 "--no-daemon",
                 "--no-input",
                 "--allow-degraded",
-                "--secret",
-                &secret_argument,
                 "-W",
                 ".github/workflows/retained-secret.yml",
             ],
@@ -481,7 +796,9 @@ fn remote_origin_credentials_are_contained_at_the_compiled_run_boundary() {
                     "{} did not retain the captured Git configuration",
                     case.name
                 );
-                assert_complete_tree_is_clean(&run, &representations);
+                assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+                assert_source_not_in_shared_cas(&sandbox, &run);
+                assert_phase_24_storage_absent(&sandbox);
             }
             ExpectedBoundary::RejectedBeforeEngine => {
                 assert!(
@@ -497,8 +814,8 @@ fn remote_origin_credentials_are_contained_at_the_compiled_run_boundary() {
                     "{} reached the engine boundary after unsafe source rejection: {stderr}",
                     case.name
                 );
-                for run in run_directories(&sandbox) {
-                    assert_complete_tree_is_clean(&run, &representations);
+                if sandbox.home().join(".litci").exists() {
+                    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
                 }
             }
         }
@@ -510,11 +827,15 @@ fn credential_bytes_in_a_retained_symlink_target_block_result_publication() {
     assert_real_docker();
     let sandbox = Sandbox::new();
     let running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
-    let (run_id, container, token) = observe_runtime_token(&sandbox);
+    let (run_id, container) = observe_running_container(&sandbox);
     let container_cleanup = ContainerGuard::new(container.clone());
     let run = one_run_directory(&sandbox);
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let dynamic_value = read_container_text(&container, DYNAMIC_VALUE_MARKER);
+    let representations = sensitive_representations(&dynamic_value);
+    let source_identities = source_identities(&run);
     symlink(
-        format!("../ghp_REMOTE_CREDENTIAL_{token}"),
+        format!("../{dynamic_value}"),
         run.join("credential-target-link"),
     )
     .expect("inject credential-bearing retained symlink");
@@ -535,7 +856,11 @@ fn credential_bytes_in_a_retained_symlink_target_block_result_publication() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("credential-bearing data"), "{stderr}");
-    assert!(!stderr.contains(&token), "{stderr}");
+    assert!(!stderr.contains(&dynamic_value), "{stderr}");
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
     container_cleanup.cleanup();
     support::assert_run_resources_removed(&run);
 }
@@ -545,9 +870,12 @@ fn unsafe_retained_file_mode_blocks_result_and_terminal_publication() {
     assert_real_docker();
     let sandbox = Sandbox::new();
     let running = RunningLitci::spawn(&sandbox, &workflow(TerminalPath::Success));
-    let (run_id, container, _token) = observe_runtime_token(&sandbox);
+    let (run_id, container) = observe_running_container(&sandbox);
     let container_cleanup = ContainerGuard::new(container.clone());
     let run = one_run_directory(&sandbox);
+    wait_for_container_path(&container, STORAGE_ENV_CHECKED_MARKER);
+    let representations = observed_dynamic_representations(&container);
+    let source_identities = source_identities(&run);
     fs::set_permissions(
         run.join("source-manifest.json"),
         fs::Permissions::from_mode(0o644),
@@ -570,6 +898,10 @@ fn unsafe_retained_file_mode_blocks_result_and_terminal_publication() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unsafe artifact metadata"), "{stderr}");
+    assert_rendered_bytes_are_clean(&output, &representations);
+    assert_complete_tree_is_clean(&sandbox.home().join(".litci"), &representations);
+    assert_identities_not_in_shared_cas(&sandbox, &source_identities);
+    assert_phase_24_storage_absent(&sandbox);
     container_cleanup.cleanup();
     support::assert_run_resources_removed(&run);
 }
@@ -653,6 +985,155 @@ fn assert_execution_succeeded_before_writer_failure(run: &Path) {
     );
 }
 
+fn assert_unpublished_run_is_aborted(sandbox: &Sandbox, run: &Path, context: &str) {
+    assert!(
+        !run.join("result.json").exists(),
+        "{context} published result.json"
+    );
+    let terminals = journal_records(run)
+        .into_iter()
+        .filter(|record| record["type"] == "run_finished")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "{context} did not retain exactly one terminal event"
+    );
+    assert_eq!(
+        terminals[0]["conclusion"], "Aborted",
+        "{context} retained a non-aborted terminal"
+    );
+    let run_id = run
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("run identity");
+    let store = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
+    )
+    .expect("open retained content catalog");
+    assert!(
+        store
+            .reclaimable_run_ids()
+            .expect("read terminal catalog runs")
+            .iter()
+            .any(|candidate| candidate == run_id),
+        "{context} did not mark the catalog run aborted"
+    );
+}
+
+fn assert_no_rendered_passed(output: &Output, context: &str) {
+    for (stream, bytes) in [
+        ("stdout", output.stdout.as_slice()),
+        ("stderr", output.stderr.as_slice()),
+    ] {
+        let rendered = String::from_utf8_lossy(bytes);
+        assert!(
+            !rendered.contains("Passed"),
+            "{context} rendered a Passed terminal or conclusion on {stream}: {rendered}"
+        );
+    }
+}
+
+fn assert_private_tree_modes(root: &Path) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).expect("inspect private staged source");
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        let expected = if metadata.is_dir() { 0o700 } else { 0o600 };
+        assert_eq!(
+            metadata.permissions().mode() & 0o7777,
+            expected,
+            "{} was not privately staged",
+            path.display()
+        );
+        if metadata.is_dir() {
+            pending.extend(
+                fs::read_dir(&path)
+                    .expect("read private staged source")
+                    .map(|entry| entry.expect("read staged source entry").path()),
+            );
+        }
+    }
+}
+
+fn assert_source_not_in_shared_cas(sandbox: &Sandbox, run: &Path) {
+    assert_identities_not_in_shared_cas(sandbox, &source_identities(run));
+}
+
+fn source_identities(run: &Path) -> Vec<greenlit_store::cas::ObjectDigest> {
+    let manifest_bytes = fs::read(run.join("source-manifest.json")).expect("read source manifest");
+    let canonical_manifest = manifest_bytes
+        .strip_suffix(b"\n")
+        .expect("source manifest has one trailing newline");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(canonical_manifest).expect("parse source manifest");
+    let computed_snapshot = greenlit_store::cas::ObjectDigest::of_bytes(canonical_manifest);
+    let snapshot = fs::read(run.join("run-lock.json")).map_or(computed_snapshot, |bytes| {
+        let lock: serde_json::Value = serde_json::from_slice(&bytes).expect("parse RunLock");
+        greenlit_store::cas::ObjectDigest::parse(
+            lock["source"]["snapshot_digest"]
+                .as_str()
+                .expect("source snapshot identity"),
+        )
+        .expect("valid source snapshot identity")
+    });
+    std::iter::once(snapshot)
+        .chain(
+            manifest
+                .as_array()
+                .expect("source manifest entries")
+                .iter()
+                .map(|entry| {
+                    greenlit_store::cas::ObjectDigest::parse(
+                        entry["digest"].as_str().expect("source entry identity"),
+                    )
+                    .expect("valid source entry identity")
+                }),
+        )
+        .collect()
+}
+
+fn assert_identities_not_in_shared_cas(
+    sandbox: &Sandbox,
+    identities: &[greenlit_store::cas::ObjectDigest],
+) {
+    let store = greenlit_store::cas::CasStore::open(
+        greenlit_store::cas::CasStore::default_path_under(sandbox.home()),
+    )
+    .expect("open shared CAS");
+    for identity in identities {
+        assert!(
+            store
+                .read_verified(identity)
+                .expect("inspect source CAS containment")
+                .is_none(),
+            "Phase 12 published frozen source identity {identity} into shared CAS"
+        );
+    }
+}
+
+fn assert_phase_24_storage_absent(sandbox: &Sandbox) {
+    for relative in ["cache", "artifacts", "toolcache", "package-cache"] {
+        let path = sandbox.home().join(".litci").join(relative);
+        assert!(
+            !path.exists(),
+            "Phase 12 created quarantined workflow-storage state at {}",
+            path.display()
+        );
+    }
+}
+
+fn observed_dynamic_representations(container: &str) -> Vec<Vec<u8>> {
+    let value = read_container_text(container, DYNAMIC_VALUE_MARKER);
+    assert!(
+        value.starts_with("ghp_DYNAMIC_MASK_"),
+        "workflow did not generate the expected credential-shaped dynamic mask"
+    );
+    sensitive_representations(&value)
+}
+
 fn workflow(terminal: TerminalPath) -> String {
     let finish = match terminal {
         TerminalPath::Success | TerminalPath::PreparationFailed => "exit 0",
@@ -667,33 +1148,10 @@ fn workflow(terminal: TerminalPath) -> String {
     } else {
         ""
     };
-    let leak_script = if matches!(terminal, TerminalPath::PreparationFailed) {
-        format!("{LEAK_SCRIPT}\n{}", cli_secret_leak_script())
-    } else {
-        LEAK_SCRIPT.to_string()
-    };
     format!(
         "on: push\njobs:\n  leak:\n    runs-on: ubuntu-latest\n    steps:\n      - shell: bash\n        run: |\n{}\n          {finish}\n{second_job}",
-        indent(&leak_script, 10)
+        indent(LEAK_SCRIPT, 10)
     )
-}
-
-fn cli_secret_leak_script() -> String {
-    r#"
-cli_secret=$(cat /tmp/greenlit-secret-invariant-cli)
-printf 'cli-direct=%s\n' "$cli_secret"
-encoded=$(printf '%s' "$cli_secret" | base64 | tr -d '\n')
-printf 'cli-base64=%s\n' "$encoded"
-printf 'cli-percent='
-percent_encode "$cli_secret"
-printf '\n'
-first=$(printf '%s' "$cli_secret" | cut -c 1-13)
-rest=$(printf '%s' "$cli_secret" | cut -c 14-)
-printf 'cli-split=%s' "$first"
-sleep 0.1
-printf '%s\n' "$rest"
-"#
-    .to_string()
 }
 
 fn indent(value: &str, spaces: usize) -> String {
@@ -709,7 +1167,21 @@ fn indent(value: &str, spaces: usize) -> String {
 fn assert_rendered_bytes_are_clean(output: &Output, representations: &[Vec<u8>]) {
     let mut rendered = output.stdout.clone();
     rendered.extend_from_slice(&output.stderr);
-    assert_no_sensitive_bytes(&rendered, representations, "rendered output");
+    let mut redacted = String::from_utf8_lossy(&rendered).into_owned();
+    for representation in representations {
+        redacted = redacted.replace(
+            String::from_utf8_lossy(representation).as_ref(),
+            "<credential>",
+        );
+    }
+    for (index, representation) in representations.iter().enumerate() {
+        assert!(
+            !rendered
+                .windows(representation.len())
+                .any(|window| window == representation),
+            "rendered output contains credential representation {index}; redacted output:\n{redacted}"
+        );
+    }
 }
 
 fn assert_complete_tree_is_clean(root: &Path, representations: &[Vec<u8>]) {

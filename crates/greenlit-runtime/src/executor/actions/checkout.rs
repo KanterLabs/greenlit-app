@@ -149,14 +149,14 @@ pub(crate) async fn execute(
             repository,
         });
     };
-    masker.add(&token);
+    masker.add(&token)?;
 
     let (sha_or_ref, is_full_sha) = (git_ref.clone(), looks_like_sha(&git_ref));
     let auth_header = format!(
         "AUTHORIZATION: basic {}",
         base64_basic(&format!("x-access-token:{token}"))
     );
-    masker.add(&auth_header);
+    masker.add(&auth_header)?;
     let remote_url = format!("https://github.com/{repository}.git");
     let fetch_ref = if is_full_sha {
         sha_or_ref.clone()

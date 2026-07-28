@@ -11,9 +11,13 @@
 
 use std::io::Write;
 
-use greenlit_engine::execution::log_commands::{Annotation, LogLine, Masker, parse_line};
+use greenlit_engine::execution::log_commands::{
+    Annotation, LogLine, MaskRegistrationError, Masker, parse_line,
+};
 
 use crate::engine::ExecOutputSink;
+
+const MAX_BUFFERED_LINE_BYTES: usize = 256 * 1024;
 
 /// A [`ExecOutputSink`] that renders a step's output live, honoring workflow
 /// log commands and masking. Borrows the shared run [`Masker`] (so
@@ -50,7 +54,11 @@ impl<'a> StepLogSink<'a> {
 
     /// Flush any buffered partial lines (output that lacked a trailing newline).
     /// Called once the exec has finished streaming.
-    pub fn finish(&mut self) {
+    pub fn finish(&mut self) -> Result<(), MaskRegistrationError> {
+        if let Err(error) = self.masker.ensure_healthy() {
+            self.discard_buffers();
+            return Err(error);
+        }
         if !self.stdout_line.is_empty() {
             let line = std::mem::take(&mut self.stdout_line);
             self.emit(&line);
@@ -59,10 +67,14 @@ impl<'a> StepLogSink<'a> {
             let line = std::mem::take(&mut self.stderr_line);
             self.emit(&line);
         }
+        self.masker.ensure_healthy()
     }
 
     /// Process one complete raw line (without its terminator).
     fn emit(&mut self, raw: &[u8]) {
+        if self.masker.ensure_healthy().is_err() {
+            return;
+        }
         // Non-UTF-8 output is rendered lossily; workflow commands are ASCII, so
         // a lossy view never misclassifies one.
         let text = String::from_utf8_lossy(raw);
@@ -70,7 +82,7 @@ impl<'a> StepLogSink<'a> {
             LogLine::AddMask(value) => {
                 // The value itself is never printed — registering it is the
                 // whole point. Later lines that echo it are redacted.
-                self.masker.add(&value);
+                let _ = self.masker.add_dynamic(&value);
             }
             LogLine::StartGroup(title) => {
                 let title = self.masker.apply(&title);
@@ -113,23 +125,54 @@ impl<'a> StepLogSink<'a> {
             self.write_failed = true;
         }
     }
+
+    fn ingest(&mut self, chunk: &[u8], is_stderr: bool) {
+        if self.masker.ensure_healthy().is_err() {
+            self.discard_buffers();
+            return;
+        }
+        for piece in chunk.split_inclusive(|byte| *byte == b'\n') {
+            let buffer_len = if is_stderr {
+                self.stderr_line.len()
+            } else {
+                self.stdout_line.len()
+            };
+            if buffer_len
+                .checked_add(piece.len())
+                .is_none_or(|size| size > MAX_BUFFERED_LINE_BYTES)
+            {
+                self.discard_buffers();
+                let _ = self.masker.fail_closed();
+                return;
+            }
+            if is_stderr {
+                self.stderr_line.extend_from_slice(piece);
+            } else {
+                self.stdout_line.extend_from_slice(piece);
+            }
+            if piece.ends_with(b"\n") {
+                drain(self, is_stderr);
+                if self.masker.ensure_healthy().is_err() {
+                    self.discard_buffers();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn discard_buffers(&mut self) {
+        self.stdout_line.clear();
+        self.stderr_line.clear();
+    }
 }
 
 impl ExecOutputSink for StepLogSink<'_> {
     fn on_stdout(&mut self, chunk: &[u8]) {
-        // Take ownership of the buffer to satisfy the borrow checker while
-        // `emit` borrows `self`.
-        let mut buffer = std::mem::take(&mut self.stdout_line);
-        buffer.extend_from_slice(chunk);
-        self.stdout_line = buffer;
-        drain(self, false);
+        self.ingest(chunk, false);
     }
 
     fn on_stderr(&mut self, chunk: &[u8]) {
-        let mut buffer = std::mem::take(&mut self.stderr_line);
-        buffer.extend_from_slice(chunk);
-        self.stderr_line = buffer;
-        drain(self, true);
+        self.ingest(chunk, true);
     }
 }
 

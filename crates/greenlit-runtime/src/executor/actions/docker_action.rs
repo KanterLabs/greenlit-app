@@ -386,11 +386,12 @@ pub(crate) async fn run_step(
     let id = engine.create_container(&spec).await?;
     let mut sink = StepLogSink::new(out, masker);
     let run_result = engine.run_container(&id, &mut sink).await;
-    sink.finish();
+    let mask_result = sink.finish();
     // Best-effort teardown regardless of the run's own outcome — a leaked
     // sibling container must never be the difference between a diagnosable
     // step failure and a silent resource leak.
     let _ = engine.remove_container(&id).await;
+    mask_result?;
     let output = run_result?;
     // Collected even when the action failed: GitHub reads a failed step's
     // command files too, and an action that sets an output and *then* exits

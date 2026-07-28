@@ -2,8 +2,8 @@
 
 use std::path::PathBuf;
 
-use greenlit_engine::execution::env::RunnerEnv;
 use greenlit_engine::execution::job_outputs::JobOutputError;
+use greenlit_engine::execution::{MaskRegistrationError, Masker, env::RunnerEnv};
 use greenlit_expr::{EvalError, Value};
 use greenlit_workflow::Span;
 
@@ -34,9 +34,12 @@ pub struct RunConfig {
     pub inputs: Value,
     /// The `secrets` context (empty until Phase 3).
     pub secrets: Value,
-    /// Values to mask from the first line of output (from `::add-mask::`-style
-    /// pre-registration; secret-context masking arrives in Phase 3).
-    pub initial_masks: Vec<String>,
+    /// Run-level sensitive-value authority shared with caller-side event,
+    /// evidence, metrics, and retained-tree consumers.
+    ///
+    /// Every clone observes accepted `::add-mask::` values immediately. The
+    /// registry is in-memory only and must never be serialized.
+    pub masker: Masker,
     /// A token unique to this `litci run` invocation, used to namespace any
     /// `jobs.<id>.container.volumes:` named-volume source
     /// (`crate::executor::container::validate_container`) so a workflow can
@@ -73,6 +76,11 @@ pub struct RunConfig {
     /// Where the local cache, artifact, and toolcache stores live, when this
     /// run serves them. `None` runs with no cache service at all.
     pub store: Option<StoreConfig>,
+    /// Whether workflow-controlled traffic may leave the private job network.
+    ///
+    /// This policy is independent of cache-shim availability so disabling
+    /// credential-bearing stores cannot silently enable external traffic.
+    pub allow_external_network: bool,
     /// Host-enforced ceilings applied to every job and service container.
     pub resources: crate::ResourceLimits,
 }
@@ -131,6 +139,11 @@ fn resolve_locked_image(
 /// here — they are [`crate::EngineState`] variants with their own fix actions.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    /// The run-level sensitive-value authority could not safely accept a mask.
+    ///
+    /// The wrapped error is deliberately fixed and value-independent.
+    #[error(transparent)]
+    MaskRegistration(#[from] MaskRegistrationError),
     /// Stabilization quarantine rejected a runtime-derived required
     /// capability before the first container-engine operation.
     #[error(

@@ -1019,7 +1019,7 @@ async fn run_exec(
         Some(minutes) => {
             let duration = Duration::from_secs_f64((minutes * 60.0).max(0.0));
             match tokio::time::timeout(duration, engine.exec(container, spec, &mut sink)).await {
-                Ok(result) => exit_from(result?),
+                Ok(result) => result.map(exit_from).map_err(ExecError::from),
                 // A timed-out step is a failure (GitHub kills it). Dropping
                 // the future here only stops *streaming* it — the process
                 // itself keeps running inside the container unless we
@@ -1029,16 +1029,21 @@ async fn run_exec(
                 // rationale). Terminate before reporting the timeout so the
                 // container is in a known state by the time the next step
                 // starts.
-                Err(_elapsed) => {
-                    engine.terminate(container, pid_file).await?;
-                    StepExit::TimedOut
-                }
+                Err(_elapsed) => engine
+                    .terminate(container, pid_file)
+                    .await
+                    .map(|()| StepExit::TimedOut)
+                    .map_err(ExecError::from),
             }
         }
-        None => exit_from(engine.exec(container, spec, &mut sink).await?),
+        None => engine
+            .exec(container, spec, &mut sink)
+            .await
+            .map(exit_from)
+            .map_err(ExecError::from),
     };
-    sink.finish();
-    Ok(exit)
+    sink.finish()?;
+    exit
 }
 
 /// Map a completed exec's exit code onto the step-exit model.

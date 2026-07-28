@@ -71,8 +71,8 @@ pub(super) async fn resolve_image(
             // (the pull's progress events, a later error) can reach output,
             // matching "never log them" (`PHASE-3-actions.md`).
             if let Some(credentials) = &resolved.credentials {
-                masker.add(&credentials.username);
-                masker.add(&credentials.password);
+                masker.add(&credentials.username)?;
+                masker.add(&credentials.password)?;
             }
             let additions =
                 validate_container(&resolved, &shared.config.workspace, shared.namespace)?;

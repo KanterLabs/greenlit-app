@@ -61,9 +61,6 @@ pub struct StoreConfig {
     /// available to this run. Clean verification disables these transparent
     /// mutable stores without discarding immutable CAS content.
     pub serve_mutable_caches: bool,
-    /// Whether workflow traffic may leave the job/service network. Hermetic
-    /// verification sets this false and the in-namespace guard fails closed.
-    pub allow_external_network: bool,
     /// The bearer token this run's shim requires on its API routes.
     pub runtime_token: String,
     /// The per-run signature blob URLs carry in place of a bearer header.
@@ -147,6 +144,7 @@ pub async fn create(
     engine: &dyn ContainerEngine,
     name: &str,
     store: Option<&StoreConfig>,
+    allow_external_network: bool,
 ) -> Result<JobNetwork, RuntimeError> {
     engine.create_network(name).await?;
     let info = engine.inspect_network(name).await?;
@@ -155,7 +153,7 @@ pub async fn create(
         gateway: info.gateway.clone(),
         subnet: info.subnet.clone(),
         shim_port: None,
-        allow_external: store.is_none_or(|config| config.allow_external_network),
+        allow_external: allow_external_network,
     };
 
     let Some(store) = store.filter(|config| config.serve_mutable_caches) else {
@@ -596,7 +594,22 @@ pub fn toolcache_bind(
     root: &std::path::Path,
     container_path: &str,
 ) -> std::io::Result<crate::engine::BindMount> {
-    std::fs::create_dir_all(root)?;
+    let state_root = root.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "toolcache path has no Greenlit state parent",
+        )
+    })?;
+    let relative = root.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "toolcache path has no final component",
+        )
+    })?;
+    drop(super::private_state::ensure_directory(
+        state_root,
+        std::path::Path::new(relative),
+    )?);
     Ok(crate::engine::BindMount {
         host_path: root.to_string_lossy().into_owned(),
         container_path: container_path.to_string(),
@@ -611,8 +624,26 @@ pub fn cargo_download_binds(
 ) -> std::io::Result<Vec<crate::engine::BindMount>> {
     let registry = root.join("cargo").join("registry");
     let git = root.join("cargo").join("git");
-    std::fs::create_dir_all(&registry)?;
-    std::fs::create_dir_all(&git)?;
+    let state_root = root.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "package-cache path has no Greenlit state parent",
+        )
+    })?;
+    let root_name = root.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "package-cache path has no final component",
+        )
+    })?;
+    drop(super::private_state::ensure_directory(
+        state_root,
+        &std::path::Path::new(root_name).join("cargo/registry"),
+    )?);
+    drop(super::private_state::ensure_directory(
+        state_root,
+        &std::path::Path::new(root_name).join("cargo/git"),
+    )?);
     let registry = registry.to_string_lossy().into_owned();
     let git = git.to_string_lossy().into_owned();
     Ok(vec![

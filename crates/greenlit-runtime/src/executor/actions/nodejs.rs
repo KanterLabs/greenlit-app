@@ -249,8 +249,9 @@ pub(crate) async fn run_phase(
         working_dir: Some(working_dir.to_string()),
     };
     let mut sink = StepLogSink::new(out, masker);
-    let output = engine.exec(container, &spec, &mut sink).await?;
-    sink.finish();
+    let output = engine.exec(container, &spec, &mut sink).await;
+    sink.finish()?;
+    let output = output?;
     let exit = if output.exit_code == 0 {
         StepExit::Success
     } else {
