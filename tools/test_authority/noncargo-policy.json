@@ -1,0 +1,518 @@
+{
+  "schema_version": 1,
+  "execution_commands": [
+    {
+      "entrypoint": "tools/check-live-parity",
+      "executable": "/usr/bin/python3",
+      "argv": ["-I", "-B", "tools/check-live-parity", "github", "--repository-root", "$GITHUB_WORKSPACE", "--output-root", "$RUNNER_TEMP/greenlit-live-github"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-live-parity",
+      "executable": "/usr/bin/python3",
+      "argv": ["-I", "-B", "tools/check-live-parity", "github", "--repository-root", "$GITHUB_WORKSPACE", "--output-root", "$RUNNER_TEMP/greenlit-release-github-evidence"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-live-parity",
+      "executable": "tools/check-live-parity",
+      "argv": ["compare", "--repository-root", "$GITHUB_WORKSPACE", "--greenlit-binary", "$local_root/binary/litci", "--output-root", "$output"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-live-parity",
+      "executable": "tools/check-live-parity",
+      "argv": ["local", "--repository-root", "$GITHUB_WORKSPACE", "--greenlit-binary", "$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci", "--output-root", "$output"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-live-parity",
+      "executable": "tools/check-live-parity",
+      "argv": ["local", "--repository-root", "$GITHUB_WORKSPACE", "--greenlit-binary", "$parity_binary_root/release/litci", "--output-root", "$parity_output"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-release-dogfood",
+      "executable": "tools/check-release-dogfood",
+      "argv": ["target/release-candidate/target/release/litci"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/check-release-dogfood",
+      "executable": "tools/check-release-dogfood",
+      "argv": ["target/release/litci"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/compare-parity",
+      "executable": "tools/compare-parity",
+      "argv": ["--repository-root", "$GITHUB_WORKSPACE", "--repository-id", "KanterLabs/greenlit-app", "--source-commit", "$GITHUB_SHA", "--greenlit-binary", "$candidate/target/release/litci", "--capture-root", "$parity", "--exceptions", "$GITHUB_WORKSPACE/docs/PARITY-EXCEPTIONS.md", "$parity/seed-oracle.json", "$parity/seed-github-actions.json", "$parity/seed-greenlit-release.json"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/release-check",
+      "executable": "tools/release-check",
+      "argv": ["finalize"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/release-provenance",
+      "executable": "tools/release-provenance",
+      "argv": ["seal", "--repository-root", "$GITHUB_WORKSPACE", "--candidate-root", "$candidate", "--parity-root", "$parity", "--output", "$bundle", "--expected-source", "$GITHUB_SHA"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/release-provenance",
+      "executable": "tools/release-provenance",
+      "argv": ["verify", "--repository-root", "$GITHUB_WORKSPACE", "--candidate-root", "$candidate", "--parity-root", "$parity", "--expected-source", "$GITHUB_SHA"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/release_check_credential_bundle.py",
+      "executable": "/usr/bin/python3",
+      "argv": ["-I", "-B", "tools/release_check_credential_bundle.py", "unpack-github", "--bundle", "$github_bundle", "--output-root", "$github_root", "--expected-sha256", "${{ needs.live_parity_github.outputs.github_sha256 }}", "--expected-source", "$GITHUB_SHA"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/release_check_credential_bundle.py",
+      "executable": "/usr/bin/python3",
+      "argv": ["-I", "-B", "tools/release_check_credential_bundle.py", "unpack-local", "--bundle", "$local_bundle", "--output-root", "$local_root", "--expected-sha256", "${{ needs.live_parity_local.outputs.local_sha256 }}", "--expected-source", "$GITHUB_SHA"],
+      "count": 1
+    },
+    {
+      "entrypoint": "tools/test-copy-strategy-capability",
+      "executable": "tools/test-copy-strategy-capability",
+      "argv": ["target/x86_64-unknown-linux-musl/init/greenlit-init"],
+      "count": 2
+    },
+    {
+      "entrypoint": "tools/test-credential-capability",
+      "executable": "tools/test-credential-capability",
+      "argv": [],
+      "count": 2
+    },
+    {
+      "entrypoint": "tools/test-stargz-provider",
+      "executable": "tools/test-stargz-provider",
+      "argv": [],
+      "count": 2
+    },
+    {
+      "entrypoint": "tools/tests/check-capability-test-manifest",
+      "executable": "tools/tests/check-capability-test-manifest",
+      "argv": ["--run-owner", "docker-policy"],
+      "count": 2
+    },
+    {
+      "entrypoint": "tools/tests/check-capability-test-manifest",
+      "executable": "tools/tests/check-capability-test-manifest",
+      "argv": ["--run-owner", "docker-runtime"],
+      "count": 2
+    },
+    {
+      "entrypoint": "tools/tests/check-capability-test-manifest",
+      "executable": "tools/tests/check-capability-test-manifest",
+      "argv": ["--run-owner", "host-deep-path"],
+      "count": 2
+    }
+  ],
+  "route_entrypoints": [
+    "tools/check-live-parity",
+    "tools/check-release-dogfood",
+    "tools/compare-parity",
+    "tools/release-check",
+    "tools/release-provenance",
+    "tools/release_check_credential.py",
+    "tools/release_check_credential_bundle.py",
+    "tools/test-copy-strategy-capability",
+    "tools/test-credential-capability",
+    "tools/test-stargz-provider",
+    "tools/tests/check-capability-test-manifest",
+    "tools/tests/provision-keyctl"
+  ],
+  "entries": [
+    {
+      "entrypoint": "tools/check-live-parity",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": ["tools/live_parity"],
+      "sources": [
+        "tools/check-live-parity",
+        "tools/live_parity/__init__.py",
+        "tools/live_parity/cli.py",
+        "tools/live_parity/contract.py",
+        "tools/live_parity/errors.py",
+        "tools/live_parity/filesystem.py",
+        "tools/live_parity/github.py",
+        "tools/live_parity/orchestration.py",
+        "tools/live_parity/process.py",
+        "tools/live_parity/source.py",
+        "tools/live_parity/source_worktree.py"
+      ],
+      "closure_sha256": "ed7e12cf910041a59b3bedba0c5199fba9ab9a4460b97a713bb6d4c5026da14b",
+      "dynamic_sources": [],
+      "delegates": [
+        {
+          "source": "tools/live_parity/orchestration.py",
+          "path": "tools/collect-parity-observation",
+          "count": 3,
+          "target": "tools/collect-parity-observation"
+        },
+        {
+          "source": "tools/live_parity/orchestration.py",
+          "path": "tools/compare-parity",
+          "count": 1,
+          "target": "tools/compare-parity"
+        }
+      ],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/check-release-dogfood",
+      "language": "shell",
+      "import_roots": [],
+      "inventory_roots": [],
+      "sources": ["tools/check-release-dogfood"],
+      "closure_sha256": "5de99c001aace0d1d27551bb376c5d6bb8338df8e916d6b8114fc460e2c8a9a9",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/collect-parity-observation",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": ["tools/parity_producer"],
+      "sources": [
+        "tools/collect-parity-observation",
+        "tools/parity_producer/__init__.py",
+        "tools/parity_producer/bounded_process.py",
+        "tools/parity_producer/capture.py",
+        "tools/parity_producer/capture_git.py",
+        "tools/parity_producer/cli.py",
+        "tools/parity_producer/common.py",
+        "tools/parity_producer/contract.py",
+        "tools/parity_producer/github.py",
+        "tools/parity_producer/github_evidence.py",
+        "tools/parity_producer/github_inputs.py",
+        "tools/parity_producer/github_job.py",
+        "tools/parity_producer/host_environment.py",
+        "tools/parity_producer/live_root.py",
+        "tools/parity_producer/local.py",
+        "tools/parity_producer/local_binary.py",
+        "tools/parity_producer/markers.py",
+        "tools/parity_producer/oracle.py",
+        "tools/parity_producer/oracle_workflow.py",
+        "tools/parity_producer/retained.py",
+        "tools/parity_producer/retained_journal.py",
+        "tools/parity_producer/secure_output.py"
+      ],
+      "closure_sha256": "f1cbdb45dc6a2c1f573bd58d3c225cdf34d5e6eb1f83c9a80de52d2f47bb01af",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": ["tools/compare-parity"],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/compare-parity",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": ["tools/parity_compare"],
+      "sources": [
+        "tools/compare-parity",
+        "tools/parity_compare/__init__.py",
+        "tools/parity_compare/binary.py",
+        "tools/parity_compare/binary_process.py",
+        "tools/parity_compare/capture.py",
+        "tools/parity_compare/capture_claims.py",
+        "tools/parity_compare/cli.py",
+        "tools/parity_compare/diff.py",
+        "tools/parity_compare/exception_paths.py",
+        "tools/parity_compare/exceptions.py",
+        "tools/parity_compare/lifecycle.py",
+        "tools/parity_compare/live_capture.py",
+        "tools/parity_compare/provenance.py",
+        "tools/parity_compare/repository.py",
+        "tools/parity_compare/repository_worktree.py",
+        "tools/parity_compare/schema.py",
+        "tools/parity_compare/seed.py",
+        "tools/parity_compare/selftest.py",
+        "tools/parity_compare/selftest_audit.py",
+        "tools/parity_compare/selftest_data.py",
+        "tools/parity_compare/selftest_entry.py",
+        "tools/parity_compare/selftest_live.py",
+        "tools/parity_compare/selftest_provenance.py",
+        "tools/parity_compare/selftest_repo.py",
+        "tools/parity_compare/selftest_runner.py",
+        "tools/parity_compare/text.py",
+        "tools/parity_compare/values.py",
+        "tools/parity_compare/workflow.py"
+      ],
+      "closure_sha256": "af500104064c26c17c98db4a0432e8fa0d0ff4eb250801a3987d78c5f4354f0f",
+      "dynamic_sources": [
+        {
+          "path": "tools/parity_compare/selftest_entry.py",
+          "source": "tools/parity_compare/selftest_runner.py",
+          "count": 1
+        }
+      ],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/release-check",
+      "language": "shell",
+      "import_roots": [],
+      "inventory_roots": [],
+      "sources": ["tools/release-check"],
+      "closure_sha256": "2a523fb6040d818443f4360a7fa7eb1e5819c83011dbed78f5df938127a7236f",
+      "dynamic_sources": [],
+      "delegates": [
+        {
+          "source": "tools/release-check",
+          "path": "tools/check-live-parity",
+          "count": 1,
+          "target": "tools/check-live-parity"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/check-stabilization-ledger",
+          "count": 2,
+          "authority": "stabilization-ledger gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/check-stubs",
+          "count": 1,
+          "authority": "stub gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/check-test-authority",
+          "count": 2,
+          "authority": "test-authority gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/compare-parity",
+          "count": 1,
+          "target": "tools/compare-parity"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/release-provenance",
+          "count": 2,
+          "target": "tools/release-provenance"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/release_check_credential_bundle.py",
+          "count": 5,
+          "target": "tools/release_check_credential_bundle.py"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-capability-test-manifest",
+          "count": 2,
+          "target": "tools/tests/check-capability-test-manifest"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-criterion-manifest",
+          "count": 1,
+          "authority": "criterion manifest gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-parity-producer",
+          "count": 1,
+          "authority": "parity producer gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-portable-test-manifest",
+          "count": 3,
+          "authority": "portable manifest gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-release-provenance-temp",
+          "count": 1,
+          "authority": "release provenance temporary-file gate"
+        },
+        {
+          "source": "tools/release-check",
+          "path": "tools/tests/check-release-transfer-bundles",
+          "count": 1,
+          "authority": "release transfer bundle gate"
+        }
+      ],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/release-provenance",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": ["tools/release_provenance"],
+      "sources": [
+        "tools/release-provenance",
+        "tools/release_provenance/__init__.py",
+        "tools/release_provenance/bundle.py",
+        "tools/release_provenance/bundle_contract.py",
+        "tools/release_provenance/candidate.py",
+        "tools/release_provenance/common.py",
+        "tools/release_provenance/crate_archive.py",
+        "tools/release_provenance/manifest.py",
+        "tools/release_provenance/package_source.py",
+        "tools/release_provenance/repository.py",
+        "tools/release_provenance/version_execution.py"
+      ],
+      "closure_sha256": "bdb96b42c3d8acc816c02b5662da8eb885b10ca58e85dde44c0916bdb46db7fc",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/release_check_credential.py",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": [],
+      "sources": [
+        "tools/release_check_credential.py",
+        "tools/release_check_credential_workflow.py"
+      ],
+      "closure_sha256": "90c041bf7a0a1a2c2213bfc6f211af55b61d2a601fa3d45a5e8fd3c5f1831b75",
+      "dynamic_sources": [],
+      "delegates": [
+        {
+          "source": "tools/release_check_credential.py",
+          "path": "tools/check-live-parity",
+          "count": 1,
+          "target": "tools/check-live-parity"
+        }
+      ],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/release_check_credential_bundle.py",
+      "language": "python",
+      "import_roots": ["tools"],
+      "inventory_roots": [],
+      "sources": [
+        "tools/release_check_credential_bundle.py",
+        "tools/release_check_credential_bundle_extract.py",
+        "tools/release_check_credential_bundle_inputs.py",
+        "tools/release_check_credential_bundle_io.py"
+      ],
+      "closure_sha256": "5402ba205797a2c04a23cd65fd1c5a3476263f0cc73bc763c24035a92e903627",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/test-copy-strategy-capability",
+      "language": "shell",
+      "import_roots": ["tools/tests"],
+      "inventory_roots": [],
+      "sources": [
+        "tools/test-copy-strategy-capability",
+        "tools/tests/check-greenlit-init-copy-strategies"
+      ],
+      "closure_sha256": "053d34c62050fccef3cdb3d263aff2913425bfce98d1feb5f75ae484b6e30f73",
+      "dynamic_sources": [
+        {
+          "path": "tools/tests/check-greenlit-init-copy-strategies",
+          "source": "tools/test-copy-strategy-capability",
+          "count": 1
+        }
+      ],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/test-credential-capability",
+      "language": "shell",
+      "import_roots": [],
+      "inventory_roots": [],
+      "sources": ["tools/test-credential-capability"],
+      "closure_sha256": "afa75bb34538bff8e1f94bf3bef0562b06110f054fd509b3c3ce8cfdc301cd37",
+      "dynamic_sources": [],
+      "delegates": [
+        {
+          "source": "tools/test-credential-capability",
+          "path": "tools/tests/check-capability-test-manifest",
+          "count": 1,
+          "target": "tools/tests/check-capability-test-manifest"
+        }
+      ],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/test-stargz-provider",
+      "language": "shell",
+      "import_roots": [],
+      "inventory_roots": [],
+      "sources": ["tools/test-stargz-provider"],
+      "closure_sha256": "7b87f84fbc85deab18066cbf95842f460e4189f5fc36cd1cf5747bcb670e9538",
+      "dynamic_sources": [],
+      "delegates": [
+        {
+          "source": "tools/test-stargz-provider",
+          "path": "tools/tests/check-capability-test-manifest",
+          "count": 1,
+          "target": "tools/tests/check-capability-test-manifest"
+        }
+      ],
+      "import_targets": [],
+      "authority_imports": []
+    },
+    {
+      "entrypoint": "tools/tests/check-capability-test-manifest",
+      "language": "python",
+      "import_roots": ["tools/tests", "tools"],
+      "inventory_roots": [],
+      "sources": [
+        "tools/tests/capability_harness_selftest.py",
+        "tools/tests/capability_manifest_selftest.py",
+        "tools/tests/capability_workflow_policy.py",
+        "tools/tests/capability_workflows.py",
+        "tools/tests/capability_yaml.py",
+        "tools/tests/cargo_test_manifest.py",
+        "tools/tests/check-capability-test-manifest"
+      ],
+      "closure_sha256": "39123c3b2271e1b591f259958631047a7aced8c87b9c0059b1cb7c7157455533",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": [
+        "test_authority.model",
+        "test_authority.noncargo_commands",
+        "test_authority.noncargo_fs",
+        "test_authority.noncargo_policy",
+        "test_authority.noncargo_schema",
+        "test_authority.noncargo_sources"
+      ]
+    },
+    {
+      "entrypoint": "tools/tests/provision-keyctl",
+      "language": "shell",
+      "import_roots": [],
+      "inventory_roots": [],
+      "sources": ["tools/tests/provision-keyctl"],
+      "closure_sha256": "6f2d4b3c8271045970f083987c93f3ba846e9fe83dccb74c95a30250fbf5df1b",
+      "dynamic_sources": [],
+      "delegates": [],
+      "import_targets": [],
+      "authority_imports": []
+    }
+  ]
+}

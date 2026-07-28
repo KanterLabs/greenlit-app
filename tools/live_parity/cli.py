@@ -202,35 +202,37 @@ def main() -> int:
                 arguments.repository_root,
                 arguments.expected_launcher_sha256,
             )
-            print("live parity production credential boundary canary passed")
-            return 0
-        if arguments.command != "github":
-            _require_credential_free(arguments.command)
-        repository, source_commit = exact_source(arguments.repository_root)
-        require_empty = arguments.command != "compare"
-        with OutputRoot.bind(
-            arguments.output_root,
-            repository,
-            require_empty=require_empty,
-        ) as output:
-            if arguments.command == "local":
-                binary = BinaryBinding.bind(arguments.greenlit_binary)
-                produce_local(repository, binary, output, source_commit)
-            elif arguments.command == "github":
-                if credential is None:
-                    raise GateError("GitHub credential boundary was not established")
-                run = _selected_run(credential, arguments.run_id, source_commit)
-                produce_github(repository, output, source_commit, run, credential)
-            else:
-                binary = BinaryBinding.bind(arguments.greenlit_binary)
-                compare_evidence(repository, binary, output, source_commit)
+            message = "live parity production credential boundary canary passed"
+        else:
+            if arguments.command != "github":
+                _require_credential_free(arguments.command)
+            repository, source_commit = exact_source(arguments.repository_root)
+            require_empty = arguments.command != "compare"
+            with OutputRoot.bind(
+                arguments.output_root,
+                repository,
+                require_empty=require_empty,
+            ) as output:
+                if arguments.command == "local":
+                    binary = BinaryBinding.bind(arguments.greenlit_binary)
+                    produce_local(repository, binary, output, source_commit)
+                elif arguments.command == "github":
+                    if credential is None:
+                        raise GateError("GitHub credential boundary was not established")
+                    run = _selected_run(credential, arguments.run_id, source_commit)
+                    produce_github(repository, output, source_commit, run, credential)
+                else:
+                    binary = BinaryBinding.bind(arguments.greenlit_binary)
+                    compare_evidence(repository, binary, output, source_commit)
+            suffix = f", run {run.run_id}" if run is not None else ""
+            message = (
+                f"live parity {arguments.command} passed: "
+                f"source {source_commit}{suffix}"
+            )
     except (GateError, OSError) as error:
         print(f"live parity gate failed: {error}", file=sys.stderr)
         return 1
-    suffix = f", run {run.run_id}" if run is not None else ""
-    print(
-        f"live parity {arguments.command} passed: source {source_commit}{suffix}"
-    )
+    print(message)
     return 0
 
 

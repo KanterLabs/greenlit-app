@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Public isolation canaries for split release and CI parity workflows."""
 
 from __future__ import annotations
@@ -8,9 +8,23 @@ import os
 import subprocess
 import sys
 import tempfile
+
+if not sys.flags.isolated:
+    os.execve(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", "-B", __file__, *sys.argv[1:]],
+        os.environ,
+    )
+sys.dont_write_bytecode = True
+sys.pycache_prefix = "/proc/self/fd/greenlit-impossible-pycache"
+
 from pathlib import Path
 
-sys.dont_write_bytecode = True
+_ENTRYPOINT = Path(__file__).absolute()
+if _ENTRYPOINT.is_symlink():
+    print("release credential canary failed: launcher must not be a symbolic link", file=sys.stderr)
+    raise SystemExit(1)
+sys.path[:0] = [str(_ENTRYPOINT.parent)]
 
 from release_check_credential_workflow import (
     WorkflowError,
@@ -95,7 +109,7 @@ def _boundary_command(root: Path) -> list[str]:
         "--norc",
         "-c",
         (
-            f'exec {PYTHON} -E -s -B "$1" credential-canary '
+            f'exec {PYTHON} -I -B "$1" credential-canary '
             '--repository-root "$2" --expected-launcher-sha256 "$3"'
         ),
         "live-credential-canary",
@@ -144,8 +158,7 @@ os.execve(
     "/usr/bin/python3",
     [
         "/usr/bin/python3",
-        "-E",
-        "-s",
+        "-I",
         "-B",
         sys.argv[1],
         "credential-canary",
@@ -160,8 +173,7 @@ os.execve(
     result = subprocess.run(
         [
             PYTHON,
-            "-E",
-            "-s",
+            "-I",
             "-B",
             "-c",
             child_code,
@@ -195,8 +207,7 @@ def _symlink_case(root: Path, commit: str) -> None:
         result = subprocess.run(
             [
                 PYTHON,
-                "-E",
-                "-s",
+                "-I",
                 "-B",
                 str(symlink),
                 "credential-canary",

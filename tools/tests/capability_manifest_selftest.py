@@ -7,11 +7,11 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from capability_harness_selftest import harness_semantic_canaries
 from cargo_test_manifest import GateError
 
 
@@ -30,8 +30,6 @@ def _run(
         environment.update(environment_overrides)
     return subprocess.run(
         [
-            sys.executable,
-            "-B",
             str(CHECKER),
             "--repository-root",
             str(repository_root),
@@ -178,6 +176,12 @@ def self_test_negative() -> int:
                 )
 
         mutations: list[tuple[str, dict[str, Any], str]] = []
+        boolean_version = copy.deepcopy(baseline_value)
+        boolean_version["schema_version"] = True
+        mutations.append(
+            ("boolean schema version", boolean_version, "schema_version must be 3")
+        )
+
         removed = copy.deepcopy(baseline_value)
         removed["workflow_routes"].pop()
         mutations.append(("route removal", removed, "workflow routes differ"))
@@ -283,6 +287,22 @@ def self_test_negative() -> int:
                     f"status={result.returncode}\n{result.stdout}{result.stderr}"
                 )
 
+        runtime_route = _route(
+            baseline_value, ".github/workflows/ci.yml", "runtime-integration"
+        )
+        profile_block = _render_run_step(
+            "Prepare pinned runner profile",
+            _step(
+                runtime_route, "prerequisites", "Prepare pinned runner profile"
+            )["run"],
+        )
+        runner_block = _render_run_step(
+            "Run real-daemon executor tests",
+            _step(
+                runtime_route, "executions", "Run real-daemon executor tests"
+            )["run"],
+        )
+        runtime_tail = profile_block + "\n" + runner_block
         workflow_mutations = (
             (
                 "step condition",
@@ -290,6 +310,7 @@ def self_test_negative() -> int:
                 "      - name: Reflink and bounded-stream copy strategies\n",
                 "      - name: Reflink and bounded-stream copy strategies\n"
                 "        if: ${{ false }}\n",
+                "complete ordered workflow steps differ from policy",
             ),
             (
                 "step continue-on-error",
@@ -297,6 +318,7 @@ def self_test_negative() -> int:
                 "      - name: Reflink and bounded-stream copy strategies\n",
                 "      - name: Reflink and bounded-stream copy strategies\n"
                 "        continue-on-error: true\n",
+                "complete ordered workflow steps differ from policy",
             ),
             (
                 "job condition",
@@ -304,6 +326,7 @@ def self_test_negative() -> int:
                 "  credential-capability:\n",
                 "  credential-capability:\n"
                 "    if: ${{ false }}\n",
+                "workflow differs from checker-owned policy",
             ),
             (
                 "workflow shell default",
@@ -313,24 +336,72 @@ def self_test_negative() -> int:
                 "  run:\n"
                 "    shell: bash {0}\n\n"
                 "permissions:\n",
+                "workflow differs from checker-owned policy",
+            ),
+            (
+                "unnamed inserted step",
+                ".github/workflows/ci.yml",
+                profile_block,
+                profile_block + "\n      - run: true\n",
+                "complete ordered workflow steps differ from policy",
+            ),
+            (
+                "reordered steps",
+                ".github/workflows/ci.yml",
+                runtime_tail,
+                runner_block + "\n" + profile_block,
+                "complete ordered workflow steps differ from policy",
+            ),
+            (
+                "duplicate step",
+                ".github/workflows/ci.yml",
+                profile_block,
+                profile_block + "\n" + profile_block,
+                "repeats step name 'Prepare pinned runner profile'",
+            ),
+            (
+                "unmodeled named step",
+                ".github/workflows/ci.yml",
+                profile_block,
+                profile_block
+                + "\n      - name: Unmodeled authority step\n"
+                "        run: true\n",
+                "complete ordered workflow steps differ from policy",
+            ),
+            (
+                "comment-only local-tool marker",
+                ".github/workflows/ci.yml",
+                runtime_tail,
+                profile_block
+                + "\n"
+                "      - name: Run real-daemon executor tests\n"
+                "        run: |\n"
+                "          # tools/tests/check-capability-test-manifest "
+                "--run-owner docker-runtime\n"
+                "          true\n",
+                "complete ordered workflow steps differ from policy",
             ),
         )
-        for index, (label, workflow, old, new) in enumerate(workflow_mutations):
+        for index, (label, workflow, old, new, expected) in enumerate(
+            workflow_mutations
+        ):
             root = temporary / f"workflow-root-{index}"
             root.mkdir()
             _copy_workflows(root, baseline_value)
             _replace_once(root / workflow, old, new)
             result = _run(baseline, root)
-            if (
-                result.returncode != 1
-                or "workflow differs from checker-owned policy" not in result.stderr
-            ):
+            if result.returncode != 1 or expected not in result.stderr:
                 raise GateError(
                     f"{label} did not fail at the public command boundary\n"
                     f"status={result.returncode}\n{result.stdout}{result.stderr}"
                 )
+
+        harness_count = harness_semantic_canaries(
+            temporary, baseline, baseline_value
+        )
     print(
-        "capability manifest negative gate passed: 16 environment, route, profile, "
-        "coordinated, condition, and command mutations rejected"
+        f"capability manifest negative gate passed: {22 + harness_count} "
+        "environment, route, profile, coordinated, condition, command, and "
+        "harness mutations rejected"
     )
     return 0

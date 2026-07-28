@@ -105,7 +105,7 @@ jobs:
           output="$RUNNER_TEMP/greenlit-release-local-input"
           chmod 0600 "$bundle"
           test ! -e "$output"
-          /usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \
+          /usr/bin/python3 -I -B tools/release_check_credential_bundle.py \
             unpack-prepared \
             --bundle "$bundle" \
             --output-root "$output" \
@@ -134,7 +134,7 @@ jobs:
           binary="$RUNNER_TEMP/greenlit-release-local-input/candidate/target/release/litci"
           install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
-            /usr/bin/python3 -E -s -B \
+            /usr/bin/python3 -I -B \
               tools/release_check_credential_bundle.py pack-local \
               --input-root "$RUNNER_TEMP/greenlit-release-local-evidence" \
               --greenlit-binary "$binary" \
@@ -175,7 +175,7 @@ jobs:
           output="$RUNNER_TEMP/greenlit-release-github-evidence"
           test ! -e "$output"
           install -d -m 000700 "$output"
-          /usr/bin/python3 -E -s -B \
+          /usr/bin/python3 -I -B \
             tools/release_check_credential.py --self-test
 
       - name: Collect GitHub evidence with no candidate present
@@ -183,7 +183,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GREENLIT_BUILD_COMMIT: ${{ github.sha }}
         run: >-
-          exec /usr/bin/python3 -E -s -B
+          exec /usr/bin/python3 -I -B
           tools/check-live-parity github
           --repository-root "$GITHUB_WORKSPACE"
           --output-root "$RUNNER_TEMP/greenlit-release-github-evidence"
@@ -195,7 +195,7 @@ jobs:
           bundle="$GITHUB_WORKSPACE/target/release-github-evidence.tar"
           install -d -m 000700 "$GITHUB_WORKSPACE/target"
           digest="$(
-            /usr/bin/python3 -E -s -B \
+            /usr/bin/python3 -I -B \
               tools/release_check_credential_bundle.py pack-github \
               --input-root "$RUNNER_TEMP/greenlit-release-github-evidence" \
               --output "$bundle" \

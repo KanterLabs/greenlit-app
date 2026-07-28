@@ -62,17 +62,18 @@ def main(arguments: list[str] | None = None) -> int:
             is AcquisitionDisposition.NON_CERTIFYING
         ):
             validate_without_publication(production, **publication_arguments)
-            print(
+            message = (
                 "non-certifying producer self-test passed: "
                 "no canonical files published"
             )
-            return 0
-        capture, observation = publish(production, **publication_arguments)
+        else:
+            capture, observation = publish(production, **publication_arguments)
+            message = f"wrote parity capture: {capture}\n"
+            message += f"wrote parity observation: {observation}"
     except ProducerError as error:
         print(f"parity observation not produced: {error}", file=sys.stderr)
         return 2
-    print(f"wrote parity capture: {capture}")
-    print(f"wrote parity observation: {observation}")
+    print(message)
     return 0
 
 

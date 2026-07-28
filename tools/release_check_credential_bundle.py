@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3 -I
 """Deterministic, SHA-bound transfer bundles for split release jobs."""
 
 from __future__ import annotations
@@ -10,10 +10,24 @@ import re
 import sys
 import tarfile
 import tempfile
-from pathlib import Path
 from typing import BinaryIO
 
+if not sys.flags.isolated:
+    os.execve(
+        "/usr/bin/python3",
+        ["/usr/bin/python3", "-I", "-B", __file__, *sys.argv[1:]],
+        os.environ,
+    )
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/proc/self/fd/greenlit-impossible-pycache"
+
+from pathlib import Path
+
+_ENTRYPOINT = Path(__file__).absolute()
+if _ENTRYPOINT.is_symlink():
+    print("release transfer failed: launcher must not be a symbolic link", file=sys.stderr)
+    raise SystemExit(1)
+sys.path[:0] = [str(_ENTRYPOINT.parent)]
 
 from release_check_credential_bundle_io import (
     MAX_BUNDLE_BYTES,
@@ -231,30 +245,30 @@ def main() -> int:
                 arguments.local_binary.absolute(),
             )
             print("verified prepared/local release binary identity")
-            return 0
-        if COMMIT.fullmatch(arguments.expected_source) is None:
-            raise BundleError("expected source must be a full lowercase commit")
-        kind = arguments.command.split("-", 1)[1]
-        if arguments.command.startswith("pack-"):
-            binary = getattr(arguments, "greenlit_binary", None)
-            digest = _pack(
-                kind,
-                arguments.input_root.absolute(),
-                arguments.output.absolute(),
-                arguments.expected_source,
-                binary.absolute() if binary is not None else None,
-            )
-            print(digest)
         else:
-            if SHA256.fullmatch(arguments.expected_sha256) is None:
-                raise BundleError("expected digest must be lowercase SHA-256")
-            _unpack(
-                kind,
-                arguments.bundle.absolute(),
-                arguments.output_root.absolute(),
-                arguments.expected_sha256,
-                arguments.expected_source,
-            )
+            if COMMIT.fullmatch(arguments.expected_source) is None:
+                raise BundleError("expected source must be a full lowercase commit")
+            kind = arguments.command.split("-", 1)[1]
+            if arguments.command.startswith("pack-"):
+                binary = getattr(arguments, "greenlit_binary", None)
+                digest = _pack(
+                    kind,
+                    arguments.input_root.absolute(),
+                    arguments.output.absolute(),
+                    arguments.expected_source,
+                    binary.absolute() if binary is not None else None,
+                )
+                print(digest)
+            else:
+                if SHA256.fullmatch(arguments.expected_sha256) is None:
+                    raise BundleError("expected digest must be lowercase SHA-256")
+                _unpack(
+                    kind,
+                    arguments.bundle.absolute(),
+                    arguments.output_root.absolute(),
+                    arguments.expected_sha256,
+                    arguments.expected_source,
+                )
     except (BundleError, OSError) as error:
         print(f"release transfer failed: {error}", file=sys.stderr)
         return 1

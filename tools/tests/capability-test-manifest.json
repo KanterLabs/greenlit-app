@@ -13,7 +13,7 @@
         "litci_test_boundaries"
       ],
       "tests": [
-        "device_flow_refresh_rotates_and_persists_across_processes_without_leaking",
+        "device_flow_persists_but_plan_and_run_never_refresh_or_use_credential",
         "pat_and_external_gh_persist_replace_and_fail_closed_without_leaking",
         "sanitization::external_credential_error_bodies_are_sanitized_by_the_compiled_cli"
       ]
@@ -248,7 +248,7 @@
       "executions": [
         {
           "name": "Verify, merge, and compare exact evidence",
-          "run": "set -euo pipefail\nlocal_bundle=\"$RUNNER_TEMP/greenlit-ci-live-local/ci-live-local.tar\"\ngithub_bundle=\"$RUNNER_TEMP/greenlit-ci-live-github/ci-live-github.tar\"\nlocal_root=\"$RUNNER_TEMP/greenlit-ci-live-local-unpacked\"\ngithub_root=\"$RUNNER_TEMP/greenlit-ci-live-github-unpacked\"\noutput=\"$RUNNER_TEMP/greenlit-live-parity\"\nchmod 0600 \"$local_bundle\" \"$github_bundle\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential_bundle.py unpack-local \\\n  --bundle \"$local_bundle\" \\\n  --output-root \"$local_root\" \\\n  --expected-sha256 \"${{ needs.live_parity_local.outputs.local_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential_bundle.py unpack-github \\\n  --bundle \"$github_bundle\" \\\n  --output-root \"$github_root\" \\\n  --expected-sha256 \"${{ needs.live_parity_github.outputs.github_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\nmv \"$local_root/parity\" \"$output\"\nmv \"$github_root/parity/seed-github-actions.json\" \"$output/\"\nmv \\\n  \"$github_root/parity/captures/shell-only-seed-github-actions.json\" \\\n  \"$output/captures/\"\ntools/check-live-parity compare \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$local_root/binary/litci\" \\\n  --output-root \"$output\"\n"
+          "run": "set -euo pipefail\nlocal_bundle=\"$RUNNER_TEMP/greenlit-ci-live-local/ci-live-local.tar\"\ngithub_bundle=\"$RUNNER_TEMP/greenlit-ci-live-github/ci-live-github.tar\"\nlocal_root=\"$RUNNER_TEMP/greenlit-ci-live-local-unpacked\"\ngithub_root=\"$RUNNER_TEMP/greenlit-ci-live-github-unpacked\"\noutput=\"$RUNNER_TEMP/greenlit-live-parity\"\nchmod 0600 \"$local_bundle\" \"$github_bundle\"\n/usr/bin/python3 -I -B \\\n  tools/release_check_credential_bundle.py unpack-local \\\n  --bundle \"$local_bundle\" \\\n  --output-root \"$local_root\" \\\n  --expected-sha256 \"${{ needs.live_parity_local.outputs.local_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\n/usr/bin/python3 -I -B \\\n  tools/release_check_credential_bundle.py unpack-github \\\n  --bundle \"$github_bundle\" \\\n  --output-root \"$github_root\" \\\n  --expected-sha256 \"${{ needs.live_parity_github.outputs.github_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\nmv \"$local_root/parity\" \"$output\"\nmv \"$github_root/parity/seed-github-actions.json\" \"$output/\"\nmv \\\n  \"$github_root/parity/captures/shell-only-seed-github-actions.json\" \\\n  \"$output/captures/\"\ntools/check-live-parity compare \\\n  --repository-root \"$GITHUB_WORKSPACE\" \\\n  --greenlit-binary \"$local_root/binary/litci\" \\\n  --output-root \"$output\"\n"
         }
       ]
     },
@@ -261,13 +261,13 @@
       "prerequisites": [
         {
           "name": "Prepare credential-only boundary",
-          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-live-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-live-github\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-live-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-live-github\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -I -B \\\n  tools/release_check_credential.py --self-test\n"
         }
       ],
       "executions": [
         {
           "name": "Collect GitHub evidence with no candidate present",
-          "run": "exec /usr/bin/python3 -E -s -B\ntools/check-live-parity github\n--repository-root \"$GITHUB_WORKSPACE\"\n--output-root \"$RUNNER_TEMP/greenlit-live-github\"\n"
+          "run": "exec /usr/bin/python3 -I -B tools/check-live-parity github --repository-root \"$GITHUB_WORKSPACE\" --output-root \"$RUNNER_TEMP/greenlit-live-github\""
         }
       ]
     },
@@ -443,13 +443,13 @@
       "prerequisites": [
         {
           "name": "Prepare credential-only source boundary",
-          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-release-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-release-github-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -E -s -B \\\n  tools/release_check_credential.py --self-test\n"
+          "run": "! /usr/bin/git config --local --get-regexp \\\n  '^(http\\..*\\.extraheader|credential(\\..*)?\\.helper)$' \\\n  >/dev/null 2>&1\ngit switch -C greenlit-release-github \"$GITHUB_SHA\"\ncommand -v /usr/bin/python3 >/dev/null\ncommand -v /usr/local/bin/gh >/dev/null\noutput=\"$RUNNER_TEMP/greenlit-release-github-evidence\"\ntest ! -e \"$output\"\ninstall -d -m 000700 \"$output\"\n/usr/bin/python3 -I -B \\\n  tools/release_check_credential.py --self-test\n"
         }
       ],
       "executions": [
         {
           "name": "Collect GitHub evidence with no candidate present",
-          "run": "exec /usr/bin/python3 -E -s -B\ntools/check-live-parity github\n--repository-root \"$GITHUB_WORKSPACE\"\n--output-root \"$RUNNER_TEMP/greenlit-release-github-evidence\"\n"
+          "run": "exec /usr/bin/python3 -I -B tools/check-live-parity github --repository-root \"$GITHUB_WORKSPACE\" --output-root \"$RUNNER_TEMP/greenlit-release-github-evidence\""
         }
       ]
     },
@@ -466,7 +466,7 @@
         },
         {
           "name": "Verify and unpack prepared binary",
-          "run": "set -euo pipefail\nbundle=\"$RUNNER_TEMP/greenlit-release-prepared/release-prepared.tar\"\noutput=\"$RUNNER_TEMP/greenlit-release-local-input\"\nchmod 0600 \"$bundle\"\ntest ! -e \"$output\"\n/usr/bin/python3 -E -s -B tools/release_check_credential_bundle.py \\\n  unpack-prepared \\\n  --bundle \"$bundle\" \\\n  --output-root \"$output\" \\\n  --expected-sha256 \"${{ needs.prepare.outputs.prepared_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\n"
+          "run": "set -euo pipefail\nbundle=\"$RUNNER_TEMP/greenlit-release-prepared/release-prepared.tar\"\noutput=\"$RUNNER_TEMP/greenlit-release-local-input\"\nchmod 0600 \"$bundle\"\ntest ! -e \"$output\"\n/usr/bin/python3 -I -B tools/release_check_credential_bundle.py \\\n  unpack-prepared \\\n  --bundle \"$bundle\" \\\n  --output-root \"$output\" \\\n  --expected-sha256 \"${{ needs.prepare.outputs.prepared_sha256 }}\" \\\n  --expected-source \"$GITHUB_SHA\"\n"
         }
       ],
       "executions": [

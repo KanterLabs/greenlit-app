@@ -391,8 +391,10 @@ def run_self_test(executable: Path) -> int:
             summary = f"compare-parity self-test failed: {len(runner.failures)} "
             summary += f"of {runner.count} checks failed"
             print(summary, file=sys.stderr)
-            return 1
-        print(f"compare-parity self-test passed ({runner.count} command checks)")
-        return 0
+            status = 1
+        else:
+            print(f"compare-parity self-test passed ({runner.count} command checks)")
+            status = 0
+    return status
 
 __all__ = ["run_self_test"]

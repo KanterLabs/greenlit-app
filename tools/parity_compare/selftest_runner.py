@@ -6,7 +6,6 @@ import copy
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Callable
 
@@ -151,7 +150,14 @@ class Runner:
                 / "parity_compare"
                 / "selftest_entry.py"
             )
-        command = [sys.executable, str(executable), *options, *map(str, paths)]
+        command = [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(executable),
+            *options,
+            *map(str, paths),
+        ]
         invocation_environment = os.environ.copy()
         if environment:
             invocation_environment.update(environment)

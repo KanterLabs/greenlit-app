@@ -597,7 +597,7 @@ def validate_workflow_documents(ci_text: str, release_text: str) -> None:
             "Upload exact GitHub evidence bundle",
         ),
         token_command=(
-            'exec /usr/bin/python3 -E -s -B tools/check-live-parity github '
+            'exec /usr/bin/python3 -I -B tools/check-live-parity github '
             '--repository-root "$GITHUB_WORKSPACE" '
             '--output-root "$RUNNER_TEMP/greenlit-live-github"'
         ),
@@ -621,7 +621,7 @@ def validate_workflow_documents(ci_text: str, release_text: str) -> None:
             "Upload exact GitHub evidence",
         ),
         token_command=(
-            'exec /usr/bin/python3 -E -s -B tools/check-live-parity github '
+            'exec /usr/bin/python3 -I -B tools/check-live-parity github '
             '--repository-root "$GITHUB_WORKSPACE" '
             '--output-root "$RUNNER_TEMP/greenlit-release-github-evidence"'
         ),
