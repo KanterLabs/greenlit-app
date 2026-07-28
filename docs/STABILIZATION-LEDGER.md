@@ -110,6 +110,7 @@ commit.
 | GL-STAB-099 | high | 12 | The closed-output invariant drops the renderer before Greenlit fully renders the final workflow log, so its intended post-execution writer failure can race with step execution. | Real-Docker retained invariant that reads the complete final masked log line from the compiled CLI pipe before closing that pipe | resolved | 106d3aa |
 | GL-STAB-100 | high | 12 | Disabling workflow stores returns the embedded init helper to ephemeral host scratch, which is invisible to a sibling Docker daemon and can turn the helper bind into a directory. | Real-Docker retained invariant requiring one reusable digest-addressed private helper plus release-built tokenless parity on the canonical DinD runner | resolved | 26e21cc |
 | GL-STAB-101 | medium | 12 | An oversized private file at the digest-addressed init-helper identity can exhaust Greenlit memory before the collision receives an actionable rejection. | Compiled-CLI real-Docker sparse-helper collision under a child address-space cap with exact preparation-failure and zero-step resource-cleanup evidence | resolved | def8a56 |
+| GL-STAB-102 | medium | 12 | A mismatched durable init helper reports two conflicting recovery actions, including a formal fix that cannot resolve the collision. | Compiled-CLI real-Docker helper-collision case requiring one exact path-specific fix and rejecting the ineffective writability instruction | resolved | 55db6ce |
 
 ## Field contract
 
