@@ -97,6 +97,7 @@ commit.
 | GL-STAB-086 | high | 12 | A standalone parity binary installed directly beneath its private root makes the sibling isolated HOME appear nested within the binary target boundary, so local evidence fails before execution. | Canonical private target/release binary layout plus exact live local parity production | open | — |
 | GL-STAB-087 | critical | 12 | Retained run directories inherit SGID from the runner while evidence creation ignores special bits, so the terminal secret scanner rejects and may remove otherwise valid evidence. | Compiled-CLI SGID-HOME creation and pre-existing-special-bit rejection case plus real retained-secret capability owner | open | — |
 | GL-STAB-088 | high | 12 | Live local parity replaces the selected source branch with a synthetic name that fails the seed workflow's push filters before the release binary can execute. | Exact selected-ref branch binding in CI and release routes plus same-SHA local parity production | open | — |
+| GL-STAB-089 | high | 12 | Both release-binary dogfood runs pass, but their enclosing job fails cleanup because the no-new-privileges runner cannot sudo away root-owned derived cache entries. | Two complete dogfood passes followed by exact-root cleanup through an already-materialized pinned networkless helper | open | — |
 
 ## Field contract
 

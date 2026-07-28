@@ -5,6 +5,7 @@ repository_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd "$repository_root"
 
 binary="${1:-target/release/litci}"
+readonly cleanup_image='rust:1.96.0@sha256:58fe97504a0e4cbba5d85599619a589923d3e779472a6fb0840d58d1c4ba99d7'
 if [[ ! -x "$binary" ]]; then
   echo "release-built litci is not executable at $binary" >&2
   exit 1
@@ -20,26 +21,50 @@ if [[ ! -d "$dogfood_parent" || -L "$dogfood_parent" ]]; then
 fi
 dogfood_root="$(mktemp -d "$dogfood_parent/greenlit-dogfood.XXXXXX")"
 cleanup_dogfood_root() {
-  local -a cleanup_command
   if [[ ! -d "$dogfood_root" || -L "$dogfood_root" ]]; then
     echo "temporary dogfood root changed identity: $dogfood_root" >&2
     return 1
   fi
-  if ((EUID == 0)); then
-    cleanup_command=(find)
-  else
-    if ! command -v sudo >/dev/null || ! sudo -n true; then
-      echo "passwordless sudo is required to remove root-owned dogfood cache entries" >&2
-      return 1
-    fi
-    cleanup_command=(sudo -n find)
+  if find -- "$dogfood_root" -xdev -depth -delete >/dev/null 2>&1; then
+    return 0
   fi
-  if ! "${cleanup_command[@]}" -- "$dogfood_root" -depth -delete; then
+  if [[ "$dogfood_root" == *,* ]]; then
+    echo "temporary dogfood root cannot be mounted safely: $dogfood_root" >&2
+    return 1
+  fi
+  # This Phase 12 harness fallback closes GL-STAB-089 only. GL-STAB-062 stays
+  # open for Phase 24, which must make the ordinary host cleanup path sufficient.
+  if ! docker image inspect "$cleanup_image" >/dev/null; then
+    echo "the pinned dogfood cleanup image is not already materialized" >&2
+    return 1
+  fi
+  if ! docker run \
+    --rm \
+    --pull never \
+    --network none \
+    --read-only \
+    --user 0:0 \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    --cap-add DAC_OVERRIDE \
+    --pids-limit 32 \
+    --memory 128m \
+    --cpus 1 \
+    --mount "type=bind,src=$dogfood_root,dst=/cleanup" \
+    --entrypoint /usr/bin/find \
+    "$cleanup_image" \
+    /cleanup -xdev -mindepth 1 -depth -delete
+  then
+    echo "isolated dogfood cleanup could not remove root-owned entries" >&2
+    return 1
+  fi
+  if ! find -- "$dogfood_root" -xdev -depth -delete; then
     echo "could not remove temporary dogfood evidence $dogfood_root" >&2
     return 1
   fi
 }
 trap 'cleanup_status=$?; trap - EXIT; cleanup_dogfood_root || exit 1; exit "$cleanup_status"' EXIT
+chmod 0700 "$dogfood_root"
 
 assert_no_managed_resource() {
   local resource="$1"
@@ -358,5 +383,8 @@ PY
     volume ls --quiet --filter "name=greenlit-run-$run_id"
 done
 
-cleanup_dogfood_root
+if ! cleanup_dogfood_root; then
+  trap - EXIT
+  exit 1
+fi
 trap - EXIT
