@@ -96,7 +96,7 @@ linux-keyutils = "0.2.5"
 ring = "0.17.14"
 # Confirmation downloads GitHub's evidence artifact archive, verifies its
 # API-reported SHA-256 digest, and reads exactly one bounded JSON member.
-zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 # Exported workflow and external artifact identities use the same SHA-256
 # representation as RunLock/CAS evidence.
 sha2 = "0.11.0"
