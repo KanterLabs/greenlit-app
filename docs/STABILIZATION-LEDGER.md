@@ -85,6 +85,7 @@ commit.
 | GL-STAB-074 | high | 12 | Criterion targets can execute every declared sample while enforcing no latency ceiling, allowing a material parser or evaluator regression to remain green. | Manifest-authoritative Criterion upper-bound gate for every declared benchmark identity | open | — |
 | GL-STAB-075 | high | 12 | Non-Cargo capability commands and prerequisite steps can be removed or substituted without either test-authority manifest noticing. | Public capability-manifest workflow-route mutation canaries for owners, runners, prerequisites, and execution commands | open | — |
 | GL-STAB-076 | high | 12 | Warm execution repulls an already materialized exact-digest runner or workflow image and emits setup-download evidence on every unchanged run. | Native warm performance gate requiring zero retained setup-download events across repeated compiled-Greenlit execution | open | — |
+| GL-STAB-077 | high | 12 | The credential-isolation self-test relies on ambient Git safe-directory configuration and fails before its canaries inside a GitHub job container. | Exact job-container credential self-test with a script-bound repository trust path | open | — |
 
 ## Field contract
 
