@@ -489,7 +489,7 @@
         "tools/tests/cargo_test_manifest.py",
         "tools/tests/check-capability-test-manifest"
       ],
-      "closure_sha256": "39123c3b2271e1b591f259958631047a7aced8c87b9c0059b1cb7c7157455533",
+      "closure_sha256": "6c131e0517f005848e4e042eeee1ab8c68e90dfd3269d32e3ff9a60bfcd1d691",
       "dynamic_sources": [],
       "delegates": [],
       "import_targets": [],
