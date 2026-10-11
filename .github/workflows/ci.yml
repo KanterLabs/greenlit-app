@@ -13,8 +13,15 @@ name: CI
 # this repository's own gates under Greenlit itself a *required* CI step.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Superseded validation can stop; PR merge checks and main push checks
+# use separate groups because they validate different event revisions.
+concurrency:
+  group: greenlit-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
