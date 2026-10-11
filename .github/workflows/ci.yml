@@ -10,7 +10,14 @@ name: CI
 #   7. criterion benches (record only until Phase 5; no budget gate yet)
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Superseded validation can stop; PR merge checks and main push checks
+# use separate groups because they validate different event revisions.
+concurrency:
+  group: greenlit-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
