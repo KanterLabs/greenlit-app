@@ -17,13 +17,16 @@ env:
 
 jobs:
   gates:
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
     container:
       image: rust:1.96.0 # matches rust-toolchain.toml channel
     defaults:
       run:
         shell: bash # job containers default to sh -e {0}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Provision toolchain components
         run: |
           rustc --version
