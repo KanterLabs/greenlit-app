@@ -20,12 +20,12 @@ env:
   CARGO_TERM_COLOR: always
   # The homelab runner and its DinD sidecar share runner.temp. Host paths
   # created under the runner container's private /tmp are invisible to Docker.
-  TMPDIR: /home/runner/_work/_temp
 
 jobs:
   ci:
     name: fmt, clippy, deny, stubs, test, doc, bench
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     # Keep the portable gates independent of whatever happens to be installed
     # on a runner host. Greenlit resolves this tag to an immutable digest in
     # the RunLock, and both GitHub and local runs see the same Rust userspace.
@@ -35,6 +35,9 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@v7
 
@@ -99,11 +102,20 @@ jobs:
   runtime-integration:
     name: real Docker executor acceptance
     needs: ci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
       - name: Provision pinned Rust toolchain
         run: rustup show
 
@@ -134,11 +146,20 @@ jobs:
   provider-and-policy:
     name: configured stargz provider and policy modes
     needs: runtime-integration
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
       - name: Provision pinned Rust toolchain
         run: rustup show
 
@@ -169,11 +190,20 @@ jobs:
   # contents such as rustup.
   dogfood:
     name: this repo's own gates, under litci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
       # Pull-request checkouts are detached merge commits. A synthetic manual
       # dispatch still has a selected ref, so give that exact SHA a local
       # branch instead of asking Greenlit to invent one.
