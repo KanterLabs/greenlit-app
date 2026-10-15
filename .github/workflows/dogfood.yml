@@ -7,6 +7,11 @@ name: dogfood
 #             -e workflow_dispatch --allow-degraded
 on: workflow_dispatch
 
+# Keep superseded validation from consuming hosted runner minutes.
+concurrency:
+  group: greenlit-dogfood-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # Keep build artifacts off the merged workspace: the host repo's target/
@@ -16,7 +21,8 @@ env:
 
 jobs:
   gates:
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     container:
       # Matches rust-toolchain.toml and is immutable across both executors.
       image: rust@sha256:58fe97504a0e4cbba5d85599619a589923d3e779472a6fb0840d58d1c4ba99d7

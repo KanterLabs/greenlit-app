@@ -9,6 +9,11 @@ on:
         type: boolean
         default: false
 
+# Serialize release preparation for the same ref without interrupting it.
+concurrency:
+  group: greenlit-release-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
 permissions:
   actions: read
   contents: read
@@ -19,17 +24,26 @@ env:
 jobs:
   prepare:
     name: tokenless build, test, and package
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       prepared_sha256: ${{ steps.prepared_digest.outputs.sha256 }}
-    env:
-      TMPDIR: /home/runner/_work/_temp
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Prepare branch-backed source identity
         run: git switch -C greenlit-release-prepare "$GITHUB_SHA"
@@ -59,19 +73,31 @@ jobs:
           name: greenlit-release-prepared
           path: target/release-prepared.tar
           if-no-files-found: error
+          retention-days: 3
 
   local_parity:
     name: tokenless oracle and Greenlit production
     needs: prepare
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       local_sha256: ${{ steps.local_digest.outputs.sha256 }}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Prepare exact source and runtime
         run: |
@@ -150,14 +176,52 @@ jobs:
           name: greenlit-release-local-evidence
           path: target/release-local-evidence.tar
           if-no-files-found: error
+          retention-days: 3
 
   github_parity:
     name: credential-only GitHub observation
     needs: prepare
-    runs-on: homelab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       github_sha256: ${{ steps.github_digest.outputs.sha256 }}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Provision the fixed trusted GitHub CLI path
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Credential collectors intentionally use this fixed path, never PATH.
+          # Only the hosted image's root-owned system binary may fill a missing path.
+          for directory in /usr/bin /usr/local/bin; do
+            test "$(stat -c %u "$directory")" = 0
+            mode="$(stat -c %a "$directory")"
+            test "$((8#$mode & 8#022))" -eq 0
+          done
+          if test ! -e /usr/local/bin/gh; then
+            test ! -L /usr/local/bin/gh
+            test -f /usr/bin/gh
+            test ! -L /usr/bin/gh
+            test -x /usr/bin/gh
+            test "$(stat -c %u /usr/bin/gh)" = 0
+            mode="$(stat -c %a /usr/bin/gh)"
+            test "$((8#$mode & 8#022))" -eq 0
+            sudo ln -s -- /usr/bin/gh /usr/local/bin/gh
+          fi
+          resolved="$(readlink -f /usr/local/bin/gh)"
+          case "$resolved" in
+            /usr/bin/gh|/usr/local/bin/gh) ;;
+            *) exit 1 ;;
+          esac
+          test -f "$resolved"
+          test -x "$resolved"
+          test "$(stat -c %u "$resolved")" = 0
+          mode="$(stat -c %a "$resolved")"
+          test "$((8#$mode & 8#022))" -eq 0
+
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -210,6 +274,7 @@ jobs:
           name: greenlit-release-github-evidence
           path: target/release-github-evidence.tar
           if-no-files-found: error
+          retention-days: 3
 
   finalize:
     name: tokenless compare, capability, and final seal
@@ -217,15 +282,26 @@ jobs:
       - prepare
       - local_parity
       - github_parity
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       candidate_sha256: ${{ steps.seal_candidate.outputs.sha256 }}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Prepare exact source and capabilities
         run: |
@@ -358,19 +434,31 @@ jobs:
           name: greenlit-app-linux-x86_64
           path: target/greenlit-release-candidate.tar
           if-no-files-found: error
+          retention-days: 3
 
   publish:
     name: refuse unverifiable publication
     if: inputs.publish
     needs: finalize
-    runs-on: homelab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment: release
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Resolve locked offline verification inputs
         run: cargo fetch --locked

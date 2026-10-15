@@ -6,15 +6,20 @@ on:
   push:
     branches:
       - main
-      - "stabilization/**"
   workflow_dispatch:
+
+# Keep superseded validation from consuming hosted runner minutes.
+concurrency:
+  group: greenlit-parity-seed-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions: {}
 
 jobs:
   shell:
     name: Shell-only parity seed
-    runs-on: homelab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - id: emit
         name: Emit deterministic output

@@ -15,14 +15,17 @@ name: CI
 # this repository's own gates under Greenlit itself a *required* CI step.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  # The homelab runner and its DinD sidecar share runner.temp. Host paths
-  # created under the runner container's private /tmp are invisible to Docker.
-  TMPDIR: /home/runner/_work/_temp
+
+# Keep superseded validation from consuming hosted runner minutes.
+concurrency:
+  group: greenlit-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   actions: read
@@ -31,9 +34,10 @@ permissions:
 jobs:
   ci:
     name: portable fmt, clippy, deny, checkers, test, doc, bench
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
-      # The host-only DinD path above is not translated into a job container.
+      # Job containers use their own writable temporary directory.
       TMPDIR: /tmp
     # Keep the portable gates independent of whatever happens to be installed
     # on a runner host. The exact digest is also retained in Greenlit's
@@ -130,19 +134,29 @@ jobs:
       - name: Criterion benchmark manifest
         run: tools/tests/check-criterion-manifest
 
-  # A workflow job container intentionally cannot receive the host Docker
-  # socket. Keep the real-daemon acceptance on the heavy runner, while the
-  # portable suite above remains identical locally and on GitHub.
+  # Keep real-daemon acceptance on a fresh GitHub-hosted VM, while the
+  # portable suite above runs in its pinned Rust job container.
   runtime-integration:
     name: real Docker executor acceptance
     needs: ci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -182,13 +196,24 @@ jobs:
   credential-capability:
     name: isolated persistent-keyring acceptance
     needs: ci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -211,13 +236,24 @@ jobs:
   host-deep-path:
     name: native beyond-PATH_MAX filesystem invariant
     needs: ci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -242,13 +278,24 @@ jobs:
   provider-and-policy:
     name: configured stargz provider
     needs: runtime-integration
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -265,18 +312,29 @@ jobs:
       - name: Direct containerd/stargz provider
         run: tools/test-stargz-provider
 
-  # Keep the native performance authority on a fresh ARC pod and private DinD
-  # daemon so earlier provider work cannot warm or contaminate its runtime.
+  # Keep the native performance authority on a fresh GitHub-hosted VM and
+  # Docker daemon so earlier provider work cannot warm its runtime.
   performance-policy:
     name: native performance and policy modes
     needs: runtime-integration
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Provision pinned Rust toolchain
         run: rustup show
@@ -300,15 +358,26 @@ jobs:
       (github.ref == 'refs/heads/main' ||
        startsWith(github.ref, 'refs/heads/stabilization/'))
     needs: ci
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     outputs:
       local_sha256: ${{ steps.local_digest.outputs.sha256 }}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Prepare branch-backed source identity
         run: |
@@ -393,6 +462,7 @@ jobs:
           name: greenlit-ci-live-local
           path: target/ci-live-local.tar
           if-no-files-found: error
+          retention-days: 3
 
   live_parity_github:
     name: credential-only same-SHA GitHub observation
@@ -401,10 +471,47 @@ jobs:
       (github.ref == 'refs/heads/main' ||
        startsWith(github.ref, 'refs/heads/stabilization/'))
     needs: ci
-    runs-on: homelab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       github_sha256: ${{ steps.github_digest.outputs.sha256 }}
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Provision the fixed trusted GitHub CLI path
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Credential collectors intentionally use this fixed path, never PATH.
+          # Only the hosted image's root-owned system binary may fill a missing path.
+          for directory in /usr/bin /usr/local/bin; do
+            test "$(stat -c %u "$directory")" = 0
+            mode="$(stat -c %a "$directory")"
+            test "$((8#$mode & 8#022))" -eq 0
+          done
+          if test ! -e /usr/local/bin/gh; then
+            test ! -L /usr/local/bin/gh
+            test -f /usr/bin/gh
+            test ! -L /usr/bin/gh
+            test -x /usr/bin/gh
+            test "$(stat -c %u /usr/bin/gh)" = 0
+            mode="$(stat -c %a /usr/bin/gh)"
+            test "$((8#$mode & 8#022))" -eq 0
+            sudo ln -s -- /usr/bin/gh /usr/local/bin/gh
+          fi
+          resolved="$(readlink -f /usr/local/bin/gh)"
+          case "$resolved" in
+            /usr/bin/gh|/usr/local/bin/gh) ;;
+            *) exit 1 ;;
+          esac
+          test -f "$resolved"
+          test -x "$resolved"
+          test "$(stat -c %u "$resolved")" = 0
+          mode="$(stat -c %a "$resolved")"
+          test "$((8#$mode & 8#022))" -eq 0
+
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -456,6 +563,7 @@ jobs:
           name: greenlit-ci-live-github
           path: target/ci-live-github.tar
           if-no-files-found: error
+          retention-days: 3
 
   live_parity_compare:
     name: tokenless same-SHA parity comparison
@@ -466,13 +574,24 @@ jobs:
     needs:
       - live_parity_local
       - live_parity_github
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out exact source without persisted credentials
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       - name: Prepare exact comparison source
         run: |
@@ -532,6 +651,7 @@ jobs:
           name: greenlit-live-parity
           path: ${{ runner.temp }}/greenlit-live-parity/
           if-no-files-found: error
+          retention-days: 3
 
   # TESTING.md "Dogfood clause": "from Phase 2 onward this repo's own workflow
   # must run green under Greenlit itself, and that run is a required CI step
@@ -539,7 +659,7 @@ jobs:
   # failed its founding premise."
   #
   # The dedicated workflow supplies its repository-declared Rust toolchain
-  # through an immutable job container. The locked ARC runner profile is
+  # through an immutable job container. The locked local runner profile is
   # intentionally not inferred to contain GitHub-hosted runner toolcache
   # contents such as rustup.
   dogfood:
@@ -549,13 +669,24 @@ jobs:
       - performance-policy
       - credential-capability
       - host-deep-path
-    runs-on: homelab-heavy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
+      - name: Use the per-job temporary directory
+        shell: bash
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up the project Rust toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
 
       # Pull-request checkouts are detached merge commits. A synthetic manual
       # dispatch still has a selected ref, so give that exact SHA a local
