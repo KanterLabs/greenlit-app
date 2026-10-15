@@ -23,6 +23,12 @@ concurrency:
   group: greenlit-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Superseded validation can stop; PR merge checks and main push checks
+# use separate groups because they validate different event revisions.
+concurrency:
+  group: greenlit-ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   # The homelab runner and its DinD sidecar share runner.temp. Host paths
