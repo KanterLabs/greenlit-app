@@ -6,16 +6,19 @@
 
 ### GitHub CI infrastructure
 
-Greenlit (`litci`) is the product under test; it is not Actions Runner
-Controller. ARC manages the ephemeral GitHub runner pods that execute this
-repository's workflows. Keep sustained Rust, dogfood, benchmark, integration,
-and release-verification jobs on `homelab-heavy`; keep inexpensive publishing
-or metadata work on `homelab`. Choose per job and preserve the runner-label
-planner/runtime tests when adding a tier.
+Shane retired the homelab CI fleet on 2026-10-11. Workflow jobs use standard
+GitHub-hosted runners, normally `runs-on: ubuntu-24.04`. Provision the pinned
+Rust toolchain, native prerequisites, and temporary paths explicitly on each
+fresh runner. Keep required check names and credential boundaries intact.
 
-A test failure after GitHub assigns a runner is not by itself an ARC failure.
-The canonical platform contract is
-`KanterLabs/infrastructure/homelab/ci-runners/README.md`.
+Automatic push validation runs on main; pull-request and manual validation
+remain available. Cancel superseded validation, bound job timeouts, cache
+Rust dependencies, and retain diagnostic artifacts briefly. The Actions
+spending cap is $25 per month with stop-usage enabled. Do not reactivate the
+retired VM or provision larger runners during routine maintenance.
+
+Gitea is canonical and GitHub is the execution mirror. The operating contract
+is `KanterLabs/infrastructure/homelab/ci-runners/README.md`.
 
 | Surface | Name |
 |---|---|
